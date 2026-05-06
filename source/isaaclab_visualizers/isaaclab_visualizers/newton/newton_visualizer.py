@@ -205,6 +205,9 @@ class NewtonViewerGL(ViewerGL):
                     show_com = self.show_com
                     changed, self.show_com = imgui.checkbox("Show Center of Mass", show_com)
 
+                    show_particles = self.show_particles
+                    changed, self.show_particles = imgui.checkbox("Show Particles", show_particles)
+
             imgui.set_next_item_open(True, imgui.Cond_.appearing)
             if imgui.collapsing_header("Rendering Options"):
                 imgui.separator()
@@ -327,6 +330,7 @@ class NewtonVisualizer(BaseVisualizer):
             self._viewer.show_springs = self.cfg.show_springs
             self._viewer.show_inertia_boxes = self.cfg.show_inertia_boxes
             self._viewer.show_com = self.cfg.show_com
+            self._viewer.show_particles = self.cfg.show_particles
 
             self._viewer.renderer.draw_shadows = self.cfg.enable_shadows
             self._viewer.renderer.draw_sky = self.cfg.enable_sky

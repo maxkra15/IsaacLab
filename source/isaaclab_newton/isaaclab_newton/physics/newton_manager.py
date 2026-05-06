@@ -507,6 +507,7 @@ class NewtonManager(PhysicsManager):
             New builder with up-axis and per-shape defaults (gap, margin) applied.
         """
         builder = ModelBuilder(up_axis=up_axis or cls._up_axis, **kwargs)
+        cls._register_solver_custom_attributes(builder)
         # Resolve which NewtonShapeCfg to apply: user override if active config
         # is NewtonCfg, else the wrapper's own defaults so callers from non-Newton
         # contexts (tests, early construction) still get the rough-terrain margin.
@@ -514,6 +515,16 @@ class NewtonManager(PhysicsManager):
         shape_cfg = cfg.default_shape_cfg if isinstance(cfg, NewtonCfg) else NewtonShapeCfg()
         checked_apply(shape_cfg, builder.default_shape_cfg)
         return builder
+
+    @classmethod
+    def _register_solver_custom_attributes(cls, builder: ModelBuilder) -> None:
+        """Register custom builder attributes required by the active Newton solver."""
+        cfg = PhysicsManager._cfg
+        solver_cfg = getattr(cfg, "solver_cfg", None)
+        if getattr(solver_cfg, "solver_type", None) == "implicit_mpm":
+            from newton.solvers import SolverImplicitMPM
+
+            SolverImplicitMPM.register_custom_attributes(builder)
 
     @classmethod
     def cl_register_site(cls, body_pattern: str | None, xform: wp.transform) -> str:
@@ -739,6 +750,7 @@ class NewtonManager(PhysicsManager):
         # Create builder from USD stage if not provided
         if cls._builder is None:
             cls.instantiate_builder_from_stage()
+        cls._register_solver_custom_attributes(cls._builder)
 
         logger.info("Dispatching MODEL_INIT callbacks")
         cls.dispatch_event(PhysicsEvent.MODEL_INIT)
@@ -827,6 +839,7 @@ class NewtonManager(PhysicsManager):
         env_paths.sort(key=lambda x: x[0])
 
         builder = ModelBuilder(up_axis=up_axis)
+        cls._register_solver_custom_attributes(builder)
 
         schema_resolvers = [SchemaResolverNewton(), SchemaResolverPhysx()]
 
@@ -841,6 +854,7 @@ class NewtonManager(PhysicsManager):
             # Build a prototype from the first env (all envs assumed identical)
             _, proto_path = env_paths[0]
             proto = ModelBuilder(up_axis=up_axis)
+            cls._register_solver_custom_attributes(proto)
             proto.add_usd(
                 stage,
                 root_path=proto_path,
