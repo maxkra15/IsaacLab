@@ -13,6 +13,13 @@ the sand after each robot step.
 
 .. code-block:: bash
 
+    # headless/no visualizer, suitable for training-style runs
+    ./isaaclab.sh -p scripts/demos/newton_anymal_mpm_sand.py
+
+    # native Newton visualizer for debugging particles and robot motion
+    ./isaaclab.sh -p scripts/demos/newton_anymal_mpm_sand.py --viz newton
+
+    # Isaac Sim Kit plus Newton visualizers
     ./isaaclab.sh -p scripts/demos/newton_anymal_mpm_sand.py --viz kit,newton
 
 The demo spawns Isaac Lab's ANYmal-C USD for Kit visuals and drives those prims
@@ -41,9 +48,13 @@ parser.add_argument("--command-yaw", type=float, default=0.0, help="Commanded ya
 parser.add_argument("--max-steps", type=int, default=-1, help="Stop after this many frames; negative runs forever.")
 parser.add_argument("--policy", type=str, default=None, help="Optional path to a TorchScript ANYmal policy.")
 parser.add_argument("--disable-cuda-graph", action="store_true", help="Disable MJWarp CUDA graph capture.")
-parser.add_argument("--kit-sand-stride", type=int, default=1, help="Render every Nth sand particle in Kit.")
+parser.add_argument(
+    "--kit-sand-stride",
+    type=int,
+    default=1,
+    help="Render every Nth sand particle in Kit; 1 renders every particle.",
+)
 AppLauncher.add_app_launcher_args(parser)
-parser.set_defaults(visualizer=["kit", "newton"])
 args_cli = parser.parse_args()
 
 app_launcher = AppLauncher(args_cli)
@@ -52,6 +63,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import warnings
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import torch
@@ -69,6 +81,55 @@ from isaaclab_assets.robots.anymal import ANYMAL_C_CFG  # isort:skip
 
 LAB_TO_MUJOCO = [0, 6, 3, 9, 1, 7, 4, 10, 2, 8, 5, 11]
 MUJOCO_TO_LAB = [0, 4, 8, 2, 6, 10, 1, 5, 9, 3, 7, 11]
+
+
+def quat_mul(q_a: np.ndarray, q_b: np.ndarray) -> np.ndarray:
+    """Multiply quaternions in XYZW order."""
+    ax, ay, az, aw = q_a
+    bx, by, bz, bw = q_b
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ],
+        dtype=np.float64,
+    )
+
+
+def quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate a vector by a quaternion in XYZW order."""
+    q_vec = q[:3]
+    t = 2.0 * np.cross(q_vec, v)
+    return v + q[3] * t + np.cross(q_vec, t)
+
+
+def rpy_to_quat(rpy: np.ndarray) -> np.ndarray:
+    """Convert URDF RPY angles to an XYZW quaternion."""
+    roll, pitch, yaw = rpy
+    cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+    cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+    cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
+    return np.array(
+        [
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        ],
+        dtype=np.float64,
+    )
+
+
+def compose_transform(
+    parent_pos: np.ndarray, parent_quat: np.ndarray, child_pos: np.ndarray, child_quat: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compose parent and child transforms represented as position plus XYZW quaternion."""
+    pos = parent_pos + quat_rotate(parent_quat, child_pos)
+    quat = quat_mul(parent_quat, child_quat)
+    quat /= np.linalg.norm(quat)
+    return pos, quat
 
 
 def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -133,10 +194,78 @@ def spawn_sand(builder: newton.ModelBuilder, voxel_size: float, particles_per_ce
     )
 
 
+def setup_kit_scene(sim: sim_utils.SimulationContext) -> None:
+    """Create simple Kit-only scene visuals for the demo."""
+    if "kit" not in sim.resolve_visualizer_types():
+        return
+
+    stage = sim_utils.get_current_stage()
+    if not stage.GetPrimAtPath("/World/Ground").IsValid():
+        ground_cfg = sim_utils.GroundPlaneCfg(size=(12.0, 12.0), color=(0.46, 0.38, 0.24))
+        ground_cfg.func("/World/Ground", ground_cfg)
+
+    if not stage.GetPrimAtPath("/World/DomeLight").IsValid():
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/DomeLight", light_cfg)
+
+
+def resolve_kit_body_prim_path(stage, root_path: str, body_name: str) -> str:
+    """Find the USD prim that owns a robot body visual, falling back to a new Xform."""
+    from pxr import Usd, UsdGeom  # noqa: PLC0415
+
+    direct_path = f"{root_path}/{body_name}"
+    if stage.GetPrimAtPath(direct_path).IsValid():
+        return direct_path
+
+    root_prim = stage.GetPrimAtPath(root_path)
+    if root_prim.IsValid():
+        for prim in Usd.PrimRange(root_prim):
+            if prim.GetName() == body_name:
+                return str(prim.GetPath())
+
+    UsdGeom.Xform.Define(stage, direct_path)
+    return direct_path
+
+
+def parse_fixed_link_offsets(urdf_path: str, dynamic_body_names: set[str]) -> dict[str, list[tuple[str, np.ndarray, np.ndarray]]]:
+    """Map each dynamic Newton body link to fixed-descendant visual links and their body-frame offsets."""
+    root = ET.parse(urdf_path).getroot()
+    fixed_children: dict[str, list[tuple[str, np.ndarray, np.ndarray]]] = {}
+
+    for joint in root.findall("joint"):
+        if joint.attrib.get("type") != "fixed":
+            continue
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is None or child is None:
+            continue
+        origin = joint.find("origin")
+        xyz = np.zeros(3, dtype=np.float64)
+        rpy = np.zeros(3, dtype=np.float64)
+        if origin is not None:
+            xyz = np.fromstring(origin.attrib.get("xyz", "0 0 0"), sep=" ", dtype=np.float64)
+            rpy = np.fromstring(origin.attrib.get("rpy", "0 0 0"), sep=" ", dtype=np.float64)
+        fixed_children.setdefault(parent.attrib["link"], []).append((child.attrib["link"], xyz, rpy_to_quat(rpy)))
+
+    offsets: dict[str, list[tuple[str, np.ndarray, np.ndarray]]] = {}
+    for body_name in dynamic_body_names:
+        stack = [(body_name, np.zeros(3, dtype=np.float64), np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64))]
+        visited = {body_name}
+        while stack:
+            parent_link, parent_pos, parent_quat = stack.pop()
+            for child_link, child_pos_local, child_quat_local in fixed_children.get(parent_link, []):
+                if child_link in visited or child_link in dynamic_body_names:
+                    continue
+                child_pos, child_quat = compose_transform(parent_pos, parent_quat, child_pos_local, child_quat_local)
+                offsets.setdefault(body_name, []).append((child_link, child_pos, child_quat))
+                visited.add(child_link)
+                stack.append((child_link, child_pos, child_quat))
+
+    return offsets
+
+
 def create_kit_body_prims(builder: newton.ModelBuilder) -> None:
     """Spawn ANYmal-C USD visuals and relabel Newton bodies to valid USD paths."""
-    from pxr import UsdGeom  # noqa: PLC0415
-
     ANYMAL_C_CFG.spawn.func(
         "/World/Robot",
         ANYMAL_C_CFG.spawn,
@@ -147,13 +276,10 @@ def create_kit_body_prims(builder: newton.ModelBuilder) -> None:
 
     for body_id, body_label in enumerate(builder.body_label):
         body_name = body_label.rsplit("/", 1)[-1]
-        body_prim_path = f"/World/Robot/{body_name}"
-        if not stage.GetPrimAtPath(body_prim_path).IsValid():
-            UsdGeom.Xform.Define(stage, body_prim_path)
-        builder.body_label[body_id] = body_prim_path
+        builder.body_label[body_id] = resolve_kit_body_prim_path(stage, "/World/Robot", body_name)
 
 
-def build_anymal_sand_model() -> str:
+def build_anymal_sand_model() -> tuple[str, str]:
     """Populate ``NewtonManager`` with ANYmal-C, ground, and MPM particles."""
     builder = NewtonManager.create_builder()
     SolverMuJoCo.register_custom_attributes(builder)
@@ -217,7 +343,7 @@ def build_anymal_sand_model() -> str:
 
     spawn_sand(builder, args_cli.voxel_size, args_cli.particles_per_cell)
     NewtonManager.set_builder(builder)
-    return str(asset_path / "rl_policies" / "anymal_walking_policy_physx.pt")
+    return str(asset_path / "rl_policies" / "anymal_walking_policy_physx.pt"), urdf_path
 
 
 def create_mpm_solver(model: newton.Model, state: newton.State) -> SolverImplicitMPM:
@@ -242,37 +368,124 @@ def create_mpm_solver(model: newton.Model, state: newton.State) -> SolverImplici
     return mpm_solver
 
 
+class KitRobotVisuals:
+    """Fallback USD transform sync for the spawned ANYmal-C Kit visual asset."""
+
+    def __init__(self, model: newton.Model, urdf_path: str):
+        from pxr import UsdGeom  # noqa: PLC0415
+
+        stage = sim_utils.get_current_stage()
+        self._body_indices: list[int] = []
+        self._offset_pos: list[np.ndarray] = []
+        self._offset_quat: list[np.ndarray] = []
+        self._xform_ops = []
+
+        body_names = [label.rsplit("/", 1)[-1] for label in model.body_label]
+        fixed_offsets = parse_fixed_link_offsets(urdf_path, set(body_names))
+
+        visual_targets: list[tuple[int, str, np.ndarray, np.ndarray]] = []
+        for body_id, body_path in enumerate(model.body_label):
+            body_name = body_names[body_id]
+            identity_pos = np.zeros(3, dtype=np.float64)
+            identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+            visual_targets.append((body_id, body_path, identity_pos, identity_quat))
+            for link_name, offset_pos, offset_quat in fixed_offsets.get(body_name, []):
+                link_path = resolve_kit_body_prim_path(stage, "/World/Robot", link_name)
+                visual_targets.append((body_id, link_path, offset_pos, offset_quat))
+
+        seen_paths = set()
+        for body_id, prim_path, offset_pos, offset_quat in visual_targets:
+            if prim_path in seen_paths:
+                continue
+            seen_paths.add(prim_path)
+            prim = stage.GetPrimAtPath(prim_path)
+            if prim.IsValid():
+                xformable = UsdGeom.Xformable(prim)
+                xformable.ClearXformOpOrder()
+                xformable.SetResetXformStack(True)
+                self._xform_ops.append(xformable.AddTransformOp(UsdGeom.XformOp.PrecisionDouble, "newton_world"))
+                self._body_indices.append(body_id)
+                self._offset_pos.append(offset_pos)
+                self._offset_quat.append(offset_quat)
+
+    def update(self, state: newton.State) -> None:
+        """Write Newton body poses into the corresponding USD body Xforms."""
+        from pxr import Gf, Sdf  # noqa: PLC0415
+
+        body_q = state.body_q.numpy()
+        with Sdf.ChangeBlock():
+            for body_id, offset_pos, offset_quat, xform_op in zip(
+                self._body_indices, self._offset_pos, self._offset_quat, self._xform_ops
+            ):
+                transform = body_q[body_id]
+                body_pos = transform[:3].astype(np.float64, copy=False)
+                body_quat = transform[3:7].astype(np.float64, copy=False)
+                visual_pos, visual_quat = compose_transform(body_pos, body_quat, offset_pos, offset_quat)
+                matrix = Gf.Matrix4d(1.0)
+                matrix.SetRotate(
+                    Gf.Quatd(
+                        float(visual_quat[3]),
+                        Gf.Vec3d(float(visual_quat[0]), float(visual_quat[1]), float(visual_quat[2])),
+                    )
+                )
+                matrix.SetTranslateOnly(Gf.Vec3d(float(visual_pos[0]), float(visual_pos[1]), float(visual_pos[2])))
+                xform_op.Set(matrix)
+
+
 class KitSandPoints:
     """Small USD ``Points`` helper for visualizing MPM particles in Kit."""
 
-    def __init__(self, prim_path: str, radius: float):
+    def __init__(self, prim_path: str, widths: np.ndarray):
         from pxr import Gf, UsdGeom, Vt  # noqa: PLC0415
 
         stage = sim_utils.get_current_stage()
         self._points = UsdGeom.Points.Define(stage, prim_path)
-        self._radius = float(radius)
+        self._widths_np = widths.astype(np.float32, copy=False)
         self._color = Gf.Vec3f(0.72, 0.60, 0.38)
-        self._points.CreateWidthsAttr(Vt.FloatArray())
-        self._points.CreateDisplayColorAttr(Vt.Vec3fArray())
+        self._points_attr = self._points.GetPointsAttr()
+        self._widths_attr = self._points.CreateWidthsAttr(Vt.FloatArray())
+        self._color_attr = self._points.CreateDisplayColorAttr(Vt.Vec3fArray())
+        self._particle_count = -1
+        self._widths = Vt.FloatArray()
+        self._colors = Vt.Vec3fArray()
 
     def update(self, positions: torch.Tensor) -> None:
-        from pxr import Vt  # noqa: PLC0415
+        from pxr import Sdf, Vt  # noqa: PLC0415
 
         positions_np = positions.detach().cpu().numpy().astype(np.float32, copy=False)
-        self._points.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(positions_np))
-        # RTX treats point widths as vertex data; author one width per point.
-        self._points.GetWidthsAttr().Set(Vt.FloatArray([self._radius] * positions_np.shape[0]))
-        self._points.GetDisplayColorAttr().Set(Vt.Vec3fArray([self._color] * positions_np.shape[0]))
+        particle_count = int(positions_np.shape[0])
+        with Sdf.ChangeBlock():
+            self._points_attr.Set(Vt.Vec3fArray.FromNumpy(positions_np))
+            if particle_count != self._particle_count:
+                # RTX treats widths/colors as vertex data, so cache them until the particle count changes.
+                self._particle_count = particle_count
+                self._widths = Vt.FloatArray(self._widths_np[:particle_count].tolist())
+                self._colors = Vt.Vec3fArray([self._color] * particle_count)
+                self._widths_attr.Set(self._widths)
+                self._color_attr.Set(self._colors)
 
 
-def create_sand_points(sim: sim_utils.SimulationContext) -> KitSandPoints | None:
+def create_kit_robot_visuals(sim: sim_utils.SimulationContext, model: newton.Model, urdf_path: str) -> KitRobotVisuals | None:
+    """Create a Kit-side fallback synchronizer for the spawned ANYmal-C visual asset."""
+    if "kit" not in sim.resolve_visualizer_types():
+        return None
+    return KitRobotVisuals(model, urdf_path)
+
+
+def create_sand_points(sim: sim_utils.SimulationContext, model: newton.Model) -> KitSandPoints | None:
     """Create Kit points for the MPM particles when Kit visualization is active."""
     if "kit" not in sim.resolve_visualizer_types():
         return None
     if args_cli.kit_sand_stride < 1:
         raise ValueError("--kit-sand-stride must be >= 1.")
+    particle_radius = wp.to_torch(model.particle_radius)
+    if args_cli.kit_sand_stride == 1:
+        rendered_radius = particle_radius
+    else:
+        rendered_radius = particle_radius[:: args_cli.kit_sand_stride]
+    widths = 2.0 * rendered_radius.detach().cpu().numpy().astype(np.float32, copy=False)
     sim_utils.create_prim("/World/Visuals", "Xform")
-    return KitSandPoints("/World/Visuals/SandParticles", radius=args_cli.voxel_size * 0.25)
+    return KitSandPoints("/World/Visuals/SandParticles", widths=widths)
 
 
 def update_sand_points(points: KitSandPoints | None, state: newton.State) -> None:
@@ -280,7 +493,16 @@ def update_sand_points(points: KitSandPoints | None, state: newton.State) -> Non
     if points is None:
         return
     particle_q = wp.to_torch(state.particle_q)
-    points.update(particle_q[:: args_cli.kit_sand_stride])
+    if args_cli.kit_sand_stride == 1:
+        points.update(particle_q)
+    else:
+        points.update(particle_q[:: args_cli.kit_sand_stride])
+
+
+def update_kit_robot_visuals(robot_visuals: KitRobotVisuals | None, state: newton.State) -> None:
+    """Push Newton robot body poses into Kit USD prims."""
+    if robot_visuals is not None:
+        robot_visuals.update(state)
 
 
 def enable_newton_particle_visualization(sim: sim_utils.SimulationContext) -> None:
@@ -331,6 +553,7 @@ def run_simulator(
     sim: sim_utils.SimulationContext,
     mpm_solver: SolverImplicitMPM,
     policy: torch.jit.ScriptModule,
+    robot_visuals: KitRobotVisuals | None,
     sand_points: KitSandPoints | None,
 ) -> None:
     """Run the coupled robot/sand simulation loop."""
@@ -372,8 +595,10 @@ def run_simulator(
         sim.step(render=False)
         state = NewtonManager.get_state_0()
         mpm_solver.step(state, state, control=None, contacts=None, dt=frame_dt)
-        update_sand_points(sand_points, state)
-        sim.render()
+        if sim.is_rendering:
+            update_kit_robot_visuals(robot_visuals, state)
+            update_sand_points(sand_points, state)
+            sim.render()
         count += 1
 
 
@@ -399,22 +624,25 @@ def main() -> None:
         ),
     )
     sim = sim_utils.SimulationContext(sim_cfg)
+    setup_kit_scene(sim)
     sim.set_camera_view(eye=[4.5, -4.5, 2.2], target=[0.0, 0.8, 0.4])
 
-    default_policy_path = build_anymal_sand_model()
+    default_policy_path, urdf_path = build_anymal_sand_model()
     sim.reset()
     enable_newton_particle_visualization(sim)
 
     model = NewtonManager.get_model()
     state = NewtonManager.get_state_0()
     mpm_solver = create_mpm_solver(model, state)
-    sand_points = create_sand_points(sim)
+    robot_visuals = create_kit_robot_visuals(sim, model, urdf_path)
+    update_kit_robot_visuals(robot_visuals, state)
+    sand_points = create_sand_points(sim, model)
     update_sand_points(sand_points, state)
     policy = load_policy(default_policy_path, wp.device_to_torch(model.device))
 
     print("[INFO]: Isaac Lab Newton ANYmal MPM sand demo ready.")
     print("[INFO]: Use --command-forward/--command-lateral/--command-yaw to change the fixed velocity command.")
-    run_simulator(sim, mpm_solver, policy, sand_points)
+    run_simulator(sim, mpm_solver, policy, robot_visuals, sand_points)
 
 
 if __name__ == "__main__":

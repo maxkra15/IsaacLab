@@ -28,12 +28,16 @@ from __future__ import annotations
 import pytest
 import warp as wp
 from isaaclab_newton.physics import (
+    CoupledProxyCfg,
+    CoupledSolverCfg,
+    CoupledSolverEntryCfg,
     FeatherstoneSolverCfg,
     KaminoSolverCfg,
     MJWarpSolverCfg,
     MPMSolverCfg,
     NewtonCfg,
     NewtonCollisionPipelineCfg,
+    NewtonCoupledManager,
     NewtonFeatherstoneManager,
     NewtonKaminoManager,
     NewtonManager,
@@ -41,9 +45,15 @@ from isaaclab_newton.physics import (
     NewtonMJWarpManager,
     NewtonSolverCfg,
     NewtonXPBDManager,
+    ProxyCouplingCfg,
     XPBDSolverCfg,
 )
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
+
+try:
+    from newton.solvers import SolverProxyCoupled
+except ImportError:
+    SolverProxyCoupled = None
 
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
@@ -110,6 +120,44 @@ SOLVER_MATRIX = [
         False,
         id="implicit_mpm",
     ),
+    pytest.param(
+        lambda: CoupledSolverCfg(
+            entries=[
+                CoupledSolverEntryCfg(
+                    name="rigid",
+                    solver_cfg=MJWarpSolverCfg(
+                        use_mujoco_contacts=False,
+                        njmax=100,
+                        nconmax=100,
+                        iterations=2,
+                        ls_iterations=2,
+                    ),
+                    bodies=[0],
+                    joints=[0],
+                ),
+                CoupledSolverEntryCfg(
+                    name="sand",
+                    solver_cfg=MPMSolverCfg(max_iterations=2, voxel_size=0.05),
+                    particles=list(range(8)),
+                ),
+            ],
+            proxy_coupling=ProxyCouplingCfg(
+                proxies=[
+                    CoupledProxyCfg(
+                        source="rigid",
+                        destination="sand",
+                        bodies=[0],
+                    )
+                ],
+            ),
+        ),
+        NewtonCoupledManager,
+        SolverProxyCoupled,
+        False,
+        True,
+        marks=pytest.mark.skipif(SolverProxyCoupled is None, reason="Newton SolverProxyCoupled is unavailable"),
+        id="proxy_coupled_mjwarp_mpm",
+    ),
 ]
 
 
@@ -152,7 +200,14 @@ def test_newton_cfg_post_init_propagates_class_type(
 
 @pytest.mark.parametrize(
     "manager",
-    [NewtonMJWarpManager, NewtonXPBDManager, NewtonFeatherstoneManager, NewtonKaminoManager, NewtonMPMManager],
+    [
+        NewtonMJWarpManager,
+        NewtonXPBDManager,
+        NewtonFeatherstoneManager,
+        NewtonKaminoManager,
+        NewtonMPMManager,
+        NewtonCoupledManager,
+    ],
 )
 def test_subclass_of_newton_manager(manager):
     """All concrete managers inherit from :class:`NewtonManager`."""
@@ -169,7 +224,14 @@ def test_abstract_build_solver_raises():
 
 @pytest.mark.parametrize(
     "manager",
-    [NewtonMJWarpManager, NewtonXPBDManager, NewtonFeatherstoneManager, NewtonKaminoManager, NewtonMPMManager],
+    [
+        NewtonMJWarpManager,
+        NewtonXPBDManager,
+        NewtonFeatherstoneManager,
+        NewtonKaminoManager,
+        NewtonMPMManager,
+        NewtonCoupledManager,
+    ],
 )
 def test_manager_name_starts_with_newton(manager):
     """The ``"newton"`` prefix is required by :class:`InteractiveScene` and the
@@ -250,6 +312,25 @@ def test_initialize_solver_populates_canonical_state(
                 jitter=0.0,
                 radius_mean=0.02,
             )
+        elif SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
+            assert builder.has_custom_attribute("mpm:young_modulus")
+            body = builder.add_body(mass=1.0)
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+            builder.add_ground_plane()
+            builder.add_particle_grid(
+                pos=wp.vec3(-0.05, -0.05, 0.10),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                dim_x=2,
+                dim_y=2,
+                dim_z=2,
+                cell_x=0.05,
+                cell_y=0.05,
+                cell_z=0.05,
+                mass=0.01,
+                jitter=0.0,
+                radius_mean=0.02,
+            )
         else:
             # Pre-populate the builder with a minimal scene so MJCF conversion has
             # something to work with.
@@ -263,6 +344,9 @@ def test_initialize_solver_populates_canonical_state(
         # Canonical state lives on the base class.
         assert NewtonManager._solver is not None
         assert isinstance(NewtonManager._solver, expected_solver_cls)
+        if SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
+            assert NewtonManager._solver.get_solver("rigid") is not None
+            assert NewtonManager._solver.get_solver("sand") is not None
         assert NewtonManager._use_single_state is expected_use_single_state
         assert NewtonManager._needs_collision_pipeline is expected_needs_collision_pipeline
 

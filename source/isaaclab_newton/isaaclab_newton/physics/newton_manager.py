@@ -521,7 +521,9 @@ class NewtonManager(PhysicsManager):
         """Register custom builder attributes required by the active Newton solver."""
         cfg = PhysicsManager._cfg
         solver_cfg = getattr(cfg, "solver_cfg", None)
-        if getattr(solver_cfg, "solver_type", None) == "implicit_mpm":
+        solver_cfgs = [solver_cfg]
+        solver_cfgs.extend(entry.solver_cfg for entry in getattr(solver_cfg, "entries", []) or [])
+        if any(getattr(cfg, "solver_type", None) == "implicit_mpm" for cfg in solver_cfgs):
             from newton.solvers import SolverImplicitMPM
 
             SolverImplicitMPM.register_custom_attributes(builder)
