@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-import numpy as np
 import warp as wp
 from newton.viewer import ViewerGL
 
@@ -273,6 +272,7 @@ class NewtonVisualizer(BaseVisualizer):
         self._last_camera_pose: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
         self._headless_no_viewer = False
         self._resolved_visible_env_ids: list[int] | None = None
+        self._viewer_step_error_logged = False
 
     def initialize(self, scene_data_provider: BaseSceneDataProvider) -> None:
         """Initialize viewer resources and bind scene data provider.
@@ -396,29 +396,35 @@ class NewtonVisualizer(BaseVisualizer):
         if self._step_counter % update_frequency != 0:
             return
 
+        if self._viewer.is_paused():
+            self._viewer._update()
+            return
+
+        frame_started = False
         try:
-            if not self._viewer.is_paused():
-                self._viewer.begin_frame(self._sim_time)
-                if self._state is not None:
-                    body_q = getattr(self._state, "body_q", None)
-                    if hasattr(body_q, "shape") and body_q.shape[0] == 0:
-                        self._viewer.end_frame()
-                        return
-                    self._viewer.log_state(self._state)
-                    if contacts is not None and hasattr(self._viewer, "log_contacts"):
-                        try:
-                            self._viewer.log_contacts(contacts, self._state)
-                        except RuntimeError as exc:
-                            logger.debug(f"[NewtonVisualizer] Failed to log contacts: {exc}")
-                    if self.cfg.enable_markers:
-                        render_newton_visualization_markers(
-                            self._viewer, self._resolved_visible_env_ids, num_envs=num_envs
-                        )
-                self._viewer.end_frame()
-            else:
-                self._viewer._update()
+            self._viewer.begin_frame(self._sim_time)
+            frame_started = True
+            if self._state is not None:
+                self._viewer.log_state(self._state)
+                if contacts is not None and hasattr(self._viewer, "log_contacts"):
+                    try:
+                        self._viewer.log_contacts(contacts, self._state)
+                    except RuntimeError as exc:
+                        logger.debug(f"[NewtonVisualizer] Failed to log contacts: {exc}")
+                if self.cfg.enable_markers:
+                    render_newton_visualization_markers(self._viewer, self._resolved_visible_env_ids, num_envs=num_envs)
         except Exception as exc:
-            logger.debug("[NewtonVisualizer] Viewer update failed: %s", exc)
+            if not self._viewer_step_error_logged:
+                logger.warning("[NewtonVisualizer] Viewer frame update failed; continuing UI/event loop: %s", exc)
+                self._viewer_step_error_logged = True
+        finally:
+            if frame_started:
+                try:
+                    self._viewer.end_frame()
+                except Exception as exc:
+                    if not self._viewer_step_error_logged:
+                        logger.warning("[NewtonVisualizer] Viewer end_frame failed: %s", exc)
+                        self._viewer_step_error_logged = True
 
     def close(self) -> None:
         """Release viewer resources."""
@@ -467,16 +473,16 @@ class NewtonVisualizer(BaseVisualizer):
         if self._viewer is None:
             return
         cam_pos, cam_target = pose
-        self._viewer.camera.pos = wp.vec3(*cam_pos)
-        cam_pos_np = np.array(cam_pos, dtype=np.float32)
-        cam_target_np = np.array(cam_target, dtype=np.float32)
-        direction = cam_target_np - cam_pos_np
-        yaw = np.degrees(np.arctan2(direction[1], direction[0]))
-        horizontal_dist = np.sqrt(direction[0] ** 2 + direction[1] ** 2)
-        pitch = np.degrees(np.arctan2(direction[2], horizontal_dist))
-        self._viewer.camera.yaw = float(yaw)
-        self._viewer.camera.pitch = float(pitch)
+        self._viewer.camera.pos = self._viewer.camera._as_vec3(cam_pos)
+        self._viewer.camera.look_at(cam_target)
         self._last_camera_pose = (cam_pos, cam_target)
+
+    def set_camera_view(self, eye: tuple, target: tuple) -> None:
+        """Set Newton viewer camera eye/target pose."""
+        pose = (tuple(float(v) for v in eye), tuple(float(v) for v in target))
+        self.cfg.eye, self.cfg.lookat = pose
+        if self._viewer is not None:
+            self._apply_camera_pose(pose)
 
     def _update_camera_from_usd_path(self) -> None:
         """Refresh camera pose from configured USD camera path when it changes."""

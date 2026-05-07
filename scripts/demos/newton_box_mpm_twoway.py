@@ -1,0 +1,311 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Single rigid box two-way coupled with MPM sand through Newton proxy coupling.
+
+This demo is intentionally small: one MuJoCo-Warp rigid box, one implicit-MPM
+sand bed, and one lagged proxy mapping from the rigid solver into the MPM solver.
+The Newton OpenGL viewer can right-mouse drag the box, and the live "Plots"
+window shows the sand reaction wrench harvested by the proxy coupler.
+
+.. code-block:: bash
+
+    ./isaaclab.sh -p scripts/demos/newton_box_mpm_twoway.py --viz newton
+"""
+
+"""Launch Isaac Sim Simulator first."""
+
+import argparse
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description="Newton proxy-coupled box interacting with MPM sand.")
+parser.add_argument("--fps", type=float, default=60.0, help="Simulation/control frames per second.")
+parser.add_argument("--max-steps", type=int, default=900, help="Stop after this many frames; negative runs forever.")
+parser.add_argument("--voxel-size", type=float, default=0.05, help="MPM grid voxel size in meters.")
+parser.add_argument("--particles-per-cell", type=float, default=1.6, help="Sand particles per grid cell.")
+parser.add_argument("--mpm-iterations", type=int, default=70, help="Maximum MPM rheology iterations.")
+parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy relaxation passes per coupled step.")
+parser.add_argument("--proxy-mass-relaxation", type=float, default=1.0, help="Scale proxy box mass inside MPM.")
+parser.add_argument("--rigid-substeps", type=int, default=4, help="MJWarp substeps inside each coupled step.")
+parser.add_argument("--box-mass", type=float, default=45.0, help="Rigid box mass in kg.")
+parser.add_argument("--box-size", type=float, default=0.35, help="Box side length in meters.")
+parser.add_argument("--box-height", type=float, default=1.35, help="Initial box center height in meters.")
+parser.add_argument("--log-interval", type=int, default=60, help="Print simulation progress every N steps; 0 disables.")
+parser.add_argument("--disable-cuda-graph", action="store_true", help="Disable Newton CUDA graph capture.")
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+"""Rest everything follows."""
+
+import numpy as np
+import torch
+import warp as wp
+
+import newton
+from newton.solvers import SolverImplicitMPM
+
+import isaaclab.sim as sim_utils
+from isaaclab_newton.physics import (
+    CoupledProxyCfg,
+    CoupledSolverCfg,
+    CoupledSolverEntryCfg,
+    MJWarpSolverCfg,
+    MPMSolverCfg,
+    NewtonCfg,
+    NewtonManager,
+    ProxyCouplingCfg,
+)
+
+
+BOX_BODY_PATH = "/World/ProxyCoupledBox"
+RIGID_ENTRY = "rigid"
+SAND_ENTRY = "sand"
+
+
+def solid_box_inertia(mass: float, half_extent: float) -> wp.mat33:
+    """Return the COM inertia tensor for a uniform cube."""
+    side = 2.0 * half_extent
+    diagonal = (1.0 / 6.0) * mass * side * side
+    return wp.mat33(diagonal, 0.0, 0.0, 0.0, diagonal, 0.0, 0.0, 0.0, diagonal)
+
+
+def spawn_sand(builder: newton.ModelBuilder) -> tuple[int, int]:
+    """Add a compact MPM sand bed and return the particle index range."""
+    density = 2500.0
+    sand_lo = np.array([-0.9, -0.9, 0.0])
+    sand_hi = np.array([0.9, 0.9, 0.45])
+    resolution = np.maximum(np.ceil(args_cli.particles_per_cell * (sand_hi - sand_lo) / args_cli.voxel_size), 1).astype(
+        int
+    )
+    cell_size = (sand_hi - sand_lo) / resolution
+    radius = float(np.max(cell_size) * 0.5)
+    mass = float(np.prod(cell_size) * density)
+
+    particle_start = builder.particle_count
+    builder.add_particle_grid(
+        pos=wp.vec3(sand_lo),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=int(resolution[0]) + 1,
+        dim_y=int(resolution[1]) + 1,
+        dim_z=int(resolution[2]) + 1,
+        cell_x=float(cell_size[0]),
+        cell_y=float(cell_size[1]),
+        cell_z=float(cell_size[2]),
+        mass=mass,
+        jitter=2.0 * radius,
+        radius_mean=radius,
+        custom_attributes={"mpm:friction": 0.75},
+    )
+    return particle_start, builder.particle_count
+
+
+def build_box_sand_model() -> tuple[newton.ModelBuilder, CoupledSolverCfg, int]:
+    """Build a shared Newton model and the Isaac Lab proxy-coupled solver config."""
+    builder = NewtonManager.create_builder()
+    SolverImplicitMPM.register_custom_attributes(builder)
+    builder.default_shape_cfg.mu = 0.75
+
+    half_extent = 0.5 * args_cli.box_size
+    box_body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, args_cli.box_height), wp.quat_identity()),
+        mass=args_cli.box_mass,
+        inertia=solid_box_inertia(args_cli.box_mass, half_extent),
+        lock_inertia=True,
+        label=BOX_BODY_PATH,
+    )
+    box_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.75)
+    box_shape = builder.add_shape_box(
+        box_body,
+        hx=half_extent,
+        hy=half_extent,
+        hz=half_extent,
+        cfg=box_cfg,
+        color=(0.12, 0.34, 0.85),
+    )
+    ground_shape = builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7), color=(0.46, 0.38, 0.24))
+
+    particle_start, particle_end = spawn_sand(builder)
+    particle_indices = list(range(particle_start, particle_end))
+
+    solver_cfg = CoupledSolverCfg(
+        entries=[
+            CoupledSolverEntryCfg(
+                name=RIGID_ENTRY,
+                solver_cfg=MJWarpSolverCfg(
+                    # MuJoCo owns rigid box-ground contacts; MPM owns particle contacts through proxy colliders.
+                    use_mujoco_contacts=True,
+                    njmax=200,
+                    nconmax=200,
+                    iterations=50,
+                    ls_iterations=25,
+                ),
+                bodies=[box_body],
+                joints=list(range(builder.joint_count)),
+                shapes=[box_shape, ground_shape],
+                substeps=args_cli.rigid_substeps,
+            ),
+            CoupledSolverEntryCfg(
+                name=SAND_ENTRY,
+                solver_cfg=MPMSolverCfg(
+                    voxel_size=args_cli.voxel_size,
+                    grid_type="fixed",
+                    grid_padding=48,
+                    max_active_cell_count=1 << 15,
+                    strain_basis="P0",
+                    transfer_scheme="pic",
+                    max_iterations=args_cli.mpm_iterations,
+                    critical_fraction=0.0,
+                    collider_velocity_mode="backward",
+                ),
+                particles=particle_indices,
+                shapes=[box_shape, ground_shape],
+            ),
+        ],
+        # The source rigid solver uses MuJoCo contacts, while the MPM entry builds colliders from the shared model.
+        use_collision_pipeline=False,
+        proxy_coupling=ProxyCouplingCfg(
+            proxies=[
+                CoupledProxyCfg(
+                    source=RIGID_ENTRY,
+                    destination=SAND_ENTRY,
+                    bodies=[box_body],
+                    mass_scale=args_cli.proxy_mass_relaxation,
+                    mode="lagged",
+                )
+            ],
+            iterations=args_cli.proxy_iterations,
+        ),
+    )
+    return builder, solver_cfg, box_body
+
+
+def configure_newton_viewer(sim: sim_utils.SimulationContext) -> None:
+    """Enable particle rendering and picking in active Newton visualizers."""
+    for visualizer in sim.visualizers:
+        viewer = getattr(visualizer, "_viewer", None)
+        if viewer is None:
+            continue
+        if hasattr(viewer, "show_particles"):
+            viewer.show_particles = True
+        if hasattr(viewer, "show_contacts"):
+            viewer.show_contacts = True
+        if hasattr(viewer, "picking_enabled"):
+            viewer.picking_enabled = True
+
+
+def apply_viewer_forces(sim: sim_utils.SimulationContext, state: newton.State) -> None:
+    """Apply Newton viewer picking/wind forces before the physics step."""
+    for visualizer in sim.visualizers:
+        viewer = getattr(visualizer, "_viewer", None)
+        if viewer is not None and hasattr(viewer, "apply_forces"):
+            viewer.apply_forces(state)
+
+
+def read_proxy_wrench(box_body: int) -> torch.Tensor:
+    """Return the latest sand reaction wrench harvested by the proxy coupler."""
+    solver = getattr(NewtonManager, "_solver", None)
+    if solver is not None and hasattr(solver, "get_proxy_body_wrenches"):
+        wrenches = solver.get_proxy_body_wrenches(RIGID_ENTRY, SAND_ENTRY)
+        if wrenches is not None:
+            return wp.to_torch(wrenches)[box_body].detach().clone()
+    return torch.zeros(6, device=wp.to_torch(NewtonManager.get_state_0().joint_q).device)
+
+
+def log_wrench_plots(sim: sim_utils.SimulationContext, wrench: torch.Tensor) -> None:
+    """Push force and torque components into the Newton viewer plot window."""
+    force = wrench[0:3]
+    torque = wrench[3:6]
+    force_mag = float(torch.linalg.norm(force).item())
+    torque_mag = float(torch.linalg.norm(torque).item())
+
+    for visualizer in sim.visualizers:
+        viewer = getattr(visualizer, "_viewer", None)
+        if viewer is None or not hasattr(viewer, "log_scalar"):
+            continue
+        viewer.log_scalar("Sand Reaction |F| [N]", force_mag, smoothing=4)
+        viewer.log_scalar("Sand Reaction Fx [N]", float(force[0].item()), smoothing=4)
+        viewer.log_scalar("Sand Reaction Fy [N]", float(force[1].item()), smoothing=4)
+        viewer.log_scalar("Sand Reaction Fz [N]", float(force[2].item()), smoothing=4)
+        viewer.log_scalar("Sand Reaction |tau| [Nm]", torque_mag, smoothing=4)
+        viewer.log_scalar("Sand Reaction tau_x [Nm]", float(torque[0].item()), smoothing=4)
+        viewer.log_scalar("Sand Reaction tau_y [Nm]", float(torque[1].item()), smoothing=4)
+        viewer.log_scalar("Sand Reaction tau_z [Nm]", float(torque[2].item()), smoothing=4)
+
+
+def log_progress(count: int, state: newton.State, wrench: torch.Tensor) -> None:
+    """Print a compact heartbeat showing motion and coupling forces."""
+    if args_cli.log_interval <= 0 or count % args_cli.log_interval != 0:
+        return
+    body_q = wp.to_torch(state.body_q)
+    particle_q = wp.to_torch(state.particle_q)
+    box_pos = body_q[0, 0:3].detach().cpu().numpy()
+    sand_min = particle_q.min(dim=0).values.detach().cpu().numpy()
+    sand_max = particle_q.max(dim=0).values.detach().cpu().numpy()
+    force_mag = float(torch.linalg.norm(wrench[0:3]).item())
+    torque_mag = float(torch.linalg.norm(wrench[3:6]).item())
+    print(
+        "[INFO]: step "
+        f"{count:06d} t={count / args_cli.fps:.2f}s "
+        f"box=({box_pos[0]:.3f}, {box_pos[1]:.3f}, {box_pos[2]:.3f}) "
+        f"|F_sand|={force_mag:.2f}N |tau_sand|={torque_mag:.2f}Nm "
+        f"sand_z=[{sand_min[2]:.3f}, {sand_max[2]:.3f}]",
+        flush=True,
+    )
+
+
+def run_simulator(sim: sim_utils.SimulationContext, box_body: int) -> None:
+    """Run the two-way coupled box/sand simulation loop."""
+    count = 0
+    while simulation_app.is_running():
+        if args_cli.max_steps >= 0 and count >= args_cli.max_steps:
+            break
+        apply_viewer_forces(sim, NewtonManager.get_state_0())
+        sim.step(render=False)
+
+        state = NewtonManager.get_state_0()
+        wrench = read_proxy_wrench(box_body)
+        log_wrench_plots(sim, wrench)
+        log_progress(count, state, wrench)
+
+        if sim.is_rendering:
+            sim.render()
+        count += 1
+
+
+def main() -> None:
+    """Set up and run the Isaac Lab one-box MPM coupling demo."""
+    if not str(args_cli.device).startswith("cuda"):
+        raise RuntimeError("Newton implicit MPM coupling requires a CUDA device.")
+
+    builder, solver_cfg, box_body = build_box_sand_model()
+    sim_cfg = sim_utils.SimulationCfg(
+        dt=1.0 / args_cli.fps,
+        device=args_cli.device,
+        gravity=(0.0, 0.0, -9.81),
+        physics=NewtonCfg(
+            solver_cfg=solver_cfg,
+            num_substeps=1,
+            use_cuda_graph=not args_cli.disable_cuda_graph,
+        ),
+    )
+    sim = sim_utils.SimulationContext(sim_cfg)
+    sim.set_camera_view(eye=[2.7, -3.1, 1.9], target=[0.0, 0.0, 0.35])
+    NewtonManager.set_builder(builder)
+    sim.reset()
+    configure_newton_viewer(sim)
+
+    print("[INFO]: Isaac Lab Newton one-box MPM two-way coupling demo ready.")
+    print("[INFO]: Right-mouse drag the box in the Newton viewer; see the Plots window for sand reaction wrench.")
+    run_simulator(sim, box_body)
+
+
+if __name__ == "__main__":
+    main()
+    simulation_app.close()

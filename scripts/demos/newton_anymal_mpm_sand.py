@@ -36,7 +36,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="ANYmal-C walking over Newton implicit MPM sand.")
 parser.add_argument("--voxel-size", type=float, default=0.08, help="MPM grid voxel size in meters.")
-parser.add_argument("--particles-per-cell", type=float, default=1.0, help="Sand particles per grid cell.")
+parser.add_argument("--particles-per-cell", type=float, default=3.0, help="Sand particles per grid cell.")
 parser.add_argument("--grid-type", choices=["sparse", "dense", "fixed"], default="sparse", help="MPM grid type.")
 parser.add_argument("--tolerance", type=float, default=1.0e-6, help="MPM rheology solver tolerance.")
 parser.add_argument("--mpm-iterations", type=int, default=50, help="Maximum MPM rheology iterations.")
