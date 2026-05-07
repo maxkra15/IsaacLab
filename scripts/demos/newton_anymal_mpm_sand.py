@@ -28,14 +28,13 @@ from Newton body transforms.  MPM particles are shown in Kit as a USD
 and particles directly.
 """
 
-"""Launch Isaac Sim Simulator first."""
-
 import argparse
+from types import SimpleNamespace
 
-from isaaclab.app import AppLauncher
+from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
 
 parser = argparse.ArgumentParser(description="ANYmal-C walking over Newton implicit MPM sand.")
-parser.add_argument("--voxel-size", type=float, default=0.08, help="MPM grid voxel size in meters.")
+parser.add_argument("--voxel-size", type=float, default=0.05, help="MPM grid voxel size in meters.")
 parser.add_argument("--particles-per-cell", type=float, default=3.0, help="Sand particles per grid cell.")
 parser.add_argument("--grid-type", choices=["sparse", "dense", "fixed"], default="sparse", help="MPM grid type.")
 parser.add_argument("--tolerance", type=float, default=1.0e-6, help="MPM rheology solver tolerance.")
@@ -54,13 +53,8 @@ parser.add_argument(
     default=1,
     help="Render every Nth sand particle in Kit; 1 renders every particle.",
 )
-AppLauncher.add_app_launcher_args(parser)
+add_launcher_args(parser)
 args_cli = parser.parse_args()
-
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
-
-"""Rest everything follows."""
 
 import warnings
 import xml.etree.ElementTree as ET
@@ -75,8 +69,6 @@ from newton.solvers import SolverImplicitMPM, SolverMuJoCo
 
 import isaaclab.sim as sim_utils
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonManager
-
-from isaaclab_assets.robots.anymal import ANYMAL_C_CFG  # isort:skip
 
 
 LAB_TO_MUJOCO = [0, 6, 3, 9, 1, 7, 4, 10, 2, 8, 5, 11]
@@ -266,6 +258,8 @@ def parse_fixed_link_offsets(urdf_path: str, dynamic_body_names: set[str]) -> di
 
 def create_kit_body_prims(builder: newton.ModelBuilder) -> None:
     """Spawn ANYmal-C USD visuals and relabel Newton bodies to valid USD paths."""
+    from isaaclab_assets.robots.anymal import ANYMAL_C_CFG  # noqa: PLC0415
+
     ANYMAL_C_CFG.spawn.func(
         "/World/Robot",
         ANYMAL_C_CFG.spawn,
@@ -279,7 +273,7 @@ def create_kit_body_prims(builder: newton.ModelBuilder) -> None:
         builder.body_label[body_id] = resolve_kit_body_prim_path(stage, "/World/Robot", body_name)
 
 
-def build_anymal_sand_model() -> tuple[str, str]:
+def build_anymal_sand_model(use_kit_visuals: bool) -> tuple[str, str]:
     """Populate ``NewtonManager`` with ANYmal-C, ground, and MPM particles."""
     builder = NewtonManager.create_builder()
     SolverMuJoCo.register_custom_attributes(builder)
@@ -308,7 +302,8 @@ def build_anymal_sand_model() -> tuple[str, str]:
         collapse_fixed_joints=True,
         ignore_inertial_definitions=False,
     )
-    create_kit_body_prims(builder)
+    if use_kit_visuals:
+        create_kit_body_prims(builder)
 
     # Only the shank collision shapes interact with particles, matching Newton's
     # reference ANYmal-MPM setup.
@@ -513,6 +508,15 @@ def enable_newton_particle_visualization(sim: sim_utils.SimulationContext) -> No
             viewer.show_particles = True
 
 
+def keep_running(sim: sim_utils.SimulationContext, count: int) -> bool:
+    """Return whether the demo loop should continue."""
+    if args_cli.max_steps >= 0 and count >= args_cli.max_steps:
+        return False
+    if not sim.visualizers:
+        return True
+    return any(not viz.is_closed and viz.is_running() for viz in sim.visualizers)
+
+
 def load_policy(default_policy_path: str, device: torch.device) -> torch.jit.ScriptModule:
     """Load the walking policy used by Newton's ANYmal example."""
     policy_path = args_cli.policy or default_policy_path
@@ -575,10 +579,7 @@ def run_simulator(
 
     count = 0
     frame_dt = 1.0 / args_cli.fps
-    while simulation_app.is_running():
-        if args_cli.max_steps >= 0 and count >= args_cli.max_steps:
-            break
-
+    while keep_running(sim, count):
         state = NewtonManager.get_state_0()
         action = apply_policy(
             policy,
@@ -602,15 +603,15 @@ def run_simulator(
         count += 1
 
 
-def main() -> None:
-    """Set up and run the Isaac Lab ANYmal-on-sand demo."""
-    if not str(args_cli.device).startswith("cuda"):
+def create_sim_cfg() -> sim_utils.SimulationCfg:
+    """Create the Isaac Lab simulation config used by the demo."""
+    device = str(args_cli.device)
+    if not device.startswith("cuda"):
         raise RuntimeError("Newton implicit MPM ANYmal demo requires a CUDA device.")
-
     frame_dt = 1.0 / args_cli.fps
-    sim_cfg = sim_utils.SimulationCfg(
+    return sim_utils.SimulationCfg(
         dt=frame_dt,
-        device=args_cli.device,
+        device=device,
         gravity=(0.0, 0.0, -9.81),
         physics=NewtonCfg(
             solver_cfg=MJWarpSolverCfg(
@@ -623,28 +624,38 @@ def main() -> None:
             use_cuda_graph=not args_cli.disable_cuda_graph,
         ),
     )
-    sim = sim_utils.SimulationContext(sim_cfg)
-    setup_kit_scene(sim)
-    sim.set_camera_view(eye=[4.5, -4.5, 2.2], target=[0.0, 0.8, 0.4])
 
-    default_policy_path, urdf_path = build_anymal_sand_model()
-    sim.reset()
-    enable_newton_particle_visualization(sim)
 
-    model = NewtonManager.get_model()
-    state = NewtonManager.get_state_0()
-    mpm_solver = create_mpm_solver(model, state)
-    robot_visuals = create_kit_robot_visuals(sim, model, urdf_path)
-    update_kit_robot_visuals(robot_visuals, state)
-    sand_points = create_sand_points(sim, model)
-    update_sand_points(sand_points, state)
-    policy = load_policy(default_policy_path, wp.device_to_torch(model.device))
+def main() -> None:
+    """Set up and run the Isaac Lab ANYmal-on-sand demo."""
+    sim_cfg = create_sim_cfg()
 
-    print("[INFO]: Isaac Lab Newton ANYmal MPM sand demo ready.")
-    print("[INFO]: Use --command-forward/--command-lateral/--command-yaw to change the fixed velocity command.")
-    run_simulator(sim, mpm_solver, policy, robot_visuals, sand_points)
+    with launch_simulation(SimpleNamespace(sim=sim_cfg), args_cli):
+        sim = sim_utils.SimulationContext(sim_cfg)
+        try:
+            setup_kit_scene(sim)
+            sim.set_camera_view(eye=[4.5, -4.5, 2.2], target=[0.0, 0.8, 0.4])
+
+            use_kit_visuals = "kit" in sim.resolve_visualizer_types()
+            default_policy_path, urdf_path = build_anymal_sand_model(use_kit_visuals)
+            sim.reset()
+            enable_newton_particle_visualization(sim)
+
+            model = NewtonManager.get_model()
+            state = NewtonManager.get_state_0()
+            mpm_solver = create_mpm_solver(model, state)
+            robot_visuals = create_kit_robot_visuals(sim, model, urdf_path)
+            update_kit_robot_visuals(robot_visuals, state)
+            sand_points = create_sand_points(sim, model)
+            update_sand_points(sand_points, state)
+            policy = load_policy(default_policy_path, wp.device_to_torch(model.device))
+
+            print("[INFO]: Isaac Lab Newton ANYmal MPM sand demo ready.")
+            print("[INFO]: Use --command-forward/--command-lateral/--command-yaw to change the fixed velocity command.")
+            run_simulator(sim, mpm_solver, policy, robot_visuals, sand_points)
+        finally:
+            sim.clear_instance()
 
 
 if __name__ == "__main__":
     main()
-    simulation_app.close()

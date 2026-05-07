@@ -335,17 +335,20 @@ def launch_simulation(
         # Newton path without Kit: AppLauncher is skipped, so manually store the visualizer
         # selection in SettingsManager (works in standalone mode via plain dict) so that
         # SimulationContext._get_cli_visualizer_types() can find it.
-        from isaaclab.app import AppLauncher
+        from isaaclab.app.settings_manager import SettingsManager
 
         disable_all = "none" in visualizer_types
+        settings = SettingsManager.instance()
+        settings.set_string("/isaaclab/visualizer/types", "" if disable_all else " ".join(sorted(visualizer_types)))
+        settings.set_bool("/isaaclab/visualizer/explicit", True)
+        settings.set_bool("/isaaclab/visualizer/disable_all", disable_all)
         if isinstance(launcher_args, argparse.Namespace):
-            AppLauncher.sync_visualizer_cli_settings_to_carb(
-                {**vars(launcher_args), "visualizer_explicit": True, "visualizer_disable_all": disable_all}
-            )
+            max_visible_envs = getattr(launcher_args, "max_visible_envs", None)
         elif isinstance(launcher_args, dict):
-            AppLauncher.sync_visualizer_cli_settings_to_carb(
-                {**launcher_args, "visualizer_explicit": True, "visualizer_disable_all": disable_all}
-            )
+            max_visible_envs = launcher_args.get("max_visible_envs")
+        else:
+            max_visible_envs = None
+        settings.set_int("/isaaclab/visualizer/max_visible_envs", -1 if max_visible_envs is None else int(max_visible_envs))
 
     try:
         yield

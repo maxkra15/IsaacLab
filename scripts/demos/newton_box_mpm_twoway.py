@@ -15,11 +15,10 @@ window shows the sand reaction wrench harvested by the proxy coupler.
     ./isaaclab.sh -p scripts/demos/newton_box_mpm_twoway.py --viz newton
 """
 
-"""Launch Isaac Sim Simulator first."""
-
 import argparse
+from types import SimpleNamespace
 
-from isaaclab.app import AppLauncher
+from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
 
 parser = argparse.ArgumentParser(description="Newton proxy-coupled box interacting with MPM sand.")
 parser.add_argument("--fps", type=float, default=60.0, help="Simulation/control frames per second.")
@@ -35,13 +34,8 @@ parser.add_argument("--box-size", type=float, default=0.35, help="Box side lengt
 parser.add_argument("--box-height", type=float, default=1.35, help="Initial box center height in meters.")
 parser.add_argument("--log-interval", type=int, default=60, help="Print simulation progress every N steps; 0 disables.")
 parser.add_argument("--disable-cuda-graph", action="store_true", help="Disable Newton CUDA graph capture.")
-AppLauncher.add_app_launcher_args(parser)
+add_launcher_args(parser)
 args_cli = parser.parse_args()
-
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
-
-"""Rest everything follows."""
 
 import numpy as np
 import torch
@@ -208,6 +202,15 @@ def apply_viewer_forces(sim: sim_utils.SimulationContext, state: newton.State) -
             viewer.apply_forces(state)
 
 
+def keep_running(sim: sim_utils.SimulationContext, count: int) -> bool:
+    """Return whether the demo loop should continue."""
+    if args_cli.max_steps >= 0 and count >= args_cli.max_steps:
+        return False
+    if not sim.visualizers:
+        return True
+    return any(not viz.is_closed and viz.is_running() for viz in sim.visualizers)
+
+
 def read_proxy_wrench(box_body: int) -> torch.Tensor:
     """Return the latest sand reaction wrench harvested by the proxy coupler."""
     solver = getattr(NewtonManager, "_solver", None)
@@ -263,9 +266,7 @@ def log_progress(count: int, state: newton.State, wrench: torch.Tensor) -> None:
 def run_simulator(sim: sim_utils.SimulationContext, box_body: int) -> None:
     """Run the two-way coupled box/sand simulation loop."""
     count = 0
-    while simulation_app.is_running():
-        if args_cli.max_steps >= 0 and count >= args_cli.max_steps:
-            break
+    while keep_running(sim, count):
         apply_viewer_forces(sim, NewtonManager.get_state_0())
         sim.step(render=False)
 
@@ -279,15 +280,14 @@ def run_simulator(sim: sim_utils.SimulationContext, box_body: int) -> None:
         count += 1
 
 
-def main() -> None:
-    """Set up and run the Isaac Lab one-box MPM coupling demo."""
-    if not str(args_cli.device).startswith("cuda"):
+def create_sim_cfg(solver_cfg: CoupledSolverCfg) -> sim_utils.SimulationCfg:
+    """Create the Isaac Lab simulation config used by the demo."""
+    device = str(args_cli.device)
+    if not device.startswith("cuda"):
         raise RuntimeError("Newton implicit MPM coupling requires a CUDA device.")
-
-    builder, solver_cfg, box_body = build_box_sand_model()
-    sim_cfg = sim_utils.SimulationCfg(
+    return sim_utils.SimulationCfg(
         dt=1.0 / args_cli.fps,
-        device=args_cli.device,
+        device=device,
         gravity=(0.0, 0.0, -9.81),
         physics=NewtonCfg(
             solver_cfg=solver_cfg,
@@ -295,17 +295,27 @@ def main() -> None:
             use_cuda_graph=not args_cli.disable_cuda_graph,
         ),
     )
-    sim = sim_utils.SimulationContext(sim_cfg)
-    sim.set_camera_view(eye=[2.7, -3.1, 1.9], target=[0.0, 0.0, 0.35])
-    NewtonManager.set_builder(builder)
-    sim.reset()
-    configure_newton_viewer(sim)
 
-    print("[INFO]: Isaac Lab Newton one-box MPM two-way coupling demo ready.")
-    print("[INFO]: Right-mouse drag the box in the Newton viewer; see the Plots window for sand reaction wrench.")
-    run_simulator(sim, box_body)
+
+def main() -> None:
+    """Set up and run the Isaac Lab one-box MPM coupling demo."""
+    builder, solver_cfg, box_body = build_box_sand_model()
+    sim_cfg = create_sim_cfg(solver_cfg)
+
+    with launch_simulation(SimpleNamespace(sim=sim_cfg), args_cli):
+        sim = sim_utils.SimulationContext(sim_cfg)
+        try:
+            sim.set_camera_view(eye=[2.7, -3.1, 1.9], target=[0.0, 0.0, 0.35])
+            NewtonManager.set_builder(builder)
+            sim.reset()
+            configure_newton_viewer(sim)
+
+            print("[INFO]: Isaac Lab Newton one-box MPM two-way coupling demo ready.")
+            print("[INFO]: Right-mouse drag the box in the Newton viewer; see the Plots window for sand reaction wrench.")
+            run_simulator(sim, box_body)
+        finally:
+            sim.clear_instance()
 
 
 if __name__ == "__main__":
     main()
-    simulation_app.close()
