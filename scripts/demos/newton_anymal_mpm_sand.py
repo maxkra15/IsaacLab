@@ -3,6 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from __future__ import annotations
+
 """Run ANYmal-C walking over implicit MPM sand through Isaac Lab.
 
 This mirrors Newton's ``mpm_anymal`` example, but the application, simulation
@@ -56,23 +58,49 @@ parser.add_argument(
 add_launcher_args(parser)
 args_cli = parser.parse_args()
 
-import warnings
 import xml.etree.ElementTree as ET
+import warnings
 
-import numpy as np
-import torch
-import warp as wp
-
-import newton
-import newton.utils
-from newton.solvers import SolverImplicitMPM, SolverMuJoCo
-
-import isaaclab.sim as sim_utils
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonManager
+np = torch = wp = newton = sim_utils = None
+SolverImplicitMPM = SolverMuJoCo = None
+MJWarpSolverCfg = NewtonCfg = NewtonManager = None
 
 
 LAB_TO_MUJOCO = [0, 6, 3, 9, 1, 7, 4, 10, 2, 8, 5, 11]
 MUJOCO_TO_LAB = [0, 4, 8, 2, 6, 10, 1, 5, 9, 3, 7, 11]
+
+
+def import_runtime_dependencies() -> None:
+    """Import Newton/Isaac Lab modules after Kit has launched when requested."""
+    global np, torch, wp, newton, sim_utils, SolverImplicitMPM, SolverMuJoCo
+    global MJWarpSolverCfg, NewtonCfg, NewtonManager
+
+    import numpy as np_module
+    import torch as torch_module
+    import warp as wp_module
+
+    import newton as newton_module
+    import newton.utils  # noqa: F401
+    from newton.solvers import SolverImplicitMPM as SolverImplicitMPMClass
+    from newton.solvers import SolverMuJoCo as SolverMuJoCoClass
+
+    import isaaclab.sim as sim_utils_module
+    from isaaclab_newton.physics import (
+        MJWarpSolverCfg as MJWarpSolverCfgClass,
+        NewtonCfg as NewtonCfgClass,
+        NewtonManager as NewtonManagerClass,
+    )
+
+    np = np_module
+    torch = torch_module
+    wp = wp_module
+    newton = newton_module
+    sim_utils = sim_utils_module
+    SolverImplicitMPM = SolverImplicitMPMClass
+    SolverMuJoCo = SolverMuJoCoClass
+    MJWarpSolverCfg = MJWarpSolverCfgClass
+    NewtonCfg = NewtonCfgClass
+    NewtonManager = NewtonManagerClass
 
 
 def quat_mul(q_a: np.ndarray, q_b: np.ndarray) -> np.ndarray:
@@ -603,17 +631,30 @@ def run_simulator(
         count += 1
 
 
-def create_sim_cfg() -> sim_utils.SimulationCfg:
-    """Create the Isaac Lab simulation config used by the demo."""
+def create_launcher_sim_cfg():
+    """Create the minimal config used to decide whether Kit is required."""
+    import isaaclab.sim as sim_utils_module
+    from isaaclab_newton.physics import NewtonCfg as NewtonCfgClass
+
     device = str(args_cli.device)
     if not device.startswith("cuda"):
         raise RuntimeError("Newton implicit MPM ANYmal demo requires a CUDA device.")
     frame_dt = 1.0 / args_cli.fps
-    return sim_utils.SimulationCfg(
+    return sim_utils_module.SimulationCfg(
         dt=frame_dt,
         device=device,
         gravity=(0.0, 0.0, -9.81),
-        physics=NewtonCfg(
+        physics=NewtonCfgClass(num_substeps=args_cli.robot_substeps, use_cuda_graph=not args_cli.disable_cuda_graph),
+    )
+
+
+def main() -> None:
+    """Set up and run the Isaac Lab ANYmal-on-sand demo."""
+    sim_cfg = create_launcher_sim_cfg()
+
+    with launch_simulation(SimpleNamespace(sim=sim_cfg), args_cli):
+        import_runtime_dependencies()
+        sim_cfg.physics = NewtonCfg(
             solver_cfg=MJWarpSolverCfg(
                 njmax=50,
                 nconmax=100,
@@ -622,15 +663,7 @@ def create_sim_cfg() -> sim_utils.SimulationCfg:
             ),
             num_substeps=args_cli.robot_substeps,
             use_cuda_graph=not args_cli.disable_cuda_graph,
-        ),
-    )
-
-
-def main() -> None:
-    """Set up and run the Isaac Lab ANYmal-on-sand demo."""
-    sim_cfg = create_sim_cfg()
-
-    with launch_simulation(SimpleNamespace(sim=sim_cfg), args_cli):
+        )
         sim = sim_utils.SimulationContext(sim_cfg)
         try:
             setup_kit_scene(sim)

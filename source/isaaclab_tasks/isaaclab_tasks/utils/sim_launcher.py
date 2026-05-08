@@ -13,10 +13,6 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import Any
 
-from isaaclab.physics.physics_manager_cfg import PhysicsCfg
-from isaaclab.renderers.renderer_cfg import RendererCfg
-from isaaclab.sensors.camera.camera_cfg import CameraCfg
-
 logger = logging.getLogger(__name__)
 
 
@@ -68,7 +64,7 @@ def _scan_config(cfg, predicates: list[Callable[[Any], bool]]) -> list[bool]:
 
 def _is_kitless_physics(node) -> bool:
     """True when the node is a kitless physics config (Newton or OvPhysX)."""
-    return isinstance(node, PhysicsCfg) and type(node).__name__ in ("NewtonCfg", "OvPhysxCfg")
+    return type(node).__name__ in ("NewtonCfg", "OvPhysxCfg") and hasattr(node, "class_type")
 
 
 def _get_visualizer_types(launcher_args: argparse.Namespace | dict | None) -> set[str]:
@@ -115,21 +111,20 @@ def _set_visualizer_intent_on_launcher_args(
 
 def _is_kit_camera(node) -> bool:
     """True for a CameraCfg whose renderer requires Kit (not Newton)."""
-    if not isinstance(node, CameraCfg):
+    if type(node).__name__ != "CameraCfg":
         return False
     renderer_cfg = getattr(node, "renderer_cfg", None)
     if renderer_cfg is None:
         return True
-    if isinstance(renderer_cfg, RendererCfg):
-        return renderer_cfg.renderer_type in ("default", "isaac_rtx")
+    renderer_type = getattr(renderer_cfg, "renderer_type", None)
+    if renderer_type is not None:
+        return renderer_type in ("default", "isaac_rtx")
     # PresetCfg renderers (e.g. MultiBackendRendererCfg) are resolved during
     # environment construction when the physics backend is known (see
     # resolve_task_config and preset resolution in presets.py).  At this
     # stage we assume they will match the physics backend, so not
     # necessarily Kit.
-    from isaaclab_tasks.utils import PresetCfg
-
-    if isinstance(renderer_cfg, PresetCfg):
+    if type(renderer_cfg).__name__ == "PresetCfg":
         return False
     return True
 
@@ -243,7 +238,7 @@ def launch_simulation(
     early_visualizer_types = _get_visualizer_types(launcher_args)
     if "kit" in early_visualizer_types:
         has_ovrtx = _scan_config(
-            env_cfg, [lambda node: isinstance(node, RendererCfg) and getattr(node, "renderer_type", None) == "ovrtx"]
+            env_cfg, [lambda node: getattr(node, "renderer_type", None) == "ovrtx"]
         )[0]
         if has_ovrtx:
             raise ValueError(

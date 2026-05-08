@@ -14,13 +14,22 @@ The package is structured as follows:
 """
 
 import os
-import toml
+
+try:
+    import toml
+except ModuleNotFoundError:
+    import tomllib
 
 # Conveniences to other module directories via relative paths
 ISAACLAB_TASKS_EXT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
 """Path to the extension source directory."""
 
-ISAACLAB_TASKS_METADATA = toml.load(os.path.join(ISAACLAB_TASKS_EXT_DIR, "config", "extension.toml"))
+_EXTENSION_TOML_PATH = os.path.join(ISAACLAB_TASKS_EXT_DIR, "config", "extension.toml")
+if "toml" in globals():
+    ISAACLAB_TASKS_METADATA = toml.load(_EXTENSION_TOML_PATH)
+else:
+    with open(_EXTENSION_TOML_PATH, "rb") as f:
+        ISAACLAB_TASKS_METADATA = tomllib.load(f)
 """Extension metadata dictionary parsed from the extension.toml file."""
 
 # Configure the module-level variables
