@@ -304,6 +304,9 @@ class RslRlBaseRunnerCfg:
     wandb_project: str = "isaaclab"
     """The wandb project name. Defaults to "isaaclab"."""
 
+    wandb_entity: str | None = None
+    """The wandb entity name. Defaults to None."""
+
     resume: bool = False
     """Whether to resume a previous training. Defaults to False.
 

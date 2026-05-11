@@ -5,12 +5,33 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+
+
+def _default_ur10_urdf_path() -> str:
+    isaac_sim_source_dir = Path(
+        os.environ.get("ISAAC_SIM_SOURCE_DIR", Path(__file__).resolve().parents[6] / "omni_isaac_sim")
+    )
+    return str(
+        isaac_sim_source_dir
+        / "source"
+        / "extensions"
+        / "isaacsim.asset.importer.urdf"
+        / "data"
+        / "urdf"
+        / "robots"
+        / "ur10"
+        / "urdf"
+        / "ur10.urdf"
+    )
 
 
 @configclass
@@ -47,7 +68,7 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     viewer = ViewerCfg(eye=(1, -1, 0.7), lookat=(0, 0.0, 0.75))
 
     # Newton UR10 import
-    ur10_urdf_path = "/home/horde/omni_isaac_sim/source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
+    ur10_urdf_path = _default_ur10_urdf_path()
     robot_base_pos = (0.0, -0.55, 0.775)
     ee_body_name = "ee_link"
     arm_joint_names = [

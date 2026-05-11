@@ -14,6 +14,9 @@ class UR10ParticleScoopPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 1000
     save_interval = 100
     experiment_name = "ur10_particle_scoop_direct"
+    logger = "wandb"
+    wandb_project = "UR10_particles_push"
+    wandb_entity = "nvidia-isaac"
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
