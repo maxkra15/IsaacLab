@@ -28,7 +28,7 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
 
     # simulation
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 120,
+        dt=1 / 60,
         render_interval=decimation,
         physics=NewtonCfg(
             solver_cfg=MJWarpSolverCfg(
@@ -44,7 +44,7 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=3.0, replicate_physics=True)
-    viewer = ViewerCfg(eye=(2.8, -2.4, 2.0), lookat=(0.55, 0.0, 0.75))
+    viewer = ViewerCfg(eye=(1, -1, 0.7), lookat=(0, 0.0, 0.75))
 
     # Newton UR10 import
     ur10_urdf_path = "/home/horde/omni_isaac_sim/source/extensions/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
@@ -60,14 +60,14 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     ]
 
     # generated Newton workspace
-    paddle_size = (0.32, 0.40, 0.025)
+    paddle_size = (0.26, 0.32, 0.025)
     paddle_ee_offset = (0.16, 0.0, 0.0)
     paddle_collision_margin = 0.035
-    table_center = (0.6, 0.0, 0.75)
-    table_size = (1.45, 1.05, 0.05)
+    table_center = (0.35, 0.0, 0.75)
+    table_size = (0.8, 0.90, 0.05)
     table_top_z = table_center[2] + 0.5 * table_size[2]
     # Side catch bin: open toward the table, bottom roughly level with the tabletop.
-    bin_center = (1.50, 0.0, table_top_z + 0.10)
+    bin_center = (0.95, -0.1, table_top_z + 0.10)
     bin_inner_half_extents = (0.22, 0.28, 0.16)
     bin_wall_thickness = 0.035
     bin_wall_height = 0.22
@@ -93,10 +93,11 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     reward_count_scale = 8.0
     reward_delta_count_scale = 16.0
     reward_particle_progress_scale = 1.0
-    reward_bin_proximity_scale = 2.0
-    reward_delta_bin_proximity_scale = 4.0
+    reward_bin_proximity_scale = 0.0
+    reward_delta_bin_proximity_scale = 12.0
     reward_spill_penalty_scale = 2.0
     reward_paddle_proximity_scale = 0.08
+    reward_paddle_speed_penalty_scale = 0.005
     action_penalty_scale = 0.005
 
 

@@ -11,16 +11,104 @@ import numpy as np
 import torch
 import warp as wp
 
+import isaaclab.sim as sim_utils
 import newton
 from newton import JointTargetMode
 from newton.solvers import SolverImplicitMPM, SolverMuJoCo
 
 from isaaclab.envs import DirectRLEnv
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab_newton.physics import (
     NewtonManager,
 )
 
 from .ur10_particle_scoop_env_cfg import UR10ParticleScoopEnvCfg
+
+
+class PolicyObservationSpheres:
+    """Render the policy's compact particle observations as Newton sphere markers."""
+
+    def __init__(self):
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/PolicyObservations",
+            markers={
+                "height_cell": sim_utils.SphereCfg(
+                    radius=0.012,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.8, 1.0)),
+                ),
+                "centroid": sim_utils.SphereCfg(
+                    radius=0.035,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.85, 0.0)),
+                ),
+                "paddle": sim_utils.SphereCfg(
+                    radius=0.025,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.4, 1.0)),
+                ),
+                "bin": sim_utils.SphereCfg(
+                    radius=0.025,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 1.0, 0.25)),
+                ),
+            },
+        )
+        self._markers = VisualizationMarkers(marker_cfg)
+        self._markers.set_visibility(False)
+        self._enabled = False
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled == self._enabled:
+            return
+        self._enabled = enabled
+        self._markers.set_visibility(enabled)
+
+    def update(self, env: "UR10ParticleScoopEnv", heightmap: torch.Tensor, paddle_pos: torch.Tensor, centroid: torch.Tensor):
+        self.set_enabled(_show_policy_observation_spheres(env))
+        if not self._enabled:
+            return
+
+        env_id = 0
+        origin = env.scene.env_origins[env_id]
+        map_size = env.cfg.heightmap_size
+        cell_yx = torch.nonzero(heightmap[env_id] > 1.0e-3, as_tuple=False)
+
+        if cell_yx.numel() > 0:
+            cell_y = cell_yx[:, 0].float()
+            cell_x = cell_yx[:, 1].float()
+            cell_height = heightmap[env_id, cell_yx[:, 0], cell_yx[:, 1]]
+            cell_pos = torch.stack(
+                (
+                    env._heightmap_x_min + (cell_x + 0.5) * env._heightmap_x_range / map_size,
+                    env._heightmap_y_min + (cell_y + 0.5) * env._heightmap_y_range / map_size,
+                    env.cfg.table_top_z + cell_height * env.cfg.heightmap_z_range + 0.02,
+                ),
+                dim=-1,
+            )
+            translations = cell_pos + origin
+            marker_indices = torch.zeros(translations.shape[0], dtype=torch.int32, device=env.device)
+        else:
+            translations = torch.empty((0, 3), device=env.device)
+            marker_indices = torch.empty((0,), dtype=torch.int32, device=env.device)
+
+        feature_pos = torch.stack(
+            (
+                centroid[env_id] + origin,
+                paddle_pos[env_id] + origin,
+                env._bin_target + origin,
+            ),
+            dim=0,
+        )
+        translations = torch.cat((translations, feature_pos), dim=0)
+        feature_indices = torch.tensor((1, 2, 3), dtype=torch.int32, device=env.device)
+        marker_indices = torch.cat((marker_indices, feature_indices), dim=0)
+        self._markers.visualize(translations=translations, marker_indices=marker_indices)
+
+
+def _show_policy_observation_spheres(env: "UR10ParticleScoopEnv") -> bool:
+    for visualizer in env.sim.visualizers:
+        viewer = getattr(visualizer, "_viewer", None)
+        if viewer is not None and getattr(viewer, "show_policy_observations", False):
+            return True
+    return False
+
 
 class UR10ParticleScoopEnv(DirectRLEnv):
     """Pure Newton UR10 + MPM particle scooping task."""
@@ -78,7 +166,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._progress_start_x = float(self.cfg.pile_lo[0])
         self._progress_target_x = float(self.cfg.bin_center[0] - self.cfg.bin_inner_half_extents[0])
         self._heightmap_x_min = 0.05
-        self._heightmap_x_range = 1.10
+        self._heightmap_x_range = max(1.10, float(self._bin_upper[0].item()) - self._heightmap_x_min + 0.05)
         self._heightmap_y_min = -0.45
         self._heightmap_y_range = 0.90
         self._heightmap_env_offsets = (
@@ -89,6 +177,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._previous_bin_count = torch.zeros(self.num_envs, device=self.device)
         self._previous_particle_progress = torch.zeros(self.num_envs, device=self.device)
         self._previous_bin_proximity = torch.zeros(self.num_envs, device=self.device)
+        self._previous_paddle_pos = self._paddle_pos_e().clone()
         self._episode_sums = {
             "particle_count": torch.zeros(self.num_envs, device=self.device),
             "delta_count": torch.zeros(self.num_envs, device=self.device),
@@ -97,8 +186,10 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             "delta_bin_proximity": torch.zeros(self.num_envs, device=self.device),
             "spill_penalty": torch.zeros(self.num_envs, device=self.device),
             "paddle_proximity": torch.zeros(self.num_envs, device=self.device),
+            "paddle_speed_penalty": torch.zeros(self.num_envs, device=self.device),
             "action_penalty": torch.zeros(self.num_envs, device=self.device),
         }
+        self._policy_observation_spheres = PolicyObservationSpheres()
         self._configure_newton_viewer()
 
     def step(self, action: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
@@ -415,7 +506,8 @@ class UR10ParticleScoopEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         particle_pos = self._particle_pos_e()
-        heightmap = self._particle_heightmap(particle_pos).reshape(self.num_envs, -1)
+        heightmap_grid = self._particle_heightmap(particle_pos)
+        heightmap = heightmap_grid.reshape(self.num_envs, -1)
         state = NewtonManager.get_state_0()
         joint_q = wp.to_torch(state.joint_q)[self._joint_q_ids]
         joint_qd = wp.to_torch(state.joint_qd)[self._joint_qd_ids]
@@ -434,6 +526,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             ),
             dim=-1,
         )
+        self._policy_observation_spheres.update(self, heightmap_grid, paddle_pos, particle_centroid)
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -449,8 +542,11 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._previous_bin_proximity = bin_proximity
         spill_fraction = self._particles_spilled(particle_pos).float().mean(dim=1)
 
-        paddle_distance = torch.linalg.norm(self._paddle_pos_e() - self._pile_center, dim=-1)
+        paddle_pos = self._paddle_pos_e()
+        paddle_distance = torch.linalg.norm(paddle_pos - self._pile_center, dim=-1)
         paddle_proximity = torch.exp(-4.0 * paddle_distance)
+        paddle_speed = torch.linalg.norm((paddle_pos - self._previous_paddle_pos) / self.step_dt, dim=-1)
+        self._previous_paddle_pos = paddle_pos
         action_penalty = torch.sum(torch.square(self._actions), dim=-1)
 
         rewards = {
@@ -464,6 +560,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             * torch.clamp(delta_bin_proximity, min=0.0),
             "spill_penalty": -self.cfg.reward_spill_penalty_scale * spill_fraction,
             "paddle_proximity": self.cfg.reward_paddle_proximity_scale * paddle_proximity,
+            "paddle_speed_penalty": -self.cfg.reward_paddle_speed_penalty_scale * torch.square(paddle_speed),
             "action_penalty": -self.cfg.action_penalty_scale * action_penalty,
         }
         reward = torch.stack(list(rewards.values()), dim=0).sum(dim=0)
@@ -518,6 +615,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._previous_bin_count[env_ids] = self._count_particles_in_bin(particle_pos)[env_ids]
         self._previous_particle_progress[env_ids] = self._particle_progress_toward_bin(particle_pos)[env_ids]
         self._previous_bin_proximity[env_ids] = self._particle_bin_proximity(particle_pos)[env_ids]
+        self._previous_paddle_pos[env_ids] = self._paddle_pos_e()[env_ids]
 
     def _particle_heightmap(self, particle_pos: torch.Tensor) -> torch.Tensor:
         map_size = self.cfg.heightmap_size

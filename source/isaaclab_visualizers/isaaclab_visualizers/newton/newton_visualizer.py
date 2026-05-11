@@ -51,6 +51,7 @@ class NewtonViewerGL(ViewerGL):
         self._fallback_draw_controls = False
         self._update_frequency = update_frequency
         self._color_edit3_prefers_sequence: bool | None = None
+        self.show_policy_observations = False
 
         try:
             self.register_ui_callback(self._render_training_controls, position="side")
@@ -206,6 +207,11 @@ class NewtonViewerGL(ViewerGL):
 
                     show_particles = self.show_particles
                     changed, self.show_particles = imgui.checkbox("Show Particles", show_particles)
+
+                    show_policy_observations = self.show_policy_observations
+                    changed, self.show_policy_observations = imgui.checkbox(
+                        "Show Policy Observations", show_policy_observations
+                    )
 
             imgui.set_next_item_open(True, imgui.Cond_.appearing)
             if imgui.collapsing_header("Rendering Options"):
