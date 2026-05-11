@@ -10,7 +10,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
-from isaaclab_newton.physics import CoupledSolverCfg, NewtonCfg
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 
 
 @configclass
@@ -18,7 +18,7 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     """Pure Newton direct RL prototype: UR10 moves MPM particles into a side bin."""
 
     # env
-    decimation = 4
+    decimation = 1
     episode_length_s = 12.0
     action_space = 6
     state_space = 0
@@ -31,8 +31,13 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
         dt=1 / 120,
         render_interval=decimation,
         physics=NewtonCfg(
-            solver_cfg=CoupledSolverCfg(),
-            num_substeps=1,
+            solver_cfg=MJWarpSolverCfg(
+                use_mujoco_contacts=False,
+                njmax=160,
+                nconmax=320,
+                iterations=80,
+            ),
+            num_substeps=4,
             use_cuda_graph=True,
         ),
     )
@@ -55,14 +60,17 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     ]
 
     # generated Newton workspace
-    paddle_size = (0.28, 0.36, 0.035)
+    paddle_size = (0.32, 0.40, 0.025)
     paddle_ee_offset = (0.16, 0.0, 0.0)
+    paddle_collision_margin = 0.035
     table_center = (0.6, 0.0, 0.75)
     table_size = (1.45, 1.05, 0.05)
     table_top_z = table_center[2] + 0.5 * table_size[2]
     # Side catch bin: open toward the table, bottom roughly level with the tabletop.
     bin_center = (1.50, 0.0, table_top_z + 0.10)
     bin_inner_half_extents = (0.22, 0.28, 0.16)
+    bin_wall_thickness = 0.035
+    bin_wall_height = 0.22
 
     # Newton MPM pile
     voxel_size = 0.055
@@ -82,10 +90,13 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
 
     # control and rewards
     action_scale = 0.55
-    reward_count_scale = 2.0
-    reward_delta_count_scale = 4.0
-    reward_particle_progress_scale = 0.5
-    reward_paddle_proximity_scale = 0.15
+    reward_count_scale = 8.0
+    reward_delta_count_scale = 16.0
+    reward_particle_progress_scale = 1.0
+    reward_bin_proximity_scale = 2.0
+    reward_delta_bin_proximity_scale = 4.0
+    reward_spill_penalty_scale = 2.0
+    reward_paddle_proximity_scale = 0.08
     action_penalty_scale = 0.005
 
 
