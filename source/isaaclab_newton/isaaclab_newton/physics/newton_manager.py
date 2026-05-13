@@ -527,6 +527,10 @@ class NewtonManager(PhysicsManager):
             from newton.solvers import SolverImplicitMPM
 
             SolverImplicitMPM.register_custom_attributes(builder)
+        if getattr(solver_cfg, "coupling_type", None) == "admm":
+            from newton.solvers import SolverAdmmCoupled
+
+            SolverAdmmCoupled.register_custom_attributes(builder)
 
     @classmethod
     def cl_register_site(cls, body_pattern: str | None, xform: wp.transform) -> str:

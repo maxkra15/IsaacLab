@@ -52,6 +52,8 @@ class NewtonViewerGL(ViewerGL):
         self._update_frequency = update_frequency
         self._color_edit3_prefers_sequence: bool | None = None
         self.show_policy_observations = False
+        self.show_reward_debug = False
+        self.show_curriculum_debug = False
 
         try:
             self.register_ui_callback(self._render_training_controls, position="side")
@@ -211,6 +213,14 @@ class NewtonViewerGL(ViewerGL):
                     show_policy_observations = self.show_policy_observations
                     changed, self.show_policy_observations = imgui.checkbox(
                         "Show Policy Observations", show_policy_observations
+                    )
+
+                    show_reward_debug = self.show_reward_debug
+                    changed, self.show_reward_debug = imgui.checkbox("Show Reward Debug", show_reward_debug)
+
+                    show_curriculum_debug = self.show_curriculum_debug
+                    changed, self.show_curriculum_debug = imgui.checkbox(
+                        "Show Curriculum Debug", show_curriculum_debug
                     )
 
             imgui.set_next_item_open(True, imgui.Cond_.appearing)

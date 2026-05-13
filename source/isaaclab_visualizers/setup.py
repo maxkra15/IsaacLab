@@ -17,16 +17,16 @@ EXTRAS_REQUIRE = {
     "kit": [],
     "newton": [
         "warp-lang",
-        "newton @ git+https://github.com/gdaviet/newton.git@ba2b8a1baa152fad08dab65984ae8ce2b8073e26",
+        "newton @ git+https://github.com/gdaviet/newton.git@142c93ca2d6d5a4ac166586f8027a2b71389ceb6",
         "PyOpenGL-accelerate",
         "imgui-bundle>=1.92.5",
     ],
     "rerun": [
-        "newton @ git+https://github.com/gdaviet/newton.git@ba2b8a1baa152fad08dab65984ae8ce2b8073e26",
+        "newton @ git+https://github.com/gdaviet/newton.git@142c93ca2d6d5a4ac166586f8027a2b71389ceb6",
         "rerun-sdk>=0.29.0",
     ],
     "viser": [
-        "newton @ git+https://github.com/gdaviet/newton.git@ba2b8a1baa152fad08dab65984ae8ce2b8073e26",
+        "newton @ git+https://github.com/gdaviet/newton.git@142c93ca2d6d5a4ac166586f8027a2b71389ceb6",
         "viser>=1.0.16",
     ],
 }

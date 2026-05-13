@@ -65,8 +65,17 @@ class CoupledSolverEntryCfg:
     These override kwargs inferred from :attr:`solver_cfg`.
     """
 
+    configure_view: Callable | str | None = None
+    """Optional callable or ``"module:attr"`` path applied to the entry's ``ModelView`` before solver construction."""
+
+    contact_policy: int | None = None
+    """Optional Newton ``SolverCoupled.Entry`` contact-policy override."""
+
     substeps: int = 1
     """Number of equal substeps this entry runs inside one coupled step."""
+
+    in_place: bool = False
+    """Step this entry in-place. Only valid for solvers that support it and when :attr:`substeps` is 1."""
 
 
 @configclass
@@ -120,14 +129,56 @@ class ProxyCouplingCfg:
 
 
 @configclass
+class AdmmCouplingCfg:
+    """Linearized ADMM coupling configuration."""
+
+    iterations: int = 5
+    """Number of ADMM iterations per coupled step."""
+
+    rho: float = 1.0
+    """ADMM penalty parameter."""
+
+    gamma: float = 0.0
+    """Proximal mass scaling parameter."""
+
+    baumgarte: float = 0.0
+    """Position error correction fraction."""
+
+    joint_stiffness: float = 1.0e4
+    """Quadratic stiffness for translational ADMM attachments from cross-solver joints."""
+
+    joint_damping: float = 0.0
+    """Quadratic damping for translational ADMM attachments from cross-solver joints."""
+
+    joint_angular_stiffness: float = 1.0e4
+    """Quadratic stiffness for angular ADMM attachments from cross-solver fixed and revolute joints."""
+
+    joint_angular_damping: float = 0.0
+    """Quadratic damping for angular ADMM attachments from cross-solver fixed and revolute joints."""
+
+    contact_detection: bool = False
+    """Whether ADMM should build contact rows from cross-solver collision candidates."""
+
+    contact_distance: float | None = None
+    """Optional minimum contact gap for generated contacts."""
+
+    contact_friction: float = 0.0
+    """Isotropic Coulomb friction coefficient for generated ADMM contact rows."""
+
+    contact_detection_margin: float = 0.01
+    """Soft particle-shape and default particle-particle contact detection margin."""
+
+    particle_contact_detection_margin: float | None = None
+    """Optional particle-particle hash-grid detection margin."""
+
+
+@configclass
 class CoupledSolverCfg(NewtonSolverCfg):
     """Configuration for Newton multi-solver coupling.
 
-    This initial Isaac Lab wrapper targets Newton's
-    :class:`newton.solvers.SolverProxyCoupled`, but the entry cfgs are solver
-    agnostic: each entry declares what it owns and which solver should advance
-    it. Future coupled algorithms can reuse the same ownership model with a
-    different manager or ``coupling_type``.
+    The entry cfgs are solver agnostic: each entry declares what it owns and
+    which solver should advance it. The selected coupling cfg chooses the Newton
+    algorithm that exchanges forces or constraints across entries.
     """
 
     class_type: type[NewtonManager] | str = "{DIR}.coupled_manager:NewtonCoupledManager"
@@ -136,14 +187,17 @@ class CoupledSolverCfg(NewtonSolverCfg):
     solver_type: str = "coupled"
     """Solver type metadata. Can be ``"coupled"``."""
 
-    coupling_type: Literal["proxy"] = "proxy"
-    """Coupling algorithm to construct. Only ``"proxy"`` is currently supported."""
+    coupling_type: Literal["proxy", "admm"] = "proxy"
+    """Coupling algorithm to construct."""
 
     entries: list[CoupledSolverEntryCfg] = field(default_factory=list)
     """Ordered sub-solver entries."""
 
     proxy_coupling: ProxyCouplingCfg = field(default_factory=ProxyCouplingCfg)
     """Configuration for ``coupling_type="proxy"``."""
+
+    admm_coupling: AdmmCouplingCfg = field(default_factory=AdmmCouplingCfg)
+    """Configuration for ``coupling_type="admm"``."""
 
     use_collision_pipeline: bool | None = None
     """Whether Isaac Lab should run Newton's external collision pipeline.

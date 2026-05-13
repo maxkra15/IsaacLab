@@ -42,7 +42,14 @@ def _apply_multiccd_compat_default(kwargs: dict, valid: set[str]) -> None:
     except ImportError:
         kwargs.pop("enable_multiccd", None)
         return
-    if hasattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD"):
+    missing_multiccd = not hasattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD")
+    if missing_multiccd and hasattr(mujoco.mjtDisableBit, "mjDSBL_NATIVECCD"):
+        # Some Isaac Sim MuJoCo builds omit the newer MULTICCD enum that
+        # mujoco_warp imports unconditionally.  Alias it before SolverMuJoCo
+        # imports mujoco_warp, then keep multi-CCD enabled so the alias is not
+        # used to disable native CCD.
+        setattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD", mujoco.mjtDisableBit.mjDSBL_NATIVECCD)
+    if not missing_multiccd:
         kwargs.pop("enable_multiccd", None)
     else:
         kwargs["enable_multiccd"] = True

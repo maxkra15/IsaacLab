@@ -28,6 +28,7 @@ from __future__ import annotations
 import pytest
 import warp as wp
 from isaaclab_newton.physics import (
+    AdmmCouplingCfg,
     CoupledProxyCfg,
     CoupledSolverCfg,
     CoupledSolverEntryCfg,
@@ -51,8 +52,9 @@ from isaaclab_newton.physics import (
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
 
 try:
-    from newton.solvers import SolverProxyCoupled
+    from newton.solvers import SolverAdmmCoupled, SolverProxyCoupled
 except ImportError:
+    SolverAdmmCoupled = None
     SolverProxyCoupled = None
 
 from isaaclab.sim import SimulationCfg, build_simulation_context
@@ -158,6 +160,32 @@ SOLVER_MATRIX = [
         marks=pytest.mark.skipif(SolverProxyCoupled is None, reason="Newton SolverProxyCoupled is unavailable"),
         id="proxy_coupled_mjwarp_mpm",
     ),
+    pytest.param(
+        lambda: CoupledSolverCfg(
+            coupling_type="admm",
+            entries=[
+                CoupledSolverEntryCfg(
+                    name="rigid",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    bodies=[0],
+                ),
+                CoupledSolverEntryCfg(
+                    name="particle",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    particles=[0],
+                    in_place=True,
+                ),
+            ],
+            admm_coupling=AdmmCouplingCfg(iterations=1, rho=1.0, gamma=0.0),
+            use_collision_pipeline=False,
+        ),
+        NewtonCoupledManager,
+        SolverAdmmCoupled,
+        False,
+        False,
+        marks=pytest.mark.skipif(SolverAdmmCoupled is None, reason="Newton SolverAdmmCoupled is unavailable"),
+        id="admm_coupled_xpbd_body_particle",
+    ),
 ]
 
 
@@ -238,6 +266,79 @@ def test_manager_name_starts_with_newton(manager):
     various backend factories that dispatch on ``physics_manager.__name__.lower()``.
     """
     assert manager.__name__.lower().startswith("newton")
+
+
+def test_coupled_entry_threads_generic_entry_options():
+    """Isaac Lab entry cfg exposes Newton's generic SolverCoupled.Entry options."""
+
+    def _configure_view(_view):
+        return None
+
+    entry = NewtonCoupledManager._build_entry(
+        CoupledSolverEntryCfg(
+            name="xpbd",
+            solver_cfg=XPBDSolverCfg(iterations=1),
+            particles=[0],
+            configure_view=_configure_view,
+            contact_policy=1,
+            in_place=True,
+        )
+    )
+    assert entry.configure_view is _configure_view
+    assert entry.contact_policy == 1
+    assert entry.in_place is True
+
+
+@pytest.mark.parametrize(
+    "cfg, match",
+    [
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                ],
+            ),
+            "Duplicate",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg(), in_place=True, substeps=2),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+            ),
+            "in_place requires substeps=1",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+                proxy_coupling=ProxyCouplingCfg(
+                    proxies=[CoupledProxyCfg(source="missing", destination="b", particles=[0])]
+                ),
+            ),
+            "source 'missing'",
+        ),
+        (
+            CoupledSolverCfg(
+                coupling_type="admm",
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+                admm_coupling=AdmmCouplingCfg(contact_friction=-1.0),
+            ),
+            "contact_friction",
+        ),
+    ],
+)
+def test_coupled_cfg_validation_rejects_invalid_configs(cfg, match):
+    """Invalid coupled configs fail before Newton constructs sub-solvers."""
+    with pytest.raises(ValueError, match=match):
+        NewtonCoupledManager._validate_solver_cfg(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +432,16 @@ def test_initialize_solver_populates_canonical_state(
                 jitter=0.0,
                 radius_mean=0.02,
             )
+        elif SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
+            assert builder.has_custom_attribute("coupling:body_particle_attachment_body")
+            body = builder.add_body(mass=1.0)
+            particle = builder.add_particle(
+                pos=wp.vec3(0.0, 0.0, 0.0),
+                vel=wp.vec3(0.0),
+                mass=0.1,
+                radius=0.02,
+            )
+            SolverAdmmCoupled.add_body_particle_attachment(builder, body, particle, stiffness=10.0)
         else:
             # Pre-populate the builder with a minimal scene so MJCF conversion has
             # something to work with.
@@ -347,13 +458,16 @@ def test_initialize_solver_populates_canonical_state(
         if SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
             assert NewtonManager._solver.get_solver("rigid") is not None
             assert NewtonManager._solver.get_solver("sand") is not None
+        if SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
+            assert NewtonManager._solver.get_solver("rigid") is not None
+            assert NewtonManager._solver.get_solver("particle") is not None
         assert NewtonManager._use_single_state is expected_use_single_state
         assert NewtonManager._needs_collision_pipeline is expected_needs_collision_pipeline
 
         # ``_contacts`` is allocated whichever way contacts are handled
         # (MuJoCo internal buffer or Newton pipeline output).
         # Kamino with internal contacts does not currently set NewtonManager._contacts.
-        if expected_solver_cls not in (SolverKamino, SolverImplicitMPM):
+        if expected_needs_collision_pipeline and expected_solver_cls not in (SolverKamino, SolverImplicitMPM):
             assert NewtonManager._contacts is not None
 
         # One step should not raise — proves the dispatch wiring lines up

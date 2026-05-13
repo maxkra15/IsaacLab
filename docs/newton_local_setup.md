@@ -1,8 +1,10 @@
 # Isaac Sim, Isaac Lab, and Newton Local Setup
 
-Last verified: 2026-05-08.
+Last verified: 2026-05-12.
 
-This machine is set up as a sibling checkout workspace under `/home/horde`.  Isaac Lab runs against a locally built Isaac Sim tree, and its Python environment imports Newton from the local coupled-solver checkout.
+This machine is set up as a sibling checkout workspace under `/home/maximiliank/Work`. Isaac Lab runs against a locally built Isaac Sim tree, and its Python environment imports Newton from the local coupled-solver checkout.
+
+2026-05-12 update for Newton PR #2848: `/home/maximiliank/Work/newton` is checked out on `pr-2848-coupled-solver-framework-latest` at `142c93ca2d6d5a4ac166586f8027a2b71389ceb6` and locally tagged `isaaclab-pr-2848-coupled-solver-142c93c`. The active IsaacLab dependency pins now use `git+https://github.com/gdaviet/newton.git@142c93ca2d6d5a4ac166586f8027a2b71389ceb6`, while the local runtime environment should install Newton editable from `/home/maximiliank/Work/newton`. An earlier local-only setup used stale PR commit `e571115e92ac990c815f1629e92576309fda9672`; prefer `142c93ca2d6d5a4ac166586f8027a2b71389ceb6`.
 
 ## Repo Link Index
 
@@ -38,7 +40,7 @@ Use the exact commits for replication.  The branch links are useful for browsing
   - Clone URL: `https://github.com/gdaviet/newton.git`
   - Repo: `https://github.com/gdaviet/newton`
   - Branch: `https://github.com/gdaviet/newton/tree/gdaviet-coupled-solver-framework`
-  - Commit: `https://github.com/gdaviet/newton/commit/ba2b8a1baa152fad08dab65984ae8ce2b8073e26`
+  - Commit: `https://github.com/gdaviet/newton/commit/142c93ca2d6d5a4ac166586f8027a2b71389ceb6`
 
 ## Current Checkouts
 
@@ -64,15 +66,8 @@ Use the exact commits for replication.  The branch links are useful for browsing
   - Commit link: `https://github.com/maxkra15/IsaacLab/commit/12d1d350657ddd821ce016f7dd5cc09f450ed010`
   - Local Isaac Sim link: `_isaac_sim -> /home/horde/omni_isaac_sim/_build/linux-x86_64/release`
 
-- `/home/horde/IsaacLab-pr5443`
-  - Purpose: separate reference checkout for the deformable-coupling PR branch.
-  - Remote: `git@github.com:maxkra15/IsaacLab.git`
-  - Repo browser: `https://github.com/maxkra15/IsaacLab`
-  - Branch: `pr-5443-deformable-coupling`
-  - Commit: `89ebfcecfe1fea70a49dfebe663a1d88f95b8754`
-  - Branch link: `https://github.com/maxkra15/IsaacLab/tree/pr-5443-deformable-coupling`
-  - Commit link: `https://github.com/maxkra15/IsaacLab/commit/89ebfcecfe1fea70a49dfebe663a1d88f95b8754`
-  - Note: this checkout does not currently have the `_isaac_sim` symlink.
+- `IsaacLab-pr5443`
+  - Removed locally on 2026-05-12. It was only a separate reference checkout for the deformable-coupling PR branch and is not required by the active Isaac Lab/Newton setup.
 
 - `/home/horde/newton`
   - Purpose: clean upstream Newton reference checkout.
@@ -83,17 +78,18 @@ Use the exact commits for replication.  The branch links are useful for browsing
   - Branch link: `https://github.com/newton-physics/newton/tree/main`
   - Commit link: `https://github.com/newton-physics/newton/commit/9b4069ebafcacf85bc77bb39f96dfb9c245ec40e`
 
-- `/home/horde/newton-coupled`
+- `/home/maximiliank/Work/newton`
   - Purpose: active Newton checkout used by the Isaac Lab environment.
   - Remote: `https://github.com/newton-physics/newton.git`
   - Dependency source repo: `https://github.com/gdaviet/newton.git`
   - Dependency repo browser: `https://github.com/gdaviet/newton`
-  - Local branch: `gdaviet-coupled-solver-framework`
-  - Commit: `ba2b8a1baa152fad08dab65984ae8ce2b8073e26`
-  - Source pinned by active Isaac Lab: `https://github.com/gdaviet/newton.git@ba2b8a1baa152fad08dab65984ae8ce2b8073e26`
+  - Local branch: `pr-2848-coupled-solver-framework-latest`
+  - Local tag: `isaaclab-pr-2848-coupled-solver-142c93c`
+  - Commit: `142c93ca2d6d5a4ac166586f8027a2b71389ceb6`
+  - Source pinned by active Isaac Lab: `https://github.com/gdaviet/newton.git@142c93ca2d6d5a4ac166586f8027a2b71389ceb6`
   - Branch link: `https://github.com/gdaviet/newton/tree/gdaviet-coupled-solver-framework`
-  - Commit link: `https://github.com/gdaviet/newton/commit/ba2b8a1baa152fad08dab65984ae8ce2b8073e26`
-  - Dirty state: one local edit in `newton/_src/solvers/coupled/solver_proxy_coupled.py`; see "Local Newton patch" below.
+  - Commit link: `https://github.com/gdaviet/newton/commit/142c93ca2d6d5a4ac166586f8027a2b71389ceb6`
+  - Dirty state: clean.
 
 ## How the Pieces Are Wired
 
@@ -112,7 +108,7 @@ The active Python executable is:
 The installed `newton` package is editable and points at the coupled checkout:
 
 ```bash
-newton -> /home/horde/newton-coupled
+newton -> /home/maximiliank/Work/newton
 ```
 
 The active `IsaacLab/source/isaaclab_newton/setup.py` pins these Newton-side dependencies for the `all` extra:
@@ -121,7 +117,7 @@ The active `IsaacLab/source/isaaclab_newton/setup.py` pins these Newton-side dep
 mujoco==3.8.0
 mujoco-warp==3.8.0.1
 PyOpenGL-accelerate==3.1.10
-newton @ git+https://github.com/gdaviet/newton.git@ba2b8a1baa152fad08dab65984ae8ce2b8073e26
+newton @ git+https://github.com/gdaviet/newton.git@142c93ca2d6d5a4ac166586f8027a2b71389ceb6
 ```
 
 Relevant source links:
@@ -130,7 +126,7 @@ Relevant source links:
 - Active Isaac Lab commit-pinned `isaaclab_newton/setup.py`: `https://github.com/maxkra15/IsaacLab/blob/12d1d350657ddd821ce016f7dd5cc09f450ed010/source/isaaclab_newton/setup.py`
 - Active Isaac Lab Newton demos: `https://github.com/maxkra15/IsaacLab/tree/feat/newton-implicit-mpm/scripts/demos`
 - Active Isaac Lab UR10 particle-scoop task: `https://github.com/maxkra15/IsaacLab/tree/feat/newton-implicit-mpm/source/isaaclab_tasks/isaaclab_tasks/direct/ur10_particle_scoop`
-- Coupled Newton solver source: `https://github.com/gdaviet/newton/blob/ba2b8a1baa152fad08dab65984ae8ce2b8073e26/newton/_src/solvers/coupled/solver_proxy_coupled.py`
+- Coupled Newton solver source: `https://github.com/gdaviet/newton/blob/142c93ca2d6d5a4ac166586f8027a2b71389ceb6/newton/_src/solvers/coupled/solver_proxy_coupled.py`
 
 The PR-5443 checkout is intentionally different.  Its `isaaclab_newton` package pins upstream Newton at `a27277ed49d6f307b8a1e4c394be7e1d14965a62` with `mujoco==3.6.0` and `mujoco-warp==3.6.0`.
 
@@ -198,22 +194,24 @@ ln -sfn /home/horde/omni_isaac_sim/_build/linux-x86_64/release _isaac_sim
 
 ### 3. Clone Newton Checkouts
 
-Clone the clean upstream reference checkout:
+Optionally clone a clean upstream reference checkout:
 
 ```bash
-cd /home/horde
-git clone https://github.com/newton-physics/newton.git newton
-git -C newton checkout 9b4069ebafcacf85bc77bb39f96dfb9c245ec40e
+cd /home/maximiliank/Work
+git clone https://github.com/newton-physics/newton.git newton-main
+git -C newton-main checkout 9b4069ebafcacf85bc77bb39f96dfb9c245ec40e
 ```
 
 Clone the active coupled-solver checkout from the fork used by the dependency pin:
 
 ```bash
-cd /home/horde
-git clone https://github.com/gdaviet/newton.git newton-coupled
-cd newton-coupled
-git checkout gdaviet-coupled-solver-framework
-git checkout ba2b8a1baa152fad08dab65984ae8ce2b8073e26
+cd /home/maximiliank/Work
+git clone https://github.com/newton-physics/newton.git newton
+cd newton
+git fetch origin pull/2848/head:pr-2848-coupled-solver-framework-latest
+git checkout pr-2848-coupled-solver-framework-latest
+git checkout 142c93ca2d6d5a4ac166586f8027a2b71389ceb6
+git tag isaaclab-pr-2848-coupled-solver-142c93c 142c93ca2d6d5a4ac166586f8027a2b71389ceb6
 ```
 
 If the branch name is unavailable but the commit exists, checking out the commit is enough for replication.
@@ -223,9 +221,9 @@ If the branch name is unavailable but the commit exists, checking out the commit
 Install Isaac Lab into the Isaac Sim Python environment, then override Newton with the local coupled checkout:
 
 ```bash
-cd /home/horde/IsaacLab
+cd /home/maximiliank/Work/IsaacLab
 ./isaaclab.sh -i all
-./_isaac_sim/python.sh -m pip install -e /home/horde/newton-coupled
+./_isaac_sim/python.sh -m pip install -e /home/maximiliank/Work/newton
 ./_isaac_sim/python.sh -m pip install toml
 ```
 
@@ -233,37 +231,14 @@ The explicit `toml` install is included because this checkout imports `toml` fro
 
 ## Local Newton Patch
 
-The current `/home/horde/newton-coupled` checkout has one local, uncommitted helper method.  Reapply it if the target commit does not already have it:
-
-```diff
-diff --git a/newton/_src/solvers/coupled/solver_proxy_coupled.py b/newton/_src/solvers/coupled/solver_proxy_coupled.py
-@@
-     def get_proxy_contacts(self, source: str, destination: str) -> Contacts | None:
-         config = self._proxy_collision_configs.get((source, destination))
-         return None if config is None else config.contacts
- 
-+    def get_proxy_body_wrenches(self, source: str, destination: str) -> wp.array | None:
-+        """Return harvested body feedback wrenches for one proxy direction.
-+
-+        Values are indexed by parent-model body id and use Newton's spatial-vector
-+        layout ``(force_x, force_y, force_z, torque_x, torque_y, torque_z)``.
-+        """
-+        for mapping in self._proxy_mappings:
-+            if mapping.src_name == source and mapping.dst_name == destination:
-+                return mapping.coupling_forces
-+        return None
-+
-     def _after_entry_states_created(self) -> None:
-         model = self.model
-         device = model.device
-```
+No local Newton patch is required for PR #2848. The IsaacLab box coupling demo reads sand reaction forces through `SolverImplicitMPM.collect_collider_impulses()` when the older local `get_proxy_body_wrenches()` helper is absent.
 
 ## Sanity Checks
 
 Confirm the local package wiring:
 
 ```bash
-cd /home/horde/IsaacLab
+cd /home/maximiliank/Work/IsaacLab
 ./isaaclab.sh -p -c "import newton; print(newton.__file__)"
 ./_isaac_sim/python.sh -m pip show newton isaaclab_newton mujoco mujoco-warp warp-lang
 ```
@@ -271,13 +246,13 @@ cd /home/horde/IsaacLab
 Expected `newton.__file__` starts with:
 
 ```text
-/home/horde/newton-coupled/newton/
+/home/maximiliank/Work/newton/newton/
 ```
 
 Run smoke tests and demos:
 
 ```bash
-cd /home/horde/IsaacLab
+cd /home/maximiliank/Work/IsaacLab
 ./isaaclab.sh -p scripts/tutorials/00_sim/create_empty.py --viz kit
 ./isaaclab.sh -p scripts/demos/newton_box_mpm_twoway.py --viz newton --max-steps 100 --disable-cuda-graph
 ./isaaclab.sh -p scripts/demos/newton_anymal_mpm_sand.py --viz newton --max-steps 100 --disable-cuda-graph

@@ -7,69 +7,93 @@
 
 from __future__ import annotations
 
-import importlib
-import inspect
-from collections.abc import Callable
-
 from newton import Model
-from newton.solvers import (
-    SolverFeatherstone,
-    SolverImplicitMPM,
-    SolverKamino,
-    SolverMuJoCo,
-    SolverProxyCoupled,
-    SolverXPBD,
-)
+from newton.solvers import SolverAdmmCoupled, SolverCoupled, SolverProxyCoupled
 
-from .coupled_manager_cfg import CoupledProxyCfg, CoupledSolverCfg, CoupledSolverEntryCfg
-from .mjwarp_manager import resolve_mujoco_solver_kwargs
+from .coupled_manager_cfg import AdmmCouplingCfg, CoupledProxyCfg, CoupledSolverCfg, CoupledSolverEntryCfg
 from .newton_manager import NewtonManager
-from .newton_manager_cfg import NewtonSolverCfg
+from .solver_factory import (
+    resolve_class_or_callable,
+    resolve_newton_solver_class_and_kwargs,
+    solver_cfg_needs_external_contacts,
+)
 
 
 class NewtonCoupledManager(NewtonManager):
     """:class:`NewtonManager` specialization for Newton coupled solvers.
 
     The manager is intentionally thin: Isaac Lab owns lifecycle, state buffers,
-    collision-pipeline refresh, and visualization, while Newton's
-    ``SolverProxyCoupled`` owns per-solver ``ModelView`` construction and
-    proxy-force exchange.
+    collision-pipeline refresh, and visualization, while Newton's coupled
+    solvers own per-solver ``ModelView`` construction and
+    cross-entry force or constraint exchange.
     """
+
+    @classmethod
+    def get_entry_solver(cls, name: str):
+        """Return a named sub-solver from the active coupled solver."""
+        solver = NewtonManager._solver
+        if solver is None or not hasattr(solver, "get_solver"):
+            raise RuntimeError("Newton coupled solver is not initialized.")
+        return solver.get_solver(name)
+
+    @classmethod
+    def get_entry_view(cls, name: str):
+        """Return a named sub-solver model view from the active coupled solver."""
+        solver = NewtonManager._solver
+        if solver is None or not hasattr(solver, "get_view"):
+            raise RuntimeError("Newton coupled solver is not initialized.")
+        return solver.get_view(name)
+
+    @classmethod
+    def get_proxy_body_wrenches(cls, source: str, destination: str):
+        """Return proxy body feedback wrenches when the active Newton solver exposes them."""
+        solver = NewtonManager._solver
+        if solver is None or not hasattr(solver, "get_proxy_body_wrenches"):
+            return None
+        return solver.get_proxy_body_wrenches(source, destination)
 
     @classmethod
     def _build_solver(cls, model: Model, solver_cfg: CoupledSolverCfg) -> None:
         """Construct a Newton coupled solver and populate the base-class slots."""
-        if solver_cfg.coupling_type != "proxy":
-            raise ValueError(f"Unsupported Newton coupling_type {solver_cfg.coupling_type!r}; expected 'proxy'.")
-        if len(solver_cfg.entries) < 2:
-            raise ValueError("Newton coupled solver requires at least two solver entries.")
-        if not solver_cfg.proxy_coupling.proxies:
-            raise ValueError("Newton proxy coupling requires at least one proxy mapping.")
+        cls._validate_solver_cfg(solver_cfg)
 
-        NewtonManager._solver = SolverProxyCoupled(
-            model=model,
-            entries=[cls._build_entry(entry_cfg) for entry_cfg in solver_cfg.entries],
-            coupling=SolverProxyCoupled.CouplingProxy(
-                proxies=[cls._build_proxy(proxy_cfg) for proxy_cfg in solver_cfg.proxy_coupling.proxies],
-                iterations=solver_cfg.proxy_coupling.iterations,
-            ),
-        )
+        entries = [cls._build_entry(entry_cfg) for entry_cfg in solver_cfg.entries]
+        if solver_cfg.coupling_type == "proxy":
+            NewtonManager._solver = SolverProxyCoupled(
+                model=model,
+                entries=entries,
+                coupling=SolverProxyCoupled.CouplingProxy(
+                    proxies=[cls._build_proxy(proxy_cfg) for proxy_cfg in solver_cfg.proxy_coupling.proxies],
+                    iterations=solver_cfg.proxy_coupling.iterations,
+                ),
+            )
+        elif solver_cfg.coupling_type == "admm":
+            NewtonManager._solver = SolverAdmmCoupled(
+                model=model,
+                entries=entries,
+                coupling=cls._build_admm(solver_cfg.admm_coupling),
+            )
+        else:
+            raise ValueError(f"Unsupported Newton coupling_type {solver_cfg.coupling_type!r}.")
+
+        if hasattr(NewtonManager._solver, "prepare_graph_capture"):
+            NewtonManager._solver.prepare_graph_capture()
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = cls._needs_external_collision_pipeline(solver_cfg)
 
     @classmethod
-    def _build_entry(cls, entry_cfg: CoupledSolverEntryCfg) -> SolverProxyCoupled.Entry:
+    def _build_entry(cls, entry_cfg: CoupledSolverEntryCfg) -> SolverCoupled.Entry:
         """Build a Newton ``SolverCoupled.Entry`` from an Isaac Lab entry cfg."""
-        if not entry_cfg.name:
-            raise ValueError("CoupledSolverEntryCfg.name must be non-empty.")
-        if entry_cfg.substeps < 1:
-            raise ValueError(f"CoupledSolverEntryCfg {entry_cfg.name!r} substeps must be >= 1.")
+        solver_class, solver_kwargs = resolve_newton_solver_class_and_kwargs(
+            entry_cfg.solver_cfg,
+            entry_cfg.solver_class,
+            entry_cfg.solver_kwargs,
+        )
+        configure_view = (
+            None if entry_cfg.configure_view is None else resolve_class_or_callable(entry_cfg.configure_view)
+        )
 
-        solver_class = cls._resolve_solver_class(entry_cfg)
-        solver_kwargs = cls._solver_kwargs(entry_cfg.solver_cfg)
-        solver_kwargs.update(entry_cfg.solver_kwargs)
-
-        return SolverProxyCoupled.Entry(
+        return SolverCoupled.Entry(
             name=entry_cfg.name,
             solver=solver_class,
             bodies=list(entry_cfg.bodies),
@@ -77,7 +101,10 @@ class NewtonCoupledManager(NewtonManager):
             joints=list(entry_cfg.joints),
             shapes=list(entry_cfg.shapes),
             solver_kwargs=solver_kwargs,
+            configure_view=configure_view,
+            contact_policy=entry_cfg.contact_policy,
             substeps=entry_cfg.substeps,
+            in_place=entry_cfg.in_place,
         )
 
     @staticmethod
@@ -102,75 +129,98 @@ class NewtonCoupledManager(NewtonManager):
         )
 
     @classmethod
-    def _resolve_solver_class(cls, entry_cfg: CoupledSolverEntryCfg) -> type | Callable:
-        """Resolve the Newton solver class for an entry."""
-        if entry_cfg.solver_class is not None:
-            return cls._resolve_class_or_callable(entry_cfg.solver_class)
-
-        solver_type = getattr(entry_cfg.solver_cfg, "solver_type", None)
-        if solver_type == "mujoco_warp":
-            return SolverMuJoCo
-        if solver_type == "implicit_mpm":
-            return SolverImplicitMPM
-        if solver_type == "xpbd":
-            return SolverXPBD
-        if solver_type == "featherstone":
-            return SolverFeatherstone
-        if solver_type == "kamino":
-            return SolverKamino
-        raise ValueError(
-            f"Cannot infer coupled entry solver class from solver_type={solver_type!r}. "
-            "Set CoupledSolverEntryCfg.solver_class for custom solvers."
+    def _build_admm(cls, admm_cfg: AdmmCouplingCfg) -> SolverAdmmCoupled.CouplingAdmm:
+        """Build a Newton ADMM coupling config from an Isaac Lab cfg."""
+        return SolverAdmmCoupled.CouplingAdmm(
+            iterations=admm_cfg.iterations,
+            rho=admm_cfg.rho,
+            gamma=admm_cfg.gamma,
+            baumgarte=admm_cfg.baumgarte,
+            joint_stiffness=admm_cfg.joint_stiffness,
+            joint_damping=admm_cfg.joint_damping,
+            joint_angular_stiffness=admm_cfg.joint_angular_stiffness,
+            joint_angular_damping=admm_cfg.joint_angular_damping,
+            contact_detection=admm_cfg.contact_detection,
+            contact_distance=admm_cfg.contact_distance,
+            contact_friction=admm_cfg.contact_friction,
+            contact_detection_margin=admm_cfg.contact_detection_margin,
+            particle_contact_detection_margin=admm_cfg.particle_contact_detection_margin,
         )
 
-    @staticmethod
-    def _resolve_class_or_callable(value: type | Callable | str) -> type | Callable:
-        """Resolve a callable, LazyType-like object, or ``module:attr`` string."""
-        if isinstance(value, str):
-            module_name, _, attr = value.partition(":")
-            if not module_name or not attr:
-                raise ValueError(f"Expected solver_class as 'module:Class', got {value!r}.")
-            return getattr(importlib.import_module(module_name), attr)
-        if hasattr(value, "_resolve"):
-            return value._resolve()
-        return value
+    @classmethod
+    def _validate_solver_cfg(cls, solver_cfg: CoupledSolverCfg) -> None:
+        """Validate coupled-solver config before constructing Newton objects."""
+        if solver_cfg.coupling_type not in ("proxy", "admm"):
+            raise ValueError(f"Unsupported Newton coupling_type {solver_cfg.coupling_type!r}.")
+        if len(solver_cfg.entries) < 2:
+            raise ValueError("Newton coupled solver requires at least two solver entries.")
+        cls._validate_entries(solver_cfg.entries)
+        if solver_cfg.coupling_type == "proxy":
+            cls._validate_proxy_coupling(solver_cfg)
+        else:
+            cls._validate_admm_coupling(solver_cfg.admm_coupling)
 
     @staticmethod
-    def _solver_kwargs(solver_cfg: NewtonSolverCfg) -> dict:
-        """Translate an Isaac Lab solver cfg into Newton constructor kwargs."""
-        solver_type = getattr(solver_cfg, "solver_type", None)
-        if solver_type == "implicit_mpm":
-            return {"config": solver_cfg.to_solver_config()}
-        if solver_type == "mujoco_warp":
-            return resolve_mujoco_solver_kwargs(solver_cfg)
+    def _validate_entries(entries: list[CoupledSolverEntryCfg]) -> None:
+        names: set[str] = set()
+        for entry in entries:
+            if not entry.name:
+                raise ValueError("CoupledSolverEntryCfg.name must be non-empty.")
+            if entry.name in names:
+                raise ValueError(f"Duplicate CoupledSolverEntryCfg name {entry.name!r}.")
+            names.add(entry.name)
+            if entry.substeps < 1:
+                raise ValueError(f"CoupledSolverEntryCfg {entry.name!r} substeps must be >= 1.")
+            if entry.in_place and entry.substeps != 1:
+                raise ValueError(f"CoupledSolverEntryCfg {entry.name!r} in_place requires substeps=1.")
 
-        solver_class_by_type = {
-            "xpbd": SolverXPBD,
-            "featherstone": SolverFeatherstone,
-            "kamino": SolverKamino,
-        }
-        solver_class = solver_class_by_type.get(solver_type)
-        if solver_class is None:
-            return {}
+    @classmethod
+    def _validate_proxy_coupling(cls, solver_cfg: CoupledSolverCfg) -> None:
+        if len(solver_cfg.entries) > 2:
+            raise ValueError("Newton proxy coupling currently supports at most two solver entries.")
+        if not solver_cfg.proxy_coupling.proxies:
+            raise ValueError("Newton proxy coupling requires at least one proxy mapping.")
+        if solver_cfg.proxy_coupling.iterations < 1:
+            raise ValueError("ProxyCouplingCfg.iterations must be >= 1.")
+        entry_names = {entry.name for entry in solver_cfg.entries}
+        for proxy in solver_cfg.proxy_coupling.proxies:
+            if proxy.source not in entry_names:
+                raise ValueError(f"CoupledProxyCfg source {proxy.source!r} does not match a coupled entry.")
+            if proxy.destination not in entry_names:
+                raise ValueError(f"CoupledProxyCfg destination {proxy.destination!r} does not match a coupled entry.")
+            if proxy.source == proxy.destination:
+                raise ValueError("CoupledProxyCfg source and destination must be different entries.")
+            if not proxy.bodies and not proxy.particles:
+                raise ValueError("CoupledProxyCfg must map at least one body or particle.")
+            if proxy.proxy_bodies is not None and len(proxy.proxy_bodies) != len(proxy.bodies):
+                raise ValueError("CoupledProxyCfg proxy_bodies must match bodies length.")
+            if proxy.proxy_particles is not None and len(proxy.proxy_particles) != len(proxy.particles):
+                raise ValueError("CoupledProxyCfg proxy_particles must match particles length.")
+            if proxy.mass_scale <= 0.0:
+                raise ValueError("CoupledProxyCfg mass_scale must be > 0.")
+            if proxy.collide_interval is not None and proxy.collide_interval < 1:
+                raise ValueError("CoupledProxyCfg collide_interval must be >= 1.")
 
-        valid = set(inspect.signature(solver_class.__init__).parameters) - {"self", "model"}
-        return {key: value for key, value in solver_cfg.to_dict().items() if key in valid}
+    @staticmethod
+    def _validate_admm_coupling(admm_cfg: AdmmCouplingCfg) -> None:
+        if admm_cfg.iterations < 1:
+            raise ValueError("AdmmCouplingCfg.iterations must be >= 1.")
+        if admm_cfg.rho <= 0.0:
+            raise ValueError("AdmmCouplingCfg.rho must be > 0.")
+        if admm_cfg.gamma < 0.0:
+            raise ValueError("AdmmCouplingCfg.gamma must be >= 0.")
+        if admm_cfg.contact_distance is not None and admm_cfg.contact_distance < 0.0:
+            raise ValueError("AdmmCouplingCfg.contact_distance must be >= 0.")
+        if admm_cfg.contact_friction < 0.0:
+            raise ValueError("AdmmCouplingCfg.contact_friction must be >= 0.")
+        if admm_cfg.contact_detection_margin < 0.0:
+            raise ValueError("AdmmCouplingCfg.contact_detection_margin must be >= 0.")
+        if admm_cfg.particle_contact_detection_margin is not None and admm_cfg.particle_contact_detection_margin < 0.0:
+            raise ValueError("AdmmCouplingCfg.particle_contact_detection_margin must be >= 0.")
 
     @classmethod
     def _needs_external_collision_pipeline(cls, solver_cfg: CoupledSolverCfg) -> bool:
         """Return whether the coupled solver should receive external contacts."""
         if solver_cfg.use_collision_pipeline is not None:
             return solver_cfg.use_collision_pipeline
-        return any(cls._entry_needs_external_contacts(entry.solver_cfg) for entry in solver_cfg.entries)
-
-    @staticmethod
-    def _entry_needs_external_contacts(solver_cfg: NewtonSolverCfg) -> bool:
-        """Infer external contact needs for known Newton sub-solvers."""
-        solver_type = getattr(solver_cfg, "solver_type", None)
-        if solver_type == "mujoco_warp":
-            return not getattr(solver_cfg, "use_mujoco_contacts", True)
-        if solver_type == "kamino":
-            return not getattr(solver_cfg, "use_collision_detector", True)
-        if solver_type in ("xpbd", "featherstone"):
-            return True
-        return False
+        return any(solver_cfg_needs_external_contacts(entry.solver_cfg) for entry in solver_cfg.entries)

@@ -43,6 +43,10 @@ def test_visualizer_alias_parsing():
     assert args.visualizer == ["kit", "newton"]
     assert args.visualizer_explicit is True
 
+    args = parser.parse_args(["--vis", "newton"])
+    assert args.visualizer == ["newton"]
+    assert args.visualizer_explicit is True
+
 
 def test_headless_deprecated_arg_parsing():
     """Test that deprecated --headless is still accepted by the parser."""

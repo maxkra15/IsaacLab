@@ -13,7 +13,7 @@ import warp as wp
 
 import isaaclab.sim as sim_utils
 import newton
-from newton import JointTargetMode
+from newton import JointTargetMode, eval_fk
 from newton.solvers import SolverImplicitMPM, SolverMuJoCo
 
 from isaaclab.envs import DirectRLEnv
@@ -32,9 +32,17 @@ class PolicyObservationSpheres:
         marker_cfg = VisualizationMarkersCfg(
             prim_path="/Visuals/PolicyObservations",
             markers={
+                "grid_cell": sim_utils.SphereCfg(
+                    radius=0.006,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.15, 0.15)),
+                ),
                 "height_cell": sim_utils.SphereCfg(
                     radius=0.012,
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.8, 1.0)),
+                ),
+                "dense_cell": sim_utils.SphereCfg(
+                    radius=0.014,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.95, 0.55, 0.10)),
                 ),
                 "centroid": sim_utils.SphereCfg(
                     radius=0.035,
@@ -48,6 +56,22 @@ class PolicyObservationSpheres:
                     radius=0.025,
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 1.0, 0.25)),
                 ),
+                "mouth": sim_utils.SphereCfg(
+                    radius=0.02,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.15, 0.15)),
+                ),
+                "in_bin": sim_utils.SphereCfg(
+                    radius=0.01,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 1.0, 0.1)),
+                ),
+                "spilled": sim_utils.SphereCfg(
+                    radius=0.012,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.05, 0.05)),
+                ),
+                "pile_center": sim_utils.SphereCfg(
+                    radius=0.025,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.2, 1.0)),
+                ),
             },
         )
         self._markers = VisualizationMarkers(marker_cfg)
@@ -60,52 +84,87 @@ class PolicyObservationSpheres:
         self._enabled = enabled
         self._markers.set_visibility(enabled)
 
-    def update(self, env: "UR10ParticleScoopEnv", heightmap: torch.Tensor, paddle_pos: torch.Tensor, centroid: torch.Tensor):
-        self.set_enabled(_show_policy_observation_spheres(env))
+    def update(
+        self,
+        env: "UR10ParticleScoopEnv",
+        heightmap: torch.Tensor,
+        density: torch.Tensor,
+        paddle_corners: torch.Tensor,
+        centroid: torch.Tensor,
+        particle_pos: torch.Tensor,
+    ) -> None:
+        show_obs = _viewer_flag_enabled(env, "show_policy_observations")
+        show_reward_debug = _viewer_flag_enabled(env, "show_reward_debug")
+        show_curriculum_debug = _viewer_flag_enabled(env, "show_curriculum_debug")
+        self.set_enabled(show_obs or show_reward_debug or show_curriculum_debug)
         if not self._enabled:
             return
 
         env_id = 0
         origin = env.scene.env_origins[env_id]
         map_size = env.cfg.heightmap_size
-        cell_yx = torch.nonzero(heightmap[env_id] > 1.0e-3, as_tuple=False)
-
-        if cell_yx.numel() > 0:
-            cell_y = cell_yx[:, 0].float()
-            cell_x = cell_yx[:, 1].float()
-            cell_height = heightmap[env_id, cell_yx[:, 0], cell_yx[:, 1]]
-            cell_pos = torch.stack(
-                (
-                    env._heightmap_x_min + (cell_x + 0.5) * env._heightmap_x_range / map_size,
-                    env._heightmap_y_min + (cell_y + 0.5) * env._heightmap_y_range / map_size,
-                    env.cfg.table_top_z + cell_height * env.cfg.heightmap_z_range + 0.02,
-                ),
-                dim=-1,
-            )
-            translations = cell_pos + origin
-            marker_indices = torch.zeros(translations.shape[0], dtype=torch.int32, device=env.device)
-        else:
-            translations = torch.empty((0, 3), device=env.device)
-            marker_indices = torch.empty((0,), dtype=torch.int32, device=env.device)
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(map_size, device=env.device),
+            torch.arange(map_size, device=env.device),
+            indexing="ij",
+        )
+        cell_x = grid_x.reshape(-1).float()
+        cell_y = grid_y.reshape(-1).float()
+        cell_height = heightmap[env_id].reshape(-1)
+        cell_density = density[env_id].reshape(-1)
+        cell_pos = torch.stack(
+            (
+                env._heightmap_x_min + (cell_x + 0.5) * env._heightmap_x_range / map_size,
+                env._heightmap_y_min + (cell_y + 0.5) * env._heightmap_y_range / map_size,
+                env._heightmap_z_min + cell_height * env.cfg.heightmap_z_range + 0.02,
+            ),
+            dim=-1,
+        )
+        translations = cell_pos + origin
+        marker_indices = torch.zeros_like(cell_height, dtype=torch.int32)
+        marker_indices = torch.where(cell_height > 1.0e-3, torch.ones_like(marker_indices), marker_indices)
+        marker_indices = torch.where(cell_density > 0.35, torch.full_like(marker_indices, 2), marker_indices)
 
         feature_pos = torch.stack(
             (
                 centroid[env_id] + origin,
-                paddle_pos[env_id] + origin,
                 env._bin_target + origin,
+                env._bin_mouth_center + origin,
             ),
             dim=0,
         )
-        translations = torch.cat((translations, feature_pos), dim=0)
-        feature_indices = torch.tensor((1, 2, 3), dtype=torch.int32, device=env.device)
+        corner_pos = paddle_corners[env_id] + origin
+        translations = torch.cat((translations, feature_pos[:1], corner_pos, feature_pos[1:]), dim=0)
+        feature_indices = torch.tensor((3, 4, 4, 4, 4, 5, 6), dtype=torch.int32, device=env.device)
         marker_indices = torch.cat((marker_indices, feature_indices), dim=0)
+        if show_reward_debug:
+            env_particles = particle_pos[env_id]
+            in_bin_particles = env_particles[env._particles_in_bin(particle_pos)[env_id]]
+            spilled_particles = env_particles[env._particles_spilled(particle_pos)[env_id]]
+            debug_translations = []
+            debug_indices = []
+            if in_bin_particles.numel() > 0:
+                debug_translations.append(in_bin_particles + origin)
+                debug_indices.append(torch.full((in_bin_particles.shape[0],), 7, dtype=torch.int32, device=env.device))
+            if spilled_particles.numel() > 0:
+                debug_translations.append(spilled_particles + origin)
+                debug_indices.append(torch.full((spilled_particles.shape[0],), 8, dtype=torch.int32, device=env.device))
+            if debug_translations:
+                translations = torch.cat((translations, *debug_translations), dim=0)
+                marker_indices = torch.cat((marker_indices, *debug_indices), dim=0)
+        if show_curriculum_debug:
+            pile_marker = env._current_pile_center[env_id : env_id + 1] + origin
+            translations = torch.cat((translations, pile_marker), dim=0)
+            marker_indices = torch.cat(
+                (marker_indices, torch.full((1,), 9, dtype=torch.int32, device=env.device)), dim=0
+            )
         self._markers.visualize(translations=translations, marker_indices=marker_indices)
 
 
-def _show_policy_observation_spheres(env: "UR10ParticleScoopEnv") -> bool:
+def _viewer_flag_enabled(env: "UR10ParticleScoopEnv", flag_name: str) -> bool:
     for visualizer in env.sim.visualizers:
         viewer = getattr(visualizer, "_viewer", None)
-        if viewer is not None and getattr(viewer, "show_policy_observations", False):
+        if viewer is not None and getattr(viewer, flag_name, False):
             return True
     return False
 
@@ -131,24 +190,38 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._mpm_graph = self._capture_mpm_graph()
 
         state = NewtonManager.get_state_0()
+        model = NewtonManager.get_model()
         self._default_joint_q = wp.to_torch(state.joint_q)[self._joint_q_ids].clone()
         self._default_joint_qd = wp.to_torch(state.joint_qd)[self._joint_qd_ids].clone()
+        joint_lower = wp.to_torch(model.joint_limit_lower)[self._joint_qd_ids].clone()
+        joint_upper = wp.to_torch(model.joint_limit_upper)[self._joint_qd_ids].clone()
+        finite_limits = torch.isfinite(joint_lower) & torch.isfinite(joint_upper) & ((joint_upper - joint_lower) > 1.0e-3)
+        reasonable_limits = finite_limits & ((joint_upper - joint_lower) < 100.0)
+        self._joint_lower = torch.where(reasonable_limits, joint_lower, torch.full_like(joint_lower, -2.0 * torch.pi))
+        self._joint_upper = torch.where(reasonable_limits, joint_upper, torch.full_like(joint_upper, 2.0 * torch.pi))
+        self._joint_center = 0.5 * (self._joint_lower + self._joint_upper)
+        self._joint_half_range = torch.clamp(0.5 * (self._joint_upper - self._joint_lower), min=1.0e-6)
         self._default_particle_q = wp.to_torch(state.particle_q)[self._particle_ids].clone()
+        self._default_particle_e = self._default_particle_q - self.scene.env_origins[:, None, :]
         self._joint_targets = self._default_joint_q.clone()
         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._bin_center = torch.tensor(self.cfg.bin_center, device=self.device)
         self._bin_half_extents = torch.tensor(self.cfg.bin_inner_half_extents, device=self.device)
         self._bin_lower = self._bin_center - self._bin_half_extents
         self._bin_upper = self._bin_center + self._bin_half_extents
-        self._bin_lower[2] = self.cfg.table_top_z - 0.5 * self.cfg.voxel_size
-        self._bin_upper[2] = self.cfg.table_top_z + self.cfg.bin_wall_height + 0.5 * self.cfg.voxel_size
+        self._bin_lower[2] = self._bin_lower[2] + self.cfg.bin_particle_min_height
         self._bin_target = self._bin_center.clone()
-        self._bin_target[2] = self.cfg.table_top_z + 0.5 * self.cfg.bin_wall_height
+        self._bin_target[2] = self._bin_center[2]
+        self._bin_mouth_center = self._bin_center.clone()
+        self._bin_mouth_center[0] = self._bin_lower[0]
+        self._bin_mouth_center[2] = (
+            self.cfg.bin_center[2] - self.cfg.bin_inner_half_extents[2] + self.cfg.bin_front_wall_height
+        )
         self._workspace_lower = torch.tensor(
             (
                 self.cfg.table_center[0] - 0.5 * self.cfg.table_size[0] - 0.10,
                 self.cfg.table_center[1] - 0.5 * self.cfg.table_size[1] - 0.15,
-                self.cfg.table_top_z - 0.10,
+                min(self.cfg.heightmap_z_min, float(self._bin_lower[2])) - 0.05,
             ),
             device=self.device,
         )
@@ -156,38 +229,79 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             (
                 self._bin_upper[0].item() + 0.15,
                 self.cfg.table_center[1] + 0.5 * self.cfg.table_size[1] + 0.15,
-                self.cfg.table_top_z + self.cfg.heightmap_z_range,
+                max(self.cfg.table_top_z + self.cfg.heightmap_z_range, float(self._bin_upper[2]) + 0.10),
             ),
             device=self.device,
         )
-        self._pile_center = 0.5 * (
+        self._default_pile_center = 0.5 * (
             torch.tensor(self.cfg.pile_lo, device=self.device) + torch.tensor(self.cfg.pile_hi, device=self.device)
         )
-        self._progress_start_x = float(self.cfg.pile_lo[0])
-        self._progress_target_x = float(self.cfg.bin_center[0] - self.cfg.bin_inner_half_extents[0])
-        self._heightmap_x_min = 0.05
-        self._heightmap_x_range = max(1.10, float(self._bin_upper[0].item()) - self._heightmap_x_min + 0.05)
-        self._heightmap_y_min = -0.45
-        self._heightmap_y_range = 0.90
+        self._default_pile_half_extents = 0.5 * (
+            torch.tensor(self.cfg.pile_hi, device=self.device) - torch.tensor(self.cfg.pile_lo, device=self.device)
+        )
+        self._default_particle_offsets = self._default_particle_e - self._default_pile_center
+        self._current_pile_center = self._default_pile_center.unsqueeze(0).repeat(self.num_envs, 1)
+        self._current_pile_half_extents = self._default_pile_half_extents.unsqueeze(0).repeat(self.num_envs, 1)
+        self._progress_target_x = float(self._bin_mouth_center[0])
+        self._heightmap_x_min = float(self.cfg.heightmap_x_bounds[0])
+        self._heightmap_x_range = float(self.cfg.heightmap_x_bounds[1] - self.cfg.heightmap_x_bounds[0])
+        self._heightmap_y_min = float(self.cfg.heightmap_y_bounds[0])
+        self._heightmap_y_range = float(self.cfg.heightmap_y_bounds[1] - self.cfg.heightmap_y_bounds[0])
+        self._heightmap_z_min = float(self.cfg.heightmap_z_min)
         self._heightmap_env_offsets = (
             torch.arange(self.num_envs, device=self.device, dtype=torch.long)
             * self.cfg.heightmap_size
             * self.cfg.heightmap_size
         ).unsqueeze(1)
+        self._paddle_center_offset = torch.tensor(self.cfg.paddle_ee_offset, device=self.device)
+        paddle_x, paddle_y, _ = self.cfg.paddle_size
+        self._paddle_corner_offsets = torch.tensor(
+            (
+                (-0.5 * paddle_x, -0.5 * paddle_y, 0.0),
+                (-0.5 * paddle_x, 0.5 * paddle_y, 0.0),
+                (0.5 * paddle_x, -0.5 * paddle_y, 0.0),
+                (0.5 * paddle_x, 0.5 * paddle_y, 0.0),
+            ),
+            device=self.device,
+        ) + self._paddle_center_offset
         self._previous_bin_count = torch.zeros(self.num_envs, device=self.device)
+        self._previous_bin_fraction = torch.zeros(self.num_envs, device=self.device)
         self._previous_particle_progress = torch.zeros(self.num_envs, device=self.device)
         self._previous_bin_proximity = torch.zeros(self.num_envs, device=self.device)
         self._previous_paddle_pos = self._paddle_pos_e().clone()
+        self._previous_particle_centroid = self._robust_particle_centroid(self._particle_pos_e()).clone()
+        self._previous_actions = torch.zeros_like(self._actions)
+        self._episode_succeeded = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._curriculum_stage = 0
+        self._curriculum_success_ema = 0.0
+        self._curriculum_resets_in_stage = 0
+        self._last_bin_fraction = torch.zeros(self.num_envs, device=self.device)
+        self._last_spill_fraction = torch.zeros(self.num_envs, device=self.device)
+        self._last_particle_progress = torch.zeros(self.num_envs, device=self.device)
+        self._last_bin_proximity = torch.zeros(self.num_envs, device=self.device)
+        self._last_mouth_entry = torch.zeros(self.num_envs, device=self.device)
+        self._last_paddle_speed = torch.zeros(self.num_envs, device=self.device)
+        self._last_action_rate = torch.zeros(self.num_envs, device=self.device)
+        self._last_paddle_bin_proximity = torch.zeros(self.num_envs, device=self.device)
+        self._last_paddle_orientation = torch.zeros(self.num_envs, device=self.device)
+        self._last_paddle_velocity = torch.zeros(self.num_envs, 3, device=self.device)
+        self._last_particle_centroid_velocity = torch.zeros(self.num_envs, 3, device=self.device)
         self._episode_sums = {
-            "particle_count": torch.zeros(self.num_envs, device=self.device),
-            "delta_count": torch.zeros(self.num_envs, device=self.device),
+            "bin_fraction": torch.zeros(self.num_envs, device=self.device),
+            "delta_bin_fraction": torch.zeros(self.num_envs, device=self.device),
             "particle_progress": torch.zeros(self.num_envs, device=self.device),
             "bin_proximity": torch.zeros(self.num_envs, device=self.device),
-            "delta_bin_proximity": torch.zeros(self.num_envs, device=self.device),
+            "mouth_entry": torch.zeros(self.num_envs, device=self.device),
             "spill_penalty": torch.zeros(self.num_envs, device=self.device),
             "paddle_proximity": torch.zeros(self.num_envs, device=self.device),
+            "paddle_bin_proximity": torch.zeros(self.num_envs, device=self.device),
+            "paddle_orientation": torch.zeros(self.num_envs, device=self.device),
+            "paddle_low_penalty": torch.zeros(self.num_envs, device=self.device),
             "paddle_speed_penalty": torch.zeros(self.num_envs, device=self.device),
             "action_penalty": torch.zeros(self.num_envs, device=self.device),
+            "action_rate_penalty": torch.zeros(self.num_envs, device=self.device),
+            "joint_velocity_penalty": torch.zeros(self.num_envs, device=self.device),
+            "success_bonus": torch.zeros(self.num_envs, device=self.device),
         }
         self._policy_observation_spheres = PolicyObservationSpheres()
         self._configure_newton_viewer()
@@ -406,10 +520,16 @@ class UR10ParticleScoopEnv(DirectRLEnv):
 
     def _add_workspace_colliders(self, builder: newton.ModelBuilder) -> list[int]:
         workspace_shapes: list[int] = []
+        workspace_shapes.extend(self._add_table(builder))
+        workspace_shapes.extend(self._add_deep_side_bin(builder))
+        return workspace_shapes
+
+    def _add_table(self, builder: newton.ModelBuilder) -> list[int]:
+        shapes: list[int] = []
         tx, ty, tz = self.cfg.table_center
         sx, sy, sz = self.cfg.table_size
         table_cfg = newton.ModelBuilder.ShapeConfig(mu=0.8, density=0.0, margin=0.01, gap=0.01)
-        workspace_shapes.append(
+        shapes.append(
             builder.add_shape_box(
                 -1,
                 xform=wp.transform(wp.vec3(tx, ty, tz), wp.quat_identity()),
@@ -420,13 +540,33 @@ class UR10ParticleScoopEnv(DirectRLEnv):
                 color=(0.45, 0.34, 0.24),
             )
         )
+        leg_sx, leg_sy, leg_sz = self.cfg.table_leg_size
+        leg_z = tz - 0.5 * sz - 0.5 * leg_sz
+        for leg_x in (tx - 0.43 * sx, tx + 0.43 * sx):
+            for leg_y in (ty - 0.43 * sy, ty + 0.43 * sy):
+                shapes.append(
+                    builder.add_shape_box(
+                        -1,
+                        xform=wp.transform(wp.vec3(leg_x, leg_y, leg_z), wp.quat_identity()),
+                        hx=0.5 * leg_sx,
+                        hy=0.5 * leg_sy,
+                        hz=0.5 * leg_sz,
+                        cfg=table_cfg,
+                        color=(0.32, 0.24, 0.16),
+                    )
+                )
+        return shapes
 
+    def _add_deep_side_bin(self, builder: newton.ModelBuilder) -> list[int]:
+        workspace_shapes: list[int] = []
         wall_thickness = self.cfg.bin_wall_thickness
-        bin_height = self.cfg.bin_wall_height
         bin_x, bin_y, _ = self.cfg.bin_center
         bin_half_x, bin_half_y, _ = self.cfg.bin_inner_half_extents
-        wall_z = self.cfg.table_top_z + 0.5 * bin_height
-        bottom_z = self.cfg.table_top_z - 0.5 * wall_thickness
+        bin_lower_z = self.cfg.bin_center[2] - self.cfg.bin_inner_half_extents[2]
+        bin_wall_height = self.cfg.bin_wall_height
+        wall_z = bin_lower_z + 0.5 * bin_wall_height
+        front_wall_z = bin_lower_z + 0.5 * self.cfg.bin_front_wall_height
+        bottom_z = bin_lower_z - 0.5 * wall_thickness
         wall_cfg = newton.ModelBuilder.ShapeConfig(mu=0.8, density=0.0, margin=0.01, gap=0.01)
         workspace_shapes.append(
             builder.add_shape_box(
@@ -440,9 +580,22 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             )
         )
         walls = [
-            ((2.0 * bin_half_x + wall_thickness, wall_thickness, bin_height), (bin_x, bin_y + bin_half_y, wall_z)),
-            ((2.0 * bin_half_x + wall_thickness, wall_thickness, bin_height), (bin_x, bin_y - bin_half_y, wall_z)),
-            ((wall_thickness, 2.0 * bin_half_y + wall_thickness, bin_height), (bin_x + bin_half_x, bin_y, wall_z)),
+            (
+                (2.0 * bin_half_x + wall_thickness, wall_thickness, bin_wall_height),
+                (bin_x, bin_y + bin_half_y + 0.5 * wall_thickness, wall_z),
+            ),
+            (
+                (2.0 * bin_half_x + wall_thickness, wall_thickness, bin_wall_height),
+                (bin_x, bin_y - bin_half_y - 0.5 * wall_thickness, wall_z),
+            ),
+            (
+                (wall_thickness, 2.0 * bin_half_y + 2.0 * wall_thickness, bin_wall_height),
+                (bin_x + bin_half_x + 0.5 * wall_thickness, bin_y, wall_z),
+            ),
+            (
+                (wall_thickness, 2.0 * bin_half_y + 2.0 * wall_thickness, self.cfg.bin_front_wall_height),
+                (bin_x - bin_half_x - 0.5 * wall_thickness, bin_y, front_wall_z),
+            ),
         ]
         for size, pos in walls:
             workspace_shapes.append(
@@ -454,6 +607,34 @@ class UR10ParticleScoopEnv(DirectRLEnv):
                     hz=0.5 * size[2],
                     cfg=wall_cfg,
                     color=(0.1, 0.18, 0.32),
+                )
+            )
+        rim_z = bin_lower_z + bin_wall_height + 0.5 * self.cfg.bin_rim_height
+        rim_cfg = newton.ModelBuilder.ShapeConfig(mu=0.9, density=0.0, margin=0.01, gap=0.01)
+        rim_segments = [
+            (
+                (2.0 * bin_half_x + 2.0 * wall_thickness, self.cfg.bin_rim_thickness, self.cfg.bin_rim_height),
+                (bin_x, bin_y + bin_half_y + 0.5 * wall_thickness, rim_z),
+            ),
+            (
+                (2.0 * bin_half_x + 2.0 * wall_thickness, self.cfg.bin_rim_thickness, self.cfg.bin_rim_height),
+                (bin_x, bin_y - bin_half_y - 0.5 * wall_thickness, rim_z),
+            ),
+            (
+                (self.cfg.bin_rim_thickness, 2.0 * bin_half_y + 2.0 * wall_thickness, self.cfg.bin_rim_height),
+                (bin_x + bin_half_x + 0.5 * wall_thickness, bin_y, rim_z),
+            ),
+        ]
+        for size, pos in rim_segments:
+            workspace_shapes.append(
+                builder.add_shape_box(
+                    -1,
+                    xform=wp.transform(wp.vec3(*pos), wp.quat_identity()),
+                    hx=0.5 * size[0],
+                    hy=0.5 * size[1],
+                    hz=0.5 * size[2],
+                    cfg=rim_cfg,
+                    color=(0.12, 0.26, 0.48),
                 )
             )
         return workspace_shapes
@@ -497,79 +678,196 @@ class UR10ParticleScoopEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._apply_viewer_forces()
         self._actions = actions.clamp(-1.0, 1.0)
-        self._joint_targets = self._joint_targets + self._actions * self.cfg.action_scale * self.step_dt
+        joint_delta = self._cartesian_actions_to_joint_delta(self._actions)
+        joint_q = wp.to_torch(NewtonManager.get_state_0().joint_q)[self._joint_q_ids]
+        self._joint_targets = joint_q + joint_delta
         self._joint_targets = torch.clamp(self._joint_targets, -2.0 * torch.pi, 2.0 * torch.pi)
 
     def _apply_action(self) -> None:
         control = NewtonManager.get_control()
         wp.to_torch(control.joint_target_pos)[self._joint_qd_ids] = self._joint_targets
 
+    def _cartesian_actions_to_joint_delta(self, actions: torch.Tensor) -> torch.Tensor:
+        jacobian = self._finite_difference_ee_jacobian()
+        cartesian_delta = torch.cat(
+            (
+                actions[:, :3] * self.cfg.cartesian_position_action_scale * self.step_dt,
+                actions[:, 3:] * self.cfg.cartesian_rotation_action_scale * self.step_dt,
+            ),
+            dim=-1,
+        )
+        return self._solve_damped_ik(jacobian, cartesian_delta, self.cfg.max_ik_delta_q)
+
+    def _solve_damped_ik(self, jacobian: torch.Tensor, cartesian_delta: torch.Tensor, max_delta_q: float) -> torch.Tensor:
+        j_t = jacobian.transpose(1, 2)
+        damping_eye = (self.cfg.ik_damping**2) * torch.eye(6, device=self.device).unsqueeze(0)
+        lhs = jacobian @ j_t + damping_eye
+        rhs = cartesian_delta.unsqueeze(-1)
+        joint_delta = j_t @ torch.linalg.solve(lhs, rhs)
+        joint_delta = joint_delta.squeeze(-1)
+        return torch.clamp(joint_delta, -max_delta_q, max_delta_q)
+
+    def _finite_difference_ee_jacobian(self) -> torch.Tensor:
+        model = NewtonManager.get_model()
+        state = NewtonManager.get_state_0()
+        joint_q = wp.to_torch(state.joint_q)
+        body_q = wp.to_torch(state.body_q)
+        original_joint_q = joint_q[self._joint_q_ids].clone()
+        base_pose = body_q[self._ee_body_ids].clone()
+        eps = float(self.cfg.ik_fd_epsilon)
+        jacobian = torch.empty(self.num_envs, 6, self.cfg.action_space, device=self.device)
+
+        for joint_index in range(self.cfg.action_space):
+            q_ids = self._joint_q_ids[:, joint_index]
+            joint_q[q_ids] = original_joint_q[:, joint_index] + eps
+            eval_fk(model, state.joint_q, state.joint_qd, state, None)
+            perturbed_pose = body_q[self._ee_body_ids].clone()
+            jacobian[:, :3, joint_index] = (perturbed_pose[:, :3] - base_pose[:, :3]) / eps
+            jacobian[:, 3:, joint_index] = self._small_angle_quat_difference(
+                perturbed_pose[:, 3:7], base_pose[:, 3:7]
+            ) / eps
+            joint_q[q_ids] = original_joint_q[:, joint_index]
+
+        joint_q[self._joint_q_ids] = original_joint_q
+        eval_fk(model, state.joint_q, state.joint_qd, state, None)
+        return jacobian
+
     def _get_observations(self) -> dict:
         particle_pos = self._particle_pos_e()
-        heightmap_grid = self._particle_heightmap(particle_pos)
-        heightmap = heightmap_grid.reshape(self.num_envs, -1)
+        heightmap_grid, density_grid = self._particle_grid_observations(particle_pos)
+        particle_grid = torch.cat(
+            (heightmap_grid.reshape(self.num_envs, -1), density_grid.reshape(self.num_envs, -1)), dim=-1
+        )
         state = NewtonManager.get_state_0()
         joint_q = wp.to_torch(state.joint_q)[self._joint_q_ids]
         joint_qd = wp.to_torch(state.joint_qd)[self._joint_qd_ids]
         bin_fraction = self._count_particles_in_bin(particle_pos)[:, None] / float(self._particle_count)
-        paddle_pos = self._paddle_pos_e()
+        paddle_corners = self._paddle_corners_e()
         particle_centroid = self._robust_particle_centroid(particle_pos)
+        particle_centroid_velocity = (particle_centroid - self._previous_particle_centroid) / self.step_dt
+        particle_centroid_velocity = torch.clamp(torch.nan_to_num(particle_centroid_velocity), -2.0, 2.0)
+        self._last_particle_centroid_velocity = particle_centroid_velocity
+        self._previous_particle_centroid = particle_centroid
+        paddle_pos = self._paddle_pos_e()
+        paddle_velocity = self._last_paddle_velocity
+        bin_target = self._bin_target.unsqueeze(0).expand(self.num_envs, -1)
+        bin_mouth = self._bin_mouth_center.unsqueeze(0).expand(self.num_envs, -1)
+        vector_to_mouth = self._normalize_vector(bin_mouth - paddle_pos)
+        spill_fraction = self._particles_spilled(particle_pos).float().mean(dim=1, keepdim=True)
+        particle_progress = self._particle_progress_toward_bin(particle_pos)[:, None]
+        bin_proximity = self._particle_bin_proximity(particle_pos)[:, None]
         obs = torch.cat(
             (
-                heightmap,
-                joint_q / torch.pi,
-                0.1 * joint_qd,
-                paddle_pos,
-                particle_centroid,
-                self._bin_center.unsqueeze(0) - paddle_pos,
+                particle_grid,
+                self._normalize_joint_positions(joint_q),
+                self._normalize_joint_velocities(joint_qd),
+                self._normalize_positions(paddle_pos),
+                self._normalize_positions(paddle_corners).reshape(self.num_envs, -1),
+                self._normalize_positions(particle_centroid),
+                0.25 * particle_centroid_velocity,
+                0.2 * paddle_velocity,
+                self._normalize_positions(bin_target),
+                self._normalize_positions(bin_mouth),
+                vector_to_mouth,
                 bin_fraction,
+                spill_fraction,
+                particle_progress,
+                bin_proximity,
+                self._previous_actions,
             ),
             dim=-1,
         )
-        self._policy_observation_spheres.update(self, heightmap_grid, paddle_pos, particle_centroid)
-        return {"policy": obs}
+        self._policy_observation_spheres.update(
+            self, heightmap_grid, density_grid, paddle_corners, particle_centroid, particle_pos
+        )
+        critic_obs = torch.cat((obs, self._privileged_observations(particle_pos, paddle_velocity)), dim=-1)
+        return {"policy": torch.clamp(obs, -5.0, 5.0), "critic": torch.clamp(critic_obs, -5.0, 5.0)}
 
     def _get_rewards(self) -> torch.Tensor:
         particle_pos = self._particle_pos_e()
         count = self._count_particles_in_bin(particle_pos)
-        delta_count = count - self._previous_bin_count
+        bin_fraction = count / float(self._particle_count)
+        delta_bin_fraction = bin_fraction - self._previous_bin_fraction
         self._previous_bin_count = count
+        self._previous_bin_fraction = bin_fraction
         progress = self._particle_progress_toward_bin(particle_pos)
         delta_progress = progress - self._previous_particle_progress
         self._previous_particle_progress = progress
         bin_proximity = self._particle_bin_proximity(particle_pos)
-        delta_bin_proximity = bin_proximity - self._previous_bin_proximity
         self._previous_bin_proximity = bin_proximity
         spill_fraction = self._particles_spilled(particle_pos).float().mean(dim=1)
+        mouth_entry = self._particle_mouth_entry(particle_pos)
 
         paddle_pos = self._paddle_pos_e()
-        paddle_distance = torch.linalg.norm(paddle_pos - self._pile_center, dim=-1)
+        paddle_corners = self._paddle_corners_e()
+        paddle_distance = torch.linalg.norm(paddle_pos - self._current_pile_center, dim=-1)
         paddle_proximity = torch.exp(-4.0 * paddle_distance)
-        paddle_speed = torch.linalg.norm((paddle_pos - self._previous_paddle_pos) / self.step_dt, dim=-1)
+        paddle_bin_proximity = self._paddle_bin_proximity(paddle_pos)
+        paddle_orientation = self._paddle_push_orientation()
+        paddle_low_penalty = torch.square(
+            torch.clamp((self.cfg.paddle_min_height - paddle_corners[..., 2].amin(dim=1)) / 0.10, min=0.0)
+        )
+        paddle_low_penalty = torch.clamp(paddle_low_penalty, max=1.0)
+        paddle_velocity = (paddle_pos - self._previous_paddle_pos) / self.step_dt
+        paddle_velocity = torch.nan_to_num(
+            paddle_velocity,
+            nan=0.0,
+            posinf=self.cfg.max_paddle_speed,
+            neginf=-self.cfg.max_paddle_speed,
+        )
+        paddle_velocity = torch.clamp(paddle_velocity, -self.cfg.max_paddle_speed, self.cfg.max_paddle_speed)
+        paddle_speed = torch.linalg.norm(paddle_velocity, dim=-1)
+        paddle_speed = torch.nan_to_num(paddle_speed, nan=self.cfg.max_paddle_speed, posinf=self.cfg.max_paddle_speed)
+        paddle_speed = torch.clamp(paddle_speed, max=self.cfg.max_paddle_speed)
         self._previous_paddle_pos = paddle_pos
+        self._last_paddle_velocity = paddle_velocity
+        joint_qd = wp.to_torch(NewtonManager.get_state_0().joint_qd)[self._joint_qd_ids]
+        joint_qd = torch.nan_to_num(joint_qd, nan=0.0, posinf=self.cfg.max_joint_velocity, neginf=-self.cfg.max_joint_velocity)
+        joint_qd = torch.clamp(joint_qd, -self.cfg.max_joint_velocity, self.cfg.max_joint_velocity)
         action_penalty = torch.sum(torch.square(self._actions), dim=-1)
+        action_delta = self._actions - self._previous_actions
+        action_rate_penalty = torch.sum(torch.square(action_delta), dim=-1)
+        joint_velocity_penalty = torch.sum(torch.square(joint_qd), dim=-1)
+        success = bin_fraction >= self._target_success_fraction()
+        self._episode_succeeded |= success
+        self._previous_actions = self._actions.clone()
 
         rewards = {
-            "particle_count": self.cfg.reward_count_scale * count / float(self._particle_count),
-            "delta_count": self.cfg.reward_delta_count_scale * torch.clamp(delta_count, min=0.0) / float(
-                self._particle_count
-            ),
+            "bin_fraction": self.cfg.reward_bin_fraction_scale * bin_fraction,
+            "delta_bin_fraction": self.cfg.reward_delta_bin_fraction_scale * torch.clamp(delta_bin_fraction, min=0.0),
             "particle_progress": self.cfg.reward_particle_progress_scale * torch.clamp(delta_progress, min=0.0),
             "bin_proximity": self.cfg.reward_bin_proximity_scale * bin_proximity,
-            "delta_bin_proximity": self.cfg.reward_delta_bin_proximity_scale
-            * torch.clamp(delta_bin_proximity, min=0.0),
+            "mouth_entry": self.cfg.reward_mouth_entry_scale * mouth_entry,
             "spill_penalty": -self.cfg.reward_spill_penalty_scale * spill_fraction,
             "paddle_proximity": self.cfg.reward_paddle_proximity_scale * paddle_proximity,
+            "paddle_bin_proximity": self.cfg.reward_paddle_bin_proximity_scale * paddle_bin_proximity,
+            "paddle_orientation": self.cfg.reward_paddle_orientation_scale * paddle_orientation,
+            "paddle_low_penalty": -self.cfg.reward_paddle_low_penalty_scale * paddle_low_penalty,
             "paddle_speed_penalty": -self.cfg.reward_paddle_speed_penalty_scale * torch.square(paddle_speed),
             "action_penalty": -self.cfg.action_penalty_scale * action_penalty,
+            "action_rate_penalty": -self.cfg.action_rate_penalty_scale * action_rate_penalty,
+            "joint_velocity_penalty": -self.cfg.joint_velocity_penalty_scale * joint_velocity_penalty,
+            "success_bonus": self.cfg.reward_success_bonus * success.float(),
         }
         reward = torch.stack(list(rewards.values()), dim=0).sum(dim=0)
         for name, value in rewards.items():
             self._episode_sums[name] += value
+        self._last_bin_fraction = bin_fraction
+        self._last_spill_fraction = spill_fraction
+        self._last_particle_progress = progress
+        self._last_bin_proximity = bin_proximity
+        self._last_mouth_entry = mouth_entry
+        self._last_paddle_speed = paddle_speed
+        self._last_action_rate = torch.linalg.norm(action_delta, dim=-1)
+        self._last_paddle_bin_proximity = paddle_bin_proximity
+        self._last_paddle_orientation = paddle_orientation
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        particle_pos = self._particle_pos_e()
+        bin_fraction = self._count_particles_in_bin(particle_pos) / float(self._particle_count)
+        terminated = bin_fraction >= self._target_success_fraction()
+        self._episode_succeeded |= terminated
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, truncated
 
@@ -580,14 +878,30 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         env_ids = env_ids.long()
 
+        log_extras = None
         if hasattr(self, "_episode_sums"):
+            completed_success_rate = self._episode_succeeded[env_ids].float().mean().item()
+            self._update_curriculum(completed_success_rate, int(env_ids.numel()))
             extras = {}
             for key, value in self._episode_sums.items():
                 extras[f"Episode_Reward/{key}"] = value[env_ids].mean().item() / self.max_episode_length_s
                 value[env_ids] = 0.0
             extras["Metrics/particles_in_bin"] = self._previous_bin_count[env_ids].mean().item()
-            extras["Metrics/bin_proximity"] = self._previous_bin_proximity[env_ids].mean().item()
-            self.extras["log"] = extras
+            extras["Metrics/particle_fraction_in_bin"] = self._last_bin_fraction[env_ids].mean().item()
+            extras["Metrics/spill_fraction"] = self._last_spill_fraction[env_ids].mean().item()
+            extras["Metrics/particle_progress"] = self._last_particle_progress[env_ids].mean().item()
+            extras["Metrics/bin_proximity"] = self._last_bin_proximity[env_ids].mean().item()
+            extras["Metrics/mouth_entry"] = self._last_mouth_entry[env_ids].mean().item()
+            extras["Metrics/paddle_speed"] = self._last_paddle_speed[env_ids].mean().item()
+            extras["Metrics/action_rate"] = self._last_action_rate[env_ids].mean().item()
+            extras["Metrics/paddle_bin_proximity"] = self._last_paddle_bin_proximity[env_ids].mean().item()
+            extras["Metrics/paddle_orientation"] = self._last_paddle_orientation[env_ids].mean().item()
+            extras["Metrics/success_rate"] = self._episode_succeeded[env_ids].float().mean().item()
+            extras["Curriculum/stage"] = float(self._curriculum_stage)
+            extras["Curriculum/success_ema"] = float(self._curriculum_success_ema)
+            extras["Curriculum/target_success_fraction"] = float(self._target_success_fraction())
+            self._episode_succeeded[env_ids] = False
+            log_extras = extras
 
         super()._reset_idx(env_ids)
         state_0 = NewtonManager.get_state_0()
@@ -600,38 +914,70 @@ class UR10ParticleScoopEnv(DirectRLEnv):
 
         joint_q[self._joint_q_ids[env_ids]] = self._default_joint_q[env_ids]
         joint_qd[self._joint_qd_ids[env_ids]] = self._default_joint_qd[env_ids]
-        particle_q[self._particle_ids[env_ids]] = self._default_particle_q[env_ids]
+        reset_particle_q = self._sample_particle_reset_positions(env_ids)
+        if log_extras is not None:
+            log_extras["Curriculum/reset_pile_center_x"] = self._current_pile_center[env_ids, 0].mean().item()
+            log_extras["Curriculum/reset_pile_center_y"] = self._current_pile_center[env_ids, 1].mean().item()
+            log_extras["Curriculum/reset_pile_scale_x"] = (
+                self._current_pile_half_extents[env_ids, 0].mean().item()
+                / max(float(self._default_pile_half_extents[0]), 1.0e-6)
+            )
+            self.extras["log"] = log_extras
+        particle_q[self._particle_ids[env_ids]] = reset_particle_q
         particle_qd[self._particle_ids[env_ids]] = 0.0
         wp.to_torch(state_1.joint_q)[self._joint_q_ids[env_ids]] = self._default_joint_q[env_ids]
         wp.to_torch(state_1.joint_qd)[self._joint_qd_ids[env_ids]] = self._default_joint_qd[env_ids]
-        wp.to_torch(state_1.particle_q)[self._particle_ids[env_ids]] = self._default_particle_q[env_ids]
+        wp.to_torch(state_1.particle_q)[self._particle_ids[env_ids]] = reset_particle_q
         wp.to_torch(state_1.particle_qd)[self._particle_ids[env_ids]] = 0.0
 
+        self._reset_robot_to_curriculum_pose(env_ids, state_0, state_1, control)
+        if log_extras is not None:
+            reset_paddle = self._paddle_pos_e()[env_ids]
+            log_extras["Curriculum/reset_paddle_x"] = reset_paddle[:, 0].mean().item()
+            log_extras["Curriculum/reset_paddle_y"] = reset_paddle[:, 1].mean().item()
+            log_extras["Curriculum/reset_paddle_z"] = reset_paddle[:, 2].mean().item()
+
         self._joint_targets[env_ids] = self._default_joint_q[env_ids]
+        self._actions[env_ids] = 0.0
+        self._previous_actions[env_ids] = 0.0
+        self._joint_targets[env_ids] = wp.to_torch(state_0.joint_q)[self._joint_q_ids[env_ids]]
         wp.to_torch(control.joint_target_pos)[self._joint_qd_ids[env_ids]] = self._joint_targets[env_ids]
         if hasattr(self, "_mpm_solver"):
             self._mpm_solver._last_step_data.save_collider_current_position(state_0.body_q)
         particle_pos = self._particle_pos_e()
         self._previous_bin_count[env_ids] = self._count_particles_in_bin(particle_pos)[env_ids]
+        self._previous_bin_fraction[env_ids] = self._previous_bin_count[env_ids] / float(self._particle_count)
         self._previous_particle_progress[env_ids] = self._particle_progress_toward_bin(particle_pos)[env_ids]
         self._previous_bin_proximity[env_ids] = self._particle_bin_proximity(particle_pos)[env_ids]
         self._previous_paddle_pos[env_ids] = self._paddle_pos_e()[env_ids]
+        self._previous_particle_centroid[env_ids] = self._robust_particle_centroid(particle_pos)[env_ids]
+        self._last_paddle_velocity[env_ids] = 0.0
+        self._last_particle_centroid_velocity[env_ids] = 0.0
 
-    def _particle_heightmap(self, particle_pos: torch.Tensor) -> torch.Tensor:
+    def _particle_grid_observations(self, particle_pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         map_size = self.cfg.heightmap_size
         rel_x = (particle_pos[..., 0] - self._heightmap_x_min) / self._heightmap_x_range
         rel_y = (particle_pos[..., 1] - self._heightmap_y_min) / self._heightmap_y_range
         px = torch.clamp((rel_x * map_size).long(), 0, map_size - 1)
         py = torch.clamp((rel_y * map_size).long(), 0, map_size - 1)
         particle_height = torch.clamp(
-            (particle_pos[..., 2] - self.cfg.table_top_z) / self.cfg.heightmap_z_range, 0.0, 1.0
+            (particle_pos[..., 2] - self._heightmap_z_min) / self.cfg.heightmap_z_range, 0.0, 1.0
         )
         valid = (rel_x >= 0.0) & (rel_x < 1.0) & (rel_y >= 0.0) & (rel_y < 1.0)
+        particle_height = torch.where(
+            valid,
+            torch.clamp(particle_height, min=self.cfg.heightmap_occupied_cell_value),
+            particle_height,
+        )
         flat_indices = self._heightmap_env_offsets + py * map_size + px
         flat_values = torch.where(valid, particle_height, torch.zeros_like(particle_height))
         height = torch.zeros(self.num_envs * map_size * map_size, device=self.device)
         height.scatter_reduce_(0, flat_indices.reshape(-1), flat_values.reshape(-1), reduce="amax", include_self=True)
-        return height.reshape(self.num_envs, map_size, map_size)
+        density_values = torch.where(valid, torch.ones_like(particle_height), torch.zeros_like(particle_height))
+        density = torch.zeros_like(height)
+        density.scatter_add_(0, flat_indices.reshape(-1), density_values.reshape(-1))
+        density = torch.clamp(density / self.cfg.heightmap_density_norm, 0.0, 1.0)
+        return height.reshape(self.num_envs, map_size, map_size), density.reshape(self.num_envs, map_size, map_size)
 
     def _particle_pos_e(self) -> torch.Tensor:
         particle_pos_w = wp.to_torch(NewtonManager.get_state_0().particle_q)[self._particle_ids]
@@ -639,7 +985,84 @@ class UR10ParticleScoopEnv(DirectRLEnv):
 
     def _paddle_pos_e(self) -> torch.Tensor:
         body_q = wp.to_torch(NewtonManager.get_state_0().body_q)
-        return body_q[self._ee_body_ids, :3] - self.scene.env_origins
+        ee_pose = body_q[self._ee_body_ids]
+        return ee_pose[:, :3] + self._quat_rotate(ee_pose[:, 3:7], self._paddle_center_offset) - self.scene.env_origins
+
+    def _paddle_corners_e(self) -> torch.Tensor:
+        body_q = wp.to_torch(NewtonManager.get_state_0().body_q)
+        ee_pose = body_q[self._ee_body_ids]
+        corner_offsets = self._paddle_corner_offsets.unsqueeze(0).expand(self.num_envs, -1, -1)
+        corner_quats = ee_pose[:, None, 3:7].expand(-1, corner_offsets.shape[1], -1)
+        corner_pos = ee_pose[:, None, :3] + self._quat_rotate(corner_quats, corner_offsets)
+        return corner_pos - self.scene.env_origins[:, None, :]
+
+    def _paddle_normal_e(self) -> torch.Tensor:
+        body_q = wp.to_torch(NewtonManager.get_state_0().body_q)
+        ee_pose = body_q[self._ee_body_ids]
+        local_normal = torch.tensor((0.0, 0.0, 1.0), device=self.device).expand(self.num_envs, -1)
+        return self._quat_rotate(ee_pose[:, 3:7], local_normal)
+
+    def _paddle_bin_proximity(self, paddle_pos: torch.Tensor) -> torch.Tensor:
+        normalized_error = self._normalize_vector(self._bin_mouth_center.unsqueeze(0) - paddle_pos)
+        distance = torch.linalg.norm(normalized_error, dim=-1)
+        return torch.exp(-2.0 * torch.clamp(distance, max=4.0))
+
+    def _paddle_push_orientation(self) -> torch.Tensor:
+        normal = self._paddle_normal_e()
+        push_direction = self._bin_mouth_center.unsqueeze(0) - self._current_pile_center
+        push_direction[:, 2] = 0.0
+        push_direction = push_direction / torch.clamp(torch.linalg.norm(push_direction, dim=-1, keepdim=True), min=1.0e-6)
+        facing_bin = torch.clamp(torch.sum(normal * push_direction, dim=-1), min=0.0, max=1.0)
+        vertical_blade = torch.exp(-12.0 * torch.square(normal[:, 2]))
+        return torch.square(facing_bin) * vertical_blade
+
+    def _normalize_positions(self, positions: torch.Tensor) -> torch.Tensor:
+        norm_x = 2.0 * (positions[..., 0] - self._heightmap_x_min) / self._heightmap_x_range - 1.0
+        norm_y = 2.0 * (positions[..., 1] - self._heightmap_y_min) / self._heightmap_y_range - 1.0
+        norm_z = 2.0 * (positions[..., 2] - self._heightmap_z_min) / self.cfg.heightmap_z_range - 1.0
+        return torch.stack((norm_x, norm_y, norm_z), dim=-1)
+
+    def _normalize_joint_positions(self, joint_q: torch.Tensor) -> torch.Tensor:
+        return torch.clamp((joint_q - self._joint_center) / self._joint_half_range, -1.0, 1.0)
+
+    def _normalize_joint_velocities(self, joint_qd: torch.Tensor) -> torch.Tensor:
+        joint_qd = torch.nan_to_num(
+            joint_qd,
+            nan=0.0,
+            posinf=self.cfg.max_joint_velocity,
+            neginf=-self.cfg.max_joint_velocity,
+        )
+        return torch.clamp(joint_qd / max(float(self.cfg.max_joint_velocity), 1.0e-6), -1.0, 1.0)
+
+    def _normalize_vector(self, vector: torch.Tensor) -> torch.Tensor:
+        scale = torch.tensor(
+            (self._heightmap_x_range, self._heightmap_y_range, self.cfg.heightmap_z_range), device=self.device
+        )
+        return torch.clamp(vector / torch.clamp(scale, min=1.0e-6), -1.0, 1.0)
+
+    @staticmethod
+    def _quat_rotate(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        quat_xyz, vec = torch.broadcast_tensors(quat[..., :3], vec)
+        quat_w = torch.broadcast_to(quat[..., 3:4], quat_xyz.shape[:-1] + (1,))
+        cross = torch.cross(quat_xyz, vec, dim=-1)
+        return vec + 2.0 * (quat_w * cross + torch.cross(quat_xyz, cross, dim=-1))
+
+    @staticmethod
+    def _quat_multiply(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        lhs_xyz, lhs_w = lhs[..., :3], lhs[..., 3:4]
+        rhs_xyz, rhs_w = rhs[..., :3], rhs[..., 3:4]
+        xyz = lhs_w * rhs_xyz + rhs_w * lhs_xyz + torch.cross(lhs_xyz, rhs_xyz, dim=-1)
+        w = lhs_w * rhs_w - torch.sum(lhs_xyz * rhs_xyz, dim=-1, keepdim=True)
+        return torch.cat((xyz, w), dim=-1)
+
+    @staticmethod
+    def _quat_conjugate(quat: torch.Tensor) -> torch.Tensor:
+        return torch.cat((-quat[..., :3], quat[..., 3:4]), dim=-1)
+
+    def _small_angle_quat_difference(self, target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        delta = self._quat_multiply(target, self._quat_conjugate(source))
+        sign = torch.where(delta[..., 3:4] < 0.0, -1.0, 1.0)
+        return 2.0 * sign * delta[..., :3]
 
     def _robust_particle_centroid(self, particle_pos: torch.Tensor) -> torch.Tensor:
         in_workspace = self._particles_in_workspace(particle_pos)
@@ -678,12 +1101,123 @@ class UR10ParticleScoopEnv(DirectRLEnv):
 
     def _particle_progress_toward_bin(self, particle_pos: torch.Tensor) -> torch.Tensor:
         particle_x = particle_pos[..., 0]
-        x_progress = (particle_x - self._progress_start_x) / max(self._progress_target_x - self._progress_start_x, 1.0e-6)
+        progress_start_x = self._current_pile_center[:, 0:1] - self._current_pile_half_extents[:, 0:1]
+        progress_range = torch.clamp(self._progress_target_x - progress_start_x, min=1.0e-6)
+        x_progress = (particle_x - progress_start_x) / progress_range
         x_progress = torch.clamp(x_progress, 0.0, 1.0)
         y_error = (particle_pos[..., 1] - self._bin_center[1]) / max(float(self.cfg.bin_inner_half_extents[1]), 1.0e-6)
         y_alignment = torch.exp(-torch.square(y_error))
-        z_valid = (particle_pos[..., 2] > self._bin_lower[2]) & (particle_pos[..., 2] < self._bin_upper[2])
+        z_valid = (particle_pos[..., 2] > self._heightmap_z_min) & (particle_pos[..., 2] < self._workspace_upper[2])
         return (x_progress * y_alignment * z_valid.float()).mean(dim=1)
+
+    def _particle_mouth_entry(self, particle_pos: torch.Tensor) -> torch.Tensor:
+        mouth_depth = max(0.08, 2.0 * self.cfg.voxel_size)
+        in_mouth_x = torch.abs(particle_pos[..., 0] - self._bin_mouth_center[0]) < mouth_depth
+        in_mouth_y = torch.abs(particle_pos[..., 1] - self._bin_mouth_center[1]) < self._bin_half_extents[1]
+        near_entry_height = torch.abs(particle_pos[..., 2] - self._bin_mouth_center[2]) < 0.18
+        return (in_mouth_x & in_mouth_y & near_entry_height).float().mean(dim=1)
+
+    def _target_success_fraction(self) -> float:
+        if not self.cfg.curriculum_enabled:
+            return float(self.cfg.success_fraction)
+        stage = min(self._curriculum_stage, len(self.cfg.curriculum_stage_success_fractions) - 1)
+        return float(self.cfg.curriculum_stage_success_fractions[stage])
+
+    def _update_curriculum(self, success_rate: float, reset_count: int) -> None:
+        if not self.cfg.curriculum_enabled:
+            return
+        alpha = float(self.cfg.curriculum_success_ema_alpha)
+        self._curriculum_success_ema = (1.0 - alpha) * self._curriculum_success_ema + alpha * success_rate
+        self._curriculum_resets_in_stage += reset_count
+        max_stage = len(self.cfg.curriculum_stage_success_fractions) - 1
+        if self._curriculum_stage >= max_stage:
+            return
+        threshold = float(self.cfg.curriculum_success_rate_thresholds[self._curriculum_stage])
+        if (
+            self._curriculum_resets_in_stage >= self.cfg.curriculum_min_resets_per_stage
+            and self._curriculum_success_ema >= threshold
+        ):
+            self._curriculum_stage += 1
+            self._curriculum_success_ema = 0.0
+            self._curriculum_resets_in_stage = 0
+
+    def _sample_particle_reset_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
+        if not self.cfg.curriculum_enabled:
+            self._current_pile_center[env_ids] = self._default_pile_center
+            self._current_pile_half_extents[env_ids] = self._default_pile_half_extents
+            return self._default_particle_q[env_ids]
+
+        stage = min(self._curriculum_stage, len(self.cfg.curriculum_stage_success_fractions) - 1)
+        x_range = self.cfg.curriculum_pile_center_x_ranges[stage]
+        y_range = self.cfg.curriculum_pile_center_y_ranges[stage]
+        scale_range = self.cfg.curriculum_pile_scale_ranges[stage]
+        num_resets = env_ids.numel()
+        rand = torch.rand(num_resets, 3, device=self.device)
+        center = self._default_pile_center.unsqueeze(0).repeat(num_resets, 1)
+        center[:, 0] = float(x_range[0]) + rand[:, 0] * float(x_range[1] - x_range[0])
+        center[:, 1] = float(y_range[0]) + rand[:, 1] * float(y_range[1] - y_range[0])
+        center[:, 2] = 0.5 * (self.cfg.pile_lo[2] + self.cfg.pile_hi[2])
+        scale = float(scale_range[0]) + rand[:, 2:3] * float(scale_range[1] - scale_range[0])
+        scaled_offsets = self._default_particle_offsets[env_ids] * scale.unsqueeze(-1)
+        local_particle_pos = center[:, None, :] + scaled_offsets
+        local_particle_pos[..., 2] = torch.clamp(local_particle_pos[..., 2], min=self.cfg.table_top_z + 0.015)
+        self._current_pile_center[env_ids] = center
+        self._current_pile_half_extents[env_ids] = self._default_pile_half_extents * scale
+        return local_particle_pos + self.scene.env_origins[env_ids, None, :]
+
+    def _reset_robot_to_curriculum_pose(self, env_ids: torch.Tensor, state_0, state_1, control) -> None:
+        if not self.cfg.curriculum_enabled or not self.cfg.curriculum_robot_init_enabled:
+            return
+
+        stage = min(self._curriculum_stage, len(self.cfg.curriculum_stage_success_fractions) - 1)
+        num_resets = env_ids.numel()
+        rand = torch.rand(num_resets, 2, device=self.device)
+        x_offsets = self.cfg.curriculum_robot_start_x_offset_ranges[stage]
+        y_noise = self.cfg.curriculum_robot_start_y_noise_ranges[stage]
+        target_paddle = self._current_pile_center[env_ids].clone()
+        target_paddle[:, 0] -= float(x_offsets[0]) + rand[:, 0] * float(x_offsets[1] - x_offsets[0])
+        target_paddle[:, 1] += float(y_noise[0]) + rand[:, 1] * float(y_noise[1] - y_noise[0])
+        target_paddle[:, 2] = self.cfg.table_top_z + float(self.cfg.curriculum_robot_start_z_offsets[stage])
+
+        target_quat = torch.tensor((0.0, 0.70710678, 0.0, 0.70710678), device=self.device).repeat(num_resets, 1)
+        model = NewtonManager.get_model()
+        joint_q = wp.to_torch(state_0.joint_q)
+        joint_qd = wp.to_torch(state_0.joint_qd)
+        eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
+
+        for _ in range(self.cfg.curriculum_robot_init_iterations):
+            jacobian = self._finite_difference_ee_jacobian()[env_ids]
+            paddle_error = torch.clamp(target_paddle - self._paddle_pos_e()[env_ids], -0.10, 0.10)
+            current_quat = wp.to_torch(state_0.body_q)[self._ee_body_ids[env_ids], 3:7]
+            rotation_error = torch.clamp(self._small_angle_quat_difference(target_quat, current_quat), -0.35, 0.35)
+            cartesian_delta = torch.cat((paddle_error, rotation_error), dim=-1)
+            joint_delta = self._solve_damped_ik(jacobian, cartesian_delta, self.cfg.max_ik_reset_delta_q)
+            joint_ids = self._joint_q_ids[env_ids]
+            new_joint_q = torch.clamp(
+                joint_q[joint_ids] + joint_delta,
+                self._joint_lower[env_ids],
+                self._joint_upper[env_ids],
+            )
+            joint_q[joint_ids] = new_joint_q
+            joint_qd[self._joint_qd_ids[env_ids]] = 0.0
+            eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
+
+        wp.to_torch(state_1.joint_q)[self._joint_q_ids[env_ids]] = joint_q[self._joint_q_ids[env_ids]]
+        wp.to_torch(state_1.joint_qd)[self._joint_qd_ids[env_ids]] = 0.0
+        wp.to_torch(control.joint_target_pos)[self._joint_qd_ids[env_ids]] = joint_q[self._joint_q_ids[env_ids]]
+
+    def _privileged_observations(self, particle_pos: torch.Tensor, paddle_velocity: torch.Tensor) -> torch.Tensor:
+        stage_count = max(len(self.cfg.curriculum_stage_success_fractions) - 1, 1)
+        stage = torch.full((self.num_envs, 1), self._curriculum_stage / stage_count, device=self.device)
+        success_fraction = torch.full((self.num_envs, 1), self._target_success_fraction(), device=self.device)
+        success_ema = torch.full((self.num_envs, 1), self._curriculum_success_ema, device=self.device)
+        pile_center = self._normalize_positions(self._current_pile_center)
+        pile_scale = self._current_pile_half_extents / torch.clamp(self._default_pile_half_extents, min=1.0e-6)
+        particle_std = torch.std(particle_pos, dim=1, unbiased=False) / torch.tensor(
+            (self._heightmap_x_range, self._heightmap_y_range, self.cfg.heightmap_z_range), device=self.device
+        )
+        paddle_speed = torch.linalg.norm(paddle_velocity, dim=-1, keepdim=True) / self.cfg.max_paddle_speed
+        return torch.cat((stage, success_fraction, success_ema, pile_center, pile_scale, particle_std, paddle_speed), dim=-1)
 
     def _configure_newton_viewer(self) -> None:
         for visualizer in self.sim.visualizers:

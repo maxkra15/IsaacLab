@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
 
 parser = argparse.ArgumentParser(description="Newton proxy-coupled box interacting with MPM sand.")
-parser.add_argument("--fps", type=float, default=100.0, help="Simulation/control frames per second.")
+parser.add_argument("--fps", type=float, default=60.0, help="Simulation/control frames per second.")
 parser.add_argument("--max-steps", type=int, default=900, help="Stop after this many frames; negative runs forever.")
 parser.add_argument("--voxel-size", type=float, default=0.05, help="MPM grid voxel size in meters.")
 parser.add_argument("--particles-per-cell", type=float, default=3.0, help="Sand particles per grid cell.")
@@ -31,11 +31,11 @@ parser.add_argument("--mpm-iterations", type=int, default=50, help="Maximum MPM 
 parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy relaxation passes per coupled step.")
 parser.add_argument("--proxy-mass-relaxation", type=float, default=1.0, help="Scale proxy box mass inside MPM.")
 parser.add_argument("--rigid-substeps", type=int, default=4, help="MJWarp substeps inside each coupled step.")
-parser.add_argument("--box-mass", type=float, default=75.0, help="Rigid box mass in kg.")
+parser.add_argument("--box-mass", type=float, default=150.0, help="Rigid box mass in kg.")
 parser.add_argument("--box-size", type=float, default=0.5, help="Box side length in meters.")
 parser.add_argument("--box-height", type=float, default=2.0, help="Initial box center height in meters.")
-parser.add_argument("--sand-friction", type=float, default=0.75, help="MPM Drucker-Prager friction coefficient.")
-parser.add_argument("--sand-damping", type=float, default=0.0, help="MPM elastic damping relaxation time in seconds.")
+parser.add_argument("--sand-friction", type=float, default=0.35, help="MPM Drucker-Prager friction coefficient.")
+parser.add_argument("--sand-damping", type=float, default=0.30, help="MPM elastic damping relaxation time in seconds.")
 parser.add_argument("--sand-young-modulus", type=float, default=1.0e15, help="MPM Young's modulus in Pa.")
 parser.add_argument("--sand-yield-pressure", type=float, default=1.0e15, help="MPM compressive yield pressure in Pa.")
 parser.add_argument("--sand-tensile-yield-ratio", type=float, default=0.0, help="MPM tensile yield ratio.")
@@ -59,7 +59,7 @@ args_cli = parser.parse_args()
 np = torch = wp = newton = sim_utils = None
 SolverImplicitMPM = None
 CoupledProxyCfg = CoupledSolverCfg = CoupledSolverEntryCfg = None
-MJWarpSolverCfg = MPMSolverCfg = NewtonCfg = NewtonManager = ProxyCouplingCfg = None
+MJWarpSolverCfg = MPMSolverCfg = NewtonCfg = NewtonCoupledManager = NewtonManager = ProxyCouplingCfg = None
 
 
 BOX_BODY_PATH = "/World/ProxyCoupledBox"
@@ -71,7 +71,7 @@ def import_runtime_dependencies() -> None:
     """Import Newton/Isaac Lab modules after Kit has launched when requested."""
     global np, torch, wp, newton, sim_utils, SolverImplicitMPM
     global CoupledProxyCfg, CoupledSolverCfg, CoupledSolverEntryCfg
-    global MJWarpSolverCfg, MPMSolverCfg, NewtonCfg, NewtonManager, ProxyCouplingCfg
+    global MJWarpSolverCfg, MPMSolverCfg, NewtonCfg, NewtonCoupledManager, NewtonManager, ProxyCouplingCfg
 
     import numpy as np_module
     import torch as torch_module
@@ -88,6 +88,7 @@ def import_runtime_dependencies() -> None:
         MJWarpSolverCfg as MJWarpSolverCfgClass,
         MPMSolverCfg as MPMSolverCfgClass,
         NewtonCfg as NewtonCfgClass,
+        NewtonCoupledManager as NewtonCoupledManagerClass,
         NewtonManager as NewtonManagerClass,
         ProxyCouplingCfg as ProxyCouplingCfgClass,
     )
@@ -104,6 +105,7 @@ def import_runtime_dependencies() -> None:
     MJWarpSolverCfg = MJWarpSolverCfgClass
     MPMSolverCfg = MPMSolverCfgClass
     NewtonCfg = NewtonCfgClass
+    NewtonCoupledManager = NewtonCoupledManagerClass
     NewtonManager = NewtonManagerClass
     ProxyCouplingCfg = ProxyCouplingCfgClass
 
@@ -213,6 +215,7 @@ def build_box_sand_model() -> tuple[newton.ModelBuilder, CoupledSolverCfg, int]:
                 ),
                 particles=particle_indices,
                 shapes=[box_shape, ground_shape],
+                in_place=True,
             ),
         ],
         # Match Newton's reference example: call model.collide() externally, then pass contacts to MuJoCo.
@@ -393,13 +396,37 @@ def keep_running(sim: sim_utils.SimulationContext, count: int) -> bool:
     return any(not viz.is_closed and viz.is_running() for viz in sim.visualizers)
 
 
-def read_proxy_wrench(box_body: int) -> torch.Tensor:
+def read_proxy_wrench(box_body: int, dt: float) -> torch.Tensor:
     """Return the latest sand reaction wrench harvested by the proxy coupler."""
-    solver = getattr(NewtonManager, "_solver", None)
-    if solver is not None and hasattr(solver, "get_proxy_body_wrenches"):
-        wrenches = solver.get_proxy_body_wrenches(RIGID_ENTRY, SAND_ENTRY)
-        if wrenches is not None:
-            return wp.to_torch(wrenches)[box_body].detach().clone()
+    wrenches = NewtonCoupledManager.get_proxy_body_wrenches(RIGID_ENTRY, SAND_ENTRY)
+    if wrenches is not None:
+        return wp.to_torch(wrenches)[box_body].detach().clone()
+
+    try:
+        mpm_solver = NewtonCoupledManager.get_entry_solver(SAND_ENTRY)
+    except (KeyError, RuntimeError):
+        mpm_solver = None
+    if (
+        mpm_solver is not None
+        and hasattr(mpm_solver, "collect_collider_impulses")
+        and hasattr(mpm_solver, "collider_body_index")
+    ):
+        state = NewtonManager.get_state_0()
+        impulses, positions, collider_ids = mpm_solver.collect_collider_impulses(state)
+        collider_ids_t = wp.to_torch(collider_ids).long()
+        if collider_ids_t.numel() > 0:
+            collider_body_index = wp.to_torch(mpm_solver.collider_body_index).long()
+            valid = (collider_ids_t >= 0) & (collider_ids_t < collider_body_index.shape[0])
+            body_ids = torch.full_like(collider_ids_t, -1)
+            body_ids[valid] = collider_body_index[collider_ids_t[valid]]
+            body_mask = body_ids == int(box_body)
+            if bool(body_mask.any()):
+                force_samples = wp.to_torch(impulses)[body_mask] / float(dt)
+                force = force_samples.sum(dim=0)
+                points = wp.to_torch(positions)[body_mask]
+                body_center = wp.to_torch(state.body_q)[box_body, 0:3]
+                torque = torch.cross(points - body_center, force_samples, dim=1).sum(dim=0)
+                return torch.cat((force, torque)).detach().clone()
     return torch.zeros(6, device=wp.to_torch(NewtonManager.get_state_0().joint_q).device)
 
 
@@ -458,7 +485,7 @@ def run_simulator(
         sim.step(render=False)
 
         state = NewtonManager.get_state_0()
-        wrench = read_proxy_wrench(box_body)
+        wrench = read_proxy_wrench(box_body, dt=1.0 / args_cli.fps)
         log_wrench_plots(sim, wrench)
         log_progress(count, state, wrench)
 

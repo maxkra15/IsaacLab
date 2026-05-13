@@ -461,6 +461,7 @@ class AppLauncher:
         arg_group.add_argument(
             "--visualizer",
             "--viz",
+            "--vis",
             type=AppLauncher._parse_visualizer_csv,
             action=ExplicitAction,
             default=None,
