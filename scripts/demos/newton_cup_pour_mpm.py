@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
-"""Newton MPM cup-pouring demo with Isaac Sim tableware assets.
+"""Newton MPM teapot-pouring demo with Isaac Sim tableware assets.
 
-This demo places a table, bowl, and mug/cup visual in Isaac Lab, fills an
-analytic Newton cup collider with small MPM particles, and kinematically tilts
-the cup so the material pours into the bowl.
+This demo places a table, bowl, and hollow teapot asset in Isaac Lab, fills the
+teapot mesh with small MPM particles, and kinematically tilts it so the material
+pours into the bowl.
 
 .. code-block:: bash
 
@@ -18,40 +18,61 @@ the cup so the material pours into the bowl.
 
 import argparse
 import math
-from dataclasses import dataclass
+import os
 from types import SimpleNamespace
 
 from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
 
 
-parser = argparse.ArgumentParser(description="Newton MPM cup pour demo.")
+parser = argparse.ArgumentParser(description="Newton MPM teapot pour demo.")
 parser.add_argument("--fps", type=float, default=120.0, help="Simulation/control frames per second.")
 parser.add_argument("--max-steps", type=int, default=900, help="Stop after this many frames; negative runs forever.")
 parser.add_argument("--sim-substeps", type=int, default=1, help="Newton MPM substeps per rendered/control frame.")
 parser.add_argument("--voxel-size", type=float, default=0.01, help="MPM grid voxel size in meters.")
+parser.add_argument(
+    "--grid-type",
+    type=str,
+    choices=("sparse", "dense", "fixed"),
+    default="fixed",
+    help="MPM grid allocation mode. Sparse follows falling particles and colliders better for pouring.",
+)
+parser.add_argument("--grid-padding", type=int, default=196, help="Extra MPM grid cells around active particles.")
+parser.add_argument("--max-active-cell-count", type=int, default=1 << 18, help="Maximum active MPM grid cells.")
 parser.add_argument("--particles-per-cell", type=float, default=2.5, help="Particle lattice density per MPM grid cell.")
 parser.add_argument("--mpm-iterations", type=int, default=160, help="Maximum MPM rheology iterations.")
 parser.add_argument("--density", type=float, default=1000.0, help="Particle material density in kg/m^3.")
 parser.add_argument("--viscosity", type=float, default=50.0, help="MPM plastic viscosity; higher values look thicker.")
 parser.add_argument("--fluid-friction", type=float, default=0.0, help="MPM particle friction coefficient.")
-parser.add_argument("--fill-fraction", type=float, default=1.0, help="Fraction of the cup interior height initially filled.")
+parser.add_argument("--fill-fraction", type=float, default=1.0, help="Fraction of the teapot reservoir height initially filled.")
 parser.add_argument(
     "--fluid-wall-clearance",
     type=float,
-    default=0.014,
-    help="Minimum distance between initial particles and the cup inner wall/bottom/rim.",
+    default=0.025,
+    help="Minimum distance between initial particles and the teapot reservoir wall.",
 )
 parser.add_argument(
     "--fluid-bottom-clearance",
     type=float,
-    default=0.0,
-    help="Minimum distance between initial particles and the cup floor.",
+    default=0.01,
+    help="Minimum distance between initial particles and the teapot reservoir floor.",
 )
 parser.add_argument(
     "--fluid-top-clearance",
     type=float,
-    default=0.0,
-    help="Minimum distance between initial particles and the cup rim.",
+    default=0.015,
+    help="Minimum distance between initial particles and the teapot reservoir rim.",
+)
+parser.add_argument(
+    "--fluid-reservoir-radius-scale",
+    type=float,
+    default=0.34,
+    help="Scale applied to the inferred central teapot-body radius for particle seeding.",
+)
+parser.add_argument(
+    "--fluid-ellipsoid-shrink",
+    type=float,
+    default=0.88,
+    help="Extra shrink factor for the ellipsoid used to keep initial particles inside the teapot.",
 )
 parser.add_argument("--tensile-yield-ratio", type=float, default=1.0, help="MPM tensile yield ratio for cohesion.")
 parser.add_argument("--yield-pressure", type=float, default=1.0e15, help="MPM compressive yield pressure.")
@@ -59,36 +80,40 @@ parser.add_argument("--yield-stress", type=float, default=0.0, help="MPM deviato
 parser.add_argument("--young-modulus", type=float, default=1.0e15, help="MPM Young's modulus.")
 parser.add_argument("--damping", type=float, default=0.0, help="MPM elastic damping relaxation time.")
 parser.add_argument("--collider-margin", type=float, default=0.002, help="Collider margin/thickness used by MPM.")
-parser.add_argument("--cup-friction", type=float, default=0.0, help="Cup collider friction.")
+parser.add_argument("--cup-friction", type=float, default=0.0, help="Teapot mesh collider friction.")
 parser.add_argument("--bowl-friction", type=float, default=0.05, help="Bowl collider friction.")
 parser.add_argument("--table-friction", type=float, default=0.5, help="Table/ground collider friction.")
-parser.add_argument("--hold-time", type=float, default=0.45, help="Seconds to hold the filled cup upright.")
-parser.add_argument("--tilt-time", type=float, default=2.2, help="Seconds over which the cup tilts.")
-parser.add_argument("--pour-angle-deg", type=float, default=112.0, help="Final cup tilt angle toward the bowl.")
+parser.add_argument("--hold-time", type=float, default=0.55, help="Seconds to hold the filled teapot upright.")
+parser.add_argument("--tilt-time", type=float, default=2, help="Seconds over which the teapot tilts.")
+parser.add_argument("--pour-angle-deg", type=float, default=60.0, help="Final teapot tilt angle toward the bowl.")
+parser.add_argument("--teapot-lift-height", type=float, default=0.80, help="Meters to lift the teapot after it tilts.")
+parser.add_argument("--teapot-lift-time", type=float, default=3, help="Seconds over which the tilted teapot lifts.")
 parser.add_argument("--log-interval", type=int, default=60, help="Print simulation progress every N steps; 0 disables.")
 parser.add_argument("--disable-cuda-graph", action="store_true", help="Disable Newton CUDA graph capture.")
 parser.add_argument("--kit-particle-stride", type=int, default=2, help="Render every Nth particle in Kit; 1 renders all.")
 parser.add_argument("--grains-per-particle", type=int, default=5, help="Newton viewer grain samples per MPM particle.")
 parser.add_argument("--grain-radius-scale", type=float, default=1.0, help="Scale factor for Newton viewer grain radii.")
+parser.add_argument("--newton-usd-output", type=str, default=None, help="Optional path for Newton ViewerUSD export.")
+parser.add_argument("--newton-usd-max-frames", type=int, default=None, help="Maximum frames to write to Newton USD.")
 parser.add_argument("--table-usd", type=str, default=None, help="Override the table USD asset path.")
 parser.add_argument("--bowl-usd", type=str, default=None, help="Override the bowl USD asset path.")
-parser.add_argument("--cup-usd", type=str, default=None, help="Override the cup/mug USD asset path.")
 parser.add_argument(
-    "--cup-visual",
+    "--teapot-usd",
+    "--teapot-usdz",
+    dest="teapot_usd",
     type=str,
-    choices=("procedural", "usd"),
-    default="procedural",
-    help="Use the matching procedural flat cup visual or a USD mug/beaker visual.",
+    default=None,
+    help="Override the local hollow teapot USD asset path.",
 )
+parser.add_argument("--teapot-scale", type=float, default=0.005, help="Uniform scale for the hollow teapot USD asset.")
 parser.add_argument(
-    "--cup-kind",
-    type=str,
-    choices=("mug", "beaker"),
-    default="mug",
-    help="Default IsaacLab cup-like asset to use when --cup-usd is not provided.",
+    "--teapot-roll-correction-deg",
+    type=float,
+    default=+90.0,
+    help="Local X-axis roll correction applied to the teapot mesh before physics import.",
 )
 parser.add_argument("--table-visual-z", type=float, default=0.68, help="Z translation for the table USD visual.")
-parser.add_argument("--asset-scale", type=float, default=1.0, help="Uniform scale applied to bowl/cup visual assets.")
+parser.add_argument("--asset-scale", type=float, default=1.0, help="Uniform scale applied to tableware visual assets.")
 add_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -100,29 +125,32 @@ MPMSolverCfg = NewtonCfg = NewtonManager = None
 
 TABLE_PATH = "/World/Table"
 BOWL_PATH = "/World/Bowl"
-CUP_BODY_PATH = "/World/Cup"
+CUP_BODY_PATH = "/World/Teapot"
+CUP_ASSET_PATH = f"{CUP_BODY_PATH}/Asset"
 GROUND_PATH = "/World/Ground"
 VISUALS_PATH = "/World/Visuals"
+TEAPOT_USD_PATH = "/home/maximiliank/Work/IsaacLab/source/isaaclab_assets/isaaclab_assets/rand/teapot_hollow_separate_lid.usdc"
 
 TABLE_TOP_Z = 0.85
 TABLE_HALF_EXTENTS = (0.85, 0.55, 0.03)
 BOWL_BASE_POS = (0.22, 0.0, TABLE_TOP_Z + 0.02)
 BOWL_HEIGHT = 0.13
 BOWL_RIM_Z = BOWL_BASE_POS[2] + BOWL_HEIGHT
-CUP_BASE_POS = (0.02, 0.0, BOWL_RIM_Z + 0.24)
-CUP_INNER_RADIUS = 0.075
-CUP_WALL_THICKNESS = 0.008
-CUP_HEIGHT = 0.18
+CUP_BASE_POS = (-0.20, 0.0, BOWL_RIM_Z + 0.2)
+CUP_INNER_RADIUS = 0.105
+CUP_WALL_THICKNESS = 0.010
+CUP_HEIGHT = 0.205
 CUP_BOTTOM_THICKNESS = 0.024
+CAMERA_TARGET = (0.0, 0.0, 1.26)
+CAMERA_EYE = (0.0, -2.0, 1.86)
 
 
-@dataclass(frozen=True)
 class AssetPaths:
     """Resolved USD asset paths for the Kit-only visual scene."""
 
-    table: str
-    bowl: str
-    cup: str
+    def __init__(self, table: str, bowl: str):
+        self.table = table
+        self.bowl = bowl
 
 
 def import_runtime_dependencies() -> None:
@@ -159,16 +187,10 @@ def resolve_asset_paths() -> AssetPaths:
 
     from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 
-    cup_default = (
-        f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_beaker_red.usd"
-        if args_cli.cup_kind == "beaker"
-        else f"{ISAACLAB_NUCLEUS_DIR}/Objects/Mug/mug.usd"
-    )
     return AssetPaths(
         table=args_cli.table_usd or f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd",
         bowl=args_cli.bowl_usd
         or f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_bowl_yellow.usd",
-        cup=args_cli.cup_usd or cup_default,
     )
 
 
@@ -187,7 +209,7 @@ def smoothstep(value: float) -> float:
 
 
 def cup_pose_at_time(sim_time: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return cup position, orientation, and angular velocity for the scripted pour."""
+    """Return teapot position, orientation, and angular velocity for the scripted pour."""
 
     if args_cli.tilt_time <= 0.0:
         alpha = 1.0
@@ -200,74 +222,271 @@ def cup_pose_at_time(sim_time: float) -> tuple[np.ndarray, np.ndarray, np.ndarra
         if 0.0 < raw < 1.0:
             alpha_dot = (6.0 * clamped * (1.0 - clamped)) / args_cli.tilt_time
 
+    lift_start_time = args_cli.hold_time + max(args_cli.tilt_time, 0.0)
+    if args_cli.teapot_lift_time <= 0.0:
+        lift_alpha = 1.0 if sim_time >= lift_start_time else 0.0
+        lift_speed = 0.0
+    else:
+        lift_raw = (sim_time - lift_start_time) / args_cli.teapot_lift_time
+        lift_alpha = max(0.0, min(1.0, lift_raw))
+        lift_speed = 0.0
+        if 0.0 < lift_raw < 1.0:
+            lift_speed = args_cli.teapot_lift_height / args_cli.teapot_lift_time
+
     final_angle = math.radians(args_cli.pour_angle_deg)
     angle = final_angle * alpha
     angular_speed = final_angle * alpha_dot
     pos = np.array(CUP_BASE_POS, dtype=np.float32)
+    pos[2] += args_cli.teapot_lift_height * lift_alpha
     quat = np.array(quat_y(angle), dtype=np.float32)
     # Spatial vectors store linear velocity followed by angular velocity.
-    qd = np.array([0.0, 0.0, 0.0, 0.0, angular_speed, 0.0], dtype=np.float32)
+    qd = np.array([0.0, 0.0, lift_speed, 0.0, angular_speed, 0.0], dtype=np.float32)
     return pos, quat, qd
 
 
-def create_open_cup_mesh(
-    *,
-    inner_radius: float,
-    wall_thickness: float,
-    height: float,
-    bottom_thickness: float,
-    num_segments: int = 80,
-    include_bottom: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Create a thick, open-top cup mesh in local coordinates."""
+def get_teapot_usd_path() -> str:
+    """Return the local hollow teapot USD asset path."""
 
-    theta = np.linspace(0.0, 2.0 * math.pi, num_segments, endpoint=False)
-    cos_t = np.cos(theta)
-    sin_t = np.sin(theta)
-    outer_radius = inner_radius + wall_thickness
-
-    def ring(radius: float, z: float) -> np.ndarray:
-        return np.column_stack([radius * cos_t, radius * sin_t, np.full(num_segments, z)])
-
-    inner_bottom = ring(inner_radius, 0.0)
-    inner_top = ring(inner_radius, height)
-    outer_top = ring(outer_radius, height)
-    outer_bottom = ring(outer_radius, -bottom_thickness)
-    rings = [inner_bottom, inner_top, outer_top, outer_bottom]
-    if include_bottom:
-        rings.extend(
-            [
-                np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
-                np.array([[0.0, 0.0, -bottom_thickness]], dtype=np.float32),
-            ]
+    usd_path = os.path.abspath(args_cli.teapot_usd or TEAPOT_USD_PATH)
+    if not os.path.exists(usd_path):
+        raise FileNotFoundError(
+            f"Teapot USD not found: {usd_path}. Pass --teapot-usd with the local hollow teapot asset path."
         )
-    vertices = np.vstack(rings).astype(np.float32)
-    inner_center_id = 4 * num_segments
-    outer_center_id = inner_center_id + 1
+    return usd_path
 
-    indices: list[int] = []
-    for i in range(num_segments):
-        j = (i + 1) % num_segments
-        ib_i, ib_j = i, j
-        it_i, it_j = i + num_segments, j + num_segments
-        ot_i, ot_j = i + 2 * num_segments, j + 2 * num_segments
-        ob_i, ob_j = i + 3 * num_segments, j + 3 * num_segments
 
-        # Inner wall normals face inward toward the fluid volume.
-        indices.extend([ib_i, it_i, ib_j])
-        indices.extend([ib_j, it_i, it_j])
-        # Outer wall normals face away from the solid cup wall.
-        indices.extend([ob_i, ob_j, ot_i])
-        indices.extend([ot_i, ob_j, ot_j])
-        # Top rim.
-        indices.extend([it_i, ot_i, it_j])
-        indices.extend([it_j, ot_i, ot_j])
-        if include_bottom:
-            # Visual-only flat bottom; physics uses a separate thick cylinder plug.
-            indices.extend([inner_center_id, ib_i, ib_j])
-            indices.extend([outer_center_id, ob_j, ob_i])
+def _prune_mesh_to_largest_connected_component(mesh_prim) -> bool:
+    """Remove disconnected mesh islands such as the separate teapot lid."""
 
-    return vertices, np.array(indices, dtype=np.int32)
+    from collections import defaultdict, deque
+
+    from pxr import Gf, UsdGeom  # noqa: PLC0415
+
+    mesh = UsdGeom.Mesh(mesh_prim)
+    points_value = mesh.GetPointsAttr().Get()
+    counts_value = mesh.GetFaceVertexCountsAttr().Get()
+    indices_value = mesh.GetFaceVertexIndicesAttr().Get()
+    if (
+        points_value is None
+        or counts_value is None
+        or indices_value is None
+        or len(points_value) == 0
+        or len(counts_value) == 0
+        or len(indices_value) == 0
+    ):
+        return False
+
+    points = np.asarray(points_value, dtype=np.float64)
+    counts = np.asarray(counts_value, dtype=np.int64)
+    indices = np.asarray(indices_value, dtype=np.int64)
+    face_count = int(counts.shape[0])
+    if face_count <= 1:
+        return False
+
+    weld_tolerance = 1.0e-4
+    point_to_welded = np.empty(points.shape[0], dtype=np.int64)
+    welded_lookup: dict[tuple[int, int, int], int] = {}
+    for point_id, key in enumerate(map(tuple, np.round(points / weld_tolerance).astype(np.int64))):
+        point_to_welded[point_id] = welded_lookup.setdefault(key, len(welded_lookup))
+
+    face_offsets = np.concatenate(([0], np.cumsum(counts)))
+    vertex_faces: defaultdict[int, list[int]] = defaultdict(list)
+    for face_id in range(face_count):
+        start = int(face_offsets[face_id])
+        end = int(face_offsets[face_id + 1])
+        for welded_vertex in np.unique(point_to_welded[indices[start:end]]):
+            vertex_faces[int(welded_vertex)].append(face_id)
+
+    seen = np.zeros(face_count, dtype=bool)
+    components: list[list[int]] = []
+    for first_face in range(face_count):
+        if seen[first_face]:
+            continue
+        queue: deque[int] = deque([first_face])
+        seen[first_face] = True
+        component: list[int] = []
+        while queue:
+            face_id = queue.popleft()
+            component.append(face_id)
+            start = int(face_offsets[face_id])
+            end = int(face_offsets[face_id + 1])
+            for welded_vertex in np.unique(point_to_welded[indices[start:end]]):
+                for next_face in vertex_faces[int(welded_vertex)]:
+                    if not seen[next_face]:
+                        seen[next_face] = True
+                        queue.append(next_face)
+        components.append(component)
+
+    if len(components) <= 1:
+        return False
+
+    keep_faces = sorted(max(components, key=len))
+    kept_flat_indices = np.concatenate([np.arange(face_offsets[face_id], face_offsets[face_id + 1]) for face_id in keep_faces])
+    kept_counts = counts[keep_faces]
+    kept_indices = indices[kept_flat_indices]
+
+    used_points = np.unique(kept_indices)
+    point_remap = np.empty(points.shape[0], dtype=np.int64)
+    point_remap[used_points] = np.arange(used_points.shape[0])
+    new_points = points[used_points]
+    new_indices = point_remap[kept_indices]
+
+    mesh.GetPointsAttr().Set([Gf.Vec3f(float(point[0]), float(point[1]), float(point[2])) for point in new_points])
+    mesh.GetFaceVertexCountsAttr().Set([int(count) for count in kept_counts])
+    mesh.GetFaceVertexIndicesAttr().Set([int(index) for index in new_indices])
+
+    normals_attr = mesh.GetNormalsAttr()
+    normals_value = normals_attr.Get() if normals_attr.IsValid() else None
+    if (
+        normals_value is not None
+        and mesh.GetNormalsInterpolation() == UsdGeom.Tokens.faceVarying
+        and len(normals_value) == len(indices)
+    ):
+        normals_attr.Set([normals_value[int(index)] for index in kept_flat_indices])
+
+    for primvar in UsdGeom.PrimvarsAPI(mesh_prim).GetPrimvars():
+        values = primvar.Get()
+        if values is None or not hasattr(values, "__len__"):
+            continue
+        interpolation = primvar.GetInterpolation()
+        if interpolation == UsdGeom.Tokens.faceVarying and len(values) == len(indices):
+            primvar.Set([values[int(index)] for index in kept_flat_indices])
+        elif interpolation in (UsdGeom.Tokens.vertex, UsdGeom.Tokens.varying) and len(values) == len(points):
+            primvar.Set([values[int(index)] for index in used_points])
+
+    _set_mesh_extent(mesh, new_points)
+
+    removed_faces = face_count - len(keep_faces)
+    print(f"[INFO]: Removed disconnected teapot lid mesh component ({removed_faces} faces).")
+    return True
+
+
+def _set_mesh_extent(mesh, points: np.ndarray) -> None:
+    """Update a USD mesh extent from point bounds."""
+
+    from pxr import Gf  # noqa: PLC0415
+
+    min_point = points.min(axis=0)
+    max_point = points.max(axis=0)
+    mesh.GetExtentAttr().Set(
+        [
+            Gf.Vec3f(float(min_point[0]), float(min_point[1]), float(min_point[2])),
+            Gf.Vec3f(float(max_point[0]), float(max_point[1]), float(max_point[2])),
+        ]
+    )
+
+
+def _bake_mesh_roll_correction(mesh_prim) -> bool:
+    """Bake the configured roll correction into mesh points and normals."""
+
+    from pxr import Gf, UsdGeom  # noqa: PLC0415
+
+    angle = math.radians(args_cli.teapot_roll_correction_deg)
+    if abs(angle) < 1.0e-8:
+        return False
+
+    mesh = UsdGeom.Mesh(mesh_prim)
+    points_value = mesh.GetPointsAttr().Get()
+    if points_value is None or len(points_value) == 0:
+        return False
+
+    cos_angle = math.cos(angle)
+    sin_angle = math.sin(angle)
+    rotation = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cos_angle, -sin_angle],
+            [0.0, sin_angle, cos_angle],
+        ],
+        dtype=np.float64,
+    )
+
+    points = np.asarray(points_value, dtype=np.float64)
+    rotated_points = points @ rotation.T
+    mesh.GetPointsAttr().Set([Gf.Vec3f(float(point[0]), float(point[1]), float(point[2])) for point in rotated_points])
+    _set_mesh_extent(mesh, rotated_points)
+
+    normals_attr = mesh.GetNormalsAttr()
+    normals_value = normals_attr.Get() if normals_attr.IsValid() else None
+    if normals_value is not None and len(normals_value) > 0:
+        normals = np.asarray(normals_value, dtype=np.float64)
+        rotated_normals = normals @ rotation.T
+        normals_attr.Set(
+            [Gf.Vec3f(float(normal[0]), float(normal[1]), float(normal[2])) for normal in rotated_normals]
+        )
+    return True
+
+
+def _prepare_teapot_stage(stage, root_prim) -> int:
+    """Remove asset extras and prune disconnected lid components."""
+
+    from pxr import Sdf, Usd, UsdGeom  # noqa: PLC0415
+
+    for prim in list(Usd.PrimRange(root_prim)):
+        if prim == root_prim or not prim.IsValid():
+            continue
+        if prim.GetTypeName() in {"Camera", "SphereLight", "DomeLight"}:
+            prim.SetActive(False)
+
+    baked_attr = root_prim.GetAttribute("demo:rollCorrectionBakedDeg")
+    already_baked = baked_attr.IsValid() and baked_attr.HasAuthoredValueOpinion()
+    if not baked_attr.IsValid():
+        baked_attr = root_prim.CreateAttribute("demo:rollCorrectionBakedDeg", Sdf.ValueTypeNames.Double)
+    baked_count = 0
+    if not already_baked:
+        for prim in list(Usd.PrimRange(root_prim)):
+            if prim.IsA(UsdGeom.Mesh) and _bake_mesh_roll_correction(prim):
+                baked_count += 1
+        baked_attr.Set(float(args_cli.teapot_roll_correction_deg))
+        if baked_count:
+            print(f"[INFO]: Baked {args_cli.teapot_roll_correction_deg:g} deg teapot roll into {baked_count} mesh(es).")
+
+    pruned_count = 0
+    for prim in list(Usd.PrimRange(root_prim)):
+        if prim.IsA(UsdGeom.Mesh) and _prune_mesh_to_largest_connected_component(prim):
+            pruned_count += 1
+    return pruned_count
+
+
+def open_teapot_stage():
+    """Open the hollow teapot USD and add minimal physics schemas in the session layer."""
+
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics  # noqa: PLC0415
+
+    stage = Usd.Stage.Open(get_teapot_usd_path(), Usd.Stage.LoadAll)
+    if stage is None:
+        raise RuntimeError(f"Could not open teapot USD: {get_teapot_usd_path()}")
+    stage.SetEditTarget(stage.GetSessionLayer())
+
+    root_prim = stage.GetDefaultPrim()
+    if not root_prim or not root_prim.IsValid():
+        root_children = [prim for prim in stage.GetPseudoRoot().GetChildren() if prim.IsValid()]
+        if not root_children:
+            raise RuntimeError(f"Teapot USD has no root prim: {get_teapot_usd_path()}")
+        root_prim = root_children[0]
+
+    _prepare_teapot_stage(stage, root_prim)
+
+    xformable = UsdGeom.Xformable(root_prim)
+    scale_op = xformable.AddScaleOp(UsdGeom.XformOp.PrecisionDouble, "demo_asset_scale")
+    scale_op.Set(Gf.Vec3d(args_cli.teapot_scale, args_cli.teapot_scale, args_cli.teapot_scale))
+
+    rigid_api = UsdPhysics.RigidBodyAPI.Apply(root_prim)
+    rigid_api.CreateRigidBodyEnabledAttr(True)
+    rigid_api.CreateKinematicEnabledAttr(True)
+
+    mesh_count = 0
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Mesh):
+            mesh_count += 1
+            collision_api = UsdPhysics.CollisionAPI.Apply(prim)
+            collision_api.CreateCollisionEnabledAttr(True)
+            mesh_collision_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+            mesh_collision_api.CreateApproximationAttr("none")
+
+    if mesh_count == 0:
+        raise RuntimeError(f"Teapot USD contains no mesh prims: {get_teapot_usd_path()}")
+    return stage, str(root_prim.GetPath())
 
 
 def create_open_bowl_mesh(
@@ -323,24 +542,68 @@ def create_open_bowl_mesh(
     return vertices, np.array(indices, dtype=np.int32)
 
 
-def emit_fluid_particles(builder: newton.ModelBuilder) -> tuple[int, int]:
-    """Seed tiny MPM particles inside the upright cup volume."""
+def _quat_rotate_np(quat: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Rotate points by an XYZW quaternion."""
+
+    q_xyz = quat[:3]
+    q_w = quat[3]
+    t = 2.0 * np.cross(q_xyz, points)
+    return points + q_w * t + np.cross(q_xyz, t)
+
+
+def _shape_vertices_in_body_frame(builder: newton.ModelBuilder, shape_id: int) -> np.ndarray:
+    """Return imported mesh vertices transformed into the teapot body frame."""
+
+    mesh = builder.shape_source[shape_id]
+    transform = np.asarray(builder.shape_transform[shape_id][:], dtype=np.float32)
+    scale = np.asarray(builder.shape_scale[shape_id], dtype=np.float32)
+    vertices = np.asarray(mesh.vertices, dtype=np.float32) * scale
+    vertices = _quat_rotate_np(transform[3:7], vertices)
+    return vertices + transform[:3]
+
+
+def _teapot_vertices_in_body_frame(builder: newton.ModelBuilder, shape_ids: list[int]) -> np.ndarray:
+    """Merge imported teapot mesh vertices into the teapot body frame."""
+
+    vertices_per_shape = []
+    for shape_id in shape_ids:
+        mesh = builder.shape_source[shape_id]
+        if mesh is None:
+            continue
+        vertices_per_shape.append(_shape_vertices_in_body_frame(builder, shape_id))
+
+    if not vertices_per_shape:
+        raise RuntimeError("Teapot USD import produced no mesh vertices for particle seeding.")
+    return np.vstack(vertices_per_shape).astype(np.float32)
+
+
+def emit_fluid_particles(builder: newton.ModelBuilder, teapot_shape_ids: list[int]) -> tuple[int, int]:
+    """Seed tiny MPM particles inside the imported teapot mesh volume."""
 
     # Match Newton's MPM examples: keep initial particles at least one voxel
     # away from collider surfaces so the SDF projection starts well-conditioned.
     wall_clearance = max(args_cli.fluid_wall_clearance, args_cli.voxel_size, 3.0 * args_cli.collider_margin)
     bottom_clearance = max(args_cli.fluid_bottom_clearance, args_cli.voxel_size, 3.0 * args_cli.collider_margin)
     top_clearance = max(args_cli.fluid_top_clearance, 0.5 * args_cli.voxel_size, 1.5 * args_cli.collider_margin)
-    fill_height = max(0.0, min(1.0, args_cli.fill_fraction)) * CUP_HEIGHT
-    fill_height = min(fill_height, CUP_HEIGHT - top_clearance)
 
-    particle_lo = np.array(
-        [-CUP_INNER_RADIUS + wall_clearance, -CUP_INNER_RADIUS + wall_clearance, bottom_clearance]
-    )
-    particle_hi = np.array([CUP_INNER_RADIUS - wall_clearance, CUP_INNER_RADIUS - wall_clearance, fill_height])
+    teapot_vertices = _teapot_vertices_in_body_frame(builder, teapot_shape_ids)
+    mesh_lo = teapot_vertices.min(axis=0)
+    mesh_hi = teapot_vertices.max(axis=0)
+    mesh_extent = mesh_hi - mesh_lo
+
+    center_xy = np.median(teapot_vertices[:, :2], axis=0)
+    # The spout and handle dominate the full X extent, so use the side-to-side
+    # extent to estimate the central teapot body and seed conservatively inside it.
+    body_radius = args_cli.fluid_reservoir_radius_scale * float(max(mesh_extent[1], 1.0e-4))
+    z_lo = mesh_lo[2] + 0.22 * mesh_extent[2] + bottom_clearance
+    z_hi = mesh_lo[2] + 0.72 * mesh_extent[2] - top_clearance
+    particle_lo = np.array([center_xy[0] - body_radius, center_xy[1] - body_radius, z_lo], dtype=np.float32)
+    particle_hi = np.array([center_xy[0] + body_radius, center_xy[1] + body_radius, z_hi], dtype=np.float32)
+    fill_top = particle_lo[2] + max(0.0, min(1.0, args_cli.fill_fraction)) * (particle_hi[2] - particle_lo[2])
+    particle_hi[2] = min(particle_hi[2], fill_top)
     if np.any(particle_hi <= particle_lo):
         raise RuntimeError(
-            "Particle initialization has no valid cup interior. Reduce --fluid-wall-clearance or --voxel-size."
+            "Particle initialization has no valid teapot reservoir interior. Reduce --fluid-wall-clearance or --voxel-size."
         )
     resolution = np.maximum(
         np.ceil(args_cli.particles_per_cell * (particle_hi - particle_lo) / args_cli.voxel_size), 1
@@ -359,12 +622,18 @@ def emit_fluid_particles(builder: newton.ModelBuilder) -> tuple[int, int]:
     points += (rng.random(points.shape) - 0.5) * (0.10 * np.max(cell_size))
     points += particle_lo
 
-    r_xy = np.linalg.norm(points[:, 0:2], axis=1)
-    inside = (r_xy < CUP_INNER_RADIUS - wall_clearance) & (points[:, 2] < fill_height)
-    points = points[inside] + np.array(CUP_BASE_POS)
+    ellipsoid_center = 0.5 * (particle_lo + particle_hi)
+    ellipsoid_radius = 0.5 * (particle_hi - particle_lo)
+    ellipsoid_radius *= max(0.05, min(1.0, args_cli.fluid_ellipsoid_shrink))
+    normalized = (points - ellipsoid_center) / ellipsoid_radius
+    inside = np.sum(normalized * normalized, axis=1) < 1.0
+    points = points[inside]
 
     if points.shape[0] == 0:
         raise RuntimeError("Particle initialization produced no particles; reduce --voxel-size or --collider-margin.")
+
+    cup_pos, cup_quat, _ = cup_pose_at_time(0.0)
+    points = _quat_rotate_np(cup_quat, points.astype(np.float32, copy=False)) + cup_pos
 
     particle_start = builder.particle_count
     builder.add_particles(
@@ -385,14 +654,61 @@ def emit_fluid_particles(builder: newton.ModelBuilder) -> tuple[int, int]:
     return particle_start, builder.particle_count
 
 
+def add_teapot_body(builder: newton.ModelBuilder) -> tuple[int, list[int]]:
+    """Import the hollow teapot USD as the moving Newton collision body."""
+
+    cup_pos, cup_quat, _ = cup_pose_at_time(0.0)
+    teapot_stage, root_path = open_teapot_stage()
+    shape_start = builder.shape_count
+    result = builder.add_usd(
+        teapot_stage,
+        xform=wp.transform(wp.vec3(*cup_pos.tolist()), wp.quat(*cup_quat.tolist())),
+        floating=False,
+        root_path=root_path,
+        load_visual_shapes=True,
+        skip_mesh_approximation=True,
+        force_show_colliders=True,
+    )
+    body_id = result["path_body_map"].get(root_path)
+    if body_id is None:
+        raise RuntimeError("Hollow teapot USD did not create a Newton rigid body.")
+
+    teapot_shape_ids = list(range(shape_start, builder.shape_count))
+    for shape_id in teapot_shape_ids:
+        builder.shape_flags[shape_id] |= (
+            int(newton.ShapeFlags.COLLIDE_SHAPES)
+            | int(newton.ShapeFlags.COLLIDE_PARTICLES)
+            | int(newton.ShapeFlags.VISIBLE)
+        )
+        builder.shape_margin[shape_id] = args_cli.collider_margin
+        builder.shape_material_mu[shape_id] = args_cli.cup_friction
+        if builder.shape_source[shape_id] is not None:
+            builder.shape_source[shape_id].indices = builder.shape_source[shape_id].indices.reshape(-1)
+
+    if builder.shape_count == shape_start:
+        raise RuntimeError("Hollow teapot USD did not create any Newton collision shapes.")
+
+    builder.body_label[body_id] = CUP_BODY_PATH
+    builder.body_flags[body_id] = int(newton.BodyFlags.KINEMATIC)
+    builder.body_mass[body_id] = 0.0
+    builder.body_inv_mass[body_id] = 0.0
+    builder.body_inertia[body_id] = wp.mat33()
+    builder.body_inv_inertia[body_id] = wp.mat33()
+    return body_id, teapot_shape_ids
+
+
 def build_cup_pour_model() -> tuple[newton.ModelBuilder, int, tuple[int, int]]:
-    """Build the Newton MPM model with analytic colliders and fluid particles."""
+    """Build the Newton MPM model with the hollow teapot USD as the collision body."""
 
     builder = NewtonManager.create_builder()
     SolverImplicitMPM.register_custom_attributes(builder)
     builder.default_shape_cfg.mu = 0.2
 
-    table_cfg = newton.ModelBuilder.ShapeConfig(mu=args_cli.table_friction, margin=args_cli.collider_margin)
+    table_cfg = newton.ModelBuilder.ShapeConfig(
+        mu=args_cli.table_friction,
+        margin=args_cli.collider_margin,
+        has_particle_collision=True,
+    )
     builder.add_shape_box(
         -1,
         xform=wp.transform(
@@ -419,40 +735,26 @@ def build_cup_pour_model() -> tuple[newton.ModelBuilder, int, tuple[int, int]]:
         body=-1,
         xform=wp.transform(wp.vec3(*BOWL_BASE_POS), wp.quat_identity()),
         mesh=bowl_mesh,
-        cfg=newton.ModelBuilder.ShapeConfig(mu=args_cli.bowl_friction, margin=args_cli.collider_margin),
+        cfg=newton.ModelBuilder.ShapeConfig(
+            mu=args_cli.bowl_friction,
+            margin=args_cli.collider_margin,
+            has_particle_collision=True,
+        ),
         color=(0.95, 0.82, 0.16),
         label="/World/BowlCollider",
     )
 
-    cup_pos, cup_quat, _ = cup_pose_at_time(0.0)
-    cup_body = builder.add_body(
-        xform=wp.transform(wp.vec3(*cup_pos.tolist()), wp.quat(*cup_quat.tolist())),
-        mass=0.0,
-        label=CUP_BODY_PATH,
-        lock_inertia=True,
-        is_kinematic=True,
-    )
-    cup_vertices, cup_indices = create_open_cup_mesh(
-        inner_radius=CUP_INNER_RADIUS,
-        wall_thickness=CUP_WALL_THICKNESS,
-        height=CUP_HEIGHT,
-        bottom_thickness=CUP_BOTTOM_THICKNESS,
-        include_bottom=True,
-    )
-    cup_mesh = newton.Mesh(cup_vertices, cup_indices, compute_inertia=False, is_solid=False)
-    builder.add_shape_mesh(
-        body=cup_body,
-        mesh=cup_mesh,
-        cfg=newton.ModelBuilder.ShapeConfig(mu=args_cli.cup_friction, margin=args_cli.collider_margin),
-        color=(0.85, 0.88, 0.92),
-        label="/World/CupPhysicsMesh",
-    )
+    cup_body, teapot_shape_ids = add_teapot_body(builder)
 
     builder.add_ground_plane(
-        cfg=newton.ModelBuilder.ShapeConfig(mu=args_cli.table_friction, margin=args_cli.collider_margin),
+        cfg=newton.ModelBuilder.ShapeConfig(
+            mu=args_cli.table_friction,
+            margin=args_cli.collider_margin,
+            has_particle_collision=True,
+        ),
         color=(0.30, 0.30, 0.30),
     )
-    particle_range = emit_fluid_particles(builder)
+    particle_range = emit_fluid_particles(builder, teapot_shape_ids)
     return builder, cup_body, particle_range
 
 
@@ -480,44 +782,6 @@ def _spawn_usd_visual(
             fallback.func(prim_path, fallback, translation=translation, orientation=orientation)
 
 
-def setup_procedural_cup_visual(translation: np.ndarray, orientation: np.ndarray) -> None:
-    """Create a simple flat-bottom cup visual that matches the Newton collider."""
-
-    from pxr import Gf, Sdf, UsdGeom, Vt  # noqa: PLC0415
-
-    stage = sim_utils.get_current_stage()
-    cup_prim = stage.GetPrimAtPath(CUP_BODY_PATH)
-    if not cup_prim.IsValid():
-        cup_prim = UsdGeom.Xform.Define(stage, CUP_BODY_PATH).GetPrim()
-
-    xformable = UsdGeom.Xformable(cup_prim)
-    xformable.ClearXformOpOrder()
-    xformable.SetResetXformStack(True)
-    xform_op = xformable.AddTransformOp(UsdGeom.XformOp.PrecisionDouble, "newton_world")
-
-    matrix = Gf.Matrix4d(1.0)
-    matrix.SetRotate(
-        Gf.Quatd(float(orientation[3]), Gf.Vec3d(float(orientation[0]), float(orientation[1]), float(orientation[2])))
-    )
-    matrix.SetTranslateOnly(Gf.Vec3d(float(translation[0]), float(translation[1]), float(translation[2])))
-    xform_op.Set(matrix)
-
-    mesh_path = f"{CUP_BODY_PATH}/FlatCupMesh"
-    vertices, indices = create_open_cup_mesh(
-        inner_radius=CUP_INNER_RADIUS,
-        wall_thickness=CUP_WALL_THICKNESS,
-        height=CUP_HEIGHT,
-        bottom_thickness=CUP_BOTTOM_THICKNESS,
-        include_bottom=True,
-    )
-    mesh = UsdGeom.Mesh.Define(stage, mesh_path)
-    with Sdf.ChangeBlock():
-        mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(vertices.astype(np.float32, copy=False)))
-        mesh.CreateFaceVertexCountsAttr(Vt.IntArray([3] * (len(indices) // 3)))
-        mesh.CreateFaceVertexIndicesAttr(Vt.IntArray(indices.astype(np.int32, copy=False).tolist()))
-        mesh.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(0.85, 0.88, 0.92)]))
-
-
 def setup_kit_scene(sim: sim_utils.SimulationContext) -> None:
     """Create Kit USD visuals for tableware and lighting."""
 
@@ -525,7 +789,6 @@ def setup_kit_scene(sim: sim_utils.SimulationContext) -> None:
         return
 
     assets = resolve_asset_paths()
-    initial_pos, initial_quat, _ = cup_pose_at_time(0.0)
 
     table_fallback = sim_utils.CuboidCfg(
         size=(2.0 * TABLE_HALF_EXTENTS[0], 2.0 * TABLE_HALF_EXTENTS[1], 2.0 * TABLE_HALF_EXTENTS[2]),
@@ -553,25 +816,25 @@ def setup_kit_scene(sim: sim_utils.SimulationContext) -> None:
         fallback=bowl_fallback,
     )
 
-    if args_cli.cup_visual == "procedural":
-        setup_procedural_cup_visual(initial_pos, initial_quat)
-    else:
-        cup_scale = (args_cli.asset_scale, args_cli.asset_scale, args_cli.asset_scale)
-        cup_fallback = sim_utils.CylinderCfg(
-            radius=CUP_INNER_RADIUS + CUP_WALL_THICKNESS,
-            height=CUP_HEIGHT,
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.88, 0.92)),
-        )
-        _spawn_usd_visual(
-            CUP_BODY_PATH,
-            assets.cup,
-            translation=tuple(float(v) for v in initial_pos),
-            orientation=tuple(float(v) for v in initial_quat),
-            scale=cup_scale,
-            fallback=cup_fallback,
-        )
-
+    teapot_fallback = sim_utils.CylinderCfg(
+        radius=CUP_INNER_RADIUS + CUP_WALL_THICKNESS,
+        height=CUP_HEIGHT,
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.88, 0.92)),
+    )
     stage = sim_utils.get_current_stage()
+    if not stage.GetPrimAtPath(CUP_BODY_PATH).IsValid():
+        sim_utils.create_prim(CUP_BODY_PATH, "Xform")
+    _spawn_usd_visual(
+        CUP_ASSET_PATH,
+        get_teapot_usd_path(),
+        translation=(0.0, 0.0, 0.0),
+        orientation=(0.0, 0.0, 0.0, 1.0),
+        scale=(args_cli.teapot_scale, args_cli.teapot_scale, args_cli.teapot_scale),
+        fallback=teapot_fallback,
+    )
+    teapot_asset_prim = stage.GetPrimAtPath(CUP_ASSET_PATH)
+    if teapot_asset_prim.IsValid():
+        _prepare_teapot_stage(stage, teapot_asset_prim)
     if not stage.GetPrimAtPath(GROUND_PATH).IsValid():
         ground_cfg = sim_utils.GroundPlaneCfg(size=(4.0, 4.0), color=(0.30, 0.30, 0.30))
         ground_cfg.func(GROUND_PATH, ground_cfg)
@@ -761,6 +1024,44 @@ def configure_newton_viewer(sim: sim_utils.SimulationContext) -> None:
             viewer.show_contacts = True
 
 
+def create_newton_usd_recorder(model: newton.Model):
+    """Create an optional Newton ViewerUSD recorder."""
+
+    if not args_cli.newton_usd_output:
+        return None
+    from newton.viewer import ViewerUSD  # noqa: PLC0415
+
+    max_frames = args_cli.newton_usd_max_frames
+    if max_frames is None and args_cli.max_steps >= 0:
+        max_frames = args_cli.max_steps
+    output_dir = os.path.dirname(os.path.abspath(args_cli.newton_usd_output))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    recorder = ViewerUSD(output_path=args_cli.newton_usd_output, fps=int(args_cli.fps), num_frames=max_frames)
+    recorder.set_model(model)
+    recorder.show_particles = False
+    recorder.show_contacts = True
+    print(f"[INFO]: Recording Newton USD to {os.path.abspath(args_cli.newton_usd_output)}")
+    return recorder
+
+
+def record_newton_usd_frame(recorder, state: newton.State, sim_time: float) -> None:
+    """Append one frame to the optional Newton USD recorder."""
+
+    if recorder is None:
+        return
+    recorder.begin_frame(sim_time)
+    recorder.log_state(state)
+    recorder.log_points(
+        "/fluid/particles",
+        points=state.particle_q,
+        radii=recorder.model.particle_radius,
+        colors=(0.45, 0.82, 1.0),
+        hidden=False,
+    )
+    recorder.end_frame()
+
+
 def _copy_body_transform(body_q_arr, body_id: int, pos: np.ndarray, quat: np.ndarray) -> None:
     """Copy one body transform into a Warp transform array."""
 
@@ -825,6 +1126,7 @@ def run_simulator(
     cup_visual: KitBodyVisual | None,
     particle_points: KitParticlePoints | None,
     grain_renderer: NewtonGrainRenderer,
+    usd_recorder,
 ) -> None:
     """Run the scripted cup pour simulation loop."""
 
@@ -838,6 +1140,7 @@ def run_simulator(
         sim.step(render=False)
         state = NewtonManager.get_state_0()
         grain_renderer.update_and_log(sim, state, dt=1.0 / args_cli.fps)
+        record_newton_usd_frame(usd_recorder, state, sim_time)
         log_progress(count, state, cup_body)
 
         if sim.is_rendering:
@@ -865,7 +1168,7 @@ def create_launcher_sim_cfg():
 
 
 def main() -> None:
-    """Set up and run the Isaac Lab Newton cup-pour MPM demo."""
+    """Set up and run the Isaac Lab Newton teapot-pour MPM demo."""
 
     sim_cfg = create_launcher_sim_cfg()
 
@@ -875,9 +1178,9 @@ def main() -> None:
         sim_cfg.physics = NewtonCfg(
             solver_cfg=MPMSolverCfg(
                 voxel_size=args_cli.voxel_size,
-                grid_type="fixed",
-                grid_padding=48,
-                max_active_cell_count=1 << 16,
+                grid_type=args_cli.grid_type,
+                grid_padding=args_cli.grid_padding,
+                max_active_cell_count=args_cli.max_active_cell_count,
                 strain_basis="P0",
                 velocity_basis="Q1",
                 collider_basis="S2",
@@ -893,7 +1196,7 @@ def main() -> None:
         )
         sim = sim_utils.SimulationContext(sim_cfg)
         try:
-            sim.set_camera_view(eye=[1.45, -1.65, 1.65], target=[0.07, 0.0, 1.12])
+            sim.set_camera_view(eye=CAMERA_EYE, target=CAMERA_TARGET)
             setup_kit_scene(sim)
             NewtonManager.set_builder(builder)
             sim.reset()
@@ -907,16 +1210,19 @@ def main() -> None:
             update_particle_points(particle_points, state)
             grain_renderer = NewtonGrainRenderer(model, state)
             grain_renderer.update_and_log(sim, state, dt=1.0 / args_cli.fps)
+            usd_recorder = create_newton_usd_recorder(model)
 
-            print("[INFO]: Isaac Lab Newton cup-pour MPM demo ready.")
+            print("[INFO]: Isaac Lab Newton teapot-pour MPM demo ready.")
             print(
                 "[INFO]: "
                 f"Spawned {particle_range[1] - particle_range[0]} MPM particles; "
-                "the cup will tilt after the hold interval.",
+                "the teapot will tilt after the hold interval.",
                 flush=True,
             )
-            run_simulator(sim, cup_body, cup_visual, particle_points, grain_renderer)
+            run_simulator(sim, cup_body, cup_visual, particle_points, grain_renderer, usd_recorder)
         finally:
+            if "usd_recorder" in locals() and usd_recorder is not None:
+                usd_recorder.close()
             sim.clear_instance()
 
 
