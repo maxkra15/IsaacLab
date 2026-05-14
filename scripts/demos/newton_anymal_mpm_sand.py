@@ -31,6 +31,7 @@ and particles directly.
 """
 
 import argparse
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
@@ -43,6 +44,8 @@ parser.add_argument("--tolerance", type=float, default=1.0e-6, help="MPM rheolog
 parser.add_argument("--mpm-iterations", type=int, default=50, help="Maximum MPM rheology iterations.")
 parser.add_argument("--robot-substeps", type=int, default=4, help="MJWarp substeps per policy/control frame.")
 parser.add_argument("--fps", type=float, default=50.0, help="Control/render frames per second.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of independent ANYmal/sand environments to spawn.")
+parser.add_argument("--env-spacing", type=float, default=4.0, help="Spacing between replicated environments in meters.")
 parser.add_argument("--command-forward", type=float, default=1.0, help="Commanded forward velocity.")
 parser.add_argument("--command-lateral", type=float, default=0.0, help="Commanded lateral velocity.")
 parser.add_argument("--command-yaw", type=float, default=0.0, help="Commanded yaw velocity.")
@@ -57,6 +60,10 @@ parser.add_argument(
 )
 add_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.num_envs < 1:
+    parser.error("--num_envs must be >= 1.")
+if args_cli.env_spacing <= 0.0:
+    parser.error("--env-spacing must be > 0.")
 
 import xml.etree.ElementTree as ET
 import warnings
@@ -68,6 +75,16 @@ MJWarpSolverCfg = NewtonCfg = NewtonManager = None
 
 LAB_TO_MUJOCO = [0, 6, 3, 9, 1, 7, 4, 10, 2, 8, 5, 11]
 MUJOCO_TO_LAB = [0, 4, 8, 2, 6, 10, 1, 5, 9, 3, 7, 11]
+
+
+@dataclass
+class DemoModelMetadata:
+    """Index metadata for the replicated Newton worlds."""
+
+    joint_q_ids: list[list[int]]
+    joint_qd_ids: list[list[int]]
+    particle_ids: list[list[int]]
+    env_origins: list[tuple[float, float, float]]
 
 
 def import_runtime_dependencies() -> None:
@@ -166,18 +183,20 @@ def compute_obs(
     actions: torch.Tensor,
     state: newton.State,
     joint_pos_initial: torch.Tensor,
+    joint_q_ids: torch.Tensor,
+    joint_qd_ids: torch.Tensor,
     indices: torch.Tensor,
     gravity_vec: torch.Tensor,
     command: torch.Tensor,
 ) -> torch.Tensor:
     """Build the observation vector expected by the Newton ANYmal walking policy."""
-    joint_q = wp.to_torch(state.joint_q)
-    joint_qd = wp.to_torch(state.joint_qd)
-    root_quat_w = joint_q[3:7].unsqueeze(0)
-    root_lin_vel_w = joint_qd[:3].unsqueeze(0)
-    root_ang_vel_w = joint_qd[3:6].unsqueeze(0)
-    joint_pos_current = joint_q[7:].unsqueeze(0)
-    joint_vel_current = joint_qd[6:].unsqueeze(0)
+    joint_q = wp.to_torch(state.joint_q)[joint_q_ids]
+    joint_qd = wp.to_torch(state.joint_qd)[joint_qd_ids]
+    root_quat_w = joint_q[:, 3:7]
+    root_lin_vel_w = joint_qd[:, :3]
+    root_ang_vel_w = joint_qd[:, 3:6]
+    joint_pos_current = joint_q[:, 7:]
+    joint_vel_current = joint_qd[:, 6:]
 
     vel_b = quat_rotate_inverse(root_quat_w, root_lin_vel_w)
     ang_vel_b = quat_rotate_inverse(root_quat_w, root_ang_vel_w)
@@ -284,29 +303,47 @@ def parse_fixed_link_offsets(urdf_path: str, dynamic_body_names: set[str]) -> di
     return offsets
 
 
-def create_kit_body_prims(builder: newton.ModelBuilder) -> None:
+def compute_env_origins(num_envs: int, spacing: float) -> list[np.ndarray]:
+    """Lay out environment origins on a compact XY grid."""
+    columns = int(np.ceil(np.sqrt(num_envs)))
+    origins = []
+    for env_id in range(num_envs):
+        row, column = divmod(env_id, columns)
+        origins.append(np.array([column * spacing, row * spacing, 0.0], dtype=np.float64))
+    return origins
+
+
+def create_kit_body_prims(
+    builder: newton.ModelBuilder,
+    root_path: str,
+    translation: tuple[float, float, float],
+    body_start: int,
+    body_end: int,
+) -> None:
     """Spawn ANYmal-C USD visuals and relabel Newton bodies to valid USD paths."""
     from isaaclab_assets.robots.anymal import ANYMAL_C_CFG  # noqa: PLC0415
 
+    stage = sim_utils.get_current_stage()
+    parent_path = root_path.rsplit("/", 1)[0]
+    if parent_path and parent_path != "/World" and not stage.GetPrimAtPath(parent_path).IsValid():
+        sim_utils.create_prim(parent_path, "Xform")
+
     ANYMAL_C_CFG.spawn.func(
-        "/World/Robot",
+        root_path,
         ANYMAL_C_CFG.spawn,
-        translation=(0.0, 0.0, 0.62),
+        translation=translation,
         orientation=(0.0, 0.0, 0.70710678, 0.70710678),
     )
     stage = sim_utils.get_current_stage()
 
-    for body_id, body_label in enumerate(builder.body_label):
+    for body_id in range(body_start, body_end):
+        body_label = builder.body_label[body_id]
         body_name = body_label.rsplit("/", 1)[-1]
-        builder.body_label[body_id] = resolve_kit_body_prim_path(stage, "/World/Robot", body_name)
+        builder.body_label[body_id] = resolve_kit_body_prim_path(stage, root_path, body_name)
 
 
-def build_anymal_sand_model(use_kit_visuals: bool) -> tuple[str, str]:
-    """Populate ``NewtonManager`` with ANYmal-C, ground, and MPM particles."""
-    builder = NewtonManager.create_builder()
-    SolverMuJoCo.register_custom_attributes(builder)
-    SolverImplicitMPM.register_custom_attributes(builder)
-
+def configure_anymal_sand_proto(builder: newton.ModelBuilder) -> tuple[str, str]:
+    """Populate a single-environment ANYmal/sand prototype builder."""
     builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
         armature=0.06,
         limit_ke=1.0e3,
@@ -330,8 +367,6 @@ def build_anymal_sand_model(use_kit_visuals: bool) -> tuple[str, str]:
         collapse_fixed_joints=True,
         ignore_inertial_definitions=False,
     )
-    if use_kit_visuals:
-        create_kit_body_prims(builder)
 
     # Only the shank collision shapes interact with particles, matching Newton's
     # reference ANYmal-MPM setup.
@@ -358,15 +393,78 @@ def build_anymal_sand_model(use_kit_visuals: bool) -> tuple[str, str]:
     }
     for name, value in initial_q.items():
         joint_index = next(i for i, label in enumerate(builder.joint_label) if label.endswith(f"/{name}"))
-        builder.joint_q[joint_index + 6] = value
+        q_id = builder.joint_q_start[joint_index]
+        qd_id = builder.joint_qd_start[joint_index]
+        builder.joint_q[q_id] = value
+        builder.joint_target_pos[qd_id] = value
 
     for joint_dof_index in range(builder.joint_dof_count):
         builder.joint_target_ke[joint_dof_index] = 150.0
         builder.joint_target_kd[joint_dof_index] = 5.0
 
     spawn_sand(builder, args_cli.voxel_size, args_cli.particles_per_cell)
-    NewtonManager.set_builder(builder)
     return str(asset_path / "rl_policies" / "anymal_walking_policy_physx.pt"), urdf_path
+
+
+def relabel_newton_bodies(builder: newton.ModelBuilder, env_id: int, body_start: int, body_end: int) -> None:
+    """Give replicated bodies unique labels for non-Kit visualizers/debugging."""
+    for body_id in range(body_start, body_end):
+        body_name = builder.body_label[body_id].rsplit("/", 1)[-1]
+        builder.body_label[body_id] = f"env_{env_id}/{body_name}"
+
+
+def build_anymal_sand_model(use_kit_visuals: bool) -> tuple[str, str, DemoModelMetadata]:
+    """Populate ``NewtonManager`` with replicated ANYmal/sand worlds."""
+    proto = NewtonManager.create_builder()
+    SolverMuJoCo.register_custom_attributes(proto)
+    SolverImplicitMPM.register_custom_attributes(proto)
+    default_policy_path, urdf_path = configure_anymal_sand_proto(proto)
+
+    builder = NewtonManager.create_builder()
+    SolverMuJoCo.register_custom_attributes(builder)
+    SolverImplicitMPM.register_custom_attributes(builder)
+
+    env_origins = compute_env_origins(args_cli.num_envs, args_cli.env_spacing)
+    joint_q_ids: list[list[int]] = []
+    joint_qd_ids: list[list[int]] = []
+    particle_ids: list[list[int]] = []
+
+    for env_id, origin in enumerate(env_origins):
+        builder.begin_world(label=f"env_{env_id}")
+        body_offset = builder.body_count
+        particle_offset = builder.particle_count
+        joint_q_offset = builder.joint_coord_count
+        joint_qd_offset = builder.joint_dof_count
+
+        builder.add_builder(proto, xform=wp.transform(wp.vec3(*origin), wp.quat_identity()))
+
+        body_end = body_offset + proto.body_count
+        if use_kit_visuals:
+            root_path = "/World/Robot" if args_cli.num_envs == 1 else f"/World/Env_{env_id}/Robot"
+            create_kit_body_prims(
+                builder,
+                root_path,
+                translation=(float(origin[0]), float(origin[1]), 0.62),
+                body_start=body_offset,
+                body_end=body_end,
+            )
+        else:
+            relabel_newton_bodies(builder, env_id, body_offset, body_end)
+
+        joint_q_ids.append(list(range(joint_q_offset, joint_q_offset + proto.joint_coord_count)))
+        joint_qd_ids.append(list(range(joint_qd_offset, joint_qd_offset + proto.joint_dof_count)))
+        particle_ids.append(list(range(particle_offset, particle_offset + proto.particle_count)))
+        builder.end_world()
+
+    NewtonManager._num_envs = args_cli.num_envs
+    NewtonManager.set_builder(builder)
+    metadata = DemoModelMetadata(
+        joint_q_ids=joint_q_ids,
+        joint_qd_ids=joint_qd_ids,
+        particle_ids=particle_ids,
+        env_origins=[tuple(float(v) for v in origin) for origin in env_origins],
+    )
+    return default_policy_path, urdf_path, metadata
 
 
 def create_mpm_solver(model: newton.Model, state: newton.State) -> SolverImplicitMPM:
@@ -413,7 +511,7 @@ class KitRobotVisuals:
             identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
             visual_targets.append((body_id, body_path, identity_pos, identity_quat))
             for link_name, offset_pos, offset_quat in fixed_offsets.get(body_name, []):
-                link_path = resolve_kit_body_prim_path(stage, "/World/Robot", link_name)
+                link_path = resolve_kit_body_prim_path(stage, infer_robot_root_path(body_path), link_name)
                 visual_targets.append((body_id, link_path, offset_pos, offset_quat))
 
         seen_paths = set()
@@ -453,6 +551,16 @@ class KitRobotVisuals:
                 )
                 matrix.SetTranslateOnly(Gf.Vec3d(float(visual_pos[0]), float(visual_pos[1]), float(visual_pos[2])))
                 xform_op.Set(matrix)
+
+
+def infer_robot_root_path(body_path: str) -> str:
+    """Infer the USD robot root from a body prim path."""
+    marker = "/Robot/"
+    if marker in body_path:
+        return body_path.split(marker, 1)[0] + "/Robot"
+    if body_path.endswith("/Robot"):
+        return body_path
+    return "/World/Robot"
 
 
 class KitSandPoints:
@@ -563,21 +671,33 @@ def apply_policy(
     state: newton.State,
     joint_pos_initial: torch.Tensor,
     action: torch.Tensor,
+    joint_q_ids: torch.Tensor,
+    joint_qd_ids: torch.Tensor,
     lab_to_mujoco_indices: torch.Tensor,
     mujoco_to_lab_indices: torch.Tensor,
     gravity_vec: torch.Tensor,
     command: torch.Tensor,
 ) -> torch.Tensor:
     """Run the walking policy and write joint targets into Newton control."""
-    obs = compute_obs(action, state, joint_pos_initial, lab_to_mujoco_indices, gravity_vec, command)
+    obs = compute_obs(
+        action,
+        state,
+        joint_pos_initial,
+        joint_q_ids,
+        joint_qd_ids,
+        lab_to_mujoco_indices,
+        gravity_vec,
+        command,
+    )
     with torch.no_grad():
         action = policy(obs)
-        rearranged_action = torch.gather(action, 1, mujoco_to_lab_indices.unsqueeze(0))
+        rearranged_action = torch.gather(action, 1, mujoco_to_lab_indices.unsqueeze(0).expand(action.shape[0], -1))
         target = joint_pos_initial + 0.5 * rearranged_action
         target_with_free_joint = torch.cat(
-            [torch.zeros(6, device=target.device, dtype=torch.float32), target.squeeze(0)]
+            [torch.zeros((target.shape[0], 6), device=target.device, dtype=torch.float32), target],
+            dim=1,
         )
-        wp.copy(control.joint_target_pos, wp.from_torch(target_with_free_joint, dtype=wp.float32, requires_grad=False))
+        wp.to_torch(control.joint_target_pos)[joint_qd_ids] = target_with_free_joint
     return action
 
 
@@ -587,6 +707,7 @@ def run_simulator(
     policy: torch.jit.ScriptModule,
     robot_visuals: KitRobotVisuals | None,
     sand_points: KitSandPoints | None,
+    metadata: DemoModelMetadata,
 ) -> None:
     """Run the coupled robot/sand simulation loop."""
     model = NewtonManager.get_model()
@@ -594,16 +715,18 @@ def run_simulator(
     control = NewtonManager.get_control()
     torch_device = wp.device_to_torch(model.device)
 
-    joint_pos_initial = wp.to_torch(state.joint_q)[7:].unsqueeze(0).detach().clone()
-    action = torch.zeros(1, 12, device=torch_device, dtype=torch.float32)
+    joint_q_ids = torch.tensor(metadata.joint_q_ids, device=torch_device, dtype=torch.long)
+    joint_qd_ids = torch.tensor(metadata.joint_qd_ids, device=torch_device, dtype=torch.long)
+    joint_pos_initial = wp.to_torch(state.joint_q)[joint_q_ids][:, 7:].detach().clone()
+    action = torch.zeros(args_cli.num_envs, 12, device=torch_device, dtype=torch.float32)
     lab_to_mujoco_indices = torch.tensor(LAB_TO_MUJOCO, device=torch_device)
     mujoco_to_lab_indices = torch.tensor(MUJOCO_TO_LAB, device=torch_device)
-    gravity_vec = torch.tensor([[0.0, 0.0, -1.0]], device=torch_device, dtype=torch.float32)
+    gravity_vec = torch.tensor([[0.0, 0.0, -1.0]], device=torch_device, dtype=torch.float32).expand(args_cli.num_envs, -1)
     command = torch.tensor(
         [[args_cli.command_forward, args_cli.command_lateral, args_cli.command_yaw]],
         device=torch_device,
         dtype=torch.float32,
-    )
+    ).expand(args_cli.num_envs, -1)
 
     count = 0
     frame_dt = 1.0 / args_cli.fps
@@ -615,6 +738,8 @@ def run_simulator(
             state,
             joint_pos_initial,
             action,
+            joint_q_ids,
+            joint_qd_ids,
             lab_to_mujoco_indices,
             mujoco_to_lab_indices,
             gravity_vec,
@@ -670,7 +795,7 @@ def main() -> None:
             sim.set_camera_view(eye=[4.5, -4.5, 2.2], target=[0.0, 0.8, 0.4])
 
             use_kit_visuals = "kit" in sim.resolve_visualizer_types()
-            default_policy_path, urdf_path = build_anymal_sand_model(use_kit_visuals)
+            default_policy_path, urdf_path, metadata = build_anymal_sand_model(use_kit_visuals)
             sim.reset()
             enable_newton_particle_visualization(sim)
 
@@ -684,8 +809,9 @@ def main() -> None:
             policy = load_policy(default_policy_path, wp.device_to_torch(model.device))
 
             print("[INFO]: Isaac Lab Newton ANYmal MPM sand demo ready.")
+            print(f"[INFO]: Running {args_cli.num_envs} environment(s) with {args_cli.env_spacing:g} m spacing.")
             print("[INFO]: Use --command-forward/--command-lateral/--command-yaw to change the fixed velocity command.")
-            run_simulator(sim, mpm_solver, policy, robot_visuals, sand_points)
+            run_simulator(sim, mpm_solver, policy, robot_visuals, sand_points, metadata)
         finally:
             sim.clear_instance()
 

@@ -8,12 +8,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+
 from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
-
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 
 
 def _default_ur10_urdf_path() -> str:
@@ -44,7 +44,7 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     action_space = 6
     heightmap_size = 20
     heightmap_channels = 2
-    proprio_dim = 55
+    proprio_dim = 74
     privileged_dim = 13
     observation_space = heightmap_size * heightmap_size * heightmap_channels + proprio_dim
     state_space = observation_space + privileged_dim
@@ -126,28 +126,49 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     # Cartesian actions are end-effector deltas in the environment frame: xyz translation + axis-angle rotation.
     cartesian_position_action_scale = 0.35
     cartesian_rotation_action_scale = 1.25
-    ik_damping = 0.08
-    ik_fd_epsilon = 1.0e-3
+    ik_action_iterations = 8
+    ik_reset_iterations = 32
+    ik_lambda_initial = 0.05
+    ik_step_size = 1.0
+    ik_position_weight = 10.0
+    ik_rotation_weight = 2.0
+    ik_joint_limit_weight = 10.0
     max_ik_delta_q = 0.08
     success_fraction = 0.80
     reward_bin_fraction_scale = 12.0
     reward_delta_bin_fraction_scale = 48.0
     reward_particle_progress_scale = 1.0
+    reward_centroid_progress_scale = 8.0
     reward_mouth_entry_scale = 0.12
     reward_bin_proximity_scale = 0.05
     reward_spill_penalty_scale = 0.25
     reward_paddle_proximity_scale = 0.05
     reward_paddle_bin_proximity_scale = 0.04
     reward_paddle_orientation_scale = 0.03
+    reward_paddle_setup_scale = 0.08
+    reward_paddle_contact_scale = 0.12
+    reward_paddle_push_velocity_scale = 0.25
+    reward_particle_push_velocity_scale = 1.0
+    reward_paddle_retreat_penalty_scale = 0.20
     reward_paddle_low_penalty_scale = 0.25
     reward_paddle_speed_penalty_scale = 0.0
     reward_success_bonus = 50.0
     action_penalty_scale = 0.0
     action_rate_penalty_scale = 0.0005
     joint_velocity_penalty_scale = 0.0
-    paddle_min_height = table_top_z + 0.05
+    paddle_min_height = table_top_z + 0.005
     max_paddle_speed = 5.0
     max_joint_velocity = 10.0
+    paddle_setup_distance = 0.035
+    paddle_setup_distance_std = 0.12
+    paddle_setup_lateral_std = 0.14
+    paddle_setup_height_offset = 0.15
+    paddle_setup_height_std = 0.08
+    paddle_contact_depth = 0.16
+    paddle_contact_margin = 0.035
+    paddle_contact_count_norm = 8.0
+    paddle_push_speed_norm = 0.75
+    particle_push_speed_norm = 0.50
 
     # curriculum
     curriculum_enabled = True
@@ -182,12 +203,12 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     curriculum_robot_init_enabled = True
     curriculum_robot_init_iterations = 16
     curriculum_robot_start_x_offset_ranges = (
-        (0.00, 0.04),
-        (0.02, 0.06),
-        (0.12, 0.18),
-        (0.18, 0.32),
-        (0.22, 0.40),
-        (0.24, 0.48),
+        (0.015, 0.035),
+        (0.025, 0.055),
+        (0.040, 0.080),
+        (0.060, 0.110),
+        (0.080, 0.130),
+        (0.100, 0.160),
     )
     curriculum_robot_start_y_noise_ranges = (
         (-0.005, 0.005),
@@ -197,7 +218,7 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
         (-0.12, 0.12),
         (-0.16, 0.16),
     )
-    curriculum_robot_start_z_offsets = (0.065, 0.075, 0.11, 0.14, 0.16, 0.18)
+    curriculum_robot_start_z_offsets = (0.145, 0.145, 0.150, 0.155, 0.160, 0.165)
     max_ik_reset_delta_q = 0.16
 
 

@@ -7,20 +7,20 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import newton
+import newton.ik as ik
 import numpy as np
 import torch
 import warp as wp
-
-import isaaclab.sim as sim_utils
-import newton
-from newton import JointTargetMode, eval_fk
-from newton.solvers import SolverImplicitMPM, SolverMuJoCo
-
-from isaaclab.envs import DirectRLEnv
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab_newton.physics import (
     NewtonManager,
 )
+from newton import JointTargetMode, eval_fk
+from newton.solvers import SolverImplicitMPM, SolverMuJoCo
+
+import isaaclab.sim as sim_utils
+from isaaclab.envs import DirectRLEnv
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 from .ur10_particle_scoop_env_cfg import UR10ParticleScoopEnvCfg
 
@@ -86,7 +86,7 @@ class PolicyObservationSpheres:
 
     def update(
         self,
-        env: "UR10ParticleScoopEnv",
+        env: UR10ParticleScoopEnv,
         heightmap: torch.Tensor,
         density: torch.Tensor,
         paddle_corners: torch.Tensor,
@@ -161,7 +161,7 @@ class PolicyObservationSpheres:
         self._markers.visualize(translations=translations, marker_indices=marker_indices)
 
 
-def _viewer_flag_enabled(env: "UR10ParticleScoopEnv", flag_name: str) -> bool:
+def _viewer_flag_enabled(env: UR10ParticleScoopEnv, flag_name: str) -> bool:
     for visualizer in env.sim.visualizers:
         viewer = getattr(visualizer, "_viewer", None)
         if viewer is not None and getattr(viewer, flag_name, False):
@@ -195,12 +195,15 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._default_joint_qd = wp.to_torch(state.joint_qd)[self._joint_qd_ids].clone()
         joint_lower = wp.to_torch(model.joint_limit_lower)[self._joint_qd_ids].clone()
         joint_upper = wp.to_torch(model.joint_limit_upper)[self._joint_qd_ids].clone()
-        finite_limits = torch.isfinite(joint_lower) & torch.isfinite(joint_upper) & ((joint_upper - joint_lower) > 1.0e-3)
+        finite_limits = (
+            torch.isfinite(joint_lower) & torch.isfinite(joint_upper) & ((joint_upper - joint_lower) > 1.0e-3)
+        )
         reasonable_limits = finite_limits & ((joint_upper - joint_lower) < 100.0)
         self._joint_lower = torch.where(reasonable_limits, joint_lower, torch.full_like(joint_lower, -2.0 * torch.pi))
         self._joint_upper = torch.where(reasonable_limits, joint_upper, torch.full_like(joint_upper, 2.0 * torch.pi))
         self._joint_center = 0.5 * (self._joint_lower + self._joint_upper)
         self._joint_half_range = torch.clamp(0.5 * (self._joint_upper - self._joint_lower), min=1.0e-6)
+        self._create_ik_solver()
         self._default_particle_q = wp.to_torch(state.particle_q)[self._particle_ids].clone()
         self._default_particle_e = self._default_particle_q - self.scene.env_origins[:, None, :]
         self._joint_targets = self._default_joint_q.clone()
@@ -255,18 +258,23 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         ).unsqueeze(1)
         self._paddle_center_offset = torch.tensor(self.cfg.paddle_ee_offset, device=self.device)
         paddle_x, paddle_y, _ = self.cfg.paddle_size
-        self._paddle_corner_offsets = torch.tensor(
-            (
-                (-0.5 * paddle_x, -0.5 * paddle_y, 0.0),
-                (-0.5 * paddle_x, 0.5 * paddle_y, 0.0),
-                (0.5 * paddle_x, -0.5 * paddle_y, 0.0),
-                (0.5 * paddle_x, 0.5 * paddle_y, 0.0),
-            ),
-            device=self.device,
-        ) + self._paddle_center_offset
+        self._paddle_corner_offsets = (
+            torch.tensor(
+                (
+                    (-0.5 * paddle_x, -0.5 * paddle_y, 0.0),
+                    (-0.5 * paddle_x, 0.5 * paddle_y, 0.0),
+                    (0.5 * paddle_x, -0.5 * paddle_y, 0.0),
+                    (0.5 * paddle_x, 0.5 * paddle_y, 0.0),
+                ),
+                device=self.device,
+            )
+            + self._paddle_center_offset
+        )
+        self._paddle_half_size = 0.5 * torch.tensor(self.cfg.paddle_size, device=self.device)
         self._previous_bin_count = torch.zeros(self.num_envs, device=self.device)
         self._previous_bin_fraction = torch.zeros(self.num_envs, device=self.device)
         self._previous_particle_progress = torch.zeros(self.num_envs, device=self.device)
+        self._previous_centroid_progress = torch.zeros(self.num_envs, device=self.device)
         self._previous_bin_proximity = torch.zeros(self.num_envs, device=self.device)
         self._previous_paddle_pos = self._paddle_pos_e().clone()
         self._previous_particle_centroid = self._robust_particle_centroid(self._particle_pos_e()).clone()
@@ -278,24 +286,36 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._last_bin_fraction = torch.zeros(self.num_envs, device=self.device)
         self._last_spill_fraction = torch.zeros(self.num_envs, device=self.device)
         self._last_particle_progress = torch.zeros(self.num_envs, device=self.device)
+        self._last_centroid_progress = torch.zeros(self.num_envs, device=self.device)
         self._last_bin_proximity = torch.zeros(self.num_envs, device=self.device)
         self._last_mouth_entry = torch.zeros(self.num_envs, device=self.device)
         self._last_paddle_speed = torch.zeros(self.num_envs, device=self.device)
         self._last_action_rate = torch.zeros(self.num_envs, device=self.device)
         self._last_paddle_bin_proximity = torch.zeros(self.num_envs, device=self.device)
         self._last_paddle_orientation = torch.zeros(self.num_envs, device=self.device)
+        self._last_paddle_setup = torch.zeros(self.num_envs, device=self.device)
+        self._last_paddle_contact = torch.zeros(self.num_envs, device=self.device)
+        self._last_paddle_push_speed = torch.zeros(self.num_envs, device=self.device)
+        self._last_particle_push_speed = torch.zeros(self.num_envs, device=self.device)
+        self._last_paddle_retreat_speed = torch.zeros(self.num_envs, device=self.device)
         self._last_paddle_velocity = torch.zeros(self.num_envs, 3, device=self.device)
         self._last_particle_centroid_velocity = torch.zeros(self.num_envs, 3, device=self.device)
         self._episode_sums = {
             "bin_fraction": torch.zeros(self.num_envs, device=self.device),
             "delta_bin_fraction": torch.zeros(self.num_envs, device=self.device),
             "particle_progress": torch.zeros(self.num_envs, device=self.device),
+            "centroid_progress": torch.zeros(self.num_envs, device=self.device),
             "bin_proximity": torch.zeros(self.num_envs, device=self.device),
             "mouth_entry": torch.zeros(self.num_envs, device=self.device),
             "spill_penalty": torch.zeros(self.num_envs, device=self.device),
             "paddle_proximity": torch.zeros(self.num_envs, device=self.device),
             "paddle_bin_proximity": torch.zeros(self.num_envs, device=self.device),
             "paddle_orientation": torch.zeros(self.num_envs, device=self.device),
+            "paddle_setup": torch.zeros(self.num_envs, device=self.device),
+            "paddle_contact": torch.zeros(self.num_envs, device=self.device),
+            "paddle_push_velocity": torch.zeros(self.num_envs, device=self.device),
+            "particle_push_velocity": torch.zeros(self.num_envs, device=self.device),
+            "paddle_retreat_penalty": torch.zeros(self.num_envs, device=self.device),
             "paddle_low_penalty": torch.zeros(self.num_envs, device=self.device),
             "paddle_speed_penalty": torch.zeros(self.num_envs, device=self.device),
             "action_penalty": torch.zeros(self.num_envs, device=self.device),
@@ -382,6 +402,68 @@ class UR10ParticleScoopEnv(DirectRLEnv):
     def _simulate_mpm_step(self) -> None:
         state = NewtonManager.get_state_0()
         self._mpm_solver.step(state, state, control=None, contacts=None, dt=self.physics_dt)
+
+    def _create_ik_solver(self) -> None:
+        ik_builder = NewtonManager.create_builder()
+        SolverMuJoCo.register_custom_attributes(ik_builder)
+        ik_builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
+            armature=0.1,
+            limit_ke=1.0e3,
+            limit_kd=1.0e1,
+        )
+        ik_builder.add_urdf(
+            self.cfg.ur10_urdf_path,
+            xform=wp.transform(wp.vec3(*self.cfg.robot_base_pos), wp.quat_identity()),
+            floating=False,
+            enable_self_collisions=False,
+            collapse_fixed_joints=False,
+            ignore_inertial_definitions=False,
+        )
+        self._configure_ur10_joints(ik_builder)
+        ik_ee_body = self._find_body(ik_builder, self.cfg.ee_body_name)
+        ik_arm_q_ids, _ = self._resolve_arm_joint_ids(ik_builder)
+        if len(ik_arm_q_ids) != self.cfg.action_space:
+            raise RuntimeError(f"Expected {self.cfg.action_space} UR10 IK DOFs, found {len(ik_arm_q_ids)}.")
+
+        ik_device = NewtonManager.get_model().device
+        self._ik_model = ik_builder.finalize(device=ik_device)
+        self._ik_target_positions = wp.zeros(self.num_envs, dtype=wp.vec3, device=ik_device)
+        self._ik_target_rotations = wp.zeros(self.num_envs, dtype=wp.vec4, device=ik_device)
+        self._ik_joint_q_in = wp.zeros(
+            (self.num_envs, self._ik_model.joint_coord_count), dtype=wp.float32, device=ik_device
+        )
+        self._ik_joint_q_out = wp.zeros_like(self._ik_joint_q_in)
+        self._ik_target_positions_t = wp.to_torch(self._ik_target_positions)
+        self._ik_target_rotations_t = wp.to_torch(self._ik_target_rotations)
+        self._ik_joint_q_in_t = wp.to_torch(self._ik_joint_q_in)
+        self._ik_joint_q_out_t = wp.to_torch(self._ik_joint_q_out)
+        self._ik_default_joint_q = wp.to_torch(self._ik_model.joint_q).clone()
+        self._ik_arm_q_ids = torch.tensor(ik_arm_q_ids, device=self._ik_joint_q_in_t.device, dtype=torch.long)
+
+        position_objective = ik.IKObjectivePosition(
+            link_index=ik_ee_body,
+            link_offset=wp.vec3(*self.cfg.paddle_ee_offset),
+            target_positions=self._ik_target_positions,
+            weight=self.cfg.ik_position_weight,
+        )
+        rotation_objective = ik.IKObjectiveRotation(
+            link_index=ik_ee_body,
+            link_offset_rotation=wp.quat_identity(),
+            target_rotations=self._ik_target_rotations,
+            weight=self.cfg.ik_rotation_weight,
+        )
+        joint_limit_objective = ik.IKObjectiveJointLimit(
+            self._ik_model.joint_limit_lower,
+            self._ik_model.joint_limit_upper,
+            weight=self.cfg.ik_joint_limit_weight,
+        )
+        self._ik_solver = ik.IKSolver(
+            model=self._ik_model,
+            n_problems=self.num_envs,
+            objectives=[position_objective, rotation_objective, joint_limit_objective],
+            lambda_initial=self.cfg.ik_lambda_initial,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
 
     def _setup_scene(self) -> None:
         builder = self._build_newton_model()
@@ -678,59 +760,62 @@ class UR10ParticleScoopEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._apply_viewer_forces()
         self._actions = actions.clamp(-1.0, 1.0)
-        joint_delta = self._cartesian_actions_to_joint_delta(self._actions)
         joint_q = wp.to_torch(NewtonManager.get_state_0().joint_q)[self._joint_q_ids]
-        self._joint_targets = joint_q + joint_delta
-        self._joint_targets = torch.clamp(self._joint_targets, -2.0 * torch.pi, 2.0 * torch.pi)
+        paddle_pos, ee_quat = self._paddle_pose_e()
+        target_paddle_pos = self._clamp_paddle_target_position(
+            paddle_pos + self._actions[:, :3] * self.cfg.cartesian_position_action_scale * self.step_dt
+        )
+        target_ee_quat = self._integrate_action_rotation(ee_quat, self._actions[:, 3:])
+        self._joint_targets = self._solve_newton_ik(
+            joint_q,
+            target_paddle_pos,
+            target_ee_quat,
+            self.cfg.ik_action_iterations,
+            self.cfg.max_ik_delta_q,
+        )
 
     def _apply_action(self) -> None:
         control = NewtonManager.get_control()
         wp.to_torch(control.joint_target_pos)[self._joint_qd_ids] = self._joint_targets
 
-    def _cartesian_actions_to_joint_delta(self, actions: torch.Tensor) -> torch.Tensor:
-        jacobian = self._finite_difference_ee_jacobian()
-        cartesian_delta = torch.cat(
-            (
-                actions[:, :3] * self.cfg.cartesian_position_action_scale * self.step_dt,
-                actions[:, 3:] * self.cfg.cartesian_rotation_action_scale * self.step_dt,
-            ),
-            dim=-1,
+    def _integrate_action_rotation(self, current_quat: torch.Tensor, rotation_actions: torch.Tensor) -> torch.Tensor:
+        rotation_delta = rotation_actions * self.cfg.cartesian_rotation_action_scale * self.step_dt
+        delta_quat = self._axis_angle_to_quat(rotation_delta)
+        return self._normalize_quat(self._quat_multiply(delta_quat, current_quat))
+
+    def _solve_newton_ik(
+        self,
+        current_joint_q: torch.Tensor,
+        target_paddle_pos: torch.Tensor,
+        target_ee_quat: torch.Tensor,
+        iterations: int,
+        max_delta_q: float,
+    ) -> torch.Tensor:
+        self._ik_joint_q_in_t[:, :] = self._ik_default_joint_q.unsqueeze(0)
+        self._ik_joint_q_in_t[:, self._ik_arm_q_ids] = current_joint_q.to(self._ik_joint_q_in_t.device)
+        self._ik_target_positions_t[:, :] = target_paddle_pos.to(self._ik_target_positions_t.device)
+        self._ik_target_rotations_t[:, :] = self._normalize_quat(target_ee_quat).to(self._ik_target_rotations_t.device)
+
+        self._ik_solver.step(
+            self._ik_joint_q_in,
+            self._ik_joint_q_out,
+            iterations=iterations,
+            step_size=self.cfg.ik_step_size,
         )
-        return self._solve_damped_ik(jacobian, cartesian_delta, self.cfg.max_ik_delta_q)
+        solved_joint_q = self._ik_joint_q_out_t[:, self._ik_arm_q_ids].to(current_joint_q.device)
+        joint_delta = torch.nan_to_num(
+            solved_joint_q - current_joint_q,
+            nan=0.0,
+            posinf=max_delta_q,
+            neginf=-max_delta_q,
+        )
+        joint_delta = torch.clamp(joint_delta, -max_delta_q, max_delta_q)
+        return torch.clamp(current_joint_q + joint_delta, self._joint_lower, self._joint_upper)
 
-    def _solve_damped_ik(self, jacobian: torch.Tensor, cartesian_delta: torch.Tensor, max_delta_q: float) -> torch.Tensor:
-        j_t = jacobian.transpose(1, 2)
-        damping_eye = (self.cfg.ik_damping**2) * torch.eye(6, device=self.device).unsqueeze(0)
-        lhs = jacobian @ j_t + damping_eye
-        rhs = cartesian_delta.unsqueeze(-1)
-        joint_delta = j_t @ torch.linalg.solve(lhs, rhs)
-        joint_delta = joint_delta.squeeze(-1)
-        return torch.clamp(joint_delta, -max_delta_q, max_delta_q)
-
-    def _finite_difference_ee_jacobian(self) -> torch.Tensor:
-        model = NewtonManager.get_model()
-        state = NewtonManager.get_state_0()
-        joint_q = wp.to_torch(state.joint_q)
-        body_q = wp.to_torch(state.body_q)
-        original_joint_q = joint_q[self._joint_q_ids].clone()
-        base_pose = body_q[self._ee_body_ids].clone()
-        eps = float(self.cfg.ik_fd_epsilon)
-        jacobian = torch.empty(self.num_envs, 6, self.cfg.action_space, device=self.device)
-
-        for joint_index in range(self.cfg.action_space):
-            q_ids = self._joint_q_ids[:, joint_index]
-            joint_q[q_ids] = original_joint_q[:, joint_index] + eps
-            eval_fk(model, state.joint_q, state.joint_qd, state, None)
-            perturbed_pose = body_q[self._ee_body_ids].clone()
-            jacobian[:, :3, joint_index] = (perturbed_pose[:, :3] - base_pose[:, :3]) / eps
-            jacobian[:, 3:, joint_index] = self._small_angle_quat_difference(
-                perturbed_pose[:, 3:7], base_pose[:, 3:7]
-            ) / eps
-            joint_q[q_ids] = original_joint_q[:, joint_index]
-
-        joint_q[self._joint_q_ids] = original_joint_q
-        eval_fk(model, state.joint_q, state.joint_qd, state, None)
-        return jacobian
+    def _clamp_paddle_target_position(self, position: torch.Tensor) -> torch.Tensor:
+        lower = self._workspace_lower.clone()
+        lower[2] = max(float(lower[2]), float(self.cfg.paddle_min_height))
+        return torch.clamp(position, min=lower, max=self._workspace_upper)
 
     def _get_observations(self) -> dict:
         particle_pos = self._particle_pos_e()
@@ -753,6 +838,14 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         bin_target = self._bin_target.unsqueeze(0).expand(self.num_envs, -1)
         bin_mouth = self._bin_mouth_center.unsqueeze(0).expand(self.num_envs, -1)
         vector_to_mouth = self._normalize_vector(bin_mouth - paddle_pos)
+        vector_paddle_to_centroid = self._normalize_vector(particle_centroid - paddle_pos)
+        vector_centroid_to_mouth = self._normalize_vector(bin_mouth - particle_centroid)
+        push_direction = self._push_direction_to_bin()
+        paddle_normal = self._paddle_normal_e()
+        contact_score = self._paddle_particle_contact_score(particle_pos)
+        setup_features = self._paddle_push_setup_features(paddle_pos, particle_centroid, contact_score)
+        paddle_push_speed = torch.sum(paddle_velocity * push_direction, dim=-1, keepdim=True)
+        particle_push_speed = torch.sum(particle_centroid_velocity * push_direction, dim=-1, keepdim=True)
         spill_fraction = self._particles_spilled(particle_pos).float().mean(dim=1, keepdim=True)
         particle_progress = self._particle_progress_toward_bin(particle_pos)[:, None]
         bin_proximity = self._particle_bin_proximity(particle_pos)[:, None]
@@ -769,6 +862,13 @@ class UR10ParticleScoopEnv(DirectRLEnv):
                 self._normalize_positions(bin_target),
                 self._normalize_positions(bin_mouth),
                 vector_to_mouth,
+                vector_paddle_to_centroid,
+                vector_centroid_to_mouth,
+                push_direction,
+                paddle_normal,
+                setup_features,
+                torch.clamp(paddle_push_speed / max(float(self.cfg.paddle_push_speed_norm), 1.0e-6), -1.0, 1.0),
+                torch.clamp(particle_push_speed / max(float(self.cfg.particle_push_speed_norm), 1.0e-6), -1.0, 1.0),
                 bin_fraction,
                 spill_fraction,
                 particle_progress,
@@ -797,6 +897,13 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._previous_bin_proximity = bin_proximity
         spill_fraction = self._particles_spilled(particle_pos).float().mean(dim=1)
         mouth_entry = self._particle_mouth_entry(particle_pos)
+        particle_centroid = self._robust_particle_centroid(particle_pos)
+        particle_centroid_velocity = (particle_centroid - self._previous_particle_centroid) / self.step_dt
+        particle_centroid_velocity = torch.nan_to_num(particle_centroid_velocity, nan=0.0, posinf=2.0, neginf=-2.0)
+        particle_centroid_velocity = torch.clamp(particle_centroid_velocity, -2.0, 2.0)
+        centroid_progress = self._particle_centroid_progress_toward_bin(particle_centroid)
+        delta_centroid_progress = centroid_progress - self._previous_centroid_progress
+        self._previous_centroid_progress = centroid_progress
 
         paddle_pos = self._paddle_pos_e()
         paddle_corners = self._paddle_corners_e()
@@ -804,6 +911,9 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         paddle_proximity = torch.exp(-4.0 * paddle_distance)
         paddle_bin_proximity = self._paddle_bin_proximity(paddle_pos)
         paddle_orientation = self._paddle_push_orientation()
+        paddle_contact = self._paddle_particle_contact_score(particle_pos)
+        setup_features = self._paddle_push_setup_features(paddle_pos, particle_centroid, paddle_contact)
+        paddle_setup = setup_features[:, 0]
         paddle_low_penalty = torch.square(
             torch.clamp((self.cfg.paddle_min_height - paddle_corners[..., 2].amin(dim=1)) / 0.10, min=0.0)
         )
@@ -819,10 +929,28 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         paddle_speed = torch.linalg.norm(paddle_velocity, dim=-1)
         paddle_speed = torch.nan_to_num(paddle_speed, nan=self.cfg.max_paddle_speed, posinf=self.cfg.max_paddle_speed)
         paddle_speed = torch.clamp(paddle_speed, max=self.cfg.max_paddle_speed)
+        push_direction = self._push_direction_to_bin()
+        paddle_forward_velocity = torch.sum(paddle_velocity * push_direction, dim=-1)
+        particle_forward_velocity = torch.sum(particle_centroid_velocity * push_direction, dim=-1)
+        paddle_push_speed = torch.clamp(
+            paddle_forward_velocity / max(float(self.cfg.paddle_push_speed_norm), 1.0e-6), min=0.0, max=1.0
+        )
+        particle_push_speed = torch.clamp(
+            particle_forward_velocity / max(float(self.cfg.particle_push_speed_norm), 1.0e-6), min=0.0, max=1.0
+        )
+        paddle_retreat_speed = torch.clamp(
+            -paddle_forward_velocity / max(float(self.cfg.paddle_push_speed_norm), 1.0e-6), min=0.0, max=1.0
+        )
+        push_gate = torch.clamp(0.5 * paddle_setup + 0.5 * paddle_contact, 0.0, 1.0)
         self._previous_paddle_pos = paddle_pos
         self._last_paddle_velocity = paddle_velocity
         joint_qd = wp.to_torch(NewtonManager.get_state_0().joint_qd)[self._joint_qd_ids]
-        joint_qd = torch.nan_to_num(joint_qd, nan=0.0, posinf=self.cfg.max_joint_velocity, neginf=-self.cfg.max_joint_velocity)
+        joint_qd = torch.nan_to_num(
+            joint_qd,
+            nan=0.0,
+            posinf=self.cfg.max_joint_velocity,
+            neginf=-self.cfg.max_joint_velocity,
+        )
         joint_qd = torch.clamp(joint_qd, -self.cfg.max_joint_velocity, self.cfg.max_joint_velocity)
         action_penalty = torch.sum(torch.square(self._actions), dim=-1)
         action_delta = self._actions - self._previous_actions
@@ -836,12 +964,21 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             "bin_fraction": self.cfg.reward_bin_fraction_scale * bin_fraction,
             "delta_bin_fraction": self.cfg.reward_delta_bin_fraction_scale * torch.clamp(delta_bin_fraction, min=0.0),
             "particle_progress": self.cfg.reward_particle_progress_scale * torch.clamp(delta_progress, min=0.0),
+            "centroid_progress": self.cfg.reward_centroid_progress_scale
+            * torch.clamp(delta_centroid_progress, min=0.0),
             "bin_proximity": self.cfg.reward_bin_proximity_scale * bin_proximity,
             "mouth_entry": self.cfg.reward_mouth_entry_scale * mouth_entry,
             "spill_penalty": -self.cfg.reward_spill_penalty_scale * spill_fraction,
             "paddle_proximity": self.cfg.reward_paddle_proximity_scale * paddle_proximity,
             "paddle_bin_proximity": self.cfg.reward_paddle_bin_proximity_scale * paddle_bin_proximity,
             "paddle_orientation": self.cfg.reward_paddle_orientation_scale * paddle_orientation,
+            "paddle_setup": self.cfg.reward_paddle_setup_scale * paddle_setup,
+            "paddle_contact": self.cfg.reward_paddle_contact_scale * paddle_contact,
+            "paddle_push_velocity": self.cfg.reward_paddle_push_velocity_scale * paddle_push_speed * push_gate,
+            "particle_push_velocity": self.cfg.reward_particle_push_velocity_scale
+            * particle_push_speed
+            * paddle_contact,
+            "paddle_retreat_penalty": -self.cfg.reward_paddle_retreat_penalty_scale * paddle_retreat_speed * push_gate,
             "paddle_low_penalty": -self.cfg.reward_paddle_low_penalty_scale * paddle_low_penalty,
             "paddle_speed_penalty": -self.cfg.reward_paddle_speed_penalty_scale * torch.square(paddle_speed),
             "action_penalty": -self.cfg.action_penalty_scale * action_penalty,
@@ -855,12 +992,18 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._last_bin_fraction = bin_fraction
         self._last_spill_fraction = spill_fraction
         self._last_particle_progress = progress
+        self._last_centroid_progress = centroid_progress
         self._last_bin_proximity = bin_proximity
         self._last_mouth_entry = mouth_entry
         self._last_paddle_speed = paddle_speed
         self._last_action_rate = torch.linalg.norm(action_delta, dim=-1)
         self._last_paddle_bin_proximity = paddle_bin_proximity
         self._last_paddle_orientation = paddle_orientation
+        self._last_paddle_setup = paddle_setup
+        self._last_paddle_contact = paddle_contact
+        self._last_paddle_push_speed = paddle_push_speed
+        self._last_particle_push_speed = particle_push_speed
+        self._last_paddle_retreat_speed = paddle_retreat_speed
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -890,12 +1033,18 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             extras["Metrics/particle_fraction_in_bin"] = self._last_bin_fraction[env_ids].mean().item()
             extras["Metrics/spill_fraction"] = self._last_spill_fraction[env_ids].mean().item()
             extras["Metrics/particle_progress"] = self._last_particle_progress[env_ids].mean().item()
+            extras["Metrics/centroid_progress"] = self._last_centroid_progress[env_ids].mean().item()
             extras["Metrics/bin_proximity"] = self._last_bin_proximity[env_ids].mean().item()
             extras["Metrics/mouth_entry"] = self._last_mouth_entry[env_ids].mean().item()
             extras["Metrics/paddle_speed"] = self._last_paddle_speed[env_ids].mean().item()
             extras["Metrics/action_rate"] = self._last_action_rate[env_ids].mean().item()
             extras["Metrics/paddle_bin_proximity"] = self._last_paddle_bin_proximity[env_ids].mean().item()
             extras["Metrics/paddle_orientation"] = self._last_paddle_orientation[env_ids].mean().item()
+            extras["Metrics/paddle_setup"] = self._last_paddle_setup[env_ids].mean().item()
+            extras["Metrics/paddle_contact"] = self._last_paddle_contact[env_ids].mean().item()
+            extras["Metrics/paddle_push_speed"] = self._last_paddle_push_speed[env_ids].mean().item()
+            extras["Metrics/particle_push_speed"] = self._last_particle_push_speed[env_ids].mean().item()
+            extras["Metrics/paddle_retreat_speed"] = self._last_paddle_retreat_speed[env_ids].mean().item()
             extras["Metrics/success_rate"] = self._episode_succeeded[env_ids].float().mean().item()
             extras["Curriculum/stage"] = float(self._curriculum_stage)
             extras["Curriculum/success_ema"] = float(self._curriculum_success_ema)
@@ -918,10 +1067,9 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         if log_extras is not None:
             log_extras["Curriculum/reset_pile_center_x"] = self._current_pile_center[env_ids, 0].mean().item()
             log_extras["Curriculum/reset_pile_center_y"] = self._current_pile_center[env_ids, 1].mean().item()
-            log_extras["Curriculum/reset_pile_scale_x"] = (
-                self._current_pile_half_extents[env_ids, 0].mean().item()
-                / max(float(self._default_pile_half_extents[0]), 1.0e-6)
-            )
+            log_extras["Curriculum/reset_pile_scale_x"] = self._current_pile_half_extents[
+                env_ids, 0
+            ].mean().item() / max(float(self._default_pile_half_extents[0]), 1.0e-6)
             self.extras["log"] = log_extras
         particle_q[self._particle_ids[env_ids]] = reset_particle_q
         particle_qd[self._particle_ids[env_ids]] = 0.0
@@ -948,9 +1096,19 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._previous_bin_count[env_ids] = self._count_particles_in_bin(particle_pos)[env_ids]
         self._previous_bin_fraction[env_ids] = self._previous_bin_count[env_ids] / float(self._particle_count)
         self._previous_particle_progress[env_ids] = self._particle_progress_toward_bin(particle_pos)[env_ids]
+        particle_centroid = self._robust_particle_centroid(particle_pos)
+        self._previous_centroid_progress[env_ids] = self._particle_centroid_progress_toward_bin(particle_centroid)[
+            env_ids
+        ]
         self._previous_bin_proximity[env_ids] = self._particle_bin_proximity(particle_pos)[env_ids]
         self._previous_paddle_pos[env_ids] = self._paddle_pos_e()[env_ids]
-        self._previous_particle_centroid[env_ids] = self._robust_particle_centroid(particle_pos)[env_ids]
+        self._previous_particle_centroid[env_ids] = particle_centroid[env_ids]
+        self._last_centroid_progress[env_ids] = self._previous_centroid_progress[env_ids]
+        self._last_paddle_setup[env_ids] = 0.0
+        self._last_paddle_contact[env_ids] = self._paddle_particle_contact_score(particle_pos)[env_ids]
+        self._last_paddle_push_speed[env_ids] = 0.0
+        self._last_particle_push_speed[env_ids] = 0.0
+        self._last_paddle_retreat_speed[env_ids] = 0.0
         self._last_paddle_velocity[env_ids] = 0.0
         self._last_particle_centroid_velocity[env_ids] = 0.0
 
@@ -983,38 +1141,83 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         particle_pos_w = wp.to_torch(NewtonManager.get_state_0().particle_q)[self._particle_ids]
         return particle_pos_w - self.scene.env_origins[:, None, :]
 
-    def _paddle_pos_e(self) -> torch.Tensor:
+    def _paddle_pose_e(self) -> tuple[torch.Tensor, torch.Tensor]:
         body_q = wp.to_torch(NewtonManager.get_state_0().body_q)
         ee_pose = body_q[self._ee_body_ids]
-        return ee_pose[:, :3] + self._quat_rotate(ee_pose[:, 3:7], self._paddle_center_offset) - self.scene.env_origins
+        paddle_pos = ee_pose[:, :3] + self._quat_rotate(ee_pose[:, 3:7], self._paddle_center_offset)
+        return paddle_pos - self.scene.env_origins, ee_pose[:, 3:7]
+
+    def _paddle_pos_e(self) -> torch.Tensor:
+        return self._paddle_pose_e()[0]
 
     def _paddle_corners_e(self) -> torch.Tensor:
-        body_q = wp.to_torch(NewtonManager.get_state_0().body_q)
-        ee_pose = body_q[self._ee_body_ids]
+        paddle_pos, paddle_quat = self._paddle_pose_e()
         corner_offsets = self._paddle_corner_offsets.unsqueeze(0).expand(self.num_envs, -1, -1)
-        corner_quats = ee_pose[:, None, 3:7].expand(-1, corner_offsets.shape[1], -1)
-        corner_pos = ee_pose[:, None, :3] + self._quat_rotate(corner_quats, corner_offsets)
-        return corner_pos - self.scene.env_origins[:, None, :]
+        corner_quats = paddle_quat[:, None, :].expand(-1, corner_offsets.shape[1], -1)
+        local_corner_offsets = corner_offsets - self._paddle_center_offset
+        return paddle_pos[:, None, :] + self._quat_rotate(corner_quats, local_corner_offsets)
 
     def _paddle_normal_e(self) -> torch.Tensor:
-        body_q = wp.to_torch(NewtonManager.get_state_0().body_q)
-        ee_pose = body_q[self._ee_body_ids]
+        _, paddle_quat = self._paddle_pose_e()
         local_normal = torch.tensor((0.0, 0.0, 1.0), device=self.device).expand(self.num_envs, -1)
-        return self._quat_rotate(ee_pose[:, 3:7], local_normal)
+        return self._quat_rotate(paddle_quat, local_normal)
+
+    def _push_direction_to_bin(self) -> torch.Tensor:
+        push_direction = self._bin_mouth_center.unsqueeze(0) - self._current_pile_center
+        push_direction = push_direction.clone()
+        push_direction[:, 2] = 0.0
+        return push_direction / torch.clamp(torch.linalg.norm(push_direction, dim=-1, keepdim=True), min=1.0e-6)
 
     def _paddle_bin_proximity(self, paddle_pos: torch.Tensor) -> torch.Tensor:
-        normalized_error = self._normalize_vector(self._bin_mouth_center.unsqueeze(0) - paddle_pos)
+        normalized_error = self._scale_vector(self._bin_mouth_center.unsqueeze(0) - paddle_pos)
         distance = torch.linalg.norm(normalized_error, dim=-1)
         return torch.exp(-2.0 * torch.clamp(distance, max=4.0))
 
     def _paddle_push_orientation(self) -> torch.Tensor:
         normal = self._paddle_normal_e()
-        push_direction = self._bin_mouth_center.unsqueeze(0) - self._current_pile_center
-        push_direction[:, 2] = 0.0
-        push_direction = push_direction / torch.clamp(torch.linalg.norm(push_direction, dim=-1, keepdim=True), min=1.0e-6)
+        push_direction = self._push_direction_to_bin()
         facing_bin = torch.clamp(torch.sum(normal * push_direction, dim=-1), min=0.0, max=1.0)
         vertical_blade = torch.exp(-12.0 * torch.square(normal[:, 2]))
         return torch.square(facing_bin) * vertical_blade
+
+    def _paddle_particle_contact_score(self, particle_pos: torch.Tensor) -> torch.Tensor:
+        paddle_pos, paddle_quat = self._paddle_pose_e()
+        particle_delta = particle_pos - paddle_pos[:, None, :]
+        local_delta = self._quat_rotate(self._quat_conjugate(paddle_quat)[:, None, :], particle_delta)
+        margin = float(self.cfg.paddle_contact_margin)
+        in_face_x = torch.abs(local_delta[..., 0]) <= self._paddle_half_size[0] + margin
+        in_face_y = torch.abs(local_delta[..., 1]) <= self._paddle_half_size[1] + margin
+        in_front = local_delta[..., 2] >= self._paddle_half_size[2] - margin
+        in_reach = local_delta[..., 2] <= self._paddle_half_size[2] + self.cfg.paddle_contact_depth
+        contact_count = (in_face_x & in_face_y & in_front & in_reach & self._particles_in_workspace(particle_pos)).sum(
+            dim=1,
+            dtype=torch.float32,
+        )
+        return 1.0 - torch.exp(-contact_count / max(float(self.cfg.paddle_contact_count_norm), 1.0e-6))
+
+    def _paddle_push_setup_features(
+        self, paddle_pos: torch.Tensor, particle_centroid: torch.Tensor, contact_score: torch.Tensor
+    ) -> torch.Tensor:
+        push_direction = self._push_direction_to_bin()
+        rel_paddle = paddle_pos - particle_centroid
+        longitudinal_offset = -torch.sum(rel_paddle * push_direction, dim=-1)
+        target_offset = self._current_pile_half_extents[:, 0] + self.cfg.paddle_setup_distance
+        behind_error = (longitudinal_offset - target_offset) / max(float(self.cfg.paddle_setup_distance_std), 1.0e-6)
+        behind_score = torch.exp(-torch.square(behind_error))
+
+        lateral_vector = rel_paddle - torch.sum(rel_paddle * push_direction, dim=-1, keepdim=True) * push_direction
+        lateral_vector = lateral_vector.clone()
+        lateral_vector[:, 2] = 0.0
+        lateral_error = torch.linalg.norm(lateral_vector, dim=-1)
+        lateral_score = torch.exp(-torch.square(lateral_error / max(float(self.cfg.paddle_setup_lateral_std), 1.0e-6)))
+
+        target_height = self.cfg.table_top_z + self.cfg.paddle_setup_height_offset
+        height_error = (paddle_pos[:, 2] - target_height) / max(float(self.cfg.paddle_setup_height_std), 1.0e-6)
+        height_score = torch.exp(-torch.square(height_error))
+        orientation_score = self._paddle_push_orientation()
+        setup_score = behind_score * lateral_score * height_score * orientation_score
+        setup_score = torch.maximum(setup_score, 0.25 * contact_score * orientation_score)
+        return torch.stack((setup_score, contact_score, behind_score, lateral_score, height_score), dim=-1)
 
     def _normalize_positions(self, positions: torch.Tensor) -> torch.Tensor:
         norm_x = 2.0 * (positions[..., 0] - self._heightmap_x_min) / self._heightmap_x_range - 1.0
@@ -1034,11 +1237,14 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         )
         return torch.clamp(joint_qd / max(float(self.cfg.max_joint_velocity), 1.0e-6), -1.0, 1.0)
 
-    def _normalize_vector(self, vector: torch.Tensor) -> torch.Tensor:
+    def _scale_vector(self, vector: torch.Tensor) -> torch.Tensor:
         scale = torch.tensor(
             (self._heightmap_x_range, self._heightmap_y_range, self.cfg.heightmap_z_range), device=self.device
         )
-        return torch.clamp(vector / torch.clamp(scale, min=1.0e-6), -1.0, 1.0)
+        return vector / torch.clamp(scale, min=1.0e-6)
+
+    def _normalize_vector(self, vector: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(self._scale_vector(vector), -1.0, 1.0)
 
     @staticmethod
     def _quat_rotate(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
@@ -1054,6 +1260,25 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         xyz = lhs_w * rhs_xyz + rhs_w * lhs_xyz + torch.cross(lhs_xyz, rhs_xyz, dim=-1)
         w = lhs_w * rhs_w - torch.sum(lhs_xyz * rhs_xyz, dim=-1, keepdim=True)
         return torch.cat((xyz, w), dim=-1)
+
+    @staticmethod
+    def _normalize_quat(quat: torch.Tensor) -> torch.Tensor:
+        return quat / torch.clamp(torch.linalg.norm(quat, dim=-1, keepdim=True), min=1.0e-8)
+
+    @staticmethod
+    def _axis_angle_to_quat(axis_angle: torch.Tensor) -> torch.Tensor:
+        angle = torch.linalg.norm(axis_angle, dim=-1, keepdim=True)
+        half_angle = 0.5 * angle
+        angle_sq = torch.square(angle)
+        small_angle = angle < 1.0e-6
+        sin_over_angle = torch.where(
+            small_angle,
+            0.5 - angle_sq / 48.0,
+            torch.sin(half_angle) / torch.clamp(angle, min=1.0e-8),
+        )
+        quat_xyz = axis_angle * sin_over_angle
+        quat_w = torch.where(small_angle, 1.0 - angle_sq / 8.0, torch.cos(half_angle))
+        return UR10ParticleScoopEnv._normalize_quat(torch.cat((quat_xyz, quat_w), dim=-1))
 
     @staticmethod
     def _quat_conjugate(quat: torch.Tensor) -> torch.Tensor:
@@ -1109,6 +1334,16 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         y_alignment = torch.exp(-torch.square(y_error))
         z_valid = (particle_pos[..., 2] > self._heightmap_z_min) & (particle_pos[..., 2] < self._workspace_upper[2])
         return (x_progress * y_alignment * z_valid.float()).mean(dim=1)
+
+    def _particle_centroid_progress_toward_bin(self, particle_centroid: torch.Tensor) -> torch.Tensor:
+        progress_start_x = self._current_pile_center[:, 0] - self._current_pile_half_extents[:, 0]
+        progress_range = torch.clamp(self._progress_target_x - progress_start_x, min=1.0e-6)
+        x_progress = torch.clamp((particle_centroid[:, 0] - progress_start_x) / progress_range, 0.0, 1.0)
+        y_error = (particle_centroid[:, 1] - self._bin_center[1]) / max(
+            float(self.cfg.bin_inner_half_extents[1]), 1.0e-6
+        )
+        y_alignment = torch.exp(-torch.square(y_error))
+        return x_progress * y_alignment
 
     def _particle_mouth_entry(self, particle_pos: torch.Tensor) -> torch.Tensor:
         mouth_depth = max(0.08, 2.0 * self.cfg.voxel_size)
@@ -1175,7 +1410,8 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         x_offsets = self.cfg.curriculum_robot_start_x_offset_ranges[stage]
         y_noise = self.cfg.curriculum_robot_start_y_noise_ranges[stage]
         target_paddle = self._current_pile_center[env_ids].clone()
-        target_paddle[:, 0] -= float(x_offsets[0]) + rand[:, 0] * float(x_offsets[1] - x_offsets[0])
+        edge_offset = self._current_pile_half_extents[env_ids, 0]
+        target_paddle[:, 0] -= edge_offset + float(x_offsets[0]) + rand[:, 0] * float(x_offsets[1] - x_offsets[0])
         target_paddle[:, 1] += float(y_noise[0]) + rand[:, 1] * float(y_noise[1] - y_noise[0])
         target_paddle[:, 2] = self.cfg.table_top_z + float(self.cfg.curriculum_robot_start_z_offsets[stage])
 
@@ -1185,22 +1421,23 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         joint_qd = wp.to_torch(state_0.joint_qd)
         eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
 
-        for _ in range(self.cfg.curriculum_robot_init_iterations):
-            jacobian = self._finite_difference_ee_jacobian()[env_ids]
-            paddle_error = torch.clamp(target_paddle - self._paddle_pos_e()[env_ids], -0.10, 0.10)
-            current_quat = wp.to_torch(state_0.body_q)[self._ee_body_ids[env_ids], 3:7]
-            rotation_error = torch.clamp(self._small_angle_quat_difference(target_quat, current_quat), -0.35, 0.35)
-            cartesian_delta = torch.cat((paddle_error, rotation_error), dim=-1)
-            joint_delta = self._solve_damped_ik(jacobian, cartesian_delta, self.cfg.max_ik_reset_delta_q)
-            joint_ids = self._joint_q_ids[env_ids]
-            new_joint_q = torch.clamp(
-                joint_q[joint_ids] + joint_delta,
-                self._joint_lower[env_ids],
-                self._joint_upper[env_ids],
-            )
-            joint_q[joint_ids] = new_joint_q
-            joint_qd[self._joint_qd_ids[env_ids]] = 0.0
-            eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
+        target_paddle_all, target_quat_all = self._paddle_pose_e()
+        target_paddle_all = target_paddle_all.clone()
+        target_quat_all = target_quat_all.clone()
+        target_paddle_all[env_ids] = target_paddle
+        target_quat_all[env_ids] = target_quat
+        current_joint_q = joint_q[self._joint_q_ids].clone()
+        max_reset_delta = self.cfg.max_ik_reset_delta_q * self.cfg.curriculum_robot_init_iterations
+        solved_joint_q = self._solve_newton_ik(
+            current_joint_q,
+            target_paddle_all,
+            target_quat_all,
+            self.cfg.ik_reset_iterations,
+            max_reset_delta,
+        )
+        joint_q[self._joint_q_ids[env_ids]] = solved_joint_q[env_ids]
+        joint_qd[self._joint_qd_ids[env_ids]] = 0.0
+        eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
 
         wp.to_torch(state_1.joint_q)[self._joint_q_ids[env_ids]] = joint_q[self._joint_q_ids[env_ids]]
         wp.to_torch(state_1.joint_qd)[self._joint_qd_ids[env_ids]] = 0.0
@@ -1217,7 +1454,9 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             (self._heightmap_x_range, self._heightmap_y_range, self.cfg.heightmap_z_range), device=self.device
         )
         paddle_speed = torch.linalg.norm(paddle_velocity, dim=-1, keepdim=True) / self.cfg.max_paddle_speed
-        return torch.cat((stage, success_fraction, success_ema, pile_center, pile_scale, particle_std, paddle_speed), dim=-1)
+        return torch.cat(
+            (stage, success_fraction, success_ema, pile_center, pile_scale, particle_std, paddle_speed), dim=-1
+        )
 
     def _configure_newton_viewer(self) -> None:
         for visualizer in self.sim.visualizers:

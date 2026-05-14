@@ -70,6 +70,22 @@ parser = argparse.ArgumentParser(description="RBY1 waterhose manipulation with I
 parser.add_argument("--fps", type=float, default=300.0, help="Control frames per second.")
 parser.add_argument("--max-steps", type=int, default=1400, help="Stop after this many frames; negative runs forever.")
 parser.add_argument(
+    "--num_envs",
+    "--num-envs",
+    "--num_env",
+    "--num-env",
+    type=int,
+    default=1,
+    help="Number of identical waterhose environments to spawn.",
+)
+parser.add_argument(
+    "--env-spacing",
+    "--env_spacing",
+    type=float,
+    default=2.5,
+    help="Spacing in meters between cloned environments.",
+)
+parser.add_argument(
     "--asset-root",
     type=Path,
     default=_DEFAULT_CABLE_ROBOT_ASSETS,
@@ -143,6 +159,10 @@ parser.add_argument(
 )
 _add_lazy_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.num_envs < 1:
+    parser.error("--num_envs must be >= 1.")
+if args_cli.env_spacing <= 0.0:
+    parser.error("--env-spacing must be > 0.")
 
 visualizer_arg = getattr(args_cli, "visualizer", "") or ""
 if "newton" in str(visualizer_arg).lower() and "DISPLAY" not in os.environ:
@@ -400,6 +420,9 @@ class WaterhoseSceneBuilder:
     """Build a shared model and Isaac Lab coupled-solver cfg for the demo."""
 
     def __init__(self):
+        self.num_envs = int(args_cli.num_envs)
+        self.env_spacing = float(args_cli.env_spacing)
+        self.env_origins = [self._env_origin(env_id) for env_id in range(self.num_envs)]
         self.asset_root = args_cli.asset_root.expanduser().resolve()
         self.robot_urdf = self._resolve_robot_urdf()
         self.scene_usd = self._resolve_asset(args_cli.scene_usd, "Cable008/Cable008_Body.usda")
@@ -464,6 +487,13 @@ class WaterhoseSceneBuilder:
         self._vbd_joint_ids: list[int] = []
         self.cable_body_ids: list[int] = []
         self.cable_head_body_ids: list[int] = []
+        self.robot_joint_coord_ids_by_env: list[list[int]] = []
+
+    def _env_origin(self, env_id: int):
+        cols = int(np.ceil(np.sqrt(self.num_envs)))
+        row = env_id // cols
+        col = env_id % cols
+        return wp.vec3(float(col) * self.env_spacing, float(row) * self.env_spacing, 0.0)
 
     def _resolve_asset(self, explicit_path: Path | None, relative_path: str) -> Path:
         path = explicit_path.expanduser().resolve() if explicit_path is not None else self.asset_root / relative_path
@@ -504,6 +534,19 @@ class WaterhoseSceneBuilder:
         """Return ``(builder, solver_cfg)`` for Isaac Lab's Newton manager."""
         static_scene_builder = self._build_static_scene_template()
         robot = self._build_robot()
+        proto_builder = self._build_single_env_proto(robot, static_scene_builder)
+        proto_meta = self._capture_proto_metadata(proto_builder, robot)
+        builder = self._build_replicated_builder(proto_builder, proto_meta, robot, static_scene_builder)
+        # Finalize the standalone IK model after USD scene parsing.  The USD
+        # physics importer for Cable008 is fragile if called after CUDA/Warp
+        # solver modules have already initialized during robot.finalize().
+        self.single_robot_model = robot.finalize(device=str(args_cli.device))
+        builder.color()
+        import_isaaclab_runtime_dependencies()
+        NewtonManager._num_envs = self.num_envs
+        return builder, self._make_solver_cfg()
+
+    def _build_single_env_proto(self, robot, static_scene_builder):
         builder = newton.ModelBuilder()
         SolverVBD.register_custom_attributes(builder)
         builder.default_shape_cfg = self.robot_shape_cfg
@@ -523,13 +566,167 @@ class WaterhoseSceneBuilder:
 
         self._add_waterhose_world(builder, static_scene_builder)
         self._select_proxy_bodies(builder)
-        # Finalize the standalone IK model after USD scene parsing.  The USD
-        # physics importer for Cable008 is fragile if called after CUDA/Warp
-        # solver modules have already initialized during robot.finalize().
-        self.single_robot_model = robot.finalize(device=str(args_cli.device))
-        builder.color()
-        import_isaaclab_runtime_dependencies()
-        return builder, self._make_solver_cfg()
+        return builder
+
+    def _capture_proto_metadata(self, proto_builder, robot) -> dict[str, object]:
+        return {
+            "mujoco_body_ids": list(self._mujoco_body_ids),
+            "mujoco_shape_ids": list(self._mujoco_shape_ids),
+            "mujoco_joint_ids": list(self._mujoco_joint_ids),
+            "mujoco_joint_coord_count": self._mujoco_joint_coord_count,
+            "mujoco_joint_dof_count": self._mujoco_joint_dof_count,
+            "mujoco_articulation_count": self._mujoco_articulation_count,
+            "vbd_body_ids": list(self._vbd_body_ids),
+            "vbd_shape_ids": list(self._vbd_shape_ids),
+            "vbd_joint_ids": list(self._vbd_joint_ids),
+            "proxy_body_ids": list(self.proxy_body_ids),
+            "proxy_shape_ids": list(self.proxy_shape_ids),
+            "scene_body_ids": list(self.scene_body_ids),
+            "scene_shape_ids": list(self.scene_shape_ids),
+            "cable_body_ids": list(self.cable_body_ids),
+            "cable_head_body_ids": list(self.cable_head_body_ids),
+            "primary_cable_body_ids": list(self.primary_cable_body_ids),
+            "tip_body_id": self.tip_body_id,
+            "plug_body_id": self.plug_body_id,
+            "grasp_body_id": self.grasp_body_id,
+            "cable_body_q_targets": dict(self.cable_body_q_targets),
+            "robot_joint_coord_count": robot.joint_coord_count,
+        }
+
+    def _build_replicated_builder(self, proto_builder, proto_meta: dict[str, object], robot, static_scene_builder):
+        self._reset_replicated_metadata()
+        if self.num_envs == 1:
+            self._append_env_metadata(proto_meta, (0, 0, 0, 0, 0), self.env_origins[0], is_primary=True)
+            return proto_builder
+
+        builder = newton.ModelBuilder()
+        SolverVBD.register_custom_attributes(builder)
+        builder.default_shape_cfg = self.robot_shape_cfg
+        builder.bound_mass = proto_builder.bound_mass
+        builder.bound_inertia = proto_builder.bound_inertia
+        for env_id, origin in enumerate(self.env_origins):
+            body_offset = builder.body_count
+            shape_offset = builder.shape_count
+            joint_offset = builder.joint_count
+            joint_coord_offset = builder.joint_coord_count
+            builder.add_builder(robot, xform=wp.transform(origin, wp.quat_identity()))
+            self._mujoco_body_ids.extend(range(body_offset, body_offset + robot.body_count))
+            self._mujoco_shape_ids.extend(range(shape_offset, shape_offset + robot.shape_count))
+            self._mujoco_joint_ids.extend(range(joint_offset, joint_offset + robot.joint_count))
+            self._mujoco_body_count += robot.body_count
+            self._mujoco_shape_count += robot.shape_count
+            self._mujoco_joint_count += robot.joint_count
+            self._mujoco_joint_coord_count += robot.joint_coord_count
+            self._mujoco_joint_dof_count += robot.joint_dof_count
+            self._mujoco_articulation_count += robot.articulation_count
+            self.robot_joint_coord_ids_by_env.append(
+                [joint_coord_offset + joint_id for joint_id in range(robot.joint_coord_count)]
+            )
+
+        self._select_proxy_bodies(builder)
+
+        vbd_body_ids: list[int] = []
+        vbd_shape_ids: list[int] = []
+        vbd_joint_ids: list[int] = []
+        primary_env_metadata = None
+        for env_id, origin in enumerate(self.env_origins):
+            self._add_waterhose_world(builder, static_scene_builder, origin=origin)
+            vbd_body_ids.extend(self._vbd_body_ids)
+            vbd_shape_ids.extend(self._vbd_shape_ids)
+            vbd_joint_ids.extend(self._vbd_joint_ids)
+            if env_id == 0:
+                primary_env_metadata = {
+                    "scene_body_ids": list(self.scene_body_ids),
+                    "scene_shape_ids": list(self.scene_shape_ids),
+                    "cable_body_ids": list(self.cable_body_ids),
+                    "cable_head_body_ids": list(self.cable_head_body_ids),
+                    "primary_cable_body_ids": list(self.primary_cable_body_ids),
+                    "tip_body_id": self.tip_body_id,
+                    "plug_body_id": self.plug_body_id,
+                    "grasp_body_id": self.grasp_body_id,
+                }
+
+        self._vbd_body_ids = vbd_body_ids
+        self._vbd_shape_ids = vbd_shape_ids
+        self._vbd_joint_ids = vbd_joint_ids
+        if primary_env_metadata is not None:
+            self.scene_body_ids = primary_env_metadata["scene_body_ids"]
+            self.scene_shape_ids = primary_env_metadata["scene_shape_ids"]
+            self.cable_body_ids = primary_env_metadata["cable_body_ids"]
+            self.cable_head_body_ids = primary_env_metadata["cable_head_body_ids"]
+            self.primary_cable_body_ids = primary_env_metadata["primary_cable_body_ids"]
+            self.tip_body_id = primary_env_metadata["tip_body_id"]
+            self.plug_body_id = primary_env_metadata["plug_body_id"]
+            self.grasp_body_id = primary_env_metadata["grasp_body_id"]
+        return builder
+
+    def _reset_replicated_metadata(self) -> None:
+        self._mujoco_body_count = 0
+        self._mujoco_shape_count = 0
+        self._mujoco_joint_count = 0
+        self._mujoco_joint_coord_count = 0
+        self._mujoco_joint_dof_count = 0
+        self._mujoco_articulation_count = 0
+        self._mujoco_body_ids = []
+        self._mujoco_shape_ids = []
+        self._mujoco_joint_ids = []
+        self._vbd_body_ids = []
+        self._vbd_shape_ids = []
+        self._vbd_joint_ids = []
+        self.proxy_body_ids = []
+        self.proxy_shape_ids = []
+        self.cable_body_q_targets = {}
+        self.robot_joint_coord_ids_by_env = []
+
+    def _append_env_metadata(
+        self,
+        proto_meta: dict[str, object],
+        offsets: tuple[int, int, int, int, int],
+        origin,
+        *,
+        is_primary: bool,
+    ) -> None:
+        body_offset, shape_offset, joint_offset, joint_coord_offset, _joint_dof_offset = offsets
+
+        def offset_ids(ids: list[int], offset: int) -> list[int]:
+            return [offset + int(idx) for idx in ids]
+
+        self._mujoco_body_ids.extend(offset_ids(proto_meta["mujoco_body_ids"], body_offset))
+        self._mujoco_shape_ids.extend(offset_ids(proto_meta["mujoco_shape_ids"], shape_offset))
+        self._mujoco_joint_ids.extend(offset_ids(proto_meta["mujoco_joint_ids"], joint_offset))
+        self._vbd_body_ids.extend(offset_ids(proto_meta["vbd_body_ids"], body_offset))
+        self._vbd_shape_ids.extend(offset_ids(proto_meta["vbd_shape_ids"], shape_offset))
+        self._vbd_joint_ids.extend(offset_ids(proto_meta["vbd_joint_ids"], joint_offset))
+        self.proxy_body_ids.extend(offset_ids(proto_meta["proxy_body_ids"], body_offset))
+        self.proxy_shape_ids.extend(offset_ids(proto_meta["proxy_shape_ids"], shape_offset))
+
+        self._mujoco_body_count += len(proto_meta["mujoco_body_ids"])
+        self._mujoco_shape_count += len(proto_meta["mujoco_shape_ids"])
+        self._mujoco_joint_count += len(proto_meta["mujoco_joint_ids"])
+        self._mujoco_joint_coord_count += int(proto_meta["mujoco_joint_coord_count"])
+        self._mujoco_joint_dof_count += int(proto_meta["mujoco_joint_dof_count"])
+        self._mujoco_articulation_count += int(proto_meta["mujoco_articulation_count"])
+
+        robot_joint_coord_count = int(proto_meta["robot_joint_coord_count"])
+        self.robot_joint_coord_ids_by_env.append(
+            [joint_coord_offset + joint_id for joint_id in range(robot_joint_coord_count)]
+        )
+
+        origin_np = np.array([float(origin[0]), float(origin[1]), float(origin[2]), 0.0, 0.0, 0.0, 0.0])
+        for proto_body_id, target_q in proto_meta["cable_body_q_targets"].items():
+            target_np = np.asarray(target_q, dtype=np.float64) + origin_np
+            self.cable_body_q_targets[body_offset + int(proto_body_id)] = tuple(float(v) for v in target_np)
+
+        if not is_primary:
+            return
+        self.scene_body_ids = offset_ids(proto_meta["scene_body_ids"], body_offset)
+        self.scene_shape_ids = offset_ids(proto_meta["scene_shape_ids"], shape_offset)
+        self.cable_body_ids = offset_ids(proto_meta["cable_body_ids"], body_offset)
+        self.cable_head_body_ids = offset_ids(proto_meta["cable_head_body_ids"], body_offset)
+        self.primary_cable_body_ids = offset_ids(proto_meta["primary_cable_body_ids"], body_offset)
+        self.tip_body_id = body_offset + int(proto_meta["tip_body_id"])
+        self.plug_body_id = body_offset + int(proto_meta["plug_body_id"])
+        self.grasp_body_id = body_offset + int(proto_meta["grasp_body_id"])
 
     def _build_static_scene_template(self):
         """Import the authored static scene through Newton's USD importer before robot setup."""
@@ -643,7 +840,7 @@ class WaterhoseSceneBuilder:
             for dof_id in range(robot.joint_dof_count):
                 gravcomp_joint.values[dof_id] = True
 
-    def _add_waterhose_world(self, builder, static_scene_builder) -> None:
+    def _add_waterhose_world(self, builder, static_scene_builder, origin=None) -> None:
         builder.default_shape_cfg = self.hose_shape_cfg
         builder.rigid_contact_margin = 0.0
         builder.rigid_gap = 0.001
@@ -653,20 +850,23 @@ class WaterhoseSceneBuilder:
 
         scene_body_start = builder.body_count
         scene_shape_start = builder.shape_count
-        builder.add_builder(static_scene_builder)
+        if origin is None:
+            builder.add_builder(static_scene_builder)
+        else:
+            builder.add_builder(static_scene_builder, xform=wp.transform(origin, wp.quat_identity()))
         self.scene_body_ids = list(range(scene_body_start, builder.body_count))
         self.scene_shape_ids = list(range(scene_shape_start, builder.shape_count))
         for shape_index, shape_a in enumerate(self.scene_shape_ids):
             for shape_b in self.scene_shape_ids[shape_index + 1 :]:
                 builder.add_shape_collision_filter_pair(shape_a, shape_b)
 
-        self._add_hoses_from_usd(builder)
+        self._add_hoses_from_usd(builder, origin=origin)
 
         self._vbd_body_ids = list(range(vbd_body_start, builder.body_count))
         self._vbd_shape_ids = list(range(vbd_shape_start, builder.shape_count))
         self._vbd_joint_ids = list(range(vbd_joint_start, builder.joint_count))
 
-    def _add_hoses_from_usd(self, builder) -> None:
+    def _add_hoses_from_usd(self, builder, origin=None) -> None:
         global add_cable_from_usd_curve
 
         if add_cable_from_usd_curve is None:
@@ -702,7 +902,7 @@ class WaterhoseSceneBuilder:
             self._sanitize_imported_labels(builder, result, cable_index)
             self._filter_cable_self_collisions(builder, [*result.cable_body_ids, *result.head_body_ids])
             self._filter_head_parent_neighbor_collisions(builder, result, cable_index)
-            self._cache_asset_transformed_body_targets(builder, [*result.cable_body_ids, *result.head_body_ids])
+            self._cache_asset_transformed_body_targets(builder, [*result.cable_body_ids, *result.head_body_ids], origin)
 
             if cable_index == 0:
                 self.primary_cable_body_ids = list(result.cable_body_ids)
@@ -793,9 +993,11 @@ class WaterhoseSceneBuilder:
         for joint_id in self._vbd_joint_ids:
             set_mode(joint_id, hard=False)
 
-    def _cache_asset_transformed_body_targets(self, builder, body_ids: list[int]) -> None:
+    def _cache_asset_transformed_body_targets(self, builder, body_ids: list[int], origin=None) -> None:
         rot = wp.transform_get_rotation(self.asset_xform)
         pos = wp.transform_get_translation(self.asset_xform)
+        if origin is not None:
+            pos = pos + origin
         for body_id in body_ids:
             body_q = builder.body_q[body_id]
             old_pos = wp.transform_get_translation(body_q)
@@ -1169,7 +1371,10 @@ class WaterhoseIKController:
 
     def _seed_control_targets(self) -> None:
         initial = self.single_robot_model.joint_q.numpy().astype(np.float32, copy=False)
-        wp.copy(self.control.joint_target_pos, wp.array(initial, dtype=wp.float32, device=self.model.device))
+        target_np = self.control.joint_target_pos.numpy().astype(np.float32, copy=True)
+        for joint_coord_ids in self.scene_builder.robot_joint_coord_ids_by_env:
+            target_np[joint_coord_ids] = initial
+        wp.copy(self.control.joint_target_pos, wp.array(target_np, dtype=wp.float32, device=self.model.device))
         self.last_control_q = initial.astype(np.float32, copy=True)
 
     def update(self, sim_time: float) -> str:
@@ -1541,7 +1746,10 @@ class WaterhoseIKController:
             device=self.model.device,
         )
         wp.copy(self.ik_joint_q, limited_ik_q)
-        wp.copy(self.control.joint_target_pos, wp.array(q, dtype=wp.float32, device=self.model.device))
+        target_np = self.control.joint_target_pos.numpy().astype(np.float32, copy=True)
+        for joint_coord_ids in self.scene_builder.robot_joint_coord_ids_by_env:
+            target_np[joint_coord_ids] = q
+        wp.copy(self.control.joint_target_pos, wp.array(target_np, dtype=wp.float32, device=self.model.device))
 
     def _set_gripper_targets(self, q: np.ndarray, right_alpha: float) -> None:
         right_alpha = max(0.0, min(1.0, right_alpha))
@@ -1555,15 +1763,21 @@ def setup_kit_scene(sim, scene_builder: WaterhoseSceneBuilder) -> None:
     """Create simple Kit-side reference geometry when Kit visualization is active."""
     if "kit" not in sim.resolve_visualizer_types():
         return
-    scene_prim_path = "/World/Cable008Scene"
-    if not sim_utils.get_current_stage().GetPrimAtPath(scene_prim_path).IsValid():
+    for env_id, origin in enumerate(scene_builder.env_origins):
+        scene_prim_path = "/World/Cable008Scene" if scene_builder.num_envs == 1 else f"/World/Env_{env_id}/Cable008Scene"
+        if sim_utils.get_current_stage().GetPrimAtPath(scene_prim_path).IsValid():
+            continue
         scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_builder.scene_usd))
         scene_pos = wp.transform_get_translation(scene_builder.asset_xform)
         scene_rot = wp.transform_get_rotation(scene_builder.asset_xform)
         scene_cfg.func(
             scene_prim_path,
             scene_cfg,
-            translation=(float(scene_pos[0]), float(scene_pos[1]), float(scene_pos[2])),
+            translation=(
+                float(scene_pos[0] + origin[0]),
+                float(scene_pos[1] + origin[1]),
+                float(scene_pos[2] + origin[2]),
+            ),
             orientation=(float(scene_rot[3]), float(scene_rot[0]), float(scene_rot[1]), float(scene_rot[2])),
         )
     if not sim_utils.get_current_stage().GetPrimAtPath("/World/DomeLight").IsValid():
@@ -1624,8 +1838,9 @@ def log_progress(step_count: int, task: str, scene_builder: WaterhoseSceneBuilde
     wrench_norm = 0.0
     if wrenches is not None:
         wrench_np = wrenches.numpy()
-        if scene_builder.proxy_body_ids:
-            wrench_norm = float(np.linalg.norm(wrench_np[scene_builder.proxy_body_ids, 0:3]))
+        proxy_body_ids = [body_id for body_id in scene_builder.proxy_body_ids if body_id < wrench_np.shape[0]]
+        if proxy_body_ids:
+            wrench_norm = float(np.linalg.norm(wrench_np[proxy_body_ids, 0:3]))
     print(
         "[INFO]: "
         f"step={step_count:05d} task={task:<15} "
@@ -1717,7 +1932,7 @@ def main() -> None:
             configure_newton_viewer(sim)
             controller = WaterhoseIKController(scene_builder)
 
-            print("[INFO]: Isaac Lab Newton waterhose proxy-coupled demo ready.")
+            print(f"[INFO]: Isaac Lab Newton waterhose proxy-coupled demo ready ({scene_builder.num_envs} envs).")
             print("[INFO]: MJWarp owns RBY1, VBD owns the hose, and Newton IK writes robot joint targets.")
             run_simulator(sim, controller, scene_builder)
         finally:

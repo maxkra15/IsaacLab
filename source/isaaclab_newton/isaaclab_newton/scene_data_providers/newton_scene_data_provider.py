@@ -74,6 +74,10 @@ class NewtonSceneDataProvider(BaseSceneDataProvider):
         if discovered > 0:
             self._num_envs = discovered
             return discovered
+        discovered = self._determine_num_envs_from_newton_model()
+        if discovered > 0:
+            self._num_envs = discovered
+            return discovered
         return 0
 
     def _determine_num_envs_in_scene(self) -> int:
@@ -93,6 +97,24 @@ class NewtonSceneDataProvider(BaseSceneDataProvider):
                 if match:
                     max_env_id = max(max_env_id, int(match.group(1)))
         return max_env_id + 1 if max_env_id >= 0 else 0
+
+    def _determine_num_envs_from_newton_model(self) -> int:
+        """Infer environment count from Newton model metadata when no USD env prims exist."""
+        try:
+            from isaaclab_newton.physics import NewtonManager
+
+            model = NewtonManager.get_model()
+        except Exception:
+            return 0
+        if model is None:
+            return 0
+        num_envs = getattr(model, "num_envs", None)
+        if num_envs is not None and int(num_envs) > 0:
+            return int(num_envs)
+        world_count = getattr(model, "world_count", None)
+        if world_count is not None and int(world_count) > 0:
+            return int(world_count)
+        return 0
 
     # ---- Core provider API -------------------------------------------------------------------
 
