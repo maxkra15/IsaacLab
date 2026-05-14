@@ -22,10 +22,10 @@ class RBY1DFCubeLiftEnvCfg(joint_pos_env_cfg.RBY1DFCubeLiftEnvCfg):
         # post init of parent
         super().__post_init__()
 
-        # Use stiffer PD gains for better task-space IK tracking.
+        # Use stiffer PD gains for task-space IK tracking.
         self.scene.robot = RBY1DF_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        # Relative DLS IK is the most conservative first controller for this unvalidated asset.
+        # Relative DLS IK drives the right-arm TCP while the inherited gripper action closes on the cube.
         self.actions.arm_action = DifferentialInverseKinematicsActionCfg(
             asset_name="robot",
             joint_names=RIGHT_ARM_JOINTS,

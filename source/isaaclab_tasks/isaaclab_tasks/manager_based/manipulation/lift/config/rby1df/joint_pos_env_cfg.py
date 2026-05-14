@@ -95,11 +95,17 @@ def _right_tcp_frame_cfg() -> FrameTransformerCfg:
 
 @configclass
 class RBY1DFCubeLiftEnvCfg(LiftEnvCfg):
+    """RBY1DF cube-lift scene and shared MDP setup.
+
+    The default registered RBY1DF task uses the IK subclass in ``ik_rel_env_cfg``.
+    This joint-position action remains useful as a simple comparison controller.
+    """
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
 
-        # Set RBY1DF as robot.  The base is fixed at floor height while the table top remains near z=0.
+        # Set RBY1DF as robot.
         self.scene.robot = RBY1DF_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
         # Use Newton's MJWarp manager/solver for the rigid robot/object simulation.
@@ -121,12 +127,12 @@ class RBY1DFCubeLiftEnvCfg(LiftEnvCfg):
             debug_mode=False,
         )
 
-        # Keep the first task narrow: train only the right arm and one gripper command joint.
+        # Expose only the task joints to the policy and velocity penalty.
         self.observations.policy.joint_pos.params = {"asset_cfg": _controlled_joints()}
         self.observations.policy.joint_vel.params = {"asset_cfg": _controlled_joints()}
         self.rewards.joint_vel.params["asset_cfg"] = _controlled_joints()
 
-        # Set actions for right-arm cube manipulation.
+        # Joint-position fallback; the primary task overrides this with IK.
         self.actions.arm_action = mdp.JointPositionActionCfg(
             asset_name="robot",
             joint_names=RIGHT_ARM_JOINTS,
@@ -140,7 +146,7 @@ class RBY1DFCubeLiftEnvCfg(LiftEnvCfg):
             close_command_expr={"right_gripper_finger_joint_1": 0.0},
         )
 
-        # The command term needs a physical body.  The actual TCP is represented as an offset below.
+        # The command term needs a physical body; the TCP itself is represented by the frame offset below.
         self.commands.object_pose.body_name = "right_arm_tool_flange"
         self.commands.object_pose.ranges.pos_x = (0.45, 0.65)
         self.commands.object_pose.ranges.pos_y = (-0.4, -0.1)
