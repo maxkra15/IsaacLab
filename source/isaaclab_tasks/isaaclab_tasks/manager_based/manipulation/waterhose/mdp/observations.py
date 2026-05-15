@@ -51,31 +51,37 @@ def _body_pose_tensor(env: ManagerBasedRLEnv, body_ids: list[int]) -> tuple[torc
 
 def eef_pos(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Right end-effector position [m]."""
+    _ensure_metadata(env)
     return _body_pose_tensor(env, env.waterhose_right_ee_body_ids)[0]
 
 
 def eef_quat(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Right end-effector orientation quaternion ``xyzw``."""
+    _ensure_metadata(env)
     return _body_pose_tensor(env, env.waterhose_right_ee_body_ids)[1]
 
 
 def plug_pos(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Waterhose plug position [m]."""
+    _ensure_metadata(env)
     return _body_pose_tensor(env, env.waterhose_plug_body_ids)[0]
 
 
 def plug_quat(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Waterhose plug orientation quaternion ``xyzw``."""
+    _ensure_metadata(env)
     return _body_pose_tensor(env, env.waterhose_plug_body_ids)[1]
 
 
 def tip_pos(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Waterhose tip position [m]."""
+    _ensure_metadata(env)
     return _body_pose_tensor(env, env.waterhose_tip_body_ids)[0]
 
 
 def tip_quat(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Waterhose tip orientation quaternion ``xyzw``."""
+    _ensure_metadata(env)
     return _body_pose_tensor(env, env.waterhose_tip_body_ids)[1]
 
 

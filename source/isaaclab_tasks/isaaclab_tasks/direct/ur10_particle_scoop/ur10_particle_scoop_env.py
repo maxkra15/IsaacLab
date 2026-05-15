@@ -315,6 +315,10 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._last_paddle_retreat_speed = torch.zeros(self.num_envs, device=self.device)
         self._last_paddle_velocity = torch.zeros(self.num_envs, 3, device=self.device)
         self._last_particle_centroid_velocity = torch.zeros(self.num_envs, 3, device=self.device)
+        self._nonfinite_state = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._last_nonfinite_observation = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._last_reset_ik_failure = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._last_reset_ik_position_error = torch.zeros(self.num_envs, device=self.device)
         self._episode_sums = {
             "bin_fraction": torch.zeros(self.num_envs, device=self.device),
             "delta_bin_fraction": torch.zeros(self.num_envs, device=self.device),
@@ -378,7 +382,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
 
         self.obs_buf = self._get_observations()
         if self.cfg.observation_noise_model:
-            self.obs_buf["policy"] = self._observation_noise_model(self.obs_buf["policy"])
+            self.obs_buf["proprio"] = self._observation_noise_model(self.obs_buf["proprio"])
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
@@ -417,6 +421,21 @@ class UR10ParticleScoopEnv(DirectRLEnv):
     def _simulate_mpm_step(self) -> None:
         state = NewtonManager.get_state_0()
         self._mpm_solver.step(state, state, control=None, contacts=None, dt=self.physics_dt)
+
+    @staticmethod
+    def _replace_nonfinite(values: torch.Tensor, fallback: torch.Tensor | float = 0.0) -> torch.Tensor:
+        fallback_tensor = torch.as_tensor(fallback, device=values.device, dtype=values.dtype)
+        fallback_tensor = torch.broadcast_to(fallback_tensor, values.shape)
+        return torch.where(torch.isfinite(values), values, fallback_tensor)
+
+    @staticmethod
+    def _sanitize_quat(quat: torch.Tensor) -> torch.Tensor:
+        identity = torch.zeros_like(quat)
+        identity[..., 3] = 1.0
+        finite = torch.isfinite(quat).all(dim=-1, keepdim=True)
+        norm = torch.linalg.norm(torch.nan_to_num(quat), dim=-1, keepdim=True)
+        valid = finite & (norm > 1.0e-8)
+        return torch.where(valid, quat / torch.clamp(norm, min=1.0e-8), identity)
 
     def _create_ik_solver(self) -> None:
         ik_builder = NewtonManager.create_builder()
@@ -774,8 +793,9 @@ class UR10ParticleScoopEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._apply_viewer_forces()
-        self._actions = actions.clamp(-1.0, 1.0)
+        self._actions = torch.nan_to_num(actions, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
         joint_q = wp.to_torch(NewtonManager.get_state_0().joint_q)[self._joint_q_ids]
+        self._target_paddle_pos = self._replace_nonfinite(self._target_paddle_pos, self._previous_paddle_pos)
         self._target_paddle_pos = self._clamp_paddle_target_position(
             self._target_paddle_pos + self._actions[:, :3] * self.cfg.cartesian_position_action_scale * self.step_dt
         )
@@ -827,14 +847,12 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         return torch.clamp(position, min=lower, max=self._workspace_upper)
 
     def _get_observations(self) -> dict:
-        particle_pos = self._particle_pos_e()
+        particle_pos = self._sanitize_particle_pos(self._particle_pos_e())
         heightmap_grid, density_grid = self._particle_grid_observations(particle_pos)
-        particle_grid = torch.cat(
-            (heightmap_grid.reshape(self.num_envs, -1), density_grid.reshape(self.num_envs, -1)), dim=-1
-        )
+        gridmap = torch.stack((heightmap_grid, density_grid), dim=1)
         state = NewtonManager.get_state_0()
-        joint_q = wp.to_torch(state.joint_q)[self._joint_q_ids]
-        joint_qd = wp.to_torch(state.joint_qd)[self._joint_qd_ids]
+        joint_q = self._replace_nonfinite(wp.to_torch(state.joint_q)[self._joint_q_ids], self._default_joint_q)
+        joint_qd = self._replace_nonfinite(wp.to_torch(state.joint_qd)[self._joint_qd_ids], 0.0)
         bin_fraction = self._count_particles_in_bin(particle_pos)[:, None] / float(self._particle_count)
         paddle_corners = self._paddle_corners_e()
         particle_centroid = self._robust_particle_centroid(particle_pos)
@@ -858,9 +876,8 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         spill_fraction = self._particles_spilled(particle_pos).float().mean(dim=1, keepdim=True)
         particle_progress = self._particle_progress_toward_bin(particle_pos)[:, None]
         bin_proximity = self._particle_bin_proximity(particle_pos)[:, None]
-        obs = torch.cat(
+        proprio = torch.cat(
             (
-                particle_grid,
                 self._normalize_joint_positions(joint_q),
                 self._normalize_joint_velocities(joint_qd),
                 self._normalize_positions(paddle_pos),
@@ -886,14 +903,23 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             ),
             dim=-1,
         )
+        nonfinite_proprio = ~torch.isfinite(proprio).all(dim=1)
+        if torch.any(nonfinite_proprio):
+            self._last_nonfinite_observation = nonfinite_proprio
+            self.extras.setdefault("log", {})["Diagnostics/nonfinite_proprio"] = nonfinite_proprio.float().mean().item()
+            proprio = torch.nan_to_num(proprio, nan=0.0, posinf=5.0, neginf=-5.0)
         self._policy_observation_spheres.update(
             self, heightmap_grid, density_grid, paddle_corners, particle_centroid, particle_pos
         )
-        critic_obs = torch.cat((obs, self._privileged_observations(particle_pos, paddle_velocity)), dim=-1)
-        return {"policy": torch.clamp(obs, -5.0, 5.0), "critic": torch.clamp(critic_obs, -5.0, 5.0)}
+        privileged = self._privileged_observations(particle_pos, paddle_velocity)
+        return {
+            "gridmap": torch.nan_to_num(torch.clamp(gridmap, 0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0),
+            "proprio": torch.nan_to_num(torch.clamp(proprio, -5.0, 5.0), nan=0.0, posinf=5.0, neginf=-5.0),
+            "privileged": torch.nan_to_num(torch.clamp(privileged, -5.0, 5.0), nan=0.0, posinf=5.0, neginf=-5.0),
+        }
 
     def _get_rewards(self) -> torch.Tensor:
-        particle_pos = self._particle_pos_e()
+        particle_pos = self._sanitize_particle_pos(self._particle_pos_e())
         count = self._count_particles_in_bin(particle_pos)
         bin_fraction = count / float(self._particle_count)
         delta_bin_fraction = bin_fraction - self._previous_bin_fraction
@@ -995,7 +1021,8 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             "joint_velocity_penalty": -self.cfg.joint_velocity_penalty_scale * joint_velocity_penalty,
             "success_bonus": self.cfg.reward_success_bonus * success.float(),
         }
-        reward = torch.stack(list(rewards.values()), dim=0).sum(dim=0)
+        rewards = {name: torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0) for name, value in rewards.items()}
+        reward = torch.nan_to_num(torch.stack(list(rewards.values()), dim=0).sum(dim=0), nan=0.0, posinf=0.0, neginf=0.0)
         for name, value in rewards.items():
             self._episode_sums[name] += value
         self._last_bin_fraction = bin_fraction
@@ -1016,9 +1043,19 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        particle_pos = self._particle_pos_e()
+        particle_pos_raw = self._particle_pos_e()
+        particle_pos = self._sanitize_particle_pos(particle_pos_raw)
+        joint_q = wp.to_torch(NewtonManager.get_state_0().joint_q)[self._joint_q_ids]
+        joint_qd = wp.to_torch(NewtonManager.get_state_0().joint_qd)[self._joint_qd_ids]
+        ee_pose = wp.to_torch(NewtonManager.get_state_0().body_q)[self._ee_body_ids]
+        self._nonfinite_state = (
+            ~torch.isfinite(particle_pos_raw).flatten(start_dim=1).all(dim=1)
+            | ~torch.isfinite(joint_q).all(dim=1)
+            | ~torch.isfinite(joint_qd).all(dim=1)
+            | ~torch.isfinite(ee_pose).all(dim=1)
+        )
         bin_fraction = self._count_particles_in_bin(particle_pos) / float(self._particle_count)
-        terminated = bin_fraction >= self._target_success_fraction()
+        terminated = (bin_fraction >= self._target_success_fraction()) | self._nonfinite_state
         self._episode_succeeded |= terminated
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, truncated
@@ -1055,6 +1092,12 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             extras["Metrics/particle_push_speed"] = self._last_particle_push_speed[env_ids].mean().item()
             extras["Metrics/paddle_retreat_speed"] = self._last_paddle_retreat_speed[env_ids].mean().item()
             extras["Metrics/success_rate"] = self._episode_succeeded[env_ids].float().mean().item()
+            extras["Diagnostics/nonfinite_state_rate"] = self._nonfinite_state[env_ids].float().mean().item()
+            extras["Diagnostics/nonfinite_observation_rate"] = self._last_nonfinite_observation[
+                env_ids
+            ].float().mean().item()
+            extras["Diagnostics/reset_ik_failure_rate"] = self._last_reset_ik_failure[env_ids].float().mean().item()
+            extras["Diagnostics/reset_ik_position_error"] = self._last_reset_ik_position_error[env_ids].mean().item()
             extras["Curriculum/stage"] = float(self._curriculum_stage)
             extras["Curriculum/success_ema"] = float(self._curriculum_success_ema)
             extras["Curriculum/target_success_fraction"] = float(self._target_success_fraction())
@@ -1121,8 +1164,13 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._last_paddle_retreat_speed[env_ids] = 0.0
         self._last_paddle_velocity[env_ids] = 0.0
         self._last_particle_centroid_velocity[env_ids] = 0.0
+        self._nonfinite_state[env_ids] = False
+        self._last_nonfinite_observation[env_ids] = False
+        self._last_reset_ik_failure[env_ids] = False
+        self._last_reset_ik_position_error[env_ids] = 0.0
 
     def _particle_grid_observations(self, particle_pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        particle_pos = self._sanitize_particle_pos(particle_pos)
         map_size = self.cfg.heightmap_size
         rel_x = (particle_pos[..., 0] - self._heightmap_x_min) / self._heightmap_x_range
         rel_y = (particle_pos[..., 1] - self._heightmap_y_min) / self._heightmap_y_range
@@ -1131,7 +1179,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         particle_height = torch.clamp(
             (particle_pos[..., 2] - self._heightmap_z_min) / self.cfg.heightmap_z_range, 0.0, 1.0
         )
-        valid = (rel_x >= 0.0) & (rel_x < 1.0) & (rel_y >= 0.0) & (rel_y < 1.0)
+        valid = torch.isfinite(particle_pos).all(dim=-1) & (rel_x >= 0.0) & (rel_x < 1.0) & (rel_y >= 0.0) & (rel_y < 1.0)
         particle_height = torch.where(
             valid,
             torch.clamp(particle_height, min=self.cfg.heightmap_occupied_cell_value),
@@ -1151,11 +1199,22 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         particle_pos_w = wp.to_torch(NewtonManager.get_state_0().particle_q)[self._particle_ids]
         return particle_pos_w - self.scene.env_origins[:, None, :]
 
+    def _sanitize_particle_pos(self, particle_pos: torch.Tensor) -> torch.Tensor:
+        finite_particle = torch.isfinite(particle_pos).all(dim=-1, keepdim=True)
+        if hasattr(self, "_nonfinite_state"):
+            self._nonfinite_state |= ~finite_particle.squeeze(-1).all(dim=1)
+        fallback = self._current_pile_center[:, None, :].expand_as(particle_pos)
+        return torch.where(finite_particle, particle_pos, fallback)
+
     def _paddle_pose_e(self) -> tuple[torch.Tensor, torch.Tensor]:
         body_q = wp.to_torch(NewtonManager.get_state_0().body_q)
         ee_pose = body_q[self._ee_body_ids]
-        paddle_pos = ee_pose[:, :3] + self._quat_rotate(ee_pose[:, 3:7], self._paddle_center_offset)
-        return paddle_pos - self.scene.env_origins, ee_pose[:, 3:7]
+        if hasattr(self, "_nonfinite_state"):
+            self._nonfinite_state |= ~torch.isfinite(ee_pose).all(dim=1)
+        ee_pos = self._replace_nonfinite(ee_pose[:, :3], self.scene.env_origins)
+        ee_quat = self._sanitize_quat(ee_pose[:, 3:7])
+        paddle_pos = ee_pos + self._quat_rotate(ee_quat, self._paddle_center_offset)
+        return paddle_pos - self.scene.env_origins, ee_quat
 
     def _paddle_pos_e(self) -> torch.Tensor:
         return self._paddle_pose_e()[0]
@@ -1306,6 +1365,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         return torch.cat((-quat[..., :3], quat[..., 3:4]), dim=-1)
 
     def _robust_particle_centroid(self, particle_pos: torch.Tensor) -> torch.Tensor:
+        particle_pos = self._sanitize_particle_pos(particle_pos)
         in_workspace = self._particles_in_workspace(particle_pos)
         weights = in_workspace.float()
         weighted_sum = torch.sum(particle_pos * weights.unsqueeze(-1), dim=1)
@@ -1318,14 +1378,16 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         return self._particles_in_bin(particle_pos).sum(dim=1, dtype=torch.float32)
 
     def _particles_in_bin(self, particle_pos: torch.Tensor) -> torch.Tensor:
+        finite = torch.isfinite(particle_pos).all(dim=-1)
         above_lower = particle_pos > self._bin_lower
         below_upper = particle_pos < self._bin_upper
-        return torch.all(above_lower & below_upper, dim=-1)
+        return finite & torch.all(above_lower & below_upper, dim=-1)
 
     def _particles_in_workspace(self, particle_pos: torch.Tensor) -> torch.Tensor:
+        finite = torch.isfinite(particle_pos).all(dim=-1)
         above_lower = particle_pos > self._workspace_lower
         below_upper = particle_pos < self._workspace_upper
-        return torch.all(above_lower & below_upper, dim=-1)
+        return finite & torch.all(above_lower & below_upper, dim=-1)
 
     def _particles_spilled(self, particle_pos: torch.Tensor) -> torch.Tensor:
         return ~self._particles_in_workspace(particle_pos)
@@ -1446,7 +1508,6 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         target_paddle[:, 0] = torch.clamp(target_paddle[:, 0], min=paddle_xy_lower[0], max=paddle_x_upper)
         target_paddle[:, 2] = self.cfg.table_top_z + float(self.cfg.curriculum_robot_start_z_offsets[stage])
 
-        target_quat = torch.tensor((0.0, 0.70710678, 0.0, 0.70710678), device=self.device).repeat(num_resets, 1)
         model = NewtonManager.get_model()
         joint_q = wp.to_torch(state_0.joint_q)
         joint_qd = wp.to_torch(state_0.joint_qd)
@@ -1456,7 +1517,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         target_paddle_all = target_paddle_all.clone()
         target_quat_all = target_quat_all.clone()
         target_paddle_all[env_ids] = target_paddle
-        target_quat_all[env_ids] = target_quat
+        target_quat_all[env_ids] = self._target_paddle_quat()[env_ids]
         current_joint_q = joint_q[self._joint_q_ids].clone()
         max_reset_delta = self.cfg.max_ik_reset_delta_q * self.cfg.curriculum_robot_init_iterations
         solved_joint_q = self._solve_newton_ik(
@@ -1469,6 +1530,22 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         joint_q[self._joint_q_ids[env_ids]] = solved_joint_q[env_ids]
         joint_qd[self._joint_qd_ids[env_ids]] = 0.0
         eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
+
+        achieved_paddle = self._paddle_pos_e()[env_ids]
+        reset_error = torch.linalg.norm(achieved_paddle - target_paddle, dim=-1)
+        reset_failed = (~torch.isfinite(reset_error)) | (reset_error > self.cfg.reset_ik_position_tolerance)
+        self._last_reset_ik_position_error[env_ids] = torch.nan_to_num(
+            reset_error,
+            nan=self.cfg.reset_ik_position_tolerance,
+            posinf=self.cfg.reset_ik_position_tolerance,
+            neginf=self.cfg.reset_ik_position_tolerance,
+        )
+        self._last_reset_ik_failure[env_ids] = reset_failed
+        if torch.any(reset_failed):
+            failed_env_ids = env_ids[reset_failed]
+            joint_q[self._joint_q_ids[failed_env_ids]] = current_joint_q[failed_env_ids]
+            joint_qd[self._joint_qd_ids[failed_env_ids]] = 0.0
+            eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
 
         wp.to_torch(state_1.joint_q)[self._joint_q_ids[env_ids]] = joint_q[self._joint_q_ids[env_ids]]
         wp.to_torch(state_1.joint_qd)[self._joint_qd_ids[env_ids]] = 0.0

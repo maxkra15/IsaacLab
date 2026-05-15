@@ -43,12 +43,19 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     episode_length_s = 12.0
     action_space = 3
     arm_dof_count = 6
-    heightmap_size = 20
+    heightmap_size = 64
     heightmap_channels = 2
     proprio_dim = 71
     privileged_dim = 13
-    observation_space = heightmap_size * heightmap_size * heightmap_channels + proprio_dim
-    state_space = observation_space + privileged_dim
+    observation_space = {
+        "gridmap": [heightmap_channels, heightmap_size, heightmap_size],
+        "proprio": proprio_dim,
+    }
+    state_space = {
+        "gridmap": [heightmap_channels, heightmap_size, heightmap_size],
+        "proprio": proprio_dim,
+        "privileged": privileged_dim,
+    }
 
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -67,7 +74,7 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     )
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=1.5, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=2, replicate_physics=True)
     viewer = ViewerCfg(eye=(1, -1, 0.7), lookat=(0, 0.0, 0.75))
 
     # Newton UR10 import
@@ -220,8 +227,9 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     )
     curriculum_robot_start_z_offsets = (0.145, 0.145, 0.150, 0.155, 0.160, 0.165)
     max_ik_reset_delta_q = 0.16
+    reset_ik_position_tolerance = 0.06
 
 
 @configclass
 class UR10ParticleScoopEnvCfg_PLAY(UR10ParticleScoopEnvCfg):
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=1.8, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=2.2, replicate_physics=True)

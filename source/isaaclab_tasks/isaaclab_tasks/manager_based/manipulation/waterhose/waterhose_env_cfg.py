@@ -17,6 +17,8 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
+from isaaclab_assets import ISAACLAB_ASSETS_DATA_DIR
+
 from . import mdp
 from .actions import NewtonTaskSpaceIKAction, NewtonTaskSpaceIKActionCfg
 
@@ -115,7 +117,7 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     episode_length_s = 30.0
     decimation = 1
 
-    asset_root: str = "/home/maximiliank/Downloads/cable_robot.tar/cable_robot/assets"
+    asset_root: str = f"{ISAACLAB_ASSETS_DATA_DIR}/Props/Waterhose"
     robot_urdf: str | None = None
     scene_usd: str | None = None
     cable_usd: str | None = None

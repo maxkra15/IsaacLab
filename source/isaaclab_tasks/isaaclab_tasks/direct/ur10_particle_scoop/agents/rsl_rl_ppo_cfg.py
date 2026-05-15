@@ -5,7 +5,7 @@
 
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlCNNModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
 
 @configclass
@@ -13,22 +13,34 @@ class UR10ParticleScoopPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 64
     max_iterations = 1000
     save_interval = 100
-    experiment_name = "ur10_particle_scoop_direct"
+    experiment_name = "ur10_particle_scoop_grid_cnn_direct"
     clip_actions = 1.0
     logger = "wandb"
     wandb_project = "UR10_particles_scoop"
     wandb_entity = None
-    obs_groups = {"actor": ["policy"], "critic": ["critic"]}
-    actor = RslRlMLPModelCfg(
+    obs_groups = {"actor": ["proprio", "gridmap"], "critic": ["proprio", "gridmap", "privileged"]}
+    actor = RslRlCNNModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
         obs_normalization=True,
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.6),
+        distribution_cfg=RslRlCNNModelCfg.GaussianDistributionCfg(init_std=0.6),
+        cnn_cfg=RslRlCNNModelCfg.CNNCfg(
+            output_channels=[32, 64, 64],
+            kernel_size=[8, 4, 3],
+            stride=[4, 2, 1],
+            activation="elu",
+        ),
     )
-    critic = RslRlMLPModelCfg(
+    critic = RslRlCNNModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
         obs_normalization=True,
+        cnn_cfg=RslRlCNNModelCfg.CNNCfg(
+            output_channels=[32, 64, 64],
+            kernel_size=[8, 4, 3],
+            stride=[4, 2, 1],
+            activation="elu",
+        ),
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=0.5,
@@ -44,4 +56,5 @@ class UR10ParticleScoopPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
         normalize_advantage_per_mini_batch=True,
+        share_cnn_encoders=True,
     )
