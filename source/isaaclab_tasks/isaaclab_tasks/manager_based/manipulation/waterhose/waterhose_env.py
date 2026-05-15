@@ -12,6 +12,7 @@ import torch
 from isaaclab_newton.physics import NewtonCfg
 
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.physics import PhysicsEvent
 
 from . import waterhose_core as core
 from .waterhose_env_cfg import RBY1DFWaterhoseEnvCfg
@@ -61,6 +62,23 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
             use_cuda_graph=not bool(cfg.disable_cuda_graph),
         )
         core.NewtonManager.set_builder(self.waterhose_builder)
+        self._register_cable_xform_callback()
+
+    def _register_cable_xform_callback(self) -> None:
+        def apply_cable_xform(_payload) -> None:
+            self.waterhose_scene_builder.apply_runtime_cable_asset_xform(sync_solver_prev=False)
+            handle = getattr(self, "_waterhose_cable_xform_callback", None)
+            if handle is not None:
+                handle.deregister()
+                self._waterhose_cable_xform_callback = None
+
+        self._waterhose_cable_xform_callback = core.NewtonManager.register_callback(
+            apply_cable_xform,
+            PhysicsEvent.PHYSICS_READY,
+            order=-1000,
+            name="waterhose_cable_asset_xform",
+            wrap_weak_ref=False,
+        )
 
     def _finish_waterhose_runtime_setup(self) -> None:
         scene_builder = self.waterhose_scene_builder

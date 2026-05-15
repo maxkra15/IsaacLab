@@ -53,10 +53,10 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         self._body_ids = _resolve_body_ids(self._model.body_label, core.RIGHT_EE, self.num_envs)
         self._left_body_ids = _resolve_body_ids(self._model.body_label, core.LEFT_EE, self.num_envs)
         self._torso_body_ids = _resolve_body_ids(self._model.body_label, core.TORSO, self.num_envs)
-        self._right_open_targets, self._right_closed_targets = _gripper_target_pairs(
-            self._model, self._scene_builder.right_gripper_dofs
+        self._right_open_driver, self._right_closed_driver = _gripper_driver_targets(
+            self._model, self._scene_builder.right_gripper_driver_dofs
         )
-        self._left_open_targets, _ = _gripper_target_pairs(self._model, self._scene_builder.left_gripper_dofs)
+        self._left_open_driver, _ = _gripper_driver_targets(self._model, self._scene_builder.left_gripper_driver_dofs)
         self._setup_ik()
         self._seed_control_targets()
 
@@ -88,7 +88,10 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         for env_id, joint_coord_ids in enumerate(self._scene_builder.robot_joint_coord_ids_by_env):
             ee_q = body_q[self._body_ids[env_id]]
             target_pos = ee_q[:3].astype(np.float64) + action_np[env_id, :3].astype(np.float64)
-            target_quat = _integrate_axis_angle(ee_q[3:].astype(np.float64), action_np[env_id, 3:6].astype(np.float64))
+            target_quat = _integrate_axis_angle(
+                ee_q[3:].astype(np.float64),
+                action_np[env_id, 3:6].astype(np.float64),
+            )
             q = self._solve_env(env_id, joint_q[joint_coord_ids].astype(np.float32), target_pos, target_quat)
             self._set_gripper_targets(q, float(action_np[env_id, 6]))
             max_step = np.full_like(q, float(self.cfg.max_joint_step))
@@ -123,12 +126,17 @@ class NewtonTaskSpaceIKAction(ActionTerm):
 
     def action_to_target_pose(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         state_np = core.NewtonManager.get_state_0().body_q.numpy()
+        processed_position = actions[:, :3] * float(self.cfg.position_scale)
+        processed_rotation = actions[:, 3:6] * float(self.cfg.rotation_scale)
         pos = []
         quat = []
         for env_id in range(actions.shape[0]):
             ee_q = state_np[self._body_ids[env_id]]
-            pos.append(torch.as_tensor(ee_q[:3], device=self.device, dtype=torch.float32) + actions[env_id, :3])
-            quat_np = _integrate_axis_angle(ee_q[3:].astype(np.float64), actions[env_id, 3:6].detach().cpu().numpy())
+            pos.append(torch.as_tensor(ee_q[:3], device=self.device, dtype=torch.float32) + processed_position[env_id])
+            quat_np = _integrate_axis_angle(
+                ee_q[3:].astype(np.float64),
+                processed_rotation[env_id].detach().cpu().numpy(),
+            )
             quat.append(torch.as_tensor(quat_np, device=self.device, dtype=torch.float32))
         return torch.stack(pos, dim=0), torch.stack(quat, dim=0)
 
@@ -191,12 +199,14 @@ class NewtonTaskSpaceIKAction(ActionTerm):
     def _solve_env(
         self, env_id: int, current_q: np.ndarray, target_pos: np.ndarray, target_quat: np.ndarray
     ) -> np.ndarray:
-        self._pos_objs[0].set_target_position(0, core.wp.vec3(*[float(v) for v in target_pos]))
+        origin = np.array([float(self._scene_builder.env_origins[env_id][i]) for i in range(3)], dtype=np.float64)
+        local_target_pos = target_pos - origin
+        self._pos_objs[0].set_target_position(0, core.wp.vec3(*[float(v) for v in local_target_pos]))
         self._rot_objs[0].set_target_rotation(0, core.wp.vec4(*[float(v) for v in target_quat]))
         hold_body_ids = (self._left_body_ids[env_id], self._torso_body_ids[env_id])
         for objective_idx, body_id in enumerate(hold_body_ids, start=1):
             q = core.NewtonManager.get_state_0().body_q.numpy()[body_id]
-            self._pos_objs[objective_idx].set_target_position(0, core.wp.vec3(*[float(v) for v in q[:3]]))
+            self._pos_objs[objective_idx].set_target_position(0, core.wp.vec3(*[float(v) for v in q[:3] - origin]))
             self._rot_objs[objective_idx].set_target_rotation(0, core.wp.vec4(*[float(v) for v in q[3:]]))
         core.wp.copy(
             self._ik_joint_q,
@@ -216,10 +226,16 @@ class NewtonTaskSpaceIKAction(ActionTerm):
 
     def _set_gripper_targets(self, q: np.ndarray, gripper_action: float) -> None:
         right_alpha = 1.0 if gripper_action > 0.0 else 0.0
-        for idx, dof in enumerate(self._scene_builder.right_gripper_dofs[:2]):
-            q[dof] = (1.0 - right_alpha) * self._right_open_targets[idx] + right_alpha * self._right_closed_targets[idx]
-        for idx, dof in enumerate(self._scene_builder.left_gripper_dofs[:2]):
-            q[dof] = self._left_open_targets[idx]
+        right_driver = (1.0 - right_alpha) * self._right_open_driver + right_alpha * self._right_closed_driver
+        _set_gripper_side(
+            q, self._scene_builder.right_gripper_driver_dofs, self._scene_builder.right_gripper_dofs, right_driver
+        )
+        _set_gripper_side(
+            q,
+            self._scene_builder.left_gripper_driver_dofs,
+            self._scene_builder.left_gripper_dofs,
+            self._left_open_driver,
+        )
 
 
 def _resolve_body_ids(labels: list[str], short_name: str, num_envs: int) -> list[int]:
@@ -230,13 +246,23 @@ def _resolve_body_ids(labels: list[str], short_name: str, num_envs: int) -> list
     return matches[:num_envs]
 
 
-def _gripper_target_pairs(model, dofs: list[int]) -> tuple[list[float], list[float]]:
-    if len(dofs) < 2:
-        return [0.0] * len(dofs), [0.0] * len(dofs)
-    lower = model.joint_limit_lower.numpy()[dofs]
-    upper = model.joint_limit_upper.numpy()[dofs]
-    eps = 1.0e-4
-    return [-0.04, 0.04], [float(upper[0] - eps), float(lower[1] + eps)]
+def _gripper_driver_targets(model, driver_dofs: list[int]) -> tuple[float, float]:
+    if not driver_dofs:
+        return 0.0, 0.0
+    dof = driver_dofs[0]
+    lower = float(model.joint_limit_lower.numpy()[dof])
+    upper = float(model.joint_limit_upper.numpy()[dof])
+    open_target = 0.5 * upper
+    closed_target = 2.0 * 0.0036
+    return max(lower, min(upper, open_target)), max(lower, min(upper, closed_target))
+
+
+def _set_gripper_side(q: np.ndarray, driver_dofs: list[int], finger_dofs: list[int], driver_target: float) -> None:
+    if driver_dofs:
+        q[driver_dofs[0]] = driver_target
+    if len(finger_dofs) >= 2:
+        q[finger_dofs[0]] = -0.5 * driver_target
+        q[finger_dofs[1]] = 0.5 * driver_target
 
 
 def _integrate_axis_angle(quat_xyzw: np.ndarray, axis_angle: np.ndarray) -> np.ndarray:

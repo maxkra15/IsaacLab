@@ -16,8 +16,7 @@ os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
 
 _ISAACLAB_ROOT = Path(__file__).resolve().parents[6]
 _DEFAULT_RBY1_URDF = _ISAACLAB_ROOT / "source/isaaclab_assets/data/Robots/RBY1DF/urdf/robot_edited.urdf"
-_DEFAULT_CABLE_ROBOT_ROOT = Path("/home/maximiliank/Downloads/cable_robot.tar/cable_robot")
-_DEFAULT_CABLE_ROBOT_ASSETS = _DEFAULT_CABLE_ROBOT_ROOT / "assets"
+_DEFAULT_CABLE_ROBOT_ASSETS = _ISAACLAB_ROOT / "source/isaaclab_assets/data/Props/Waterhose"
 
 
 def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
@@ -163,10 +162,21 @@ def import_newton_dependencies() -> None:
 
 
 def _load_cable_curve_importer():
-    """Load the bundle's USD cable importer without requiring it to be installed as a package."""
+    """Load the USD BasisCurves cable importer."""
+    try:
+        from newton.examples.cable_robot.usd_cable_curve_import import add_cable_from_usd_curve as importer
+
+        return importer
+    except ImportError:
+        pass
+
+    # Fallback for local asset bundles that carry a copy next to ``assets/``.
     helper_path = args_cli.asset_root.expanduser().resolve().parent / "usd_cable_curve_import.py"
     if not helper_path.is_file():
-        raise FileNotFoundError(f"Cable USD importer not found: {helper_path}")
+        raise FileNotFoundError(
+            "Cable USD importer not found in newton.examples.cable_robot or next to the configured asset root: "
+            f"{helper_path}"
+        )
     spec = importlib.util.spec_from_file_location("cable_robot_usd_cable_curve_import", helper_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to load cable USD importer from {helper_path}")
@@ -397,6 +407,10 @@ class WaterhoseSceneBuilder:
 
         self.single_robot_model = None
         self.gripper_dofs: list[int] = []
+        self.gripper_driver_dofs: list[int] = []
+        self.gripper_finger_dofs: list[int] = []
+        self.right_gripper_driver_dofs: list[int] = []
+        self.left_gripper_driver_dofs: list[int] = []
         self.right_gripper_dofs: list[int] = []
         self.left_gripper_dofs: list[int] = []
         self.proxy_body_ids: list[int] = []
@@ -687,48 +701,35 @@ class WaterhoseSceneBuilder:
             ignore_inertial_definitions=True,
         )
 
-        self._patch_zero_mass_children(robot)
-        self._disable_gripper_mimic_constraints(robot)
+        self._patch_gripper_dummy_bodies(robot)
         self._discover_gripper_dofs(robot)
         self._configure_robot_dofs(robot)
         self._seed_initial_joint_state(robot)
         self._enable_gravity_compensation(robot)
         return robot
 
-    def _patch_zero_mass_children(self, robot) -> None:
-        """Patch invalid zero-mass driven links at runtime without editing the URDF asset."""
-        min_inertia = wp.mat33(
-            robot.bound_inertia,
-            0.0,
-            0.0,
-            0.0,
-            robot.bound_inertia,
-            0.0,
-            0.0,
-            0.0,
-            robot.bound_inertia,
-        )
-        for child in {int(v) for v in robot.joint_child if int(v) >= 0}:
-            if robot.body_mass[child] <= 0.0:
-                robot.body_mass[child] = robot.bound_mass
-                robot.body_inv_mass[child] = 1.0 / robot.bound_mass
-                robot.body_inertia[child] = min_inertia
-                robot.body_inv_inertia[child] = wp.inverse(min_inertia)
-
     @staticmethod
-    def _disable_gripper_mimic_constraints(robot) -> None:
-        """Match the Newton cable example's pre-mimic gripper behavior."""
-        mimic_enabled = getattr(robot, "constraint_mimic_enabled", [])
-        mimic_count = len(mimic_enabled)
-        if mimic_count > 0:
-            robot.constraint_mimic_enabled[-mimic_count:] = [False] * mimic_count
+    def _patch_gripper_dummy_bodies(robot) -> None:
+        """Match the pure Newton example's tiny mass patch for gripper dummy links."""
+        for body_id, label in enumerate(robot.body_label):
+            if label.endswith("gripper_dummy") and robot.body_mass[body_id] == 0.0:
+                robot.body_mass[body_id] = 1.0e-6
+                robot.body_inv_mass[body_id] = 1.0e6
+                robot.body_inertia[body_id] = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-10)
+                robot.body_inv_inertia[body_id] = wp.inverse(robot.body_inertia[body_id])
 
     def _discover_gripper_dofs(self, robot) -> None:
-        right_names = ["right_gripper_left_finger_joint", "right_gripper_right_finger_joint"]
-        left_names = ["left_gripper_left_finger_joint", "left_gripper_right_finger_joint"]
-        self.right_gripper_dofs = self._joint_dofs_by_name(robot, right_names)
-        self.left_gripper_dofs = self._joint_dofs_by_name(robot, left_names)
-        self.gripper_dofs = [*self.right_gripper_dofs, *self.left_gripper_dofs]
+        self.right_gripper_driver_dofs = self._joint_dofs_by_name(robot, ["right_gripper_finger_joint_1"])
+        self.left_gripper_driver_dofs = self._joint_dofs_by_name(robot, ["left_gripper_finger_joint_1"])
+        self.right_gripper_dofs = self._joint_dofs_by_name(
+            robot, ["right_gripper_left_finger_joint", "right_gripper_right_finger_joint"]
+        )
+        self.left_gripper_dofs = self._joint_dofs_by_name(
+            robot, ["left_gripper_left_finger_joint", "left_gripper_right_finger_joint"]
+        )
+        self.gripper_driver_dofs = [*self.right_gripper_driver_dofs, *self.left_gripper_driver_dofs]
+        self.gripper_finger_dofs = [*self.right_gripper_dofs, *self.left_gripper_dofs]
+        self.gripper_dofs = [*self.gripper_driver_dofs, *self.gripper_finger_dofs]
 
     @staticmethod
     def _joint_dofs_by_name(robot, names: list[str]) -> list[int]:
@@ -740,18 +741,23 @@ class WaterhoseSceneBuilder:
         return dofs
 
     def _configure_robot_dofs(self, robot) -> None:
-        gripper_set = set(self.gripper_dofs)
-        gripper_drive_scale = float(args_cli.gripper_drive_scale)
+        driver_set = set(self.gripper_driver_dofs)
+        finger_set = set(self.gripper_finger_dofs)
         for dof in range(robot.joint_dof_count):
-            if dof in gripper_set:
-                robot.joint_target_ke[dof] = 10000.0 * gripper_drive_scale
-                robot.joint_target_kd[dof] = 1000.0 * gripper_drive_scale
-                robot.joint_effort_limit[dof] = 100000.0 * gripper_drive_scale
+            if dof in driver_set:
+                robot.joint_target_ke[dof] = 10000.0
+                robot.joint_target_kd[dof] = 1000.0
+                robot.joint_effort_limit[dof] = 100000.0
+                robot.joint_armature[dof] = 0.5
+            elif dof in finger_set:
+                robot.joint_target_ke[dof] = 500000.0
+                robot.joint_target_kd[dof] = 10000.0
+                robot.joint_effort_limit[dof] = 500000.0
                 robot.joint_armature[dof] = 0.5
             else:
-                robot.joint_target_ke[dof] = 45000.0
-                robot.joint_target_kd[dof] = 4500.0
-                robot.joint_effort_limit[dof] = 1000.0
+                robot.joint_target_ke[dof] = 120000.0
+                robot.joint_target_kd[dof] = 12000.0
+                robot.joint_effort_limit[dof] = 10000.0
                 robot.joint_armature[dof] = 0.2
             robot.joint_target_mode[dof] = int(JointTargetMode.POSITION)
 
@@ -762,8 +768,7 @@ class WaterhoseSceneBuilder:
         robot.joint_q = q
         robot.joint_target_pos = list(q)
 
-    @staticmethod
-    def _enable_gravity_compensation(robot) -> None:
+    def _enable_gravity_compensation(self, robot) -> None:
         gravcomp_body = robot.custom_attributes.get("mujoco:gravcomp")
         if gravcomp_body is not None:
             gravcomp_body.values = gravcomp_body.values or {}
@@ -774,7 +779,8 @@ class WaterhoseSceneBuilder:
         if gravcomp_joint is not None:
             gravcomp_joint.values = gravcomp_joint.values or {}
             for dof_id in range(robot.joint_dof_count):
-                gravcomp_joint.values[dof_id] = True
+                if dof_id not in self.gripper_dofs:
+                    gravcomp_joint.values[dof_id] = True
 
     def _add_waterhose_world(self, builder, static_scene_builder, origin=None) -> None:
         builder.default_shape_cfg = self.hose_shape_cfg
@@ -897,7 +903,7 @@ class WaterhoseSceneBuilder:
                 for neighbor_shape in builder.body_shapes.get(neighbor_body, []):
                     builder.add_shape_collision_filter_pair(head_shape, neighbor_shape)
 
-    def apply_runtime_cable_asset_xform(self) -> None:
+    def apply_runtime_cable_asset_xform(self, sync_solver_prev: bool = True) -> None:
         """Apply the authored cable scene transform to model/state buffers after Isaac Lab reset."""
         if not self.cable_body_q_targets:
             return
@@ -912,10 +918,11 @@ class WaterhoseSceneBuilder:
         apply_to_array(NewtonManager.get_state_0().body_q)
         apply_to_array(NewtonManager.get_state_1().body_q)
 
-        vbd_solver = NewtonCoupledManager.get_entry_solver(HOSE_ENTRY)
-        body_q_prev = getattr(vbd_solver, "body_q_prev", None)
-        if body_q_prev is not None:
-            apply_to_array(body_q_prev)
+        if sync_solver_prev:
+            vbd_solver = NewtonCoupledManager.get_entry_solver(HOSE_ENTRY)
+            body_q_prev = getattr(vbd_solver, "body_q_prev", None)
+            if body_q_prev is not None:
+                apply_to_array(body_q_prev)
 
         if args_cli.print_cable_poses:
             self._print_runtime_cable_pose_summary("manager_runtime_after_asset_xform")
@@ -1224,10 +1231,10 @@ class WaterhoseIKController:
         )
         self.grasp_shift = 0.004
         self.grasp_local_offset = np.array([0.0, -args_cli.hose_radius + 0.002, 0.0], dtype=np.float64)
-        self.right_open_targets, self.right_closed_targets = self._gripper_target_pairs(
-            scene_builder.right_gripper_dofs
+        self.right_open_driver, self.right_closed_driver = self._gripper_driver_targets(
+            scene_builder.right_gripper_driver_dofs
         )
-        self.left_open_targets, _ = self._gripper_target_pairs(scene_builder.left_gripper_dofs)
+        self.left_open_driver, _ = self._gripper_driver_targets(scene_builder.left_gripper_driver_dofs)
 
         self.ee_indices = {
             "right": _find_label_index(self.model.body_label, RIGHT_EE),
@@ -1246,16 +1253,15 @@ class WaterhoseIKController:
         self._seed_control_targets()
         self._enter_phase(0, 0.0)
 
-    def _gripper_target_pairs(self, dofs: list[int]) -> tuple[list[float], list[float]]:
-        if len(dofs) < 2:
-            return [0.0] * len(dofs), [0.0] * len(dofs)
-        lower = self.model.joint_limit_lower.numpy()[dofs]
-        upper = self.model.joint_limit_upper.numpy()[dofs]
-        # RBY1 finger coordinates use opposite signs for left/right fingers.
-        open_targets = [-0.04, 0.04]
-        eps = 1.0e-4
-        closed_targets = [float(upper[0] - eps), float(lower[1] + eps)]
-        return open_targets, closed_targets
+    def _gripper_driver_targets(self, driver_dofs: list[int]) -> tuple[float, float]:
+        if not driver_dofs:
+            return 0.0, 0.0
+        dof = driver_dofs[0]
+        lower = float(self.model.joint_limit_lower.numpy()[dof])
+        upper = float(self.model.joint_limit_upper.numpy()[dof])
+        open_target = 0.5 * upper
+        closed_target = 2.0 * 0.0036
+        return max(lower, min(upper, open_target)), max(lower, min(upper, closed_target))
 
     def _setup_ik(self) -> None:
         body_q_np = self.state.body_q.numpy()
@@ -1686,10 +1692,21 @@ class WaterhoseIKController:
 
     def _set_gripper_targets(self, q: np.ndarray, right_alpha: float) -> None:
         right_alpha = max(0.0, min(1.0, right_alpha))
-        for idx, dof in enumerate(self.scene_builder.right_gripper_dofs[:2]):
-            q[dof] = (1.0 - right_alpha) * self.right_open_targets[idx] + right_alpha * self.right_closed_targets[idx]
-        for idx, dof in enumerate(self.scene_builder.left_gripper_dofs[:2]):
-            q[dof] = self.left_open_targets[idx]
+        right_driver = (1.0 - right_alpha) * self.right_open_driver + right_alpha * self.right_closed_driver
+        self._set_gripper_side(
+            q, self.scene_builder.right_gripper_driver_dofs, self.scene_builder.right_gripper_dofs, right_driver
+        )
+        self._set_gripper_side(
+            q, self.scene_builder.left_gripper_driver_dofs, self.scene_builder.left_gripper_dofs, self.left_open_driver
+        )
+
+    @staticmethod
+    def _set_gripper_side(q: np.ndarray, driver_dofs: list[int], finger_dofs: list[int], driver_target: float) -> None:
+        if driver_dofs:
+            q[driver_dofs[0]] = driver_target
+        if len(finger_dofs) >= 2:
+            q[finger_dofs[0]] = -0.5 * driver_target
+            q[finger_dofs[1]] = 0.5 * driver_target
 
 
 def setup_kit_scene(sim, scene_builder: WaterhoseSceneBuilder) -> None:
