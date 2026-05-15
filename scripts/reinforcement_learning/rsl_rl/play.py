@@ -63,6 +63,15 @@ parser.add_argument(
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--external_callback", default=None, help="Fully qualified path to an externally defined callback.")
 parser.add_argument(
+    "--curriculum_level",
+    type=int,
+    default=None,
+    help=(
+        "Curriculum level to use for tasks that expose a curriculum stage. "
+        "For Isaac-UR10-Particle-Scoop-Direct-v0, defaults to the highest level."
+    ),
+)
+parser.add_argument(
     "--zero-policy",
     action="store_true",
     default=False,
@@ -136,6 +145,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # create isaac environment
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+        unwrapped_env = env.unwrapped
+        if hasattr(unwrapped_env, "_curriculum_stage") and hasattr(env_cfg, "curriculum_stage_success_fractions"):
+            max_curriculum_level = len(env_cfg.curriculum_stage_success_fractions) - 1
+            curriculum_level = args_cli.curriculum_level
+            if curriculum_level is None and task_name == "Isaac-UR10-Particle-Scoop-Direct-v0":
+                curriculum_level = max_curriculum_level
+            if curriculum_level is not None:
+                curriculum_level = max(0, min(curriculum_level, max_curriculum_level))
+                unwrapped_env._curriculum_stage = curriculum_level
+                unwrapped_env._curriculum_success_ema = 0.0
+                unwrapped_env._curriculum_resets_in_stage = 0
+                print(f"[INFO] Using curriculum level {curriculum_level}/{max_curriculum_level}.")
+                env.reset()
 
         # convert to single-agent instance if required by the RL algorithm
         if isinstance(env.unwrapped.cfg, DirectMARLEnvCfg):

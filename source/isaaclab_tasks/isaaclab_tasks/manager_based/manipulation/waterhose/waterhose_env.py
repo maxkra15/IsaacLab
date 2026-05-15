@@ -1,0 +1,136 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import numpy as np
+import torch
+from isaaclab_newton.physics import NewtonCfg
+
+from isaaclab.envs import ManagerBasedRLEnv
+
+from . import waterhose_core as core
+from .waterhose_env_cfg import RBY1DFWaterhoseEnvCfg
+
+
+class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
+    """Manager-based environment for the Newton proxy-coupled waterhose task."""
+
+    cfg: RBY1DFWaterhoseEnvCfg
+
+    def __init__(self, cfg: RBY1DFWaterhoseEnvCfg, render_mode: str | None = None, **kwargs):
+        self.waterhose_scene_builder = None
+        self.waterhose_builder = None
+        self._build_waterhose_model(cfg)
+        super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
+        self._finish_waterhose_runtime_setup()
+        self.obs_buf = self.observation_manager.compute(update_history=True)
+
+    def _build_waterhose_model(self, cfg: RBY1DFWaterhoseEnvCfg) -> None:
+        overrides = dict(
+            fps=float(cfg.fps),
+            num_envs=int(cfg.scene.num_envs),
+            env_spacing=float(cfg.scene.env_spacing),
+            asset_root=cfg.asset_root,
+            robot_urdf=cfg.robot_urdf,
+            scene_usd=cfg.scene_usd,
+            cable_usd=cfg.cable_usd,
+            cable_prims=cfg.cable_prims,
+            cable_prim=cfg.cable_prim,
+            hose_radius=float(cfg.hose_radius),
+            gripper_drive_scale=float(cfg.gripper_drive_scale),
+            grasp_friction=float(cfg.grasp_friction),
+            grasp_margin=float(cfg.grasp_margin),
+            grasp_contact_ke=float(cfg.grasp_contact_ke),
+            sim_substeps=int(cfg.sim_substeps),
+            rigid_substeps=int(cfg.rigid_substeps),
+            proxy_iterations=int(cfg.proxy_iterations),
+            vbd_iterations=int(cfg.vbd_iterations),
+            disable_cuda_graph=bool(cfg.disable_cuda_graph),
+            device=str(cfg.sim.device),
+        )
+        self.waterhose_scene_builder, self.waterhose_builder, solver_cfg = core.build_waterhose_scene(**overrides)
+        cfg.sim.dt = 1.0 / float(cfg.fps)
+        cfg.sim.physics = NewtonCfg(
+            solver_cfg=solver_cfg,
+            num_substeps=int(cfg.sim_substeps),
+            use_cuda_graph=not bool(cfg.disable_cuda_graph),
+        )
+        core.NewtonManager.set_builder(self.waterhose_builder)
+
+    def _finish_waterhose_runtime_setup(self) -> None:
+        scene_builder = self.waterhose_scene_builder
+        if scene_builder is None:
+            raise RuntimeError("Waterhose scene builder was not initialized.")
+        scene_builder.configure_runtime_vbd_solver()
+        scene_builder.apply_runtime_cable_asset_xform()
+        if self.sim.is_rendering:
+            core.NewtonManager.sync_transforms_to_usd()
+        core.setup_kit_scene(self.sim, scene_builder)
+        core.configure_newton_viewer(self.sim)
+        self.waterhose_right_ee_body_ids = self._resolve_body_ids(core.RIGHT_EE)
+        self.waterhose_tip_body_ids = self._resolve_matching_ids(
+            core.NewtonManager.get_model().body_label[scene_builder.tip_body_id]
+        )
+        self.waterhose_plug_body_ids = self._resolve_matching_ids(
+            core.NewtonManager.get_model().body_label[scene_builder.plug_body_id]
+        )
+        socket_pos = np.array([float(scene_builder.socket_pos[i]) for i in range(3)], dtype=np.float64)
+        socket_rot = np.array([float(scene_builder.socket_rot[i]) for i in range(4)], dtype=np.float64)
+        self.waterhose_socket_pose = np.concatenate((socket_pos, socket_rot), axis=0)
+
+    def _resolve_body_ids(self, short_name: str) -> list[int]:
+        labels = core.NewtonManager.get_model().body_label
+        suffix = "/" + short_name
+        matches = [idx for idx, label in enumerate(labels) if label == short_name or label.endswith(suffix)]
+        if len(matches) < self.num_envs:
+            raise RuntimeError(f"Expected at least {self.num_envs} bodies named {short_name!r}, found {matches}.")
+        return matches[: self.num_envs]
+
+    def _resolve_matching_ids(self, label: str) -> list[int]:
+        labels = core.NewtonManager.get_model().body_label
+        matches = [idx for idx, candidate in enumerate(labels) if candidate == label]
+        if len(matches) < self.num_envs:
+            # Some replicated builders uniquify labels; fall back to the primary id for single-env use.
+            if self.num_envs == 1:
+                return [labels.index(label)]
+            raise RuntimeError(f"Expected {self.num_envs} bodies matching {label!r}, found {matches}.")
+        return matches[: self.num_envs]
+
+    def _reset_idx(self, env_ids: Sequence[int]):
+        super()._reset_idx(env_ids)
+        # The first implementation targets demonstration collection, where episodes
+        # normally end after success. Full partial Newton state reset can be added
+        # once the coupled solver exposes per-world reset hooks for VBD bodies.
+
+    def get_task_space_action_term(self):
+        return self.action_manager.get_term("task_space")
+
+    def scripted_action(self) -> torch.Tensor:
+        """Return a repeatable scripted task-space action for demonstration seeding."""
+        if not hasattr(self, "_scripted_controller"):
+            self._scripted_controller = core.WaterhoseIKController(self.waterhose_scene_builder)
+            self._scripted_prev_target = None
+            self._scripted_prev_quat = None
+        controller = self._scripted_controller
+        controller.state = core.NewtonManager.get_state_0()
+        sim_time = float(self.common_step_counter) * self.step_dt
+        while controller._should_advance_phase(sim_time):
+            controller._enter_phase(min(controller.phase_index + 1, len(controller._PHASES) - 1), sim_time)
+        target_pos, target_quat, gripper_value, phase = controller._target_for_phase(sim_time)
+        target_pos, target_quat = controller._filter_ik_target(target_pos, target_quat)
+        target_pos_t = torch.as_tensor([float(target_pos[i]) for i in range(3)], device=self.device)
+        target_quat_t = torch.as_tensor([float(target_quat[i]) for i in range(4)], device=self.device)
+        action = self.get_task_space_action_term().target_pose_to_action(
+            target_pos_t.to(torch.float32),
+            target_quat_t.to(torch.float32),
+            env_id=0,
+        )
+        action[-1] = 1.0 if gripper_value > 0.5 else -1.0
+        actions = action.unsqueeze(0).repeat(self.num_envs, 1)
+        self.waterhose_last_scripted_phase = phase
+        return actions

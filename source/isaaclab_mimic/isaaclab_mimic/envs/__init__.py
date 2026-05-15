@@ -60,6 +60,17 @@ gym.register(
     disable_env_checker=True,
 )
 
+gym.register(
+    id="Isaac-Waterhose-RBY1DF-IK-Rel-Mimic-v0",
+    entry_point=f"{__name__}.rby1df_waterhose_ik_rel_mimic_env:RBY1DFWaterhoseIKRelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rby1df_waterhose_ik_rel_mimic_env_cfg:RBY1DFWaterhoseIKRelMimicEnvCfg"
+        ),
+    },
+    disable_env_checker=True,
+)
+
 
 ##
 # SkillGen

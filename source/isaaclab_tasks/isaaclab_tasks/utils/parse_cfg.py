@@ -211,19 +211,22 @@ def get_checkpoint_path(
             runs.sort()
         else:
             runs = sorted(runs, key=os.path.getmtime)
-        # create last run file path
-        if other_dirs is not None:
-            run_path = os.path.join(runs[-1], *other_dirs)
-        else:
-            run_path = runs[-1]
     except IndexError:
         raise ValueError(f"No runs present in the directory: '{log_path}' match: '{run_dir}'.")
 
-    # list all model checkpoints in the directory
-    model_checkpoints = [f for f in os.listdir(run_path) if re.match(checkpoint, f)]
-    # check if any checkpoints are present
-    if len(model_checkpoints) == 0:
-        raise ValueError(f"No checkpoints in the directory: '{run_path}' match '{checkpoint}'.")
+    # Search from newest to oldest and skip artifact directories without checkpoints (for example videos/).
+    run_path = None
+    model_checkpoints = []
+    for run in reversed(runs):
+        candidate_run_path = os.path.join(run, *other_dirs) if other_dirs is not None else run
+        if not os.path.isdir(candidate_run_path):
+            continue
+        model_checkpoints = [f for f in os.listdir(candidate_run_path) if re.match(checkpoint, f)]
+        if len(model_checkpoints) > 0:
+            run_path = candidate_run_path
+            break
+    if run_path is None:
+        raise ValueError(f"No checkpoints in any directory under: '{log_path}' match '{checkpoint}'.")
     # sort alphabetically while ensuring that *_10 comes after *_9
     model_checkpoints.sort(key=lambda m: f"{m:0>15}")
     # get latest matched checkpoint file
