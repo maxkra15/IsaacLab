@@ -79,6 +79,21 @@ parser.add_argument(
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--external_callback", default=None, help="Fully qualified path to an externally defined callback.")
+parser.add_argument(
+    "--curriculum_level",
+    type=int,
+    default=None,
+    help=(
+        "Curriculum level to use for tasks that expose a curriculum stage. "
+        "For Isaac-UR10-Particle-Scoop-Direct-v0, defaults to the highest level."
+    ),
+)
+parser.add_argument(
+    "--zero-policy",
+    action="store_true",
+    default=False,
+    help="Play with zero actions instead of loading a checkpoint.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, remaining_args = setup_preset_cli(parser)
@@ -130,7 +145,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
         log_root_path = os.path.abspath(log_root_path)
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
-        if args_cli.use_pretrained_checkpoint:
+        if args_cli.zero_policy:
+            resume_path = None
+        elif args_cli.use_pretrained_checkpoint:
             resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
             if not resume_path:
                 print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
@@ -140,13 +157,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
-        log_dir = os.path.dirname(resume_path)
+        log_dir = log_root_path if resume_path is None else os.path.dirname(resume_path)
 
         # set the log directory for the environment
         env_cfg.log_dir = log_dir
 
         # create isaac environment
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+        unwrapped_env = env.unwrapped
+        if hasattr(unwrapped_env, "_curriculum_stage") and hasattr(env_cfg, "curriculum_stage_success_fractions"):
+            max_curriculum_level = len(env_cfg.curriculum_stage_success_fractions) - 1
+            curriculum_level = args_cli.curriculum_level
+            if curriculum_level is None and task_name == "Isaac-UR10-Particle-Scoop-Direct-v0":
+                curriculum_level = max_curriculum_level
+            if curriculum_level is not None:
+                curriculum_level = max(0, min(curriculum_level, max_curriculum_level))
+                unwrapped_env._curriculum_stage = curriculum_level
+                unwrapped_env._curriculum_success_ema = 0.0
+                unwrapped_env._curriculum_resets_in_stage = 0
+                print(f"[INFO] Using curriculum level {curriculum_level}/{max_curriculum_level}.")
+                env.reset()
 
         # convert to single-agent instance if required by the RL algorithm
         if isinstance(env.unwrapped.cfg, DirectMARLEnvCfg):
@@ -169,49 +199,57 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # wrap around environment for rsl-rl
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        if agent_cfg.class_name == "OnPolicyRunner":
-            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        elif agent_cfg.class_name == "DistillationRunner":
-            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        if args_cli.zero_policy:
+            print("[INFO]: Playing with zero actions; no checkpoint will be loaded.")
+            runner = None
+            policy = None
+            policy_nn = None
+            if args_cli.deterministic:
+                configure_seed(env_cfg.seed, True)
         else:
-            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-        # configure_seed must be called after runner construction so that PyTorch deterministic settings
-        # do not interfere with the runner's internal initialization.
-        if args_cli.deterministic:
-            configure_seed(env_cfg.seed, True)
-        runner.load(resume_path)
-
-        # obtain the trained policy for inference
-        policy = runner.get_inference_policy(device=env.unwrapped.device)
-
-        # export the trained policy to JIT and ONNX formats
-        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-
-        if version.parse(installed_version) >= version.parse("4.0.0"):
-            # use the new export functions for rsl-rl >= 4.0.0
-            runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
-            runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
-            policy_nn = None  # Not needed for rsl-rl >= 4.0.0
-        else:
-            # extract the neural network for rsl-rl < 4.0.0
-            if version.parse(installed_version) >= version.parse("2.3.0"):
-                policy_nn = runner.alg.policy
+            print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+            # load previously trained model
+            if agent_cfg.class_name == "OnPolicyRunner":
+                runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+            elif agent_cfg.class_name == "DistillationRunner":
+                runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
             else:
-                policy_nn = runner.alg.actor_critic
+                raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+            # configure_seed must be called after runner construction so that PyTorch deterministic settings
+            # do not interfere with the runner's internal initialization.
+            if args_cli.deterministic:
+                configure_seed(env_cfg.seed, True)
+            runner.load(resume_path)
 
-            # extract the normalizer
-            if hasattr(policy_nn, "actor_obs_normalizer"):
-                normalizer = policy_nn.actor_obs_normalizer
-            elif hasattr(policy_nn, "student_obs_normalizer"):
-                normalizer = policy_nn.student_obs_normalizer
+            # obtain the trained policy for inference
+            policy = runner.get_inference_policy(device=env.unwrapped.device)
+
+            # export the trained policy to JIT and ONNX formats
+            export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+
+            if version.parse(installed_version) >= version.parse("4.0.0"):
+                # use the new export functions for rsl-rl >= 4.0.0
+                runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
+                runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
+                policy_nn = None  # Not needed for rsl-rl >= 4.0.0
             else:
-                normalizer = None
+                # extract the neural network for rsl-rl < 4.0.0
+                if version.parse(installed_version) >= version.parse("2.3.0"):
+                    policy_nn = runner.alg.policy
+                else:
+                    policy_nn = runner.alg.actor_critic
 
-            # export to JIT and ONNX
-            export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-            export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+                # extract the normalizer
+                if hasattr(policy_nn, "actor_obs_normalizer"):
+                    normalizer = policy_nn.actor_obs_normalizer
+                elif hasattr(policy_nn, "student_obs_normalizer"):
+                    normalizer = policy_nn.student_obs_normalizer
+                else:
+                    normalizer = None
+
+                # export to JIT and ONNX
+                export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+                export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
         dt = env.unwrapped.step_dt
 
@@ -225,14 +263,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # run everything in inference mode
                 with torch.inference_mode():
                     # agent stepping
-                    actions = policy(obs)
+                    if args_cli.zero_policy:
+                        actions = torch.zeros(env.num_envs, env.num_actions, device=env.unwrapped.device)
+                    else:
+                        actions = policy(obs)
                     # env stepping
                     obs, _, dones, _ = env.step(actions)
                     # reset recurrent states for episodes that have terminated
-                    if version.parse(installed_version) >= version.parse("4.0.0"):
-                        policy.reset(dones)
-                    else:
-                        policy_nn.reset(dones)
+                    if not args_cli.zero_policy:
+                        if version.parse(installed_version) >= version.parse("4.0.0"):
+                            policy.reset(dones)
+                        else:
+                            policy_nn.reset(dones)
                 if args_cli.video:
                     timestep += 1
                     if timestep == args_cli.video_length:

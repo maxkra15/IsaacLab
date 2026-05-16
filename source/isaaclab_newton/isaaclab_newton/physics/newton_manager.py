@@ -1215,7 +1215,7 @@ class NewtonManager(PhysicsManager):
         def cached_empty(*args, **kwargs):
             shape = args[0] if args else kwargs.get("shape")
             dtype = kwargs.get("dtype", args[1] if len(args) > 1 else float)
-            device = kwargs.get("device", None) or wp.get_device()
+            device = kwargs.get("device") or wp.get_device()
             key = (
                 str(device),
                 normalize_shape(shape),
@@ -1262,9 +1262,7 @@ class NewtonManager(PhysicsManager):
         original_package_step = current_step
         original_forward_step = forward.step
         original_empty = forward.wp.empty
-        original_zeros = forward.wp.zeros
         original_full = forward.wp.full
-        original_ones = forward.wp.ones
         arrays = {}
 
         def normalize_shape(shape):

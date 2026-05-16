@@ -28,6 +28,7 @@ from __future__ import annotations
 import pytest
 import warp as wp
 from isaaclab_newton.physics import (
+    AdmmContactPairCfg,
     AdmmCouplingCfg,
     CoupledProxyCfg,
     CoupledSolverCfg,
@@ -42,8 +43,8 @@ from isaaclab_newton.physics import (
     NewtonFeatherstoneManager,
     NewtonKaminoManager,
     NewtonManager,
-    NewtonMPMManager,
     NewtonMJWarpManager,
+    NewtonMPMManager,
     NewtonSolverCfg,
     NewtonXPBDManager,
     ProxyCouplingCfg,
@@ -280,12 +281,11 @@ def test_coupled_entry_threads_generic_entry_options():
             solver_cfg=XPBDSolverCfg(iterations=1),
             particles=[0],
             configure_view=_configure_view,
-            contact_policy=1,
             in_place=True,
         )
     )
     assert entry.configure_view is _configure_view
-    assert entry.contact_policy == 1
+    assert callable(entry.solver)
     assert entry.in_place is True
 
 
@@ -329,9 +329,9 @@ def test_coupled_entry_threads_generic_entry_options():
                     CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
                     CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
                 ],
-                admm_coupling=AdmmCouplingCfg(contact_friction=-1.0),
+                admm_coupling=AdmmCouplingCfg(contact_pairs=[AdmmContactPairCfg(source="a", destination="a")]),
             ),
-            "contact_friction",
+            "source and destination",
         ),
     ],
 )
@@ -456,11 +456,11 @@ def test_initialize_solver_populates_canonical_state(
         assert NewtonManager._solver is not None
         assert isinstance(NewtonManager._solver, expected_solver_cls)
         if SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
-            assert NewtonManager._solver.get_solver("rigid") is not None
-            assert NewtonManager._solver.get_solver("sand") is not None
+            assert NewtonCoupledManager.get_entry_solver("rigid") is not None
+            assert NewtonCoupledManager.get_entry_solver("sand") is not None
         if SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
-            assert NewtonManager._solver.get_solver("rigid") is not None
-            assert NewtonManager._solver.get_solver("particle") is not None
+            assert NewtonCoupledManager.get_entry_solver("rigid") is not None
+            assert NewtonCoupledManager.get_entry_solver("particle") is not None
         assert NewtonManager._use_single_state is expected_use_single_state
         assert NewtonManager._needs_collision_pipeline is expected_needs_collision_pipeline
 

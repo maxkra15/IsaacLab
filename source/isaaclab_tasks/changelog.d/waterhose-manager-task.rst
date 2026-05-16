@@ -4,6 +4,12 @@ Added
 * Added the manager-based RBY1 waterhose task with Newton proxy-coupled
   physics, task-space IK actions, and scripted demonstration recording.
 * Added ``proxy_mass_scale`` to tune RBY1 waterhose Newton proxy coupling.
+* Added ``cable_num_segments`` to resample authored RBY1 waterhose cables
+  without changing their placement.
+* Added ``command_frame`` to the RBY1 waterhose task-space IK action
+  configuration.
+* Added accumulated task-space targets for interactive RBY1 waterhose
+  teleoperation.
 
 Changed
 ^^^^^^^
@@ -14,6 +20,10 @@ Changed
   import-order helper.
 * Changed the RBY1 waterhose Newton solver, robot drive, and cable material
   defaults to follow Newton's proxy-coupled cable robot example.
+* Changed standalone SpaceMouse teleoperation to use simpler translation and
+  yaw controls by default for the Newton waterhose task.
+* Changed standalone SpaceMouse simple-mode axes to match direct gripper
+  motion for the Newton waterhose task.
 
 Fixed
 ^^^^^

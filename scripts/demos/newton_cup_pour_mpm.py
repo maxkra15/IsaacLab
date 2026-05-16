@@ -23,7 +23,6 @@ from types import SimpleNamespace
 
 from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
 
-
 parser = argparse.ArgumentParser(description="Newton MPM teapot pour demo.")
 parser.add_argument("--fps", type=float, default=120.0, help="Simulation/control frames per second.")
 parser.add_argument("--max-steps", type=int, default=900, help="Stop after this many frames; negative runs forever.")
@@ -43,7 +42,9 @@ parser.add_argument("--mpm-iterations", type=int, default=160, help="Maximum MPM
 parser.add_argument("--density", type=float, default=1000.0, help="Particle material density in kg/m^3.")
 parser.add_argument("--viscosity", type=float, default=50.0, help="MPM plastic viscosity; higher values look thicker.")
 parser.add_argument("--fluid-friction", type=float, default=0.0, help="MPM particle friction coefficient.")
-parser.add_argument("--fill-fraction", type=float, default=1.0, help="Fraction of the teapot reservoir height initially filled.")
+parser.add_argument(
+    "--fill-fraction", type=float, default=1.0, help="Fraction of the teapot reservoir height initially filled."
+)
 parser.add_argument(
     "--fluid-wall-clearance",
     type=float,
@@ -90,7 +91,9 @@ parser.add_argument("--teapot-lift-height", type=float, default=0.80, help="Mete
 parser.add_argument("--teapot-lift-time", type=float, default=3, help="Seconds over which the tilted teapot lifts.")
 parser.add_argument("--log-interval", type=int, default=60, help="Print simulation progress every N steps; 0 disables.")
 parser.add_argument("--disable-cuda-graph", action="store_true", help="Disable Newton CUDA graph capture.")
-parser.add_argument("--kit-particle-stride", type=int, default=2, help="Render every Nth particle in Kit; 1 renders all.")
+parser.add_argument(
+    "--kit-particle-stride", type=int, default=2, help="Render every Nth particle in Kit; 1 renders all."
+)
 parser.add_argument("--grains-per-particle", type=int, default=5, help="Newton viewer grain samples per MPM particle.")
 parser.add_argument("--grain-radius-scale", type=float, default=1.0, help="Scale factor for Newton viewer grain radii.")
 parser.add_argument("--newton-usd-output", type=str, default=None, help="Optional path for Newton ViewerUSD export.")
@@ -129,7 +132,9 @@ CUP_BODY_PATH = "/World/Teapot"
 CUP_ASSET_PATH = f"{CUP_BODY_PATH}/Asset"
 GROUND_PATH = "/World/Ground"
 VISUALS_PATH = "/World/Visuals"
-TEAPOT_USD_PATH = "/home/maximiliank/Work/IsaacLab/source/isaaclab_assets/isaaclab_assets/rand/teapot_hollow_separate_lid.usdc"
+TEAPOT_USD_PATH = (
+    "/home/maximiliank/Work/IsaacLab/source/isaaclab_assets/isaaclab_assets/rand/teapot_hollow_separate_lid.usdc"
+)
 
 TABLE_TOP_Z = 0.85
 TABLE_HALF_EXTENTS = (0.85, 0.55, 0.03)
@@ -159,17 +164,16 @@ def import_runtime_dependencies() -> None:
     global np, torch, wp, newton, sim_utils, SolverImplicitMPM
     global MPMSolverCfg, NewtonCfg, NewtonManager
 
+    import newton as newton_module
     import numpy as np_module
     import torch as torch_module
     import warp as wp_module
-
-    import newton as newton_module
-    from newton.solvers import SolverImplicitMPM as SolverImplicitMPMClass
-
-    import isaaclab.sim as sim_utils_module
     from isaaclab_newton.physics import MPMSolverCfg as MPMSolverCfgClass
     from isaaclab_newton.physics import NewtonCfg as NewtonCfgClass
     from isaaclab_newton.physics import NewtonManager as NewtonManagerClass
+    from newton.solvers import SolverImplicitMPM as SolverImplicitMPMClass
+
+    import isaaclab.sim as sim_utils_module
 
     np = np_module
     torch = torch_module
@@ -189,8 +193,7 @@ def resolve_asset_paths() -> AssetPaths:
 
     return AssetPaths(
         table=args_cli.table_usd or f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd",
-        bowl=args_cli.bowl_usd
-        or f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_bowl_yellow.usd",
+        bowl=args_cli.bowl_usd or f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_bowl_yellow.usd",
     )
 
 
@@ -321,7 +324,9 @@ def _prune_mesh_to_largest_connected_component(mesh_prim) -> bool:
         return False
 
     keep_faces = sorted(max(components, key=len))
-    kept_flat_indices = np.concatenate([np.arange(face_offsets[face_id], face_offsets[face_id + 1]) for face_id in keep_faces])
+    kept_flat_indices = np.concatenate(
+        [np.arange(face_offsets[face_id], face_offsets[face_id + 1]) for face_id in keep_faces]
+    )
     kept_counts = counts[keep_faces]
     kept_indices = indices[kept_flat_indices]
 
@@ -411,9 +416,7 @@ def _bake_mesh_roll_correction(mesh_prim) -> bool:
     if normals_value is not None and len(normals_value) > 0:
         normals = np.asarray(normals_value, dtype=np.float64)
         rotated_normals = normals @ rotation.T
-        normals_attr.Set(
-            [Gf.Vec3f(float(normal[0]), float(normal[1]), float(normal[2])) for normal in rotated_normals]
-        )
+        normals_attr.Set([Gf.Vec3f(float(normal[0]), float(normal[1]), float(normal[2])) for normal in rotated_normals])
     return True
 
 
@@ -594,7 +597,7 @@ def emit_fluid_particles(builder: newton.ModelBuilder, teapot_shape_ids: list[in
     center_xy = np.median(teapot_vertices[:, :2], axis=0)
     # The spout and handle dominate the full X extent, so use the side-to-side
     # extent to estimate the central teapot body and seed conservatively inside it.
-    body_radius = args_cli.fluid_reservoir_radius_scale * float(max(mesh_extent[1], 1.0e-4))
+    body_radius = args_cli.fluid_reservoir_radius_scale * float(max(mesh_extent[1], 1.0e-4)) - wall_clearance
     z_lo = mesh_lo[2] + 0.22 * mesh_extent[2] + bottom_clearance
     z_hi = mesh_lo[2] + 0.72 * mesh_extent[2] - top_clearance
     particle_lo = np.array([center_xy[0] - body_radius, center_xy[1] - body_radius, z_lo], dtype=np.float32)
@@ -603,7 +606,8 @@ def emit_fluid_particles(builder: newton.ModelBuilder, teapot_shape_ids: list[in
     particle_hi[2] = min(particle_hi[2], fill_top)
     if np.any(particle_hi <= particle_lo):
         raise RuntimeError(
-            "Particle initialization has no valid teapot reservoir interior. Reduce --fluid-wall-clearance or --voxel-size."
+            "Particle initialization has no valid teapot reservoir interior. "
+            "Reduce --fluid-wall-clearance or --voxel-size."
         )
     resolution = np.maximum(
         np.ceil(args_cli.particles_per_cell * (particle_hi - particle_lo) / args_cli.voxel_size), 1
@@ -923,7 +927,9 @@ def create_particle_points(sim: sim_utils.SimulationContext, model: newton.Model
         raise ValueError("--kit-particle-stride must be >= 1.")
 
     particle_radius = wp.to_torch(model.particle_radius)
-    rendered_radius = particle_radius if args_cli.kit_particle_stride == 1 else particle_radius[:: args_cli.kit_particle_stride]
+    rendered_radius = (
+        particle_radius if args_cli.kit_particle_stride == 1 else particle_radius[:: args_cli.kit_particle_stride]
+    )
     widths = 2.0 * rendered_radius.detach().cpu().numpy().astype(np.float32, copy=False)
     sim_utils.create_prim(VISUALS_PATH, "Xform")
     return KitParticlePoints(f"{VISUALS_PATH}/FluidParticles", widths=widths)
@@ -1153,8 +1159,9 @@ def run_simulator(
 def create_launcher_sim_cfg():
     """Create the minimal config used to decide whether Kit is required."""
 
-    import isaaclab.sim as sim_utils_module
     from isaaclab_newton.physics import NewtonCfg as NewtonCfgClass
+
+    import isaaclab.sim as sim_utils_module
 
     device = str(args_cli.device)
     if not device.startswith("cuda"):

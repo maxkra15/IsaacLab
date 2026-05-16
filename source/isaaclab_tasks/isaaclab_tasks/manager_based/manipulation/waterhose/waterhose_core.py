@@ -66,7 +66,7 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         vbd_default_contact_kd=1.0e-1,
         vbd_default_contact_margin=0.001,
         vbd_solver_friction_epsilon=0.1,
-        vbd_rigid_contact_buffer_size=1024,
+        vbd_rigid_contact_buffer_size=2048,
         vbd_proxy_margin=0.001,
         vbd_cable_density=10000.0,
         vbd_cable_mu=1.0,
@@ -83,6 +83,7 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         vbd_rigid_joint_angular_k_start=1.0e1,
         cable_stretch_stiffness=1.0e12,
         cable_stretch_damping=1.0e-3,
+        cable_num_segments=100,
         cable_bend_rigidity=3.0e0,
         cable_bend_damping=1.0e0,
         disable_cuda_graph=False,
@@ -950,6 +951,7 @@ class WaterhoseSceneBuilder:
                 head_shape_mode="mesh",
                 head_cfg=head_cfg,
                 head_mass=0.0,
+                resample_segments=int(self.cfg.cable_num_segments),
             )
             self.cable_body_ids.extend(result.cable_body_ids)
             self.cable_head_body_ids.extend(result.head_body_ids)
@@ -1019,6 +1021,8 @@ class WaterhoseSceneBuilder:
         positive_lengths = [length for length in lengths if length > 0.0]
         if not positive_lengths:
             raise ValueError(f"BasisCurves {curve_prim_path!r} has no positive-length edges.")
+        if int(self.cfg.cable_num_segments) > 0:
+            return float(sum(positive_lengths) / int(self.cfg.cable_num_segments))
         return float(np.mean(positive_lengths))
 
     @staticmethod

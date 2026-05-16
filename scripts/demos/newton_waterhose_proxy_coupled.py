@@ -30,9 +30,7 @@ from types import SimpleNamespace
 os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
 
 _ISAACLAB_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_RBY1_URDF = (
-    _ISAACLAB_ROOT / "source/isaaclab_assets/data/Robots/RBY1DF/urdf/robot_edited.urdf"
-)
+_DEFAULT_RBY1_URDF = _ISAACLAB_ROOT / "source/isaaclab_assets/data/Robots/RBY1DF/urdf/robot_edited.urdf"
 _DEFAULT_CABLE_ROBOT_ROOT = Path("/home/maximiliank/Downloads/cable_robot.tar/cable_robot")
 _DEFAULT_CABLE_ROBOT_ASSETS = _DEFAULT_CABLE_ROBOT_ROOT / "assets"
 
@@ -65,6 +63,7 @@ def _add_lazy_launcher_args(arg_parser: argparse.ArgumentParser) -> None:
     arg_parser.add_argument("--anim_recording_start_time", type=float, default=0)
     arg_parser.add_argument("--anim_recording_stop_time", type=float, default=10)
     arg_parser.add_argument("--max_visible_envs", type=int, default=None)
+
 
 parser = argparse.ArgumentParser(description="RBY1 waterhose manipulation with Isaac Lab Newton proxy coupling.")
 parser.add_argument("--fps", type=float, default=300.0, help="Control frames per second.")
@@ -228,10 +227,9 @@ def import_newton_dependencies() -> None:
     if newton is not None:
         return
 
+    import newton as newton_module
     import numpy as np_module
     import warp as wp_module
-
-    import newton as newton_module
     from newton import JointTargetMode as JointTargetModeClass
     from newton.solvers import SolverVBD as SolverVBDClass
 
@@ -267,19 +265,33 @@ def import_isaaclab_runtime_dependencies() -> None:
 
     import newton.examples as newton_examples_module
     import newton.ik as ik_module
-    import isaaclab.sim as sim_utils_module
-
     from isaaclab_newton.physics import (
         CoupledProxyCfg as CoupledProxyCfgClass,
+    )
+    from isaaclab_newton.physics import (
         CoupledSolverCfg as CoupledSolverCfgClass,
+    )
+    from isaaclab_newton.physics import (
         CoupledSolverEntryCfg as CoupledSolverEntryCfgClass,
+    )
+    from isaaclab_newton.physics import (
         MJWarpSolverCfg as MJWarpSolverCfgClass,
+    )
+    from isaaclab_newton.physics import (
         NewtonCfg as NewtonCfgClass,
+    )
+    from isaaclab_newton.physics import (
         NewtonCoupledManager as NewtonCoupledManagerClass,
+    )
+    from isaaclab_newton.physics import (
         NewtonManager as NewtonManagerClass,
+    )
+    from isaaclab_newton.physics import (
         ProxyCouplingCfg as ProxyCouplingCfgClass,
     )
     from isaaclab_newton.physics.newton_manager_cfg import NewtonSolverCfg as NewtonSolverCfgClass
+
+    import isaaclab.sim as sim_utils_module
 
     newton.examples = newton_examples_module
     ik = ik_module
@@ -369,7 +381,9 @@ def _np_quat_from_axis_angle(axis, angle: float):
 
 def _np_relative_transform(parent_pos, parent_quat, child_pos, child_quat) -> tuple[np.ndarray, np.ndarray]:
     parent_inv = _np_quat_inverse(parent_quat)
-    rel_pos = _np_quat_rotate(parent_inv, np.asarray(child_pos, dtype=np.float64) - np.asarray(parent_pos, dtype=np.float64))
+    rel_pos = _np_quat_rotate(
+        parent_inv, np.asarray(child_pos, dtype=np.float64) - np.asarray(parent_pos, dtype=np.float64)
+    )
     rel_quat = _np_quat_multiply(parent_inv, child_quat)
     return rel_pos, rel_quat / max(np.linalg.norm(rel_quat), 1.0e-12)
 
@@ -1402,9 +1416,7 @@ class WaterhoseIKController:
             self._update_grasp_local_offset()
         if phase in ("engage_hose", "reengage"):
             self._update_grasp_local_offset()
-        if phase in ("align_axes", "verify_align", "insert_hose", "release_hose"):
-            self.phase_target_quat = _np_quat_multiply(self.socket_rot_np, self.grasp_orientation_offset)
-        elif phase in ("approach_socket",):
+        if phase in ("align_axes", "verify_align", "insert_hose", "release_hose") or phase in ("approach_socket",):
             self.phase_target_quat = _np_quat_multiply(self.socket_rot_np, self.grasp_orientation_offset)
         else:
             # Hose grasp phases override this with a filtered live cable orientation.
@@ -1659,9 +1671,8 @@ class WaterhoseIKController:
         return self.grasp_local_offset.copy()
 
     def _transfer_retract_offset(self) -> np.ndarray:
-        return (
-            self.transfer_retract_standoff * self.clearance_dir_np
-            + np.array([0.0, 0.0, self.transfer_retract_lift], dtype=np.float64)
+        return self.transfer_retract_standoff * self.clearance_dir_np + np.array(
+            [0.0, 0.0, self.transfer_retract_lift], dtype=np.float64
         )
 
     def _socket_approach_pos(self) -> np.ndarray:
@@ -1764,7 +1775,9 @@ def setup_kit_scene(sim, scene_builder: WaterhoseSceneBuilder) -> None:
     if "kit" not in sim.resolve_visualizer_types():
         return
     for env_id, origin in enumerate(scene_builder.env_origins):
-        scene_prim_path = "/World/Cable008Scene" if scene_builder.num_envs == 1 else f"/World/Env_{env_id}/Cable008Scene"
+        scene_prim_path = (
+            "/World/Cable008Scene" if scene_builder.num_envs == 1 else f"/World/Env_{env_id}/Cable008Scene"
+        )
         if sim_utils.get_current_stage().GetPrimAtPath(scene_prim_path).IsValid():
             continue
         scene_cfg = sim_utils.UsdFileCfg(usd_path=str(scene_builder.scene_usd))

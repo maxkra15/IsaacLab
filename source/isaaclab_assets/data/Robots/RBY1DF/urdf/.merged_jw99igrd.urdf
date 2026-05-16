@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <robot name="rby1_dfactorybot">
-  
+
   <link name="origin"><visual>
       <geometry>
         <mesh filename="./meshes/visual/MOBILE_BASE.obj" />
@@ -637,7 +637,7 @@
     <limit effort="8.0" lower="-2.705260340" upper="2.705260340" velocity="2.094395102" />
   </joint>
 
-  
+
 
   <joint name="head_joint_1" type="revolute">
     <parent link="torso_hip_yaw" />

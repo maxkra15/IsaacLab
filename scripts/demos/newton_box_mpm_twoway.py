@@ -73,25 +73,40 @@ def import_runtime_dependencies() -> None:
     global CoupledProxyCfg, CoupledSolverCfg, CoupledSolverEntryCfg
     global MJWarpSolverCfg, MPMSolverCfg, NewtonCfg, NewtonCoupledManager, NewtonManager, ProxyCouplingCfg
 
+    import newton as newton_module
     import numpy as np_module
     import torch as torch_module
     import warp as wp_module
-
-    import newton as newton_module
+    from isaaclab_newton.physics import (
+        CoupledProxyCfg as CoupledProxyCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        CoupledSolverCfg as CoupledSolverCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        CoupledSolverEntryCfg as CoupledSolverEntryCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        MJWarpSolverCfg as MJWarpSolverCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        MPMSolverCfg as MPMSolverCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        NewtonCfg as NewtonCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        NewtonCoupledManager as NewtonCoupledManagerClass,
+    )
+    from isaaclab_newton.physics import (
+        NewtonManager as NewtonManagerClass,
+    )
+    from isaaclab_newton.physics import (
+        ProxyCouplingCfg as ProxyCouplingCfgClass,
+    )
     from newton.solvers import SolverImplicitMPM as SolverImplicitMPMClass
 
     import isaaclab.sim as sim_utils_module
-    from isaaclab_newton.physics import (
-        CoupledProxyCfg as CoupledProxyCfgClass,
-        CoupledSolverCfg as CoupledSolverCfgClass,
-        CoupledSolverEntryCfg as CoupledSolverEntryCfgClass,
-        MJWarpSolverCfg as MJWarpSolverCfgClass,
-        MPMSolverCfg as MPMSolverCfgClass,
-        NewtonCfg as NewtonCfgClass,
-        NewtonCoupledManager as NewtonCoupledManagerClass,
-        NewtonManager as NewtonManagerClass,
-        ProxyCouplingCfg as ProxyCouplingCfgClass,
-    )
 
     np = np_module
     torch = torch_module
@@ -498,8 +513,9 @@ def run_simulator(
 
 def create_launcher_sim_cfg():
     """Create the minimal config used to decide whether Kit is required."""
-    import isaaclab.sim as sim_utils_module
     from isaaclab_newton.physics import NewtonCfg as NewtonCfgClass
+
+    import isaaclab.sim as sim_utils_module
 
     device = str(args_cli.device)
     if not device.startswith("cuda"):
@@ -539,7 +555,9 @@ def main() -> None:
             update_sand_points(sand_points, state)
 
             print("[INFO]: Isaac Lab Newton one-box MPM two-way coupling demo ready.")
-            print("[INFO]: Right-mouse drag the box in the Newton viewer; see the Plots window for sand reaction wrench.")
+            print(
+                "[INFO]: Right-mouse drag the box in the Newton viewer; see the Plots window for sand reaction wrench."
+            )
             run_simulator(sim, box_body, box_visual, sand_points)
         finally:
             sim.clear_instance()

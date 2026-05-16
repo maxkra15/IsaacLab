@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 
 import newton
@@ -23,6 +24,8 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 from .ur10_particle_scoop_env_cfg import UR10ParticleScoopEnvCfg
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyObservationSpheres:
@@ -430,9 +433,13 @@ class UR10ParticleScoopEnv(DirectRLEnv):
     def _capture_mpm_graph(self):
         if not wp.get_device().is_cuda or self._mpm_solver.grid_type != "fixed":
             return None
-        with wp.ScopedCapture() as capture:
-            self._simulate_mpm_step()
-        return capture.graph
+        try:
+            with wp.ScopedCapture() as capture:
+                self._simulate_mpm_step()
+            return capture.graph
+        except RuntimeError as exc:
+            logger.warning("UR10 MPM CUDA graph capture failed; using eager MPM stepping: %s", exc)
+            return None
 
     def _step_mpm(self) -> None:
         if self._mpm_graph is not None:
@@ -1046,7 +1053,9 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             "nonfinite_penalty": -self.cfg.reward_nonfinite_penalty_scale * nonfinite_failure,
         }
         rewards = {name: torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0) for name, value in rewards.items()}
-        reward = torch.nan_to_num(torch.stack(list(rewards.values()), dim=0).sum(dim=0), nan=0.0, posinf=0.0, neginf=0.0)
+        reward = torch.nan_to_num(
+            torch.stack(list(rewards.values()), dim=0).sum(dim=0), nan=0.0, posinf=0.0, neginf=0.0
+        )
         for name, value in rewards.items():
             self._episode_sums[name] += value
         self._last_bin_fraction = bin_fraction
@@ -1130,9 +1139,9 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             extras["Diagnostics/nonfinite_joint_q_rate"] = self._nonfinite_joint_q[env_ids].float().mean().item()
             extras["Diagnostics/nonfinite_joint_qd_rate"] = self._nonfinite_joint_qd[env_ids].float().mean().item()
             extras["Diagnostics/nonfinite_body_rate"] = self._nonfinite_body[env_ids].float().mean().item()
-            extras["Diagnostics/nonfinite_observation_rate"] = self._last_nonfinite_observation[
-                env_ids
-            ].float().mean().item()
+            extras["Diagnostics/nonfinite_observation_rate"] = (
+                self._last_nonfinite_observation[env_ids].float().mean().item()
+            )
             extras["Diagnostics/reset_ik_failure_rate"] = self._last_reset_ik_failure[env_ids].float().mean().item()
             extras["Diagnostics/reset_ik_position_error"] = self._last_reset_ik_position_error[env_ids].mean().item()
             extras["Curriculum/stage"] = float(self._curriculum_stage)
@@ -1224,7 +1233,9 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         particle_height = torch.clamp(
             (particle_pos[..., 2] - self._heightmap_z_min) / self.cfg.heightmap_z_range, 0.0, 1.0
         )
-        valid = torch.isfinite(particle_pos).all(dim=-1) & (rel_x >= 0.0) & (rel_x < 1.0) & (rel_y >= 0.0) & (rel_y < 1.0)
+        valid = (
+            torch.isfinite(particle_pos).all(dim=-1) & (rel_x >= 0.0) & (rel_x < 1.0) & (rel_y >= 0.0) & (rel_y < 1.0)
+        )
         particle_height = torch.where(
             valid,
             torch.clamp(particle_height, min=self.cfg.heightmap_occupied_cell_value),
@@ -1497,9 +1508,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             return
         alpha = float(self.cfg.curriculum_success_ema_alpha)
         self._curriculum_success_ema = (1.0 - alpha) * self._curriculum_success_ema + alpha * success_rate
-        self._curriculum_bin_fraction_ema = (
-            (1.0 - alpha) * self._curriculum_bin_fraction_ema + alpha * bin_fraction
-        )
+        self._curriculum_bin_fraction_ema = (1.0 - alpha) * self._curriculum_bin_fraction_ema + alpha * bin_fraction
         self._curriculum_resets_in_stage += reset_count
         max_stage = len(self.cfg.curriculum_stage_success_fractions) - 1
         if (

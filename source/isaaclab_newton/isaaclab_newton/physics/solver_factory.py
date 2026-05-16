@@ -16,7 +16,6 @@ from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, 
 from .mjwarp_manager import resolve_mujoco_solver_kwargs
 from .newton_manager_cfg import NewtonSolverCfg
 
-
 _SOLVER_CLASS_BY_TYPE = {
     "mujoco_warp": SolverMuJoCo,
     "implicit_mpm": SolverImplicitMPM,

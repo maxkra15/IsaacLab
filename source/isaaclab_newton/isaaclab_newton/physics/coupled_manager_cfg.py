@@ -60,16 +60,13 @@ class CoupledSolverEntryCfg:
     """
 
     solver_kwargs: dict[str, Any] = field(default_factory=dict)
-    """Extra keyword arguments forwarded to the sub-solver constructor.
+    """Extra keyword arguments bound into the sub-solver factory.
 
     These override kwargs inferred from :attr:`solver_cfg`.
     """
 
     configure_view: Callable | str | None = None
     """Optional callable or ``"module:attr"`` path applied to the entry's ``ModelView`` before solver construction."""
-
-    contact_policy: int | None = None
-    """Optional Newton ``SolverCoupled.Entry`` contact-policy override."""
 
     substeps: int = 1
     """Number of equal substeps this entry runs inside one coupled step."""
@@ -129,6 +126,23 @@ class ProxyCouplingCfg:
 
 
 @configclass
+class AdmmContactPairCfg:
+    """Configuration for one Newton ADMM cross-solver contact pair."""
+
+    source: str = ""
+    """Name of one solver entry."""
+
+    destination: str = ""
+    """Name of the other solver entry."""
+
+    contact_distance: float | None = None
+    """Optional minimum contact gap [m]. ``None`` uses Newton's pair default."""
+
+    detection_margin: float | None = None
+    """Optional contact detection margin [m]. ``None`` uses Newton's pair default."""
+
+
+@configclass
 class AdmmCouplingCfg:
     """Linearized ADMM coupling configuration."""
 
@@ -156,20 +170,17 @@ class AdmmCouplingCfg:
     joint_angular_damping: float = 0.0
     """Quadratic damping for angular ADMM attachments from cross-solver fixed and revolute joints."""
 
-    contact_detection: bool = False
-    """Whether ADMM should build contact rows from cross-solver collision candidates."""
+    contact_pairs: list[AdmmContactPairCfg] = field(default_factory=list)
+    """Explicit cross-solver contact pairs to pass to Newton ADMM."""
 
-    contact_distance: float | None = None
-    """Optional minimum contact gap for generated contacts."""
+    auto_contact_pairs: bool = False
+    """Whether to ask Newton to generate a contact pair for each solver-entry combination."""
 
-    contact_friction: float = 0.0
-    """Isotropic Coulomb friction coefficient for generated ADMM contact rows."""
+    auto_contact_distance: float | None = None
+    """Optional minimum contact gap [m] for automatically generated contact pairs."""
 
-    contact_detection_margin: float = 0.01
-    """Soft particle-shape and default particle-particle contact detection margin."""
-
-    particle_contact_detection_margin: float | None = None
-    """Optional particle-particle hash-grid detection margin."""
+    auto_detection_margin: float | None = None
+    """Optional contact detection margin [m] for automatically generated contact pairs."""
 
 
 @configclass

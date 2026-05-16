@@ -25,6 +25,8 @@ class NewtonTaskSpaceIKActionCfg(ActionTermCfg):
 
     class_type: type[ActionTerm] = MISSING
     asset_name: str = "newton_waterhose"
+    command_frame: str = "world"
+    accumulate_targets: bool = False
     position_scale: float = 0.04
     rotation_scale: float = 0.25
     max_target_step: float = 0.018
@@ -51,6 +53,8 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         self._model = core.NewtonManager.get_model()
         self._control = core.NewtonManager.get_control()
         self._single_robot_model = self._scene_builder.single_robot_model
+        if self.cfg.command_frame not in ("eef", "world"):
+            raise ValueError("NewtonTaskSpaceIKActionCfg.command_frame must be 'eef' or 'world'.")
         self._body_ids = _resolve_body_ids(self._model.body_label, core.RIGHT_EE, self.num_envs)
         self._left_body_ids = _resolve_body_ids(self._model.body_label, core.LEFT_EE, self.num_envs)
         self._torso_body_ids = _resolve_body_ids(self._model.body_label, core.TORSO, self.num_envs)
@@ -59,6 +63,7 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         )
         self._left_open_driver, _ = _gripper_driver_targets(self._model, self._scene_builder.left_gripper_driver_dofs)
         self._setup_ik()
+        self._seed_task_targets()
         self._seed_control_targets()
 
     @property
@@ -88,11 +93,14 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         target_np = self._control.joint_target_pos.numpy().astype(np.float32, copy=True)
         for env_id, joint_coord_ids in enumerate(self._scene_builder.robot_joint_coord_ids_by_env):
             ee_q = body_q[self._body_ids[env_id]]
-            target_pos = ee_q[:3].astype(np.float64) + action_np[env_id, :3].astype(np.float64)
-            target_quat = _integrate_axis_angle(
-                ee_q[3:].astype(np.float64),
-                action_np[env_id, 3:6].astype(np.float64),
-            )
+            if self.cfg.accumulate_targets:
+                target_pos, target_quat = self._accumulate_target_delta(
+                    env_id, action_np[env_id, :6].astype(np.float64)
+                )
+            else:
+                ee_quat = ee_q[3:].astype(np.float64)
+                delta_pos, target_quat = self._target_delta(ee_quat, action_np[env_id, :6].astype(np.float64))
+                target_pos = ee_q[:3].astype(np.float64) + delta_pos
             q = self._solve_env(env_id, joint_q[joint_coord_ids].astype(np.float32), target_pos, target_quat)
             self._set_gripper_targets(q, float(action_np[env_id, 6]))
             max_step = np.full_like(q, float(self.cfg.max_joint_step))
@@ -111,6 +119,7 @@ class NewtonTaskSpaceIKAction(ActionTerm):
             env_ids = slice(None)
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
+        self._reset_task_targets(env_ids)
         self._reset_control_targets(env_ids)
 
     def target_pose_to_action(
@@ -118,12 +127,22 @@ class NewtonTaskSpaceIKAction(ActionTerm):
     ) -> torch.Tensor:
         curr = core.NewtonManager.get_state_0().body_q.numpy()[self._body_ids[env_id]]
         curr_pos = torch.as_tensor(curr[:3], device=self.device, dtype=torch.float32)
-        delta_pos = target_pos.to(self.device) - curr_pos
+        delta_pos = (target_pos.to(self.device) - curr_pos).detach().cpu().numpy().astype(np.float64)
         curr_quat = torch.as_tensor(curr[3:], device=self.device, dtype=torch.float32)
-        delta_axis = _torch_axis_angle_between(curr_quat, target_quat_xyzw.to(self.device))
+        curr_quat_np = curr_quat.detach().cpu().numpy().astype(np.float64)
+        target_quat_np = target_quat_xyzw.detach().cpu().numpy().astype(np.float64)
+        if self.cfg.command_frame == "eef":
+            delta_pos = core._np_quat_rotate(core._np_quat_inverse(curr_quat_np), delta_pos)
+            delta_axis_np = _axis_angle_between_eef(curr_quat_np, target_quat_np)
+        else:
+            delta_axis_np = _axis_angle_between_world(curr_quat_np, target_quat_np)
         action = torch.zeros(7, device=self.device)
-        action[:3] = delta_pos / float(self.cfg.position_scale)
-        action[3:6] = delta_axis / float(self.cfg.rotation_scale)
+        action[:3] = torch.as_tensor(delta_pos, device=self.device, dtype=torch.float32) / float(
+            self.cfg.position_scale
+        )
+        action[3:6] = torch.as_tensor(delta_axis_np, device=self.device, dtype=torch.float32) / float(
+            self.cfg.rotation_scale
+        )
         return action.clamp(-1.0, 1.0)
 
     def action_to_target_pose(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -134,13 +153,46 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         quat = []
         for env_id in range(actions.shape[0]):
             ee_q = state_np[self._body_ids[env_id]]
-            pos.append(torch.as_tensor(ee_q[:3], device=self.device, dtype=torch.float32) + processed_position[env_id])
-            quat_np = _integrate_axis_angle(
-                ee_q[3:].astype(np.float64),
-                processed_rotation[env_id].detach().cpu().numpy(),
+            ee_quat = ee_q[3:].astype(np.float64)
+            delta_pos, quat_np = self._target_delta(
+                ee_quat,
+                torch.cat((processed_position[env_id], processed_rotation[env_id])).detach().cpu().numpy(),
             )
+            pos.append(torch.as_tensor(ee_q[:3] + delta_pos, device=self.device, dtype=torch.float32))
             quat.append(torch.as_tensor(quat_np, device=self.device, dtype=torch.float32))
         return torch.stack(pos, dim=0), torch.stack(quat, dim=0)
+
+    def _target_delta(self, ee_quat: np.ndarray, action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        delta_pos = action[:3]
+        axis_angle = action[3:6]
+        if self.cfg.command_frame == "eef":
+            delta_pos = core._np_quat_rotate(ee_quat, delta_pos)
+            target_quat = _integrate_axis_angle_eef(ee_quat, axis_angle)
+        else:
+            target_quat = _integrate_axis_angle_world(ee_quat, axis_angle)
+        return delta_pos, target_quat
+
+    def _seed_task_targets(self) -> None:
+        body_q = core.NewtonManager.get_state_0().body_q.numpy()
+        self._target_pos = np.zeros((self.num_envs, 3), dtype=np.float64)
+        self._target_quat = np.zeros((self.num_envs, 4), dtype=np.float64)
+        for env_id, body_id in enumerate(self._body_ids):
+            q = body_q[body_id]
+            self._target_pos[env_id] = q[:3].astype(np.float64)
+            self._target_quat[env_id] = q[3:].astype(np.float64)
+
+    def _reset_task_targets(self, env_ids) -> None:
+        body_q = core.NewtonManager.get_state_0().body_q.numpy()
+        for env_id in self._env_indices(env_ids):
+            q = body_q[self._body_ids[env_id]]
+            self._target_pos[env_id] = q[:3].astype(np.float64)
+            self._target_quat[env_id] = q[3:].astype(np.float64)
+
+    def _accumulate_target_delta(self, env_id: int, action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        delta_pos, target_quat = self._target_delta(self._target_quat[env_id], action)
+        self._target_pos[env_id] = self._target_pos[env_id] + delta_pos
+        self._target_quat[env_id] = target_quat
+        return self._target_pos[env_id], self._target_quat[env_id]
 
     def _setup_ik(self) -> None:
         body_q_np = core.NewtonManager.get_state_0().body_q.numpy()
@@ -320,7 +372,7 @@ def _set_gripper_side(q: np.ndarray, driver_dofs: list[int], finger_dofs: list[i
         q[finger_dofs[1]] = 0.5 * driver_target
 
 
-def _integrate_axis_angle(quat_xyzw: np.ndarray, axis_angle: np.ndarray) -> np.ndarray:
+def _integrate_axis_angle_world(quat_xyzw: np.ndarray, axis_angle: np.ndarray) -> np.ndarray:
     angle = float(np.linalg.norm(axis_angle))
     if angle <= 1.0e-8:
         return quat_xyzw / max(np.linalg.norm(quat_xyzw), 1.0e-12)
@@ -329,13 +381,29 @@ def _integrate_axis_angle(quat_xyzw: np.ndarray, axis_angle: np.ndarray) -> np.n
     return quat / max(np.linalg.norm(quat), 1.0e-12)
 
 
-def _torch_axis_angle_between(curr_xyzw: torch.Tensor, target_xyzw: torch.Tensor) -> torch.Tensor:
-    curr_np = curr_xyzw.detach().cpu().numpy().astype(np.float64)
-    target_np = target_xyzw.detach().cpu().numpy().astype(np.float64)
-    delta = core._np_quat_multiply(target_np, core._np_quat_inverse(curr_np))
+def _integrate_axis_angle_eef(quat_xyzw: np.ndarray, axis_angle: np.ndarray) -> np.ndarray:
+    angle = float(np.linalg.norm(axis_angle))
+    if angle <= 1.0e-8:
+        return quat_xyzw / max(np.linalg.norm(quat_xyzw), 1.0e-12)
+    delta = core._np_quat_from_axis_angle(axis_angle / angle, angle)
+    quat = core._np_quat_multiply(quat_xyzw, delta)
+    return quat / max(np.linalg.norm(quat), 1.0e-12)
+
+
+def _axis_angle_between_world(curr_xyzw: np.ndarray, target_xyzw: np.ndarray) -> np.ndarray:
+    delta = core._np_quat_multiply(target_xyzw, core._np_quat_inverse(curr_xyzw))
+    return _axis_angle_from_quat(delta)
+
+
+def _axis_angle_between_eef(curr_xyzw: np.ndarray, target_xyzw: np.ndarray) -> np.ndarray:
+    delta = core._np_quat_multiply(core._np_quat_inverse(curr_xyzw), target_xyzw)
+    return _axis_angle_from_quat(delta)
+
+
+def _axis_angle_from_quat(delta: np.ndarray) -> np.ndarray:
     delta = delta / max(np.linalg.norm(delta), 1.0e-12)
     angle = 2.0 * np.arctan2(np.linalg.norm(delta[:3]), delta[3])
     if angle <= 1.0e-8:
-        return torch.zeros(3, device=curr_xyzw.device)
+        return np.zeros(3, dtype=np.float64)
     axis = delta[:3] / max(np.linalg.norm(delta[:3]), 1.0e-12)
-    return torch.as_tensor(axis * angle, device=curr_xyzw.device, dtype=torch.float32)
+    return axis * angle

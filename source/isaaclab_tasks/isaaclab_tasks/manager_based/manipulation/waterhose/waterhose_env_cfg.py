@@ -166,7 +166,7 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     vbd_default_contact_kd: float = 1.0e-1
     vbd_default_contact_margin: float = 0.001
     vbd_solver_friction_epsilon: float = 0.1
-    vbd_rigid_contact_buffer_size: int = 1024
+    vbd_rigid_contact_buffer_size: int = 2048
     vbd_proxy_margin: float = 0.001
     vbd_cable_density: float = 10000.0
     vbd_cable_mu: float = 1.0
@@ -183,6 +183,7 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     vbd_rigid_joint_angular_k_start: float = 1.0e1
     cable_stretch_stiffness: float = 1.0e12
     cable_stretch_damping: float = 1.0e-3
+    cable_num_segments: int = 100
     cable_bend_rigidity: float = 3.0e0
     cable_bend_damping: float = 1.0e0
     success_lateral_threshold: float = 0.0008
@@ -263,6 +264,7 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "vbd_rigid_joint_angular_k_start": float(self.vbd_rigid_joint_angular_k_start),
             "cable_stretch_stiffness": float(self.cable_stretch_stiffness),
             "cable_stretch_damping": float(self.cable_stretch_damping),
+            "cable_num_segments": int(self.cable_num_segments),
             "cable_bend_rigidity": float(self.cable_bend_rigidity),
             "cable_bend_damping": float(self.cable_bend_damping),
             "disable_cuda_graph": bool(self.disable_cuda_graph),

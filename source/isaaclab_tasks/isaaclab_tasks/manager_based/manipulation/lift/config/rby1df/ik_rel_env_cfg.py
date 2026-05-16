@@ -8,7 +8,7 @@ from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsA
 from isaaclab.utils import configclass
 
 from . import joint_pos_env_cfg
-from .joint_pos_env_cfg import RIGHT_ARM_JOINTS, RBY1DF_TCP_OFFSET_POS, RBY1DF_TCP_OFFSET_ROT
+from .joint_pos_env_cfg import RBY1DF_TCP_OFFSET_POS, RBY1DF_TCP_OFFSET_ROT, RIGHT_ARM_JOINTS
 
 ##
 # Pre-defined configs

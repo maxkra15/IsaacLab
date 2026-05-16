@@ -16,7 +16,6 @@ from isaaclab.assets.articulation import ArticulationCfg
 
 from isaaclab_assets import ISAACLAB_ASSETS_DATA_DIR
 
-
 RBY1DF_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
         asset_path=f"{ISAACLAB_ASSETS_DATA_DIR}/Robots/RBY1DF/urdf/robot_edited.urdf",

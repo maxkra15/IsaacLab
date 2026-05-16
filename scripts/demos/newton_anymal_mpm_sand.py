@@ -65,8 +65,8 @@ if args_cli.num_envs < 1:
 if args_cli.env_spacing <= 0.0:
     parser.error("--env-spacing must be > 0.")
 
-import xml.etree.ElementTree as ET
 import warnings
+import xml.etree.ElementTree as ET
 
 np = torch = wp = newton = sim_utils = None
 SolverImplicitMPM = SolverMuJoCo = None
@@ -92,21 +92,24 @@ def import_runtime_dependencies() -> None:
     global np, torch, wp, newton, sim_utils, SolverImplicitMPM, SolverMuJoCo
     global MJWarpSolverCfg, NewtonCfg, NewtonManager
 
+    import newton as newton_module
+    import newton.utils  # noqa: F401
     import numpy as np_module
     import torch as torch_module
     import warp as wp_module
-
-    import newton as newton_module
-    import newton.utils  # noqa: F401
+    from isaaclab_newton.physics import (
+        MJWarpSolverCfg as MJWarpSolverCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        NewtonCfg as NewtonCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        NewtonManager as NewtonManagerClass,
+    )
     from newton.solvers import SolverImplicitMPM as SolverImplicitMPMClass
     from newton.solvers import SolverMuJoCo as SolverMuJoCoClass
 
     import isaaclab.sim as sim_utils_module
-    from isaaclab_newton.physics import (
-        MJWarpSolverCfg as MJWarpSolverCfgClass,
-        NewtonCfg as NewtonCfgClass,
-        NewtonManager as NewtonManagerClass,
-    )
 
     np = np_module
     torch = torch_module
@@ -266,7 +269,9 @@ def resolve_kit_body_prim_path(stage, root_path: str, body_name: str) -> str:
     return direct_path
 
 
-def parse_fixed_link_offsets(urdf_path: str, dynamic_body_names: set[str]) -> dict[str, list[tuple[str, np.ndarray, np.ndarray]]]:
+def parse_fixed_link_offsets(
+    urdf_path: str, dynamic_body_names: set[str]
+) -> dict[str, list[tuple[str, np.ndarray, np.ndarray]]]:
     """Map each dynamic Newton body link to fixed-descendant visual links and their body-frame offsets."""
     root = ET.parse(urdf_path).getroot()
     fixed_children: dict[str, list[tuple[str, np.ndarray, np.ndarray]]] = {}
@@ -596,7 +601,9 @@ class KitSandPoints:
                 self._color_attr.Set(self._colors)
 
 
-def create_kit_robot_visuals(sim: sim_utils.SimulationContext, model: newton.Model, urdf_path: str) -> KitRobotVisuals | None:
+def create_kit_robot_visuals(
+    sim: sim_utils.SimulationContext, model: newton.Model, urdf_path: str
+) -> KitRobotVisuals | None:
     """Create a Kit-side fallback synchronizer for the spawned ANYmal-C visual asset."""
     if "kit" not in sim.resolve_visualizer_types():
         return None
@@ -721,7 +728,9 @@ def run_simulator(
     action = torch.zeros(args_cli.num_envs, 12, device=torch_device, dtype=torch.float32)
     lab_to_mujoco_indices = torch.tensor(LAB_TO_MUJOCO, device=torch_device)
     mujoco_to_lab_indices = torch.tensor(MUJOCO_TO_LAB, device=torch_device)
-    gravity_vec = torch.tensor([[0.0, 0.0, -1.0]], device=torch_device, dtype=torch.float32).expand(args_cli.num_envs, -1)
+    gravity_vec = torch.tensor([[0.0, 0.0, -1.0]], device=torch_device, dtype=torch.float32).expand(
+        args_cli.num_envs, -1
+    )
     command = torch.tensor(
         [[args_cli.command_forward, args_cli.command_lateral, args_cli.command_yaw]],
         device=torch_device,
@@ -758,8 +767,9 @@ def run_simulator(
 
 def create_launcher_sim_cfg():
     """Create the minimal config used to decide whether Kit is required."""
-    import isaaclab.sim as sim_utils_module
     from isaaclab_newton.physics import NewtonCfg as NewtonCfgClass
+
+    import isaaclab.sim as sim_utils_module
 
     device = str(args_cli.device)
     if not device.startswith("cuda"):
