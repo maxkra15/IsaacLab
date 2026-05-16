@@ -18,8 +18,7 @@ from pxr import UsdGeom
 import isaaclab.sim as sim_utils
 import isaaclab.utils.sensors as sensor_utils
 from isaaclab.app.settings_manager import get_settings_manager
-from isaaclab.renderers import BaseRenderer
-from isaaclab.renderers.camera_render_spec import CameraRenderSpec
+from isaaclab.renderers import BaseRenderer, CameraRenderSpec
 from isaaclab.sim.views import FrameView
 from isaaclab.utils import to_camel_case
 from isaaclab.utils.math import (
@@ -114,7 +113,8 @@ class Camera(SensorBase):
         # IsaacRtxRendererCfg overrides to flip /isaaclab/render/rtx_sensors. The
         # flag must be set pre-sim.reset() because SimulationContext.is_rendering
         # and several env classes read it before the renderer's __init__ runs.
-        if self.cfg.renderer_cfg.renderer_type == "isaac_rtx":
+        renderer_type = getattr(self.cfg.renderer_cfg, "renderer_type", None)
+        if renderer_type == "isaac_rtx":
             get_settings_manager().set_bool("/isaaclab/render/rtx_sensors", True)
 
         # Compute camera orientation (convention conversion) and spawn
@@ -314,16 +314,33 @@ class Camera(SensorBase):
         Raises:
             RuntimeError: If the camera prim is not set. Need to call :meth:`initialize` method first.
             NotImplementedError: If the stage up-axis is not "Y" or "Z".
+            ValueError: If every eye position equals its target (look-at direction undefined for the
+                whole batch). When only some rows are degenerate, those rows are skipped and the
+                remaining poses are still applied; a warning is logged.
         """
-        # resolve env_ids
+        # resolve env_ids to a tensor up front so we can index it during partial-failure filtering
         if env_ids is None:
             env_ids = self._ALL_INDICES
-        # get up axis of current stage
-        up_axis = UsdGeom.GetStageUpAxis(self.stage)
-        # set camera poses using the view
-        orientations = quat_from_matrix(create_rotation_matrix_from_view(eyes, targets, up_axis, device=self._device))
         if not isinstance(env_ids, torch.Tensor):
             env_ids = torch.tensor(env_ids, dtype=torch.int32, device=self._device)
+        # get up axis of current stage
+        up_axis = UsdGeom.GetStageUpAxis(self.stage)
+        # set camera poses using the view; degenerate rows (eye == target) come back as NaN
+        rotation_matrix = create_rotation_matrix_from_view(eyes, targets, up_axis, device=self._device)
+        valid_indices = (~torch.isnan(rotation_matrix).any(dim=(-2, -1))).nonzero(as_tuple=True)[0]
+        n_valid = valid_indices.numel()
+        n_total = rotation_matrix.shape[0]
+        if n_valid == 0:
+            raise ValueError("look-at is undefined: every eye position equals its target")
+        if n_valid < n_total:
+            logger.warning(
+                "set_world_poses_from_view: skipping %d pose(s) where eye equals target",
+                n_total - n_valid,
+            )
+            rotation_matrix = rotation_matrix.index_select(0, valid_indices)
+            eyes = eyes.index_select(0, valid_indices)
+            env_ids = env_ids.index_select(0, valid_indices)
+        orientations = quat_from_matrix(rotation_matrix)
         idx_wp = wp.from_torch(env_ids.to(dtype=torch.int32), dtype=wp.int32)
         self._view.set_world_poses(wp.from_torch(eyes.contiguous()), wp.from_torch(orientations.contiguous()), idx_wp)
 
@@ -380,9 +397,7 @@ class Camera(SensorBase):
         # references to prims located in the stage.
         sim_ctx.render_context.ensure_prepare_stage(self.stage, self._num_envs)
 
-        # Create a view for the sensor with Fabric enabled for fast pose queries.
-        # TODO: remove sync_usd_on_fabric_write=True once the GPU Fabric sync bug is fixed.
-        self._view = FrameView(self.cfg.prim_path, device=self._device, stage=self.stage, sync_usd_on_fabric_write=True)
+        self._view = FrameView(self.cfg.prim_path, device=self._device, stage=self.stage)
         # Check that sizes are correct
         if self._view.count != self._num_envs:
             raise RuntimeError(
