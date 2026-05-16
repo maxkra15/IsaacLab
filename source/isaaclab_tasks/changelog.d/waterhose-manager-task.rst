@@ -24,6 +24,8 @@ Changed
   yaw controls by default for the Newton waterhose task.
 * Changed standalone SpaceMouse simple-mode axes to match direct gripper
   motion for the Newton waterhose task.
+* Changed standalone SpaceMouse simple-mode yaw to rotate the right gripper in
+  the end-effector frame and suppress translation while twisting.
 
 Fixed
 ^^^^^

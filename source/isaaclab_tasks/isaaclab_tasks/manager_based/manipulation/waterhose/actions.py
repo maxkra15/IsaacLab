@@ -26,6 +26,7 @@ class NewtonTaskSpaceIKActionCfg(ActionTermCfg):
     class_type: type[ActionTerm] = MISSING
     asset_name: str = "newton_waterhose"
     command_frame: str = "world"
+    rotation_frame: str | None = None
     accumulate_targets: bool = False
     position_scale: float = 0.04
     rotation_scale: float = 0.25
@@ -55,6 +56,11 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         self._single_robot_model = self._scene_builder.single_robot_model
         if self.cfg.command_frame not in ("eef", "world"):
             raise ValueError("NewtonTaskSpaceIKActionCfg.command_frame must be 'eef' or 'world'.")
+        self._rotation_frame = (
+            self.cfg.rotation_frame if self.cfg.rotation_frame is not None else self.cfg.command_frame
+        )
+        if self._rotation_frame not in ("eef", "world"):
+            raise ValueError("NewtonTaskSpaceIKActionCfg.rotation_frame must be 'eef', 'world', or None.")
         self._body_ids = _resolve_body_ids(self._model.body_label, core.RIGHT_EE, self.num_envs)
         self._left_body_ids = _resolve_body_ids(self._model.body_label, core.LEFT_EE, self.num_envs)
         self._torso_body_ids = _resolve_body_ids(self._model.body_label, core.TORSO, self.num_envs)
@@ -133,6 +139,7 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         target_quat_np = target_quat_xyzw.detach().cpu().numpy().astype(np.float64)
         if self.cfg.command_frame == "eef":
             delta_pos = core._np_quat_rotate(core._np_quat_inverse(curr_quat_np), delta_pos)
+        if self._rotation_frame == "eef":
             delta_axis_np = _axis_angle_between_eef(curr_quat_np, target_quat_np)
         else:
             delta_axis_np = _axis_angle_between_world(curr_quat_np, target_quat_np)
@@ -167,6 +174,7 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         axis_angle = action[3:6]
         if self.cfg.command_frame == "eef":
             delta_pos = core._np_quat_rotate(ee_quat, delta_pos)
+        if self._rotation_frame == "eef":
             target_quat = _integrate_axis_angle_eef(ee_quat, axis_angle)
         else:
             target_quat = _integrate_axis_angle_world(ee_quat, axis_angle)

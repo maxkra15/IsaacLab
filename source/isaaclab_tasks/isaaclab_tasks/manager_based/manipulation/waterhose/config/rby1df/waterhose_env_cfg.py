@@ -17,4 +17,6 @@ class RBY1DFWaterhoseEnvCfg_PLAY(RBY1DFWaterhoseEnvCfg):
         self.scene.num_envs = 1
         self.sync_waterhose_sim_cfg()
         self.actions.task_space.accumulate_targets = True
+        self.actions.task_space.command_frame = "world"
+        self.actions.task_space.rotation_frame = "eef"
         self.observations.policy.enable_corruption = False

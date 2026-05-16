@@ -23,7 +23,10 @@ from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
 
-from isaaclab_tasks.manager_based.manipulation.waterhose.launch import get_visualizer_types, prepare_waterhose_launch
+from isaaclab_tasks.manager_based.manipulation.waterhose.launch import (
+    get_visualizer_types,
+    prepare_waterhose_launch,
+)
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Teleoperation for Isaac Lab environments.")
@@ -91,6 +94,21 @@ parser.add_argument(
     choices=(-1.0, 1.0),
     default=-1.0,
     help="Simple SpaceMouse sign for right EEF yaw rotation.",
+)
+parser.add_argument(
+    "--spacemouse_simple_deadzone",
+    type=float,
+    default=1.0e-3,
+    help="Simple SpaceMouse deadzone applied to each command axis after scaling.",
+)
+parser.add_argument(
+    "--spacemouse_simple_yaw_translation_lock",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "Zero translation while simple SpaceMouse yaw is active. Disabled by default because the SpaceMouse driver "
+        "stores the last rotation sample separately from translation samples."
+    ),
 )
 parser.add_argument(
     "--debug_teleop",
@@ -210,13 +228,22 @@ def _resolve_cloudxr_env(value: str | None) -> str | None:
 class _SimpleSpaceMouse:
     """Restrict SpaceMouse commands to translation and yaw for easier teleoperation."""
 
-    def __init__(self, device, translation_signs: tuple[float, float, float], yaw_sign: float):
+    def __init__(
+        self,
+        device,
+        translation_signs: tuple[float, float, float],
+        yaw_sign: float,
+        deadzone: float,
+        yaw_translation_lock: bool,
+    ):
         self._device = device
         self._translation_signs = translation_signs
         self._yaw_sign = yaw_sign
+        self._deadzone = max(0.0, float(deadzone))
+        self._yaw_translation_lock = yaw_translation_lock
 
     def __str__(self) -> str:
-        return f"{self._device} (simple XYZ+yaw mode)"
+        return f"{self._device} (simple XYZ+gripper-spin mode)"
 
     def reset(self) -> None:
         self._device.reset()
@@ -225,11 +252,21 @@ class _SimpleSpaceMouse:
         self._device.add_callback(key, func)
 
     def advance(self):
-        command = self._device.advance()
+        command = self._device.advance().clone()
+        if self._deadzone > 0.0:
+            command[torch.abs(command) < self._deadzone] = 0.0
         for axis, sign in enumerate(self._translation_signs):
             command[axis] *= sign
         command[3:5] = 0.0
         command[5] *= self._yaw_sign
+        translation_norm = torch.linalg.vector_norm(command[:3])
+        yaw_abs = torch.abs(command[5])
+        if translation_norm > self._deadzone:
+            command[5] = 0.0
+        elif yaw_abs > self._deadzone:
+            command[:3] = 0.0
+        if self._yaw_translation_lock and abs(float(command[5].detach().cpu())) > self._deadzone:
+            command[:3] = 0.0
         return command
 
 
@@ -268,6 +305,8 @@ def _create_builtin_device(device_name: str, sensitivity: float) -> object | Non
                     float(args_cli.spacemouse_simple_z_sign),
                 ),
                 float(args_cli.spacemouse_simple_yaw_sign),
+                float(args_cli.spacemouse_simple_deadzone),
+                bool(args_cli.spacemouse_simple_yaw_translation_lock),
             )
         return device
     elif name == "gamepad":
