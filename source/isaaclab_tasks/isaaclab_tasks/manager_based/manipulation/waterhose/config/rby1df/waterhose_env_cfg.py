@@ -15,10 +15,5 @@ class RBY1DFWaterhoseEnvCfg_PLAY(RBY1DFWaterhoseEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 1
-        self.fps = 300
-        self.sim_substeps = 10
-        self.vbd_iterations = 24
-        self.sim.dt = 1.0 / self.fps
-        self.sim.physics.num_substeps = int(self.sim_substeps)
-        self.sim.physics.use_cuda_graph = not bool(self.disable_cuda_graph)
+        self.sync_waterhose_sim_cfg()
         self.observations.policy.enable_corruption = False

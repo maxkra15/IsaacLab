@@ -144,6 +144,7 @@ class NewtonTaskSpaceIKAction(ActionTerm):
 
     def _setup_ik(self) -> None:
         body_q_np = core.NewtonManager.get_state_0().body_q.numpy()
+        self._cache_nominal_hold_targets(body_q_np)
         weights = (1.0, 1.0, 50.0)
         self._pos_objs = []
         self._rot_objs = []
@@ -191,6 +192,16 @@ class NewtonTaskSpaceIKAction(ActionTerm):
             jacobian_mode=core.ik.IKJacobianType.ANALYTIC,
         )
 
+    def _cache_nominal_hold_targets(self, body_q_np: np.ndarray) -> None:
+        self._hold_nominal_pos = np.zeros((self.num_envs, 2, 3), dtype=np.float64)
+        self._hold_nominal_quat = np.zeros((self.num_envs, 2, 4), dtype=np.float64)
+        for env_id in range(self.num_envs):
+            origin = self._env_origin(env_id)
+            for hold_index, body_id in enumerate((self._left_body_ids[env_id], self._torso_body_ids[env_id])):
+                q = body_q_np[body_id]
+                self._hold_nominal_pos[env_id, hold_index] = q[:3].astype(np.float64) - origin
+                self._hold_nominal_quat[env_id, hold_index] = q[3:].astype(np.float64)
+
     def _seed_control_targets(self) -> None:
         initial = self._single_robot_model.joint_q.numpy().astype(np.float32, copy=False)
         target_np = self._control.joint_target_pos.numpy().astype(np.float32, copy=True)
@@ -205,15 +216,15 @@ class NewtonTaskSpaceIKAction(ActionTerm):
     def _solve_env(
         self, env_id: int, current_q: np.ndarray, target_pos: np.ndarray, target_quat: np.ndarray
     ) -> np.ndarray:
-        origin = np.array([float(self._scene_builder.env_origins[env_id][i]) for i in range(3)], dtype=np.float64)
+        origin = self._env_origin(env_id)
         local_target_pos = target_pos - origin
         self._pos_objs[0].set_target_position(0, core.wp.vec3(*[float(v) for v in local_target_pos]))
         self._rot_objs[0].set_target_rotation(0, core.wp.vec4(*[float(v) for v in target_quat]))
-        hold_body_ids = (self._left_body_ids[env_id], self._torso_body_ids[env_id])
-        for objective_idx, body_id in enumerate(hold_body_ids, start=1):
-            q = core.NewtonManager.get_state_0().body_q.numpy()[body_id]
-            self._pos_objs[objective_idx].set_target_position(0, core.wp.vec3(*[float(v) for v in q[:3] - origin]))
-            self._rot_objs[objective_idx].set_target_rotation(0, core.wp.vec4(*[float(v) for v in q[3:]]))
+        for objective_idx, hold_index in enumerate(range(2), start=1):
+            pos = self._hold_nominal_pos[env_id, hold_index]
+            quat = self._hold_nominal_quat[env_id, hold_index]
+            self._pos_objs[objective_idx].set_target_position(0, core.wp.vec3(*[float(v) for v in pos]))
+            self._rot_objs[objective_idx].set_target_rotation(0, core.wp.vec4(*[float(v) for v in quat]))
         core.wp.copy(
             self._ik_joint_q,
             core.wp.array(
@@ -277,6 +288,9 @@ class NewtonTaskSpaceIKAction(ActionTerm):
         if isinstance(env_ids, int):
             return [env_ids]
         return [int(env_id) for env_id in env_ids]
+
+    def _env_origin(self, env_id: int) -> np.ndarray:
+        return np.array([float(self._scene_builder.env_origins[env_id][i]) for i in range(3)], dtype=np.float64)
 
 
 def _resolve_body_ids(labels: list[str], short_name: str, num_envs: int) -> list[int]:

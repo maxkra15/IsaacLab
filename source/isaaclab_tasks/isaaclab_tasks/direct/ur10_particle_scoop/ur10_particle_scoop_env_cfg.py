@@ -142,7 +142,7 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
     ik_rotation_weight = 2.0
     ik_joint_limit_weight = 10.0
     max_ik_delta_q = 0.035
-    success_fraction = 0.80
+    success_fraction = 0.70
     reward_bin_fraction_scale = 4.0
     reward_delta_bin_fraction_scale = 30.0
     reward_particle_progress_scale = 0.50
@@ -185,37 +185,30 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
 
     # curriculum
     curriculum_enabled = True
-    curriculum_stage_success_fractions = (0.06, 0.12, 0.22, 0.35, 0.50, 0.65, success_fraction)
-    curriculum_success_rate_thresholds = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65)
+    curriculum_stage_success_fractions = (0.06, 0.12, 0.22, success_fraction)
+    curriculum_success_rate_thresholds = (0.40, 0.45, 0.50)
     curriculum_min_resets_per_stage = 512
     curriculum_success_ema_alpha = 0.05
     curriculum_max_nonfinite_rate = 0.02
+    curriculum_decrease_nonfinite_rate = 0.20
+    curriculum_min_bin_fraction_ratio = 0.75
     curriculum_pile_center_x_ranges = (
         (0.54, 0.60),
         (0.50, 0.58),
-        (0.44, 0.54),
-        (0.38, 0.54),
-        (0.34, 0.52),
-        (0.30, 0.50),
-        (0.28, 0.50),
+        (0.46, 0.56),
+        (0.42, 0.54),
     )
     curriculum_pile_center_y_ranges = (
         (-0.08, -0.02),
         (-0.10, 0.00),
         (-0.12, 0.02),
-        (-0.16, 0.06),
-        (-0.20, 0.08),
-        (-0.22, 0.10),
-        (-0.24, 0.12),
+        (-0.14, 0.04),
     )
     curriculum_pile_scale_ranges = (
         (0.45, 0.60),
         (0.55, 0.70),
         (0.60, 0.80),
-        (0.70, 0.90),
-        (0.80, 1.00),
-        (0.85, 1.05),
-        (0.95, 1.10),
+        (0.65, 0.85),
     )
     curriculum_robot_init_enabled = True
     curriculum_robot_init_iterations = 16
@@ -223,21 +216,15 @@ class UR10ParticleScoopEnvCfg(DirectRLEnvCfg):
         (0.030, 0.080),
         (0.040, 0.100),
         (0.060, 0.130),
-        (0.080, 0.160),
-        (0.090, 0.170),
-        (0.100, 0.190),
-        (0.120, 0.220),
+        (0.070, 0.140),
     )
     curriculum_robot_start_y_noise_ranges = (
         (-0.030, 0.030),
         (-0.040, 0.040),
         (-0.060, 0.060),
         (-0.110, 0.110),
-        (-0.120, 0.120),
-        (-0.140, 0.140),
-        (-0.180, 0.180),
     )
-    curriculum_robot_start_z_offsets = (0.145, 0.145, 0.150, 0.155, 0.160, 0.165, 0.170)
+    curriculum_robot_start_z_offsets = (0.145, 0.145, 0.150, 0.155)
     max_ik_reset_delta_q = 0.16
     reset_ik_position_tolerance = 0.06
 

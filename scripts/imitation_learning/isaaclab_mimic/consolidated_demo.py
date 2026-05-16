@@ -13,6 +13,8 @@ import argparse
 
 from isaaclab.app import AppLauncher
 
+from isaaclab_tasks.manager_based.manipulation.waterhose.launch import prepare_waterhose_launch
+
 # add argparse arguments
 parser = argparse.ArgumentParser(
     description="Record demonstrations and run mimic dataset generation for Isaac Lab environments."
@@ -66,75 +68,15 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 
-def _get_dataset_env_name(input_file: str | None) -> str | None:
-    """Read the environment name from dataset metadata without importing Isaac Lab."""
-    if input_file is None:
-        return None
-
-    import json
-    import os
-
-    if not os.path.exists(input_file):
-        return None
-
-    import h5py
-
-    try:
-        with h5py.File(input_file, "r") as dataset_file:
-            env_args = dataset_file["data"].attrs.get("env_args")
-    except (KeyError, OSError):
-        return None
-    if env_args is None:
-        return None
-    if isinstance(env_args, bytes):
-        env_args = env_args.decode("utf-8")
-    try:
-        return json.loads(env_args).get("env_name")
-    except (TypeError, json.JSONDecodeError):
-        return None
-
-
-def _uses_waterhose_task() -> bool:
-    """Return whether the CLI or source dataset targets the waterhose task."""
-    task_name = args_cli.task.split(":")[-1] if args_cli.task else _get_dataset_env_name(args_cli.input_file)
-    return task_name is not None and "waterhose" in task_name.lower()
-
-
-def _prepare_newton_viewer_display() -> None:
-    """Default the Newton viewer display before launching Kit."""
-    import os
-
-    visualizer_arg = getattr(args_cli, "visualizer", "") or ""
-    if "newton" in str(visualizer_arg).lower():
-        os.environ.setdefault("DISPLAY", ":1")
-
-
-def _uses_kit_visualizer() -> bool:
-    """Return whether the CLI explicitly requests the Kit visualizer."""
-    visualizer_arg = getattr(args_cli, "visualizer", None)
-    if visualizer_arg is None:
-        return False
-    if isinstance(visualizer_arg, str):
-        visualizer_arg = [token.strip() for token in visualizer_arg.split(",")]
-    return "kit" in {str(visualizer).strip().lower() for visualizer in visualizer_arg}
-
-
-_prepare_newton_viewer_display()
-uses_waterhose_task = _uses_waterhose_task()
-uses_waterhose_newton_path = uses_waterhose_task and not _uses_kit_visualizer()
+waterhose_launch = prepare_waterhose_launch(args_cli, input_file=args_cli.input_file)
 
 # launch the simulator
-if uses_waterhose_newton_path:
+if waterhose_launch.uses_kitless_waterhose:
     app_launcher = None
     simulation_app = None
 else:
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
-
-if uses_waterhose_task:
-    from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core
-
-    core.import_newton_dependencies()
 
 """Rest everything follows."""
 

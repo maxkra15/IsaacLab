@@ -10,7 +10,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from isaaclab_newton.physics import NewtonCfg
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.physics import PhysicsEvent
@@ -35,35 +34,14 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
         self.obs_buf = self.observation_manager.compute(update_history=True)
 
     def _build_waterhose_model(self, cfg: RBY1DFWaterhoseEnvCfg) -> None:
-        overrides = dict(
-            fps=float(cfg.fps),
-            num_envs=int(cfg.scene.num_envs),
-            env_spacing=float(cfg.scene.env_spacing),
-            asset_root=cfg.asset_root,
-            robot_urdf=cfg.robot_urdf,
-            scene_usd=cfg.scene_usd,
-            cable_usd=cfg.cable_usd,
-            cable_prims=cfg.cable_prims,
-            cable_prim=cfg.cable_prim,
-            hose_radius=float(cfg.hose_radius),
-            gripper_drive_scale=float(cfg.gripper_drive_scale),
-            grasp_friction=float(cfg.grasp_friction),
-            grasp_margin=float(cfg.grasp_margin),
-            grasp_contact_ke=float(cfg.grasp_contact_ke),
-            sim_substeps=int(cfg.sim_substeps),
-            rigid_substeps=int(cfg.rigid_substeps),
-            proxy_iterations=int(cfg.proxy_iterations),
-            vbd_iterations=int(cfg.vbd_iterations),
-            disable_cuda_graph=bool(cfg.disable_cuda_graph),
-            device=str(cfg.sim.device),
+        self.waterhose_scene_builder, self.waterhose_builder, solver_cfg = core.build_waterhose_scene(
+            **cfg.waterhose_scene_kwargs()
         )
-        self.waterhose_scene_builder, self.waterhose_builder, solver_cfg = core.build_waterhose_scene(**overrides)
-        cfg.sim.dt = 1.0 / float(cfg.fps)
-        cfg.sim.physics = NewtonCfg(
-            solver_cfg=solver_cfg,
-            num_substeps=int(cfg.sim_substeps),
-            use_cuda_graph=not bool(cfg.disable_cuda_graph),
-        )
+        cfg.sim.physics.solver_cfg = solver_cfg
+        # NewtonCfg derives its manager class in __post_init__; keep it aligned
+        # with the runtime-built coupled solver cfg.
+        cfg.sim.physics.class_type = solver_cfg.class_type
+        cfg.sync_waterhose_sim_cfg()
         core.NewtonManager.set_builder(self.waterhose_builder)
         self._register_kit_scene_callback()
         self._register_cable_xform_callback()

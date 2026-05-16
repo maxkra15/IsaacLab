@@ -39,6 +39,8 @@ import os
 # Isaac Lab AppLauncher
 from isaaclab.app import AppLauncher
 
+from isaaclab_tasks.manager_based.manipulation.waterhose.launch import prepare_waterhose_launch
+
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Record demonstrations for Isaac Lab environments.")
 parser.add_argument("--task", type=str, required=True, help="Name of the task.")
@@ -91,52 +93,30 @@ if args_cli.task is None:
     parser.error("--task is required")
 
 
-def _get_visualizer_types() -> list[str]:
-    """Return normalized visualizer types from CLI arguments."""
-    visualizer_arg = getattr(args_cli, "visualizer", None)
-    if visualizer_arg is None:
-        return []
-    if isinstance(visualizer_arg, str):
-        visualizer_arg = [token.strip() for token in visualizer_arg.split(",")]
-    return [str(visualizer).strip().lower() for visualizer in visualizer_arg if str(visualizer).strip()]
-
-
-uses_waterhose_task = "waterhose" in args_cli.task.lower()
-uses_kit_visualizer = "kit" in _get_visualizer_types()
-uses_waterhose_newton_path = uses_waterhose_task and not uses_kit_visualizer
-
-if uses_waterhose_task and "newton" in _get_visualizer_types():
-    os.environ.setdefault("DISPLAY", ":1")
-if uses_waterhose_newton_path:
-    if args_cli.teleop_device is None:
-        args_cli.teleop_device = "spacemouse"
-    elif args_cli.teleop_device.lower() != "spacemouse":
-        parser.error(
-            "Waterhose recording with the Newton viewer requires --teleop_device spacemouse. "
-            "Keyboard teleoperation uses Omniverse input and requires --visualizer kit."
-        )
-if uses_waterhose_task and uses_kit_visualizer:
-    os.environ["ISAACLAB_WATERHOSE_DEFER_NEWTON_IMPORT"] = "1"
+waterhose_launch = prepare_waterhose_launch(
+    args_cli,
+    parser=parser,
+    default_standalone_spacemouse=True,
+    require_standalone_spacemouse=True,
+    standalone_spacemouse_error=(
+        "Waterhose recording with the Newton viewer requires --teleop_device spacemouse. "
+        "Keyboard teleoperation uses Omniverse input and requires --visualizer kit."
+    ),
+)
 
 # launch the simulator
-if uses_waterhose_newton_path:
+if waterhose_launch.uses_kitless_waterhose:
     app_launcher = None
     simulation_app = None
 else:
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
 
-if uses_waterhose_task and not uses_kit_visualizer:
-    from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core
-
-    core.import_newton_dependencies()
-
 """Rest everything follows."""
 
 
 # Third-party imports
 import logging
-import os
 import time
 from collections.abc import Callable
 
@@ -426,6 +406,7 @@ def setup_ui(label_text: str, env: gym.Env) -> InstructionDisplay:
         InstructionDisplay: The configured instruction display object
     """
     if simulation_app is None:
+
         class _NullInstructionDisplay:
             def show_demo(self, text):
                 pass

@@ -313,6 +313,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         self._episode_succeeded = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._curriculum_stage = 0
         self._curriculum_success_ema = 0.0
+        self._curriculum_bin_fraction_ema = 0.0
         self._curriculum_resets_in_stage = 0
         self._last_bin_fraction = torch.zeros(self.num_envs, device=self.device)
         self._last_spill_fraction = torch.zeros(self.num_envs, device=self.device)
@@ -1096,7 +1097,13 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         if hasattr(self, "_episode_sums"):
             completed_success_rate = self._episode_succeeded[env_ids].float().mean().item()
             completed_nonfinite_rate = self._nonfinite_state[env_ids].float().mean().item()
-            self._update_curriculum(completed_success_rate, completed_nonfinite_rate, int(env_ids.numel()))
+            completed_bin_fraction = self._last_bin_fraction[env_ids].mean().item()
+            self._update_curriculum(
+                completed_success_rate,
+                completed_nonfinite_rate,
+                completed_bin_fraction,
+                int(env_ids.numel()),
+            )
             extras = {}
             for key, value in self._episode_sums.items():
                 extras[f"Episode_Reward/{key}"] = value[env_ids].mean().item() / self.max_episode_length_s
@@ -1130,6 +1137,7 @@ class UR10ParticleScoopEnv(DirectRLEnv):
             extras["Diagnostics/reset_ik_position_error"] = self._last_reset_ik_position_error[env_ids].mean().item()
             extras["Curriculum/stage"] = float(self._curriculum_stage)
             extras["Curriculum/success_ema"] = float(self._curriculum_success_ema)
+            extras["Curriculum/bin_fraction_ema"] = float(self._curriculum_bin_fraction_ema)
             extras["Curriculum/target_success_fraction"] = float(self._target_success_fraction())
             self._episode_succeeded[env_ids] = False
             log_extras = extras
@@ -1482,25 +1490,45 @@ class UR10ParticleScoopEnv(DirectRLEnv):
         stage = min(self._curriculum_stage, len(self.cfg.curriculum_stage_success_fractions) - 1)
         return float(self.cfg.curriculum_stage_success_fractions[stage])
 
-    def _update_curriculum(self, success_rate: float, nonfinite_rate: float, reset_count: int) -> None:
+    def _update_curriculum(
+        self, success_rate: float, nonfinite_rate: float, bin_fraction: float, reset_count: int
+    ) -> None:
         if not self.cfg.curriculum_enabled:
             return
         alpha = float(self.cfg.curriculum_success_ema_alpha)
         self._curriculum_success_ema = (1.0 - alpha) * self._curriculum_success_ema + alpha * success_rate
+        self._curriculum_bin_fraction_ema = (
+            (1.0 - alpha) * self._curriculum_bin_fraction_ema + alpha * bin_fraction
+        )
         self._curriculum_resets_in_stage += reset_count
         max_stage = len(self.cfg.curriculum_stage_success_fractions) - 1
-        if self._curriculum_stage >= max_stage:
+        if (
+            nonfinite_rate > self.cfg.curriculum_decrease_nonfinite_rate
+            and self._curriculum_stage > 0
+            and self._curriculum_resets_in_stage >= self.cfg.curriculum_min_resets_per_stage
+        ):
+            self._curriculum_stage -= 1
+            self._curriculum_success_ema = 0.0
+            self._curriculum_bin_fraction_ema = 0.0
+            self._curriculum_resets_in_stage = 0
             return
         if nonfinite_rate > self.cfg.curriculum_max_nonfinite_rate:
             self._curriculum_success_ema = 0.5 * self._curriculum_success_ema
+            self._curriculum_bin_fraction_ema = 0.5 * self._curriculum_bin_fraction_ema
+            return
+        if self._curriculum_stage >= max_stage:
             return
         threshold = float(self.cfg.curriculum_success_rate_thresholds[self._curriculum_stage])
+        target_fraction = float(self.cfg.curriculum_stage_success_fractions[self._curriculum_stage])
+        min_bin_fraction = self.cfg.curriculum_min_bin_fraction_ratio * target_fraction
         if (
             self._curriculum_resets_in_stage >= self.cfg.curriculum_min_resets_per_stage
             and self._curriculum_success_ema >= threshold
+            and max(bin_fraction, self._curriculum_bin_fraction_ema) >= min_bin_fraction
         ):
             self._curriculum_stage += 1
             self._curriculum_success_ema = 0.0
+            self._curriculum_bin_fraction_ema = 0.0
             self._curriculum_resets_in_stage = 0
 
     def _sample_particle_reset_positions(self, env_ids: torch.Tensor) -> torch.Tensor:

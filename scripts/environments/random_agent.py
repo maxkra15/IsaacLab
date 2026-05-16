@@ -6,13 +6,13 @@
 """Script to an environment with random action agent."""
 
 import argparse
-import os
 import sys
 
 import gymnasium as gym
 import torch
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.manager_based.manipulation.waterhose.launch import prepare_waterhose_launch
 from isaaclab_tasks.utils import add_launcher_args, launch_simulation, resolve_task_config
 
 # add argparse arguments
@@ -33,31 +33,11 @@ sys.argv = [sys.argv[0]] + hydra_args
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
-def _get_visualizer_types() -> set[str]:
-    """Return visualizer types requested through the launcher CLI."""
-    visualizers = getattr(args_cli, "visualizer", None)
-    if not visualizers:
-        return set()
-    if isinstance(visualizers, str):
-        visualizers = [token.strip() for token in visualizers.split(",")]
-    return {str(visualizer).strip().lower() for visualizer in visualizers if str(visualizer).strip()}
-
-
-def _prepare_waterhose_visualizer_imports() -> None:
-    """Configure waterhose imports for the selected visualizer startup path."""
-    visualizer_types = _get_visualizer_types()
-    if visualizer_types & {"kit", "newton"}:
-        os.environ.setdefault("DISPLAY", ":1")
-    if args_cli.task is None or "waterhose" not in args_cli.task.lower() or "kit" not in visualizer_types:
-        return
-    os.environ["ISAACLAB_WATERHOSE_DEFER_NEWTON_IMPORT"] = "1"
-
-
 def main():
     """Random actions agent with Isaac Lab environment."""
 
     torch.manual_seed(42)
-    _prepare_waterhose_visualizer_imports()
+    prepare_waterhose_launch(args_cli)
 
     # parse configuration via Hydra (supports preset selection, e.g. env.sim.physics=newton_mjwarp)
     env_cfg, _ = resolve_task_config(args_cli.task, "")

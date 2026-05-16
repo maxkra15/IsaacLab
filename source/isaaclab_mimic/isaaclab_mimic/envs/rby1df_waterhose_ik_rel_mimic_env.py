@@ -7,10 +7,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core  # isort: skip
-
-core.import_newton_dependencies()
-
 import torch
 
 import isaaclab.utils.math as PoseUtils

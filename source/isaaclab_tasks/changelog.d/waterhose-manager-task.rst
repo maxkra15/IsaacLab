@@ -3,6 +3,17 @@ Added
 
 * Added the manager-based RBY1 waterhose task with Newton proxy-coupled
   physics, task-space IK actions, and scripted demonstration recording.
+* Added ``proxy_mass_scale`` to tune RBY1 waterhose Newton proxy coupling.
+
+Changed
+^^^^^^^
+
+* Changed the RBY1 waterhose task configuration to derive Newton builder timing
+  from ``SimulationCfg.dt`` instead of a separate task ``fps`` field.
+* Changed RBY1 waterhose launch scripts to use a shared Newton/Kit
+  import-order helper.
+* Changed the RBY1 waterhose Newton solver, robot drive, and cable material
+  defaults to follow Newton's proxy-coupled cable robot example.
 
 Fixed
 ^^^^^

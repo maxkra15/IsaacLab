@@ -22,7 +22,7 @@ _DEFAULT_CABLE_ROBOT_ASSETS = _ISAACLAB_ROOT / "source/isaaclab_assets/data/Prop
 def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
     """Create the namespace expected by the shared Newton waterhose builder."""
     defaults = dict(
-        fps=300.0,
+        fps=100.0,
         max_steps=1400,
         num_envs=1,
         env_spacing=2.5,
@@ -33,14 +33,58 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         cable_prims="/World/cable001/curve_0,/World/cable002/curve_0",
         cable_prim=None,
         hose_radius=0.003,
-        gripper_drive_scale=0.5,
-        grasp_friction=1.0e6,
+        gripper_drive_scale=2.0,
+        grasp_friction=3.0e6,
         grasp_margin=0.001,
         grasp_contact_ke=2.0e5,
         sim_substeps=10,
         rigid_substeps=1,
         proxy_iterations=1,
-        vbd_iterations=15,
+        proxy_mass_scale=1.0,
+        vbd_iterations=10,
+        rigid_contact_max=100000,
+        mujoco_iterations=20,
+        mujoco_ls_iterations=10,
+        mujoco_ls_parallel=True,
+        mujoco_impratio=1000.0,
+        mujoco_use_mujoco_contacts=True,
+        robot_shape_margin=0.0,
+        robot_shape_gap=0.005,
+        robot_shape_ke=5.0e4,
+        robot_shape_kd=5.0e2,
+        robot_shape_mu=2.0,
+        robot_joint_target_ke=45000.0,
+        robot_joint_target_kd=4500.0,
+        robot_joint_effort_limit=1000.0,
+        robot_joint_armature=0.2,
+        gripper_joint_target_ke=10000.0,
+        gripper_joint_target_kd=1000.0,
+        gripper_joint_effort_limit=100000.0,
+        gripper_joint_armature=0.5,
+        vbd_collide_substeps=5,
+        vbd_default_contact_ke=1.0e5,
+        vbd_default_contact_kd=1.0e-1,
+        vbd_default_contact_margin=0.001,
+        vbd_solver_friction_epsilon=0.1,
+        vbd_rigid_contact_buffer_size=1024,
+        vbd_proxy_margin=0.001,
+        vbd_cable_density=10000.0,
+        vbd_cable_mu=1.0,
+        vbd_cable_margin=0.0,
+        vbd_cable_gap=0.001,
+        vbd_static_margin=1.0e-4,
+        vbd_static_gap=0.001,
+        vbd_near_tip_mu=1.0e1,
+        vbd_far_tip_mu=1.0e5,
+        vbd_ground_mu=1.0e5,
+        vbd_rigid_avbd_beta=1.0e5,
+        vbd_rigid_contact_k_start=1.0e2,
+        vbd_rigid_joint_linear_k_start=1.0e4,
+        vbd_rigid_joint_angular_k_start=1.0e1,
+        cable_stretch_stiffness=1.0e12,
+        cable_stretch_damping=1.0e-3,
+        cable_bend_rigidity=3.0e0,
+        cable_bend_damping=1.0e0,
         disable_cuda_graph=False,
         log_interval=0,
         print_cable_poses=False,
@@ -64,6 +108,8 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         max_visible_envs=None,
     )
     defaults.update(overrides)
+    if "grasp_margin" in overrides and "vbd_proxy_margin" not in overrides:
+        defaults["vbd_proxy_margin"] = defaults["grasp_margin"]
     for key in ("asset_root", "robot_urdf", "scene_usd", "cable_usd"):
         if defaults[key] is not None:
             defaults[key] = Path(defaults[key]).expanduser()
@@ -82,9 +128,9 @@ def configure_waterhose_args(**overrides: Any) -> SimpleNamespace:
 
 def build_waterhose_scene(**overrides: Any):
     """Build the Newton waterhose model and coupled solver configuration."""
-    configure_waterhose_args(**overrides)
+    cfg = make_waterhose_args(**overrides)
     import_newton_dependencies()
-    scene_builder = WaterhoseSceneBuilder()
+    scene_builder = WaterhoseSceneBuilder(cfg)
     builder, solver_cfg = scene_builder.build()
     return scene_builder, builder, solver_cfg
 
@@ -103,7 +149,6 @@ ROBOT_PRIM_PATH = "/World/RBY1DF"
 RIGHT_EE = "right_gripper_end_effector"
 LEFT_EE = "left_gripper_end_effector"
 TORSO = "torso_hip_yaw"
-_ACTIVE_SCENE_BUILDER = None
 PROXY_BODY_NAMES = {
     "right_gripper_base",
     "right_gripper_camera_bracket",
@@ -114,6 +159,46 @@ PROXY_BODY_NAMES = {
     "left_gripper_leftfinger",
     "left_gripper_rightfinger",
 }
+_ACTIVE_SCENE_BUILDER = None
+
+
+def _active_scene_builder() -> WaterhoseSceneBuilder:
+    if _ACTIVE_SCENE_BUILDER is None:
+        raise RuntimeError("Waterhose Newton view was configured before the scene builder was initialized.")
+    return _ACTIVE_SCENE_BUILDER
+
+
+def configure_mujoco_view(view) -> None:
+    """Restrict the MuJoCo view to the robot prefix in the shared model."""
+    scene_builder = _active_scene_builder()
+    view.body_count = scene_builder._mujoco_body_count
+    view.shape_count = scene_builder._mujoco_shape_count
+    view.joint_count = scene_builder._mujoco_joint_count
+    view.joint_coord_count = scene_builder._mujoco_joint_coord_count
+    view.joint_dof_count = scene_builder._mujoco_joint_dof_count
+    view.articulation_count = scene_builder._mujoco_articulation_count
+
+
+def configure_vbd_view(view) -> None:
+    """Match the reference script's gripper-finger proxy contact material."""
+    scene_builder = _active_scene_builder()
+    if not scene_builder.proxy_shape_ids:
+        return
+    proxy_shape_ids = np.asarray(scene_builder.proxy_shape_ids, dtype=np.int32)
+    model = view.parent
+    for attr, value in (
+        ("shape_material_ke", float(scene_builder.cfg.grasp_contact_ke)),
+        ("shape_material_kd", float(scene_builder.cfg.vbd_default_contact_kd)),
+        ("shape_material_mu", float(scene_builder.cfg.grasp_friction)),
+        ("shape_margin", float(scene_builder.cfg.vbd_proxy_margin)),
+    ):
+        data = getattr(model, attr, None)
+        if data is None:
+            continue
+        data_np = data.numpy().copy()
+        data_np[proxy_shape_ids] = value
+        setattr(view, attr, wp.array(data_np, dtype=wp.float32, device=model.device))
+
 
 LEROBOT_INITIAL_STATE_22 = [
     0.0,
@@ -161,7 +246,7 @@ def import_newton_dependencies() -> None:
     JointTargetMode = JointTargetModeClass
 
 
-def _load_cable_curve_importer():
+def _load_cable_curve_importer(asset_root: Path | None = None):
     """Load the USD BasisCurves cable importer."""
     try:
         from newton.examples.cable_robot.usd_cable_curve_import import add_cable_from_usd_curve as importer
@@ -171,7 +256,8 @@ def _load_cable_curve_importer():
         pass
 
     # Fallback for local asset bundles that carry a copy next to ``assets/``.
-    helper_path = args_cli.asset_root.expanduser().resolve().parent / "usd_cable_curve_import.py"
+    root = asset_root if asset_root is not None else args_cli.asset_root.expanduser().resolve()
+    helper_path = root.parent / "usd_cable_curve_import.py"
     if not helper_path.is_file():
         raise FileNotFoundError(
             "Cable USD importer not found in newton.examples.cable_robot or next to the configured asset root: "
@@ -365,37 +451,44 @@ def _create_launcher_sim_cfg():
 class WaterhoseSceneBuilder:
     """Build a shared model and Isaac Lab coupled-solver cfg for the demo."""
 
-    def __init__(self):
-        self.num_envs = int(args_cli.num_envs)
-        self.env_spacing = float(args_cli.env_spacing)
+    def __init__(self, cfg: SimpleNamespace | None = None):
+        self.cfg = cfg if cfg is not None else args_cli
+        self.num_envs = int(self.cfg.num_envs)
+        self.env_spacing = float(self.cfg.env_spacing)
         self.env_origins = [self._env_origin(env_id) for env_id in range(self.num_envs)]
-        self.asset_root = args_cli.asset_root.expanduser().resolve()
+        self.asset_root = self.cfg.asset_root.expanduser().resolve()
         self.robot_urdf = self._resolve_robot_urdf()
-        self.scene_usd = self._resolve_asset(args_cli.scene_usd, "Cable008/Cable008_Body.usda")
-        self.cable_usd = self._resolve_asset(args_cli.cable_usd, "Cable008/curve/cable_SRA_curve03.usda")
+        self.scene_usd = self._resolve_asset(self.cfg.scene_usd, "Cable008/Cable008_Body.usda")
+        self.cable_usd = self._resolve_asset(self.cfg.cable_usd, "Cable008/curve/cable_SRA_curve03.usda")
 
-        self.robot_shape_cfg = newton.ModelBuilder.ShapeConfig(margin=0.0, gap=0.005, ke=5.0e4, kd=5.0e2, mu=2.0)
+        self.robot_shape_cfg = newton.ModelBuilder.ShapeConfig(
+            margin=float(self.cfg.robot_shape_margin),
+            gap=float(self.cfg.robot_shape_gap),
+            ke=float(self.cfg.robot_shape_ke),
+            kd=float(self.cfg.robot_shape_kd),
+            mu=float(self.cfg.robot_shape_mu),
+        )
         self.robot_shape_cfg.is_hydroelastic = False
         self.hose_shape_cfg = newton.ModelBuilder.ShapeConfig(
-            density=1000.0,
-            margin=0.0,
-            gap=0.001,
-            ke=1.0e3,
-            kd=0.0,
-            mu=0.2,
+            density=float(self.cfg.vbd_cable_density),
+            margin=float(self.cfg.vbd_cable_margin),
+            gap=float(self.cfg.vbd_cable_gap),
+            ke=float(self.cfg.vbd_default_contact_ke),
+            kd=float(self.cfg.vbd_default_contact_kd),
+            mu=float(self.cfg.vbd_cable_mu),
         )
         self.static_shape_cfg = newton.ModelBuilder.ShapeConfig(
             density=0.0,
-            margin=1.0e-4,
-            gap=0.001,
-            ke=1.0e5,
-            kd=1.0e-1,
-            mu=1.0e1,
+            margin=float(self.cfg.vbd_static_margin),
+            gap=float(self.cfg.vbd_static_gap),
+            ke=float(self.cfg.vbd_default_contact_ke),
+            kd=float(self.cfg.vbd_default_contact_kd),
+            mu=float(self.cfg.vbd_near_tip_mu),
         )
-        self.cable_stretch_stiffness = 1.0e6
-        self.cable_stretch_damping = 1.0e-5
-        self.cable_bend_stiffness = 2.0e1
-        self.cable_bend_damping = 1.0
+        self.cable_stretch_stiffness = float(self.cfg.cable_stretch_stiffness)
+        self.cable_stretch_damping = float(self.cfg.cable_stretch_damping)
+        self.cable_bend_rigidity = float(self.cfg.cable_bend_rigidity)
+        self.cable_bend_damping = float(self.cfg.cable_bend_damping)
 
         self.table_pos = wp.vec3(0.95, -0.051, 0.1925)
         self.table_half_size = (0.55, 0.35, 0.1925)
@@ -452,8 +545,8 @@ class WaterhoseSceneBuilder:
         return path
 
     def _resolve_robot_urdf(self) -> Path:
-        if args_cli.robot_urdf is not None:
-            path = args_cli.robot_urdf.expanduser().resolve()
+        if self.cfg.robot_urdf is not None:
+            path = self.cfg.robot_urdf.expanduser().resolve()
         else:
             bundled = self.asset_root / "rby1df/urdf/robot_edited.urdf"
             path = bundled if bundled.is_file() else _DEFAULT_RBY1_URDF
@@ -490,7 +583,7 @@ class WaterhoseSceneBuilder:
         # Finalize the standalone IK model after USD scene parsing.  The USD
         # physics importer for Cable008 is fragile if called after CUDA/Warp
         # solver modules have already initialized during robot.finalize().
-        self.single_robot_model = robot.finalize(device=str(args_cli.device))
+        self.single_robot_model = robot.finalize(device=str(self.cfg.device))
         builder.color()
         import_isaaclab_runtime_dependencies()
         NewtonManager._num_envs = self.num_envs
@@ -701,7 +794,8 @@ class WaterhoseSceneBuilder:
             ignore_inertial_definitions=True,
         )
 
-        self._patch_gripper_dummy_bodies(robot)
+        self._patch_zero_mass_children(robot)
+        self._disable_gripper_mimic_constraints(robot)
         self._discover_gripper_dofs(robot)
         self._configure_robot_dofs(robot)
         self._seed_initial_joint_state(robot)
@@ -709,14 +803,33 @@ class WaterhoseSceneBuilder:
         return robot
 
     @staticmethod
-    def _patch_gripper_dummy_bodies(robot) -> None:
-        """Match the pure Newton example's tiny mass patch for gripper dummy links."""
-        for body_id, label in enumerate(robot.body_label):
-            if label.endswith("gripper_dummy") and robot.body_mass[body_id] == 0.0:
-                robot.body_mass[body_id] = 1.0e-6
-                robot.body_inv_mass[body_id] = 1.0e6
-                robot.body_inertia[body_id] = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-10)
-                robot.body_inv_inertia[body_id] = wp.inverse(robot.body_inertia[body_id])
+    def _patch_zero_mass_children(robot) -> None:
+        """Patch invalid zero-mass driven links without editing the URDF asset."""
+        min_inertia = wp.mat33(
+            robot.bound_inertia,
+            0.0,
+            0.0,
+            0.0,
+            robot.bound_inertia,
+            0.0,
+            0.0,
+            0.0,
+            robot.bound_inertia,
+        )
+        for child in {int(value) for value in robot.joint_child if int(value) >= 0}:
+            if robot.body_mass[child] <= 0.0:
+                robot.body_mass[child] = robot.bound_mass
+                robot.body_inv_mass[child] = 1.0 / robot.bound_mass
+                robot.body_inertia[child] = min_inertia
+                robot.body_inv_inertia[child] = wp.inverse(min_inertia)
+
+    @staticmethod
+    def _disable_gripper_mimic_constraints(robot) -> None:
+        """Match the reference Newton waterhose examples' gripper behavior."""
+        mimic_enabled = getattr(robot, "constraint_mimic_enabled", [])
+        mimic_count = len(mimic_enabled)
+        if mimic_count > 0:
+            robot.constraint_mimic_enabled[-mimic_count:] = [False] * mimic_count
 
     def _discover_gripper_dofs(self, robot) -> None:
         self.right_gripper_driver_dofs = self._joint_dofs_by_name(robot, ["right_gripper_finger_joint_1"])
@@ -741,24 +854,19 @@ class WaterhoseSceneBuilder:
         return dofs
 
     def _configure_robot_dofs(self, robot) -> None:
-        driver_set = set(self.gripper_driver_dofs)
-        finger_set = set(self.gripper_finger_dofs)
+        gripper_set = set(self.gripper_driver_dofs) | set(self.gripper_finger_dofs)
+        gripper_scale = float(self.cfg.gripper_drive_scale)
         for dof in range(robot.joint_dof_count):
-            if dof in driver_set:
-                robot.joint_target_ke[dof] = 10000.0
-                robot.joint_target_kd[dof] = 1000.0
-                robot.joint_effort_limit[dof] = 100000.0
-                robot.joint_armature[dof] = 0.5
-            elif dof in finger_set:
-                robot.joint_target_ke[dof] = 500000.0
-                robot.joint_target_kd[dof] = 10000.0
-                robot.joint_effort_limit[dof] = 500000.0
-                robot.joint_armature[dof] = 0.5
+            if dof in gripper_set:
+                robot.joint_target_ke[dof] = float(self.cfg.gripper_joint_target_ke) * gripper_scale
+                robot.joint_target_kd[dof] = float(self.cfg.gripper_joint_target_kd) * gripper_scale
+                robot.joint_effort_limit[dof] = float(self.cfg.gripper_joint_effort_limit) * gripper_scale
+                robot.joint_armature[dof] = float(self.cfg.gripper_joint_armature)
             else:
-                robot.joint_target_ke[dof] = 120000.0
-                robot.joint_target_kd[dof] = 12000.0
-                robot.joint_effort_limit[dof] = 10000.0
-                robot.joint_armature[dof] = 0.2
+                robot.joint_target_ke[dof] = float(self.cfg.robot_joint_target_ke)
+                robot.joint_target_kd[dof] = float(self.cfg.robot_joint_target_kd)
+                robot.joint_effort_limit[dof] = float(self.cfg.robot_joint_effort_limit)
+                robot.joint_armature[dof] = float(self.cfg.robot_joint_armature)
             robot.joint_target_mode[dof] = int(JointTargetMode.POSITION)
 
     def _seed_initial_joint_state(self, robot) -> None:
@@ -812,16 +920,22 @@ class WaterhoseSceneBuilder:
         global add_cable_from_usd_curve
 
         if add_cable_from_usd_curve is None:
-            add_cable_from_usd_curve = _load_cable_curve_importer()
+            add_cable_from_usd_curve = _load_cable_curve_importer(self.asset_root)
 
         cfg = self.hose_shape_cfg.copy()
-        head_cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, ke=1.0e3, kd=0.0, mu=0.2)
+        head_cfg = newton.ModelBuilder.ShapeConfig(
+            density=float(self.cfg.vbd_cable_density),
+            ke=float(self.cfg.vbd_default_contact_ke),
+            kd=float(self.cfg.vbd_default_contact_kd),
+            mu=float(self.cfg.vbd_cable_mu),
+        )
         cable_joint_ids: list[int] = []
         fixed_body_ids: list[int] = []
         self.cable_body_ids = []
         self.cable_head_body_ids = []
 
         for cable_index, curve_prim_path in enumerate(self._cable_prim_paths()):
+            cable_bend_stiffness = self._cable_bend_stiffness(curve_prim_path)
             result = add_cable_from_usd_curve(
                 builder=builder,
                 source_usd_path=str(self.cable_usd),
@@ -830,7 +944,7 @@ class WaterhoseSceneBuilder:
                 cable_cfg=cfg,
                 stretch_stiffness=self.cable_stretch_stiffness,
                 stretch_damping=self.cable_stretch_damping,
-                bend_stiffness=self.cable_bend_stiffness,
+                bend_stiffness=cable_bend_stiffness,
                 bend_damping=self.cable_bend_damping,
                 wrap_in_articulation=False,
                 head_shape_mode="mesh",
@@ -862,11 +976,50 @@ class WaterhoseSceneBuilder:
             builder.body_inertia[body_id] = wp.mat33()
             builder.body_inv_inertia[body_id] = wp.mat33()
 
-    @staticmethod
-    def _cable_prim_paths() -> list[str]:
-        if args_cli.cable_prim:
-            return [args_cli.cable_prim]
-        return [path.strip() for path in args_cli.cable_prims.split(",") if path.strip()]
+    def _cable_prim_paths(self) -> list[str]:
+        if self.cfg.cable_prim:
+            return [self.cfg.cable_prim]
+        return [path.strip() for path in self.cfg.cable_prims.split(",") if path.strip()]
+
+    def _cable_bend_stiffness(self, curve_prim_path: str) -> float:
+        """Convert the proxy-coupled example's bend rigidity to per-joint stiffness."""
+        return self.cable_bend_rigidity / self._cable_mean_edge_length(curve_prim_path)
+
+    def _cable_mean_edge_length(self, curve_prim_path: str) -> float:
+        """Return the mean authored cable edge length [m] for one USD BasisCurves prim."""
+        from pxr import Usd, UsdGeom
+
+        stage = Usd.Stage.Open(str(self.cable_usd))
+        if stage is None:
+            raise RuntimeError(f"Failed to open cable USD stage: {self.cable_usd}")
+        curve_prim = stage.GetPrimAtPath(curve_prim_path)
+        if not curve_prim or not curve_prim.IsValid():
+            raise ValueError(f"Curve prim {curve_prim_path!r} is not valid in stage {self.cable_usd}.")
+
+        points_attr = curve_prim.GetAttribute("points")
+        points_raw = points_attr.Get() if points_attr else None
+        if points_raw is None:
+            raise ValueError(f"BasisCurves {curve_prim_path!r} is missing points.")
+
+        points = np.asarray(points_raw, dtype=np.float64).reshape(-1, 3)
+        if UsdGeom.StageHasAuthoredMetersPerUnit(stage):
+            meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage))
+        else:
+            meters_per_unit = 1.0
+        points *= meters_per_unit
+
+        connections_attr = curve_prim.GetAttribute("connections")
+        connections_raw = connections_attr.Get() if connections_attr else None
+        if connections_raw is None:
+            edges = [(index, index + 1) for index in range(points.shape[0] - 1)]
+        else:
+            edges = [(int(pair[0]), int(pair[1])) for pair in connections_raw]
+
+        lengths = [float(np.linalg.norm(points[v] - points[u])) for u, v in edges]
+        positive_lengths = [length for length in lengths if length > 0.0]
+        if not positive_lengths:
+            raise ValueError(f"BasisCurves {curve_prim_path!r} has no positive-length edges.")
+        return float(np.mean(positive_lengths))
 
     @staticmethod
     def _sanitize_imported_labels(builder, result, cable_index: int) -> None:
@@ -924,7 +1077,7 @@ class WaterhoseSceneBuilder:
             if body_q_prev is not None:
                 apply_to_array(body_q_prev)
 
-        if args_cli.print_cable_poses:
+        if self.cfg.print_cable_poses:
             self._print_runtime_cable_pose_summary("manager_runtime_after_asset_xform")
 
     def configure_runtime_vbd_solver(self) -> None:
@@ -1037,11 +1190,12 @@ class WaterhoseSceneBuilder:
     def _make_solver_cfg(self):
         global _ACTIVE_SCENE_BUILDER
         _ACTIVE_SCENE_BUILDER = self
+        rigid_contact_max_per_world = max(1, int(self.cfg.rigid_contact_max) // max(1, self.num_envs))
 
         def create_proxy_collision_pipeline(model_view):
             return newton.examples.create_collision_pipeline(
                 model_view,
-                args_cli,
+                self.cfg,
                 contact_matching="sticky",
                 contact_matching_pos_threshold=0.005,
                 contact_matching_normal_dot_threshold=0.95,
@@ -1055,34 +1209,33 @@ class WaterhoseSceneBuilder:
                         solver="newton",
                         integrator="implicitfast",
                         cone="elliptic",
-                        njmax=100000,
-                        nconmax=100000,
-                        iterations=20,
-                        ls_iterations=10,
-                        ls_parallel=False,
-                        broadphase="NXN",
-                        graph_conditional=False,
-                        impratio=1000.0,
-                        use_mujoco_contacts=True,
+                        njmax=rigid_contact_max_per_world,
+                        nconmax=rigid_contact_max_per_world,
+                        iterations=int(self.cfg.mujoco_iterations),
+                        ls_iterations=int(self.cfg.mujoco_ls_iterations),
+                        ls_parallel=bool(self.cfg.mujoco_ls_parallel),
+                        impratio=float(self.cfg.mujoco_impratio),
+                        use_mujoco_contacts=bool(self.cfg.mujoco_use_mujoco_contacts),
                     ),
                     bodies=self._mujoco_body_ids,
                     joints=self._mujoco_joint_ids,
                     shapes=self._mujoco_shape_ids,
                     configure_view=configure_mujoco_view,
-                    substeps=args_cli.rigid_substeps,
+                    substeps=self.cfg.rigid_substeps,
                 ),
                 CoupledSolverEntryCfg(
                     name=HOSE_ENTRY,
                     solver_cfg=NewtonSolverCfg(),
                     solver_class=SolverVBD,
                     solver_kwargs={
-                        "iterations": args_cli.vbd_iterations,
-                        "friction_epsilon": 0.1,
-                        "rigid_contact_hard": False,
-                        "rigid_body_contact_buffer_size": 1024,
-                        "rigid_body_particle_contact_buffer_size": 1,
-                        "rigid_joint_linear_ke": 1.0e6,
-                        "rigid_joint_angular_ke": 1.0e6,
+                        "iterations": self.cfg.vbd_iterations,
+                        "friction_epsilon": float(self.cfg.vbd_solver_friction_epsilon),
+                        "rigid_avbd_beta": float(self.cfg.vbd_rigid_avbd_beta),
+                        "rigid_contact_history": True,
+                        "rigid_contact_k_start": float(self.cfg.vbd_rigid_contact_k_start),
+                        "rigid_body_contact_buffer_size": int(self.cfg.vbd_rigid_contact_buffer_size),
+                        "rigid_joint_linear_k_start": float(self.cfg.vbd_rigid_joint_linear_k_start),
+                        "rigid_joint_angular_k_start": float(self.cfg.vbd_rigid_joint_angular_k_start),
                     },
                     bodies=self._vbd_body_ids,
                     joints=self._vbd_joint_ids,
@@ -1097,53 +1250,15 @@ class WaterhoseSceneBuilder:
                         source=ROBOT_ENTRY,
                         destination=HOSE_ENTRY,
                         bodies=self.proxy_body_ids,
-                        mass_scale=1.0,
+                        mass_scale=float(self.cfg.proxy_mass_scale),
                         mode="lagged",
                         collision_pipeline_factory=create_proxy_collision_pipeline,
-                        collide_interval=5,
+                        collide_interval=int(self.cfg.vbd_collide_substeps),
                     )
                 ],
-                iterations=args_cli.proxy_iterations,
+                iterations=self.cfg.proxy_iterations,
             ),
         )
-
-
-def _active_scene_builder() -> WaterhoseSceneBuilder:
-    if _ACTIVE_SCENE_BUILDER is None:
-        raise RuntimeError("Waterhose scene builder is not active.")
-    return _ACTIVE_SCENE_BUILDER
-
-
-def configure_mujoco_view(view) -> None:
-    """Restrict the MuJoCo view to the robot prefix in the shared model."""
-    scene_builder = _active_scene_builder()
-    view.body_count = scene_builder._mujoco_body_count
-    view.shape_count = scene_builder._mujoco_shape_count
-    view.joint_count = scene_builder._mujoco_joint_count
-    view.joint_coord_count = scene_builder._mujoco_joint_coord_count
-    view.joint_dof_count = scene_builder._mujoco_joint_dof_count
-    view.articulation_count = scene_builder._mujoco_articulation_count
-
-
-def configure_vbd_view(view) -> None:
-    """Match the reference script's gripper-finger proxy contact material."""
-    scene_builder = _active_scene_builder()
-    if not scene_builder.proxy_shape_ids:
-        return
-    proxy_shape_ids = np.asarray(scene_builder.proxy_shape_ids, dtype=np.int32)
-    model = view.parent
-    for attr, value in (
-        ("shape_material_ke", float(args_cli.grasp_contact_ke)),
-        ("shape_material_kd", 1.0e-1),
-        ("shape_material_mu", float(args_cli.grasp_friction)),
-        ("shape_margin", float(args_cli.grasp_margin)),
-    ):
-        data = getattr(model, attr, None)
-        if data is None:
-            continue
-        data_np = data.numpy().copy()
-        data_np[proxy_shape_ids] = value
-        setattr(view, attr, wp.array(data_np, dtype=wp.float32, device=model.device))
 
 
 class WaterhoseIKController:
@@ -1173,6 +1288,7 @@ class WaterhoseIKController:
 
     def __init__(self, scene_builder: WaterhoseSceneBuilder):
         self.scene_builder = scene_builder
+        self.cfg = scene_builder.cfg
         self.model = NewtonManager.get_model()
         self.state = NewtonManager.get_state_0()
         self.control = NewtonManager.get_control()
@@ -1233,7 +1349,7 @@ class WaterhoseIKController:
             _np_quat_from_axis_angle([0.0, 0.0, 1.0], -np.pi / 2.0),
         )
         self.grasp_shift = 0.004
-        self.grasp_local_offset = np.array([0.0, -args_cli.hose_radius + 0.002, 0.0], dtype=np.float64)
+        self.grasp_local_offset = np.array([0.0, -self.cfg.hose_radius + 0.002, 0.0], dtype=np.float64)
         self.right_open_driver, self.right_closed_driver = self._gripper_driver_targets(
             scene_builder.right_gripper_driver_dofs
         )
@@ -1551,7 +1667,7 @@ class WaterhoseIKController:
         self.grasp_local_offset = np.array(
             [
                 toward_cable_local[0] * self.grasp_shift,
-                -args_cli.hose_radius + 0.002 + toward_cable_local[1] * self.grasp_shift,
+                -self.cfg.hose_radius + 0.002 + toward_cable_local[1] * self.grasp_shift,
                 toward_cable_local[2] * self.grasp_shift,
             ],
             dtype=np.float64,
@@ -1714,7 +1830,7 @@ class WaterhoseIKController:
     def _gripper_joint_step_limit(self) -> float:
         if self.max_gripper_joint_velocity <= 0.0:
             return self.max_gripper_joint_step
-        step_dt = 1.0 / max(float(args_cli.fps), 1.0)
+        step_dt = 1.0 / max(float(self.cfg.fps), 1.0)
         return min(self.max_gripper_joint_step, self.max_gripper_joint_velocity * step_dt)
 
 

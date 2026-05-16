@@ -19,10 +19,11 @@ The script automatically detects which stack to use based on the environment con
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-import os
 from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
+
+from isaaclab_tasks.manager_based.manipulation.waterhose.launch import get_visualizer_types, prepare_waterhose_launch
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Teleoperation for Isaac Lab environments.")
@@ -65,29 +66,12 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 
-def _get_visualizer_types() -> list[str]:
-    """Return normalized visualizer types from CLI arguments."""
-    visualizer_arg = getattr(args_cli, "visualizer", None)
-    if visualizer_arg is None:
-        return []
-    if isinstance(visualizer_arg, str):
-        visualizer_arg = [token.strip() for token in visualizer_arg.split(",")]
-    return [str(visualizer).strip().lower() for visualizer in visualizer_arg if str(visualizer).strip()]
-
-
 def _prepare_native_teleop_visualizers() -> None:
     """Ensure native Omniverse teleop devices have a Kit app window."""
-    visualizer_types = _get_visualizer_types()
+    visualizer_types = get_visualizer_types(args_cli)
     uses_waterhose_task = args_cli.task is not None and "waterhose" in args_cli.task.lower()
     uses_newton_only_waterhose = uses_waterhose_task and "newton" in visualizer_types and "kit" not in visualizer_types
     if uses_newton_only_waterhose:
-        if args_cli.teleop_device is None:
-            args_cli.teleop_device = "spacemouse"
-        elif args_cli.teleop_device.lower() != "spacemouse":
-            parser.error(
-                "Waterhose teleoperation with the Newton viewer requires --teleop_device spacemouse. "
-                "Keyboard and gamepad teleoperation use Omniverse input and require --visualizer kit."
-            )
         return
 
     device_name = args_cli.teleop_device.lower() if args_cli.teleop_device is not None else "keyboard"
@@ -108,22 +92,22 @@ def _prepare_native_teleop_visualizers() -> None:
 
 
 _prepare_native_teleop_visualizers()
-
-if any(visualizer in {"kit", "newton"} for visualizer in _get_visualizer_types()) and "DISPLAY" not in os.environ:
-    os.environ["DISPLAY"] = ":1"
-
-uses_waterhose_task = args_cli.task is not None and "waterhose" in args_cli.task.lower()
-uses_kit_visualizer = "kit" in _get_visualizer_types()
+waterhose_launch = prepare_waterhose_launch(
+    args_cli,
+    parser=parser,
+    default_standalone_spacemouse=True,
+    require_standalone_spacemouse=True,
+    standalone_spacemouse_error=(
+        "Waterhose teleoperation with the Newton viewer requires --teleop_device spacemouse. "
+        "Keyboard and gamepad teleoperation use Omniverse input and require --visualizer kit."
+    ),
+)
 uses_standalone_waterhose_spacemouse = (
-    uses_waterhose_task
+    waterhose_launch.uses_kitless_waterhose
     and args_cli.teleop_device is not None
     and args_cli.teleop_device.lower() == "spacemouse"
-    and not uses_kit_visualizer
     and not args_cli.xr
 )
-
-if uses_waterhose_task and uses_kit_visualizer:
-    os.environ["ISAACLAB_WATERHOSE_DEFER_NEWTON_IMPORT"] = "1"
 
 app_launcher_args = vars(args_cli)
 
@@ -134,11 +118,6 @@ if uses_standalone_waterhose_spacemouse:
 else:
     app_launcher = AppLauncher(app_launcher_args)
     simulation_app = app_launcher.app
-
-if uses_waterhose_task and not uses_kit_visualizer:
-    from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core
-
-    core.import_newton_dependencies()
 
 """Rest everything follows."""
 
