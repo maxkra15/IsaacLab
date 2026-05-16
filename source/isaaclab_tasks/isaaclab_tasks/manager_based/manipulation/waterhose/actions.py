@@ -30,6 +30,7 @@ class NewtonTaskSpaceIKActionCfg(ActionTermCfg):
     max_target_step: float = 0.018
     max_joint_step: float = 0.02
     max_gripper_joint_step: float = 0.20
+    max_gripper_joint_velocity: float = 0.03
     ik_iterations: int = 12
 
 
@@ -96,7 +97,7 @@ class NewtonTaskSpaceIKAction(ActionTerm):
             self._set_gripper_targets(q, float(action_np[env_id, 6]))
             max_step = np.full_like(q, float(self.cfg.max_joint_step))
             if self._scene_builder.gripper_dofs:
-                max_step[self._scene_builder.gripper_dofs] = float(self.cfg.max_gripper_joint_step)
+                max_step[self._scene_builder.gripper_dofs] = self._gripper_joint_step_limit()
             q = self._last_control_q[env_id] + np.clip(q - self._last_control_q[env_id], -max_step, max_step)
             self._last_control_q[env_id] = q.astype(np.float32, copy=True)
             target_np[joint_coord_ids] = q
@@ -110,6 +111,7 @@ class NewtonTaskSpaceIKAction(ActionTerm):
             env_ids = slice(None)
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
+        self._reset_control_targets(env_ids)
 
     def target_pose_to_action(
         self, target_pos: torch.Tensor, target_quat_xyzw: torch.Tensor, env_id: int = 0
@@ -152,7 +154,9 @@ class NewtonTaskSpaceIKAction(ActionTerm):
                 core.ik.IKObjectivePosition(
                     link_index=body_id,
                     link_offset=core.wp.vec3(0.0, 0.0, 0.0),
-                    target_positions=core.wp.array([core.wp.transform_get_translation(tf)], dtype=core.wp.vec3),
+                    target_positions=core.wp.array(
+                        [core.wp.transform_get_translation(tf)], dtype=core.wp.vec3, device=self._model.device
+                    ),
                     weight=weight,
                 )
             )
@@ -161,7 +165,9 @@ class NewtonTaskSpaceIKAction(ActionTerm):
                 core.ik.IKObjectiveRotation(
                     link_index=body_id,
                     link_offset_rotation=core.wp.quat_identity(),
-                    target_rotations=core.wp.array([core._quat_to_vec4(quat)], dtype=core.wp.vec4),
+                    target_rotations=core.wp.array(
+                        [core._quat_to_vec4(quat)], dtype=core.wp.vec4, device=self._model.device
+                    ),
                     weight=weight,
                 )
             )
@@ -236,6 +242,41 @@ class NewtonTaskSpaceIKAction(ActionTerm):
             self._scene_builder.left_gripper_dofs,
             self._left_open_driver,
         )
+
+    def _reset_control_targets(self, env_ids) -> None:
+        joint_q = core.NewtonManager.get_state_0().joint_q.numpy()
+        target_np = self._control.joint_target_pos.numpy().astype(np.float32, copy=True)
+        for env_id in self._env_indices(env_ids):
+            joint_coord_ids = self._scene_builder.robot_joint_coord_ids_by_env[env_id]
+            q = joint_q[joint_coord_ids].astype(np.float32, copy=True)
+            self._last_control_q[env_id] = q
+            target_np[joint_coord_ids] = q
+        core.wp.copy(
+            self._control.joint_target_pos,
+            core.wp.array(target_np, dtype=core.wp.float32, device=self._model.device),
+        )
+
+    def _gripper_joint_step_limit(self) -> float:
+        max_step = float(self.cfg.max_gripper_joint_step)
+        max_velocity = float(self.cfg.max_gripper_joint_velocity)
+        if max_velocity <= 0.0:
+            return max_step
+
+        step_dt = getattr(self._env, "step_dt", None)
+        if step_dt is None:
+            step_dt = float(self._env.cfg.sim.dt) * int(self._env.cfg.decimation)
+        return min(max_step, max_velocity * float(step_dt))
+
+    def _env_indices(self, env_ids) -> list[int]:
+        if isinstance(env_ids, slice):
+            return list(range(*env_ids.indices(self.num_envs)))
+        if isinstance(env_ids, torch.Tensor):
+            return [int(env_id) for env_id in env_ids.detach().cpu().flatten().tolist()]
+        if isinstance(env_ids, np.ndarray):
+            return [int(env_id) for env_id in env_ids.reshape(-1).tolist()]
+        if isinstance(env_ids, int):
+            return [env_ids]
+        return [int(env_id) for env_id in env_ids]
 
 
 def _resolve_body_ids(labels: list[str], short_name: str, num_envs: int) -> list[int]:

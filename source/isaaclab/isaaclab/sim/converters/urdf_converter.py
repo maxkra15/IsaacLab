@@ -13,6 +13,7 @@ import os
 import pathlib
 import re
 import shutil
+import sys
 import tempfile
 
 import carb
@@ -20,6 +21,29 @@ import omni.kit.app
 
 from .asset_converter_base import AssetConverterBase
 from .urdf_converter_cfg import UrdfConverterCfg
+
+
+def _ensure_newton_usd_schemas_importable() -> None:
+    """Ensure the Newton USD schema package is importable by the URDF converter."""
+    try:
+        importlib.import_module("newton_usd_schemas")
+        return
+    except ModuleNotFoundError as exc:
+        if exc.name != "newton_usd_schemas":
+            raise
+
+    ext_manager = omni.kit.app.get_app().get_extension_manager()
+    if not ext_manager.is_extension_enabled("omni.usd.schema.newton"):
+        ext_manager.set_extension_enabled_immediate("omni.usd.schema.newton", True)
+
+    extension_id = ext_manager.get_enabled_extension_id("omni.usd.schema.newton")
+    if not extension_id:
+        return
+
+    extension_path = pathlib.Path(ext_manager.get_extension_path(extension_id))
+    schema_path = extension_path / "usd" / "schema" / "newton"
+    if (schema_path / "newton_usd_schemas").is_dir() and str(schema_path) not in sys.path:
+        sys.path.insert(0, str(schema_path))
 
 
 class UrdfConverter(AssetConverterBase):
@@ -126,6 +150,7 @@ class UrdfConverter(AssetConverterBase):
         intermediate_path = os.path.normpath(os.path.join(usd_path, "temp", f"{robot_name}.usd"))
 
         # step 1: convert URDF to intermediate USD using urdf-usd-converter
+        _ensure_newton_usd_schemas_importable()
         urdf_usd_converter = importlib.import_module("urdf_usd_converter")
         converter = urdf_usd_converter.Converter(layer_structure=False, scene=False)
         asset: Sdf.AssetPath = converter.convert(urdf_path, usdex_path)

@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
-from isaaclab.envs import ManagerBasedRLEnv
-
 from . import observations
+
+if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedRLEnv
 
 
 def reach_hose(env: ManagerBasedRLEnv) -> torch.Tensor:

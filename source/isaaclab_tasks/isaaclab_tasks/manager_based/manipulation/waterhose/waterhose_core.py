@@ -1059,7 +1059,9 @@ class WaterhoseSceneBuilder:
                         nconmax=100000,
                         iterations=20,
                         ls_iterations=10,
-                        ls_parallel=True,
+                        ls_parallel=False,
+                        broadphase="NXN",
+                        graph_conditional=False,
                         impratio=1000.0,
                         use_mujoco_contacts=True,
                     ),
@@ -1188,6 +1190,7 @@ class WaterhoseIKController:
         self.max_target_step = 0.018
         self.max_joint_step = 0.02
         self.max_gripper_joint_step = 0.20
+        self.max_gripper_joint_velocity = 0.03
         self.gripper_centering_k = 0.4
         self.gripper_axis_centering_k = 0.8
         self.gripper_centering_max_step = 0.003
@@ -1675,7 +1678,7 @@ class WaterhoseIKController:
         max_step = np.full_like(q, self.max_joint_step)
         gripper_dofs = self.scene_builder.gripper_dofs
         if gripper_dofs:
-            max_step[gripper_dofs] = self.max_gripper_joint_step
+            max_step[gripper_dofs] = self._gripper_joint_step_limit()
         q = self.last_control_q + np.clip(q - self.last_control_q, -max_step, max_step)
         self.last_control_q = q.astype(np.float32, copy=True)
         limited_ik_q = wp.array(
@@ -1708,6 +1711,12 @@ class WaterhoseIKController:
             q[finger_dofs[0]] = -0.5 * driver_target
             q[finger_dofs[1]] = 0.5 * driver_target
 
+    def _gripper_joint_step_limit(self) -> float:
+        if self.max_gripper_joint_velocity <= 0.0:
+            return self.max_gripper_joint_step
+        step_dt = 1.0 / max(float(args_cli.fps), 1.0)
+        return min(self.max_gripper_joint_step, self.max_gripper_joint_velocity * step_dt)
+
 
 def setup_kit_scene(sim, scene_builder: WaterhoseSceneBuilder) -> None:
     """Create simple Kit-side reference geometry when Kit visualization is active."""
@@ -1736,6 +1745,93 @@ def setup_kit_scene(sim, scene_builder: WaterhoseSceneBuilder) -> None:
     if not sim_utils.get_current_stage().GetPrimAtPath("/World/DomeLight").IsValid():
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/DomeLight", light_cfg)
+
+
+def prepare_kit_scene_for_newton_sync(sim, scene_builder: WaterhoseSceneBuilder, builder) -> None:
+    """Create Kit prims and relabel Newton bodies before Fabric sync is initialized."""
+    if "kit" not in sim.resolve_visualizer_types():
+        return
+
+    import_isaaclab_runtime_dependencies()
+    setup_kit_scene(sim, scene_builder)
+    stage = sim_utils.get_current_stage()
+
+    _relabel_kit_robot_bodies(stage, scene_builder, builder)
+    _relabel_kit_scene_bodies(stage, scene_builder, builder)
+    _define_missing_kit_body_prims(stage, builder)
+
+
+def _define_xform_path(stage, prim_path: str) -> None:
+    """Define an Xform and any missing parents at ``prim_path``."""
+    from pxr import UsdGeom  # noqa: PLC0415
+
+    current_path = ""
+    for component in prim_path.strip("/").split("/"):
+        if not component:
+            continue
+        current_path += "/" + component
+        if not stage.GetPrimAtPath(current_path).IsValid():
+            UsdGeom.Xform.Define(stage, current_path)
+
+
+def _resolve_kit_body_prim_path(stage, root_path: str, body_name: str) -> str:
+    """Find a body prim below ``root_path``, falling back to a new Xform."""
+    from pxr import Usd  # noqa: PLC0415
+
+    direct_path = f"{root_path}/{body_name}"
+    if stage.GetPrimAtPath(direct_path).IsValid():
+        return direct_path
+
+    root_prim = stage.GetPrimAtPath(root_path)
+    if root_prim.IsValid():
+        for prim in Usd.PrimRange(root_prim):
+            if prim.GetName() == body_name:
+                return str(prim.GetPath())
+
+    _define_xform_path(stage, direct_path)
+    return direct_path
+
+
+def _relabel_kit_robot_bodies(stage, scene_builder: WaterhoseSceneBuilder, builder) -> None:
+    """Relabel Newton robot bodies to Kit Xforms for Fabric transform sync."""
+    robot_body_ids = list(scene_builder._mujoco_body_ids)
+    if not robot_body_ids:
+        return
+    robot_body_count = max(1, len(robot_body_ids) // max(1, scene_builder.num_envs))
+    for env_id in range(scene_builder.num_envs):
+        root_path = ROBOT_PRIM_PATH if scene_builder.num_envs == 1 else f"/World/Env_{env_id}/RBY1DF"
+        start = env_id * robot_body_count
+        stop = min(start + robot_body_count, len(robot_body_ids))
+        for body_id in robot_body_ids[start:stop]:
+            body_name = builder.body_label[body_id].rsplit("/", 1)[-1]
+            builder.body_label[body_id] = _resolve_kit_body_prim_path(stage, root_path, body_name)
+
+
+def _relabel_kit_scene_bodies(stage, scene_builder: WaterhoseSceneBuilder, builder) -> None:
+    """Relabel imported static scene bodies to the spawned Kit scene prims."""
+    scene_body_ids = [body_id for body_id, label in enumerate(builder.body_label) if label.startswith("/root/")]
+    if not scene_body_ids:
+        return
+    bodies_per_env = max(1, len(scene_body_ids) // max(1, scene_builder.num_envs))
+    for index, body_id in enumerate(scene_body_ids):
+        env_id = min(index // bodies_per_env, scene_builder.num_envs - 1)
+        root_path = "/World/Cable008Scene" if scene_builder.num_envs == 1 else f"/World/Env_{env_id}/Cable008Scene"
+        body_name = builder.body_label[body_id].rsplit("/", 1)[-1]
+        builder.body_label[body_id] = _resolve_kit_body_prim_path(stage, root_path, body_name)
+
+
+def _define_missing_kit_body_prims(stage, builder) -> None:
+    """Ensure every Newton body label is an existing absolute USD prim path."""
+    for body_id, body_label in enumerate(builder.body_label):
+        if body_label.startswith("/") and stage.GetPrimAtPath(body_label).IsValid():
+            continue
+        if body_label.startswith("/") and not stage.GetPrimAtPath(body_label).IsValid():
+            prim_path = body_label
+        else:
+            body_name = body_label.rsplit("/", 1)[-1]
+            prim_path = f"/World/NewtonBodies/Body_{body_id:04d}_{body_name}"
+            builder.body_label[body_id] = prim_path
+        _define_xform_path(stage, prim_path)
 
 
 def configure_newton_viewer(sim) -> None:

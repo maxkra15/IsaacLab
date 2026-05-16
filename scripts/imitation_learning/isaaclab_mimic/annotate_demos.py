@@ -40,9 +40,85 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 
+
+def _get_dataset_env_name(input_file: str | None) -> str | None:
+    """Read the environment name from dataset metadata without importing Isaac Lab."""
+    if input_file is None:
+        return None
+
+    import json
+    import os
+
+    if not os.path.exists(input_file):
+        return None
+
+    import h5py
+
+    try:
+        with h5py.File(input_file, "r") as dataset_file:
+            env_args = dataset_file["data"].attrs.get("env_args")
+    except (KeyError, OSError):
+        return None
+    if env_args is None:
+        return None
+    if isinstance(env_args, bytes):
+        env_args = env_args.decode("utf-8")
+    try:
+        return json.loads(env_args).get("env_name")
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def _uses_waterhose_task() -> bool:
+    """Return whether the CLI or source dataset targets the waterhose task."""
+    task_name = args_cli.task.split(":")[-1] if args_cli.task else _get_dataset_env_name(args_cli.input_file)
+    return task_name is not None and "waterhose" in task_name.lower()
+
+
+def _prepare_newton_viewer_display() -> None:
+    """Default the Newton viewer display before launching Kit."""
+    import os
+
+    visualizer_arg = getattr(args_cli, "visualizer", "") or ""
+    if "newton" in str(visualizer_arg).lower():
+        os.environ.setdefault("DISPLAY", ":1")
+
+
+def _uses_kit_visualizer() -> bool:
+    """Return whether the CLI explicitly requests the Kit visualizer."""
+    visualizer_arg = getattr(args_cli, "visualizer", None)
+    if visualizer_arg is None:
+        return False
+    if isinstance(visualizer_arg, str):
+        visualizer_arg = [token.strip() for token in visualizer_arg.split(",")]
+    return "kit" in {str(visualizer).strip().lower() for visualizer in visualizer_arg}
+
+
+def _simulation_is_running(env=None) -> bool:
+    """Return whether the active simulation loop should keep running."""
+    if simulation_app is not None:
+        return simulation_app.is_running() and not simulation_app.is_exiting()
+    if env is not None and env.sim.visualizers:
+        return any(visualizer.is_running() and not visualizer.is_closed for visualizer in env.sim.visualizers)
+    return True
+
+
+_prepare_newton_viewer_display()
+uses_waterhose_task = _uses_waterhose_task()
+uses_waterhose_newton_path = uses_waterhose_task and not _uses_kit_visualizer()
+
 # launch the simulator
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
+if uses_waterhose_newton_path:
+    app_launcher = None
+    simulation_app = None
+else:
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+
+if uses_waterhose_task:
+    from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core
+
+    core.import_newton_dependencies()
 
 """Rest everything follows."""
 
@@ -66,6 +142,7 @@ from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+from isaaclab_tasks.utils.sim_launcher import launch_simulation
 
 is_paused = False
 current_action_index = 0
@@ -210,6 +287,11 @@ def main():
     env_cfg.recorders.dataset_export_dir_path = output_dir
     env_cfg.recorders.dataset_filename = output_file_name
 
+    launch_context = None
+    if simulation_app is None:
+        launch_context = launch_simulation(env_cfg, args_cli)
+        launch_context.__enter__()
+
     # create environment from loaded config
     env: ManagerBasedRLMimicEnv = gym.make(args_cli.task, cfg=env_cfg).unwrapped
 
@@ -274,7 +356,7 @@ def main():
     processed_episode_count = 0
     successful_task_count = 0  # Counter for successful task completions
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
-        while simulation_app.is_running() and not simulation_app.is_exiting():
+        while _simulation_is_running(env):
             # Iterate over the episodes in the loaded dataset file
             for episode_index, episode_name in enumerate(dataset_file_handler.get_episode_names()):
                 processed_episode_count += 1
@@ -313,6 +395,8 @@ def main():
 
     # Close environment after annotation is complete
     env.close()
+    if launch_context is not None:
+        launch_context.__exit__(None, None, None)
 
     return successful_task_count
 
@@ -519,6 +603,7 @@ if __name__ == "__main__":
     # run the main function
     successful_task_count = main()
     # close sim app
-    simulation_app.close()
+    if simulation_app is not None:
+        simulation_app.close()
     # exit with the number of successful task completions as return code
     exit(successful_task_count)

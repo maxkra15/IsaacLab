@@ -137,7 +137,7 @@ class NewtonKaminoManager(NewtonManager):
                 return
             if cls._usdrt_stage is None:
                 # No RTX active — use standard Warp capture (cudaStreamCaptureModeGlobal).
-                with wp.ScopedCapture() as capture:
+                with wp.ScopedCapture(device=device) as capture:
                     cls._simulate()
                 NewtonManager._graph = capture.graph
                 logger.info("Newton CUDA graph captured (standard Warp mode)")

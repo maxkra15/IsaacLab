@@ -83,6 +83,16 @@ def _get_visualizer_types(launcher_args: argparse.Namespace | dict | None) -> se
     return {str(v).strip().lower() for v in visualizers if str(v).strip()}
 
 
+def _ensure_newton_viewer_display(visualizer_types: set[str]) -> None:
+    """Default the X display for standalone Newton viewer runs."""
+    if "newton" not in visualizer_types or "kit" in visualizer_types or "none" in visualizer_types:
+        return
+
+    import os
+
+    os.environ.setdefault("DISPLAY", ":1")
+
+
 def _compute_visualizer_intent(env_cfg) -> dict[str, bool]:
     """Compute upstream visualizer intent from ``env_cfg.sim.visualizer_cfgs``."""
     sim_cfg = getattr(env_cfg, "sim", None)
@@ -236,10 +246,9 @@ def launch_simulation(
     # loading both in the same process causes a dynamic-linker crash.  Use
     # --visualizer newton instead, which is compatible with ovrtx presets.
     early_visualizer_types = _get_visualizer_types(launcher_args)
+    _ensure_newton_viewer_display(early_visualizer_types)
     if "kit" in early_visualizer_types:
-        has_ovrtx = _scan_config(
-            env_cfg, [lambda node: getattr(node, "renderer_type", None) == "ovrtx"]
-        )[0]
+        has_ovrtx = _scan_config(env_cfg, [lambda node: getattr(node, "renderer_type", None) == "ovrtx"])[0]
         if has_ovrtx:
             raise ValueError(
                 "[launch_simulation] '--visualizer kit' is incompatible with 'ovrtx_renderer'. "
@@ -343,7 +352,9 @@ def launch_simulation(
             max_visible_envs = launcher_args.get("max_visible_envs")
         else:
             max_visible_envs = None
-        settings.set_int("/isaaclab/visualizer/max_visible_envs", -1 if max_visible_envs is None else int(max_visible_envs))
+        settings.set_int(
+            "/isaaclab/visualizer/max_visible_envs", -1 if max_visible_envs is None else int(max_visible_envs)
+        )
 
     try:
         yield

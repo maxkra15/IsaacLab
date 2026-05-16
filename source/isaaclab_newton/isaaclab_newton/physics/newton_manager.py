@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import inspect
 import logging
 from abc import abstractmethod
 from collections.abc import Callable
@@ -1036,9 +1037,316 @@ class NewtonManager(PhysicsManager):
         device = PhysicsManager._device
         use_cuda_graph = cfg.use_cuda_graph and "cuda" in device  # type: ignore[union-attr]
         if use_cuda_graph:
+            cls._prewarm_cuda_graph_allocations()
             cls._capture_or_defer_cuda_graph()
         else:
             NewtonManager._graph = None
+
+    @classmethod
+    def _prewarm_cuda_graph_allocations(cls) -> None:
+        """Pre-allocate solver scratch buffers that are not graph-capturable."""
+        mujoco_warp_solvers = [
+            solver for solver in cls._iter_nested_solvers(cls._solver) if getattr(solver, "mjw_data", None) is not None
+        ]
+        if not mujoco_warp_solvers:
+            return
+
+        cls._ensure_mujoco_warp_step_scratch_cache()
+        cached_create_collision_context = cls._ensure_mujoco_warp_collision_context_cache()
+        cached_empty_constraint_scratch = cls._ensure_mujoco_warp_constraint_scratch_cache()
+
+        for solver in mujoco_warp_solvers:
+            mjw_data = getattr(solver, "mjw_data", None)
+            naconmax = int(getattr(mjw_data, "naconmax", 0) or 0)
+            nworld = int(getattr(mjw_data, "nworld", 0) or 0)
+            model = getattr(solver, "model", None)
+            device = getattr(model, "device", PhysicsManager._device)
+            with wp.ScopedDevice(device):
+                if cached_create_collision_context is not None and naconmax > 0:
+                    cached_create_collision_context(naconmax)
+                if cached_empty_constraint_scratch is not None and nworld > 0:
+                    cached_empty_constraint_scratch((nworld,), dtype=int)
+
+        cls._simulate_once_for_cuda_graph_warmup()
+
+    @classmethod
+    def _simulate_once_for_cuda_graph_warmup(cls) -> None:
+        """Run one eager step to force lazy solver allocations before capture."""
+        if cls._model is None or cls._state_0 is None or cls._state_1 is None:
+            return
+
+        state_0_ref = cls._state_0
+        state_1_ref = cls._state_1
+        state_0_snapshot = cls._model.state()
+        state_1_snapshot = cls._model.state()
+        state_0_snapshot.assign(state_0_ref)
+        state_1_snapshot.assign(state_1_ref)
+
+        try:
+            cls._simulate()
+            wp.synchronize_device()
+        finally:
+            NewtonManager._state_0 = state_0_ref
+            NewtonManager._state_1 = state_1_ref
+            cls._state_0.assign(state_0_snapshot)
+            cls._state_1.assign(state_1_snapshot)
+
+    @classmethod
+    def _iter_nested_solvers(cls, solver):
+        """Yield a solver and any coupled sub-solvers."""
+        if solver is None:
+            return
+        yield solver
+        entries = getattr(solver, "_entries", None)
+        if isinstance(entries, dict):
+            for entry in entries.values():
+                yield from cls._iter_nested_solvers(getattr(entry, "solver", None))
+
+    @staticmethod
+    def _ensure_mujoco_warp_collision_context_cache():
+        """Cache MuJoCo Warp collision scratch arrays for CUDA graph capture."""
+        try:
+            from mujoco_warp._src import collision_core, collision_driver
+        except ImportError:
+            return None
+
+        current_create_collision_context = getattr(collision_driver, "create_collision_context", None)
+        if getattr(current_create_collision_context, "_isaaclab_cached_context", False):
+            return current_create_collision_context
+
+        original_create_collision_context = collision_core.create_collision_context
+        contexts = {}
+
+        def cached_create_collision_context(naconmax: int):
+            key = (str(wp.get_device()), int(naconmax))
+            context = contexts.get(key)
+            if context is None:
+                context = original_create_collision_context(int(naconmax))
+                contexts[key] = context
+            return context
+
+        cached_create_collision_context._isaaclab_cached_context = True
+        cached_create_collision_context._isaaclab_contexts = contexts
+        cached_create_collision_context._isaaclab_original = original_create_collision_context
+        collision_core.create_collision_context = cached_create_collision_context
+        collision_driver.create_collision_context = cached_create_collision_context
+        return cached_create_collision_context
+
+    @staticmethod
+    def _ensure_mujoco_warp_constraint_scratch_cache():
+        """Cache MuJoCo Warp constraint scratch arrays for CUDA graph capture."""
+        try:
+            from mujoco_warp._src import constraint
+        except ImportError:
+            return None
+
+        current_make_constraint = getattr(constraint, "make_constraint", None)
+        if getattr(current_make_constraint, "_isaaclab_cached_scratch", False):
+            return getattr(current_make_constraint, "_isaaclab_get_cached_empty", None)
+        if current_make_constraint is None:
+            return None
+
+        original_make_constraint = current_make_constraint
+        original_empty = constraint.wp.empty
+        arrays = {}
+
+        def normalize_shape(shape):
+            if isinstance(shape, int):
+                return (int(shape),)
+            return tuple(int(dim) for dim in shape)
+
+        def cached_empty(*args, **kwargs):
+            shape = args[0] if args else kwargs.get("shape")
+            dtype = kwargs.get("dtype", args[1] if len(args) > 1 else float)
+            device = kwargs.get("device", None) or wp.get_device()
+            key = (
+                str(device),
+                normalize_shape(shape),
+                dtype,
+                bool(kwargs.get("pinned", False)),
+                bool(kwargs.get("requires_grad", False)),
+            )
+            array = arrays.get(key)
+            if array is None:
+                array = original_empty(*args, **kwargs)
+                arrays[key] = array
+            return array
+
+        def cached_make_constraint(*args, **kwargs):
+            previous_empty = constraint.wp.empty
+            constraint.wp.empty = cached_empty
+            try:
+                return original_make_constraint(*args, **kwargs)
+            finally:
+                constraint.wp.empty = previous_empty
+
+        cached_make_constraint._isaaclab_cached_scratch = True
+        cached_make_constraint._isaaclab_get_cached_empty = cached_empty
+        cached_make_constraint._isaaclab_arrays = arrays
+        cached_make_constraint._isaaclab_original = original_make_constraint
+        constraint.make_constraint = cached_make_constraint
+        return cached_empty
+
+    @staticmethod
+    def _ensure_mujoco_warp_step_scratch_cache() -> None:
+        """Cache MuJoCo Warp per-step scratch allocations for CUDA graph capture."""
+        try:
+            import mujoco_warp
+            from mujoco_warp._src import forward
+        except ImportError:
+            return
+
+        current_step = getattr(mujoco_warp, "step", None)
+        if getattr(current_step, "_isaaclab_cached_scratch", False):
+            return
+        if current_step is None:
+            return
+
+        original_package_step = current_step
+        original_forward_step = forward.step
+        original_empty = forward.wp.empty
+        original_zeros = forward.wp.zeros
+        original_full = forward.wp.full
+        original_ones = forward.wp.ones
+        arrays = {}
+
+        def normalize_shape(shape):
+            if shape is None:
+                return (0,)
+            if isinstance(shape, int):
+                return (int(shape),)
+            return tuple(int(dim) for dim in shape)
+
+        def find_mujoco_warp_callsite():
+            frame = inspect.currentframe()
+            frame = frame.f_back if frame is not None else None
+            while frame is not None:
+                module_name = frame.f_globals.get("__name__", "")
+                if module_name.startswith("mujoco_warp._src."):
+                    return module_name, frame.f_code.co_name, frame.f_lineno
+                frame = frame.f_back
+            return "<unknown>", "<unknown>", 0
+
+        def cached_array(kind: str, *args, **kwargs):
+            shape = args[0] if args else kwargs.get("shape")
+            dtype = kwargs.get("dtype", args[1] if len(args) > 1 else float)
+            device = kwargs.get("device", args[2] if len(args) > 2 else None) or wp.get_device()
+            key = (
+                kind,
+                find_mujoco_warp_callsite(),
+                str(device),
+                normalize_shape(shape),
+                dtype,
+                bool(kwargs.get("pinned", False)),
+                bool(kwargs.get("requires_grad", False)),
+                bool(kwargs.get("retain_grad", False)),
+            )
+            array = arrays.get(key)
+            if array is None:
+                array = original_empty(*args, **kwargs)
+                arrays[key] = array
+            if kind == "zeros":
+                array.zero_()
+            return array
+
+        def cached_filled(
+            kind: str,
+            value,
+            shape,
+            dtype,
+            device=None,
+            requires_grad=False,
+            pinned=False,
+            retain_grad=False,
+        ):
+            if dtype is None:
+                return None
+            device = device or wp.get_device()
+            key = (
+                kind,
+                find_mujoco_warp_callsite(),
+                str(device),
+                normalize_shape(shape),
+                dtype,
+                bool(pinned),
+                bool(requires_grad),
+                bool(retain_grad),
+            )
+            array = arrays.get(key)
+            if array is None:
+                array = original_empty(
+                    shape=shape,
+                    dtype=dtype,
+                    device=device,
+                    requires_grad=requires_grad,
+                    pinned=pinned,
+                    retain_grad=retain_grad,
+                )
+                arrays[key] = array
+            array.fill_(value)
+            return array
+
+        def cached_empty(*args, **kwargs):
+            return cached_array("empty", *args, **kwargs)
+
+        def cached_zeros(*args, **kwargs):
+            return cached_array("zeros", *args, **kwargs)
+
+        def cached_full(*args, **kwargs):
+            shape = args[0] if args else kwargs.get("shape")
+            value = kwargs.get("value", args[1] if len(args) > 1 else 0)
+            dtype = kwargs.get("dtype", args[2] if len(args) > 2 else None)
+            cached = cached_filled(
+                "full",
+                value,
+                shape,
+                dtype,
+                device=kwargs.get("device", args[3] if len(args) > 3 else None),
+                requires_grad=kwargs.get("requires_grad", False),
+                pinned=kwargs.get("pinned", False),
+                retain_grad=kwargs.get("retain_grad", False),
+            )
+            if cached is None:
+                return original_full(*args, **kwargs)
+            return cached
+
+        def cached_ones(*args, **kwargs):
+            shape = args[0] if args else kwargs.get("shape")
+            dtype = kwargs.get("dtype", args[1] if len(args) > 1 else float)
+            return cached_filled(
+                "ones",
+                1,
+                shape,
+                dtype,
+                device=kwargs.get("device", args[2] if len(args) > 2 else None),
+                requires_grad=kwargs.get("requires_grad", False),
+                pinned=kwargs.get("pinned", False),
+                retain_grad=kwargs.get("retain_grad", False),
+            )
+
+        def cached_step(*args, **kwargs):
+            previous_empty = forward.wp.empty
+            previous_zeros = forward.wp.zeros
+            previous_full = forward.wp.full
+            previous_ones = forward.wp.ones
+            forward.wp.empty = cached_empty
+            forward.wp.zeros = cached_zeros
+            forward.wp.full = cached_full
+            forward.wp.ones = cached_ones
+            try:
+                return original_package_step(*args, **kwargs)
+            finally:
+                forward.wp.empty = previous_empty
+                forward.wp.zeros = previous_zeros
+                forward.wp.full = previous_full
+                forward.wp.ones = previous_ones
+
+        cached_step._isaaclab_cached_scratch = True
+        cached_step._isaaclab_arrays = arrays
+        cached_step._isaaclab_original_package_step = original_package_step
+        cached_step._isaaclab_original_forward_step = original_forward_step
+        mujoco_warp.step = cached_step
+        forward.step = cached_step
 
     @classmethod
     def _setup_cubric_bindings(cls) -> None:
@@ -1061,13 +1369,19 @@ class NewtonManager(PhysicsManager):
     @classmethod
     def _capture_or_defer_cuda_graph(cls) -> None:
         """Capture the physics CUDA graph, or defer if RTX is initializing."""
+        device = PhysicsManager._device
         with Timer(name="newton_cuda_graph", msg="CUDA graph took:"):
             if cls._usdrt_stage is None:
                 # No RTX active — use standard Warp capture (cudaStreamCaptureModeGlobal).
-                with wp.ScopedCapture() as capture:
-                    cls._simulate()
-                NewtonManager._graph = capture.graph
-                logger.info("Newton CUDA graph captured (standard Warp mode)")
+                try:
+                    with wp.ScopedCapture(device=device) as capture:
+                        cls._simulate()
+                    NewtonManager._graph = capture.graph
+                    logger.info("Newton CUDA graph captured (standard Warp mode)")
+                except Exception as exc:
+                    NewtonManager._graph = None
+                    logger.warning("Newton CUDA graph capture failed; using eager execution: %s", exc)
+                    logger.debug("Newton CUDA graph capture failure details", exc_info=True)
             else:
                 # RTX is active during initialization — cudaImportExternalMemory and other
                 # non-capturable RTX ops run on background CUDA streams right now.
@@ -1217,7 +1531,9 @@ class NewtonManager(PhysicsManager):
                 cls._state_0.clear_forces()
         else:
             cfg = PhysicsManager._cfg
-            need_copy_on_last_substep = (cfg is not None and cfg.use_cuda_graph) and cls._num_substeps % 2 == 1  # type: ignore[union-attr]
+            need_copy_on_last_substep = (  # type: ignore[union-attr]
+                cfg is not None and cfg.use_cuda_graph and cls._num_substeps % 2 == 1
+            )
             for i in range(cls._num_substeps):
                 cls._step_solver(cls._state_0, cls._state_1, cls._control, cls._solver_dt)
                 if need_copy_on_last_substep and i == cls._num_substeps - 1:

@@ -11,6 +11,7 @@ from newton import Model
 from newton.solvers import SolverAdmmCoupled, SolverCoupled, SolverProxyCoupled
 
 from .coupled_manager_cfg import AdmmCouplingCfg, CoupledProxyCfg, CoupledSolverCfg, CoupledSolverEntryCfg
+from .mjwarp_manager import apply_mujoco_warp_model_overrides
 from .newton_manager import NewtonManager
 from .solver_factory import (
     resolve_class_or_callable,
@@ -76,10 +77,19 @@ class NewtonCoupledManager(NewtonManager):
         else:
             raise ValueError(f"Unsupported Newton coupling_type {solver_cfg.coupling_type!r}.")
 
+        cls._apply_entry_solver_overrides(solver_cfg.entries)
         if hasattr(NewtonManager._solver, "prepare_graph_capture"):
             NewtonManager._solver.prepare_graph_capture()
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = cls._needs_external_collision_pipeline(solver_cfg)
+
+    @classmethod
+    def _apply_entry_solver_overrides(cls, entries: list[CoupledSolverEntryCfg]) -> None:
+        """Apply post-construction solver cfg overrides for coupled sub-solvers."""
+        for entry_cfg in entries:
+            if getattr(entry_cfg.solver_cfg, "solver_type", None) != "mujoco_warp":
+                continue
+            apply_mujoco_warp_model_overrides(NewtonManager._solver.get_solver(entry_cfg.name), entry_cfg.solver_cfg)
 
     @classmethod
     def _build_entry(cls, entry_cfg: CoupledSolverEntryCfg) -> SolverCoupled.Entry:

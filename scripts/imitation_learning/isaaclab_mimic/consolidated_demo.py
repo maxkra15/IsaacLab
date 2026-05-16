@@ -65,9 +65,76 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 
+
+def _get_dataset_env_name(input_file: str | None) -> str | None:
+    """Read the environment name from dataset metadata without importing Isaac Lab."""
+    if input_file is None:
+        return None
+
+    import json
+    import os
+
+    if not os.path.exists(input_file):
+        return None
+
+    import h5py
+
+    try:
+        with h5py.File(input_file, "r") as dataset_file:
+            env_args = dataset_file["data"].attrs.get("env_args")
+    except (KeyError, OSError):
+        return None
+    if env_args is None:
+        return None
+    if isinstance(env_args, bytes):
+        env_args = env_args.decode("utf-8")
+    try:
+        return json.loads(env_args).get("env_name")
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def _uses_waterhose_task() -> bool:
+    """Return whether the CLI or source dataset targets the waterhose task."""
+    task_name = args_cli.task.split(":")[-1] if args_cli.task else _get_dataset_env_name(args_cli.input_file)
+    return task_name is not None and "waterhose" in task_name.lower()
+
+
+def _prepare_newton_viewer_display() -> None:
+    """Default the Newton viewer display before launching Kit."""
+    import os
+
+    visualizer_arg = getattr(args_cli, "visualizer", "") or ""
+    if "newton" in str(visualizer_arg).lower():
+        os.environ.setdefault("DISPLAY", ":1")
+
+
+def _uses_kit_visualizer() -> bool:
+    """Return whether the CLI explicitly requests the Kit visualizer."""
+    visualizer_arg = getattr(args_cli, "visualizer", None)
+    if visualizer_arg is None:
+        return False
+    if isinstance(visualizer_arg, str):
+        visualizer_arg = [token.strip() for token in visualizer_arg.split(",")]
+    return "kit" in {str(visualizer).strip().lower() for visualizer in visualizer_arg}
+
+
+_prepare_newton_viewer_display()
+uses_waterhose_task = _uses_waterhose_task()
+uses_waterhose_newton_path = uses_waterhose_task and not _uses_kit_visualizer()
+
 # launch the simulator
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
+if uses_waterhose_newton_path:
+    app_launcher = None
+    simulation_app = None
+else:
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+
+if uses_waterhose_task:
+    from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core
+
+    core.import_newton_dependencies()
 
 """Rest everything follows."""
 
@@ -94,6 +161,7 @@ from isaaclab_mimic.datagen.datagen_info_pool import DataGenInfoPool
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+from isaaclab_tasks.utils.sim_launcher import launch_simulation
 
 # global variable to keep track of the data generation statistics
 num_recorded = 0
@@ -178,7 +246,7 @@ class RateLimiter:
 def pre_process_actions(delta_pose: torch.Tensor, gripper_command: bool) -> torch.Tensor:
     """Pre-process actions for the environment."""
     # compute actions based on environment
-    if "Reach" in args_cli.task:
+    if args_cli.task is not None and "Reach" in args_cli.task:
         # note: reach is the only one that uses a different action space
         # compute actions
         return delta_pose
@@ -188,6 +256,35 @@ def pre_process_actions(delta_pose: torch.Tensor, gripper_command: bool) -> torc
         gripper_vel[:] = -1 if gripper_command else 1
         # compute actions
         return torch.concat([delta_pose, gripper_vel], dim=1)
+
+
+def split_teleop_command(command, device: str) -> tuple[torch.Tensor | None, bool]:
+    """Split modern tensor commands or legacy tuple commands into action parts."""
+    if command is None:
+        return None, False
+    if isinstance(command, tuple):
+        delta_pose, gripper_command = command
+        delta_pose = torch.as_tensor(delta_pose, dtype=torch.float, device=device)
+        if delta_pose.ndim == 1:
+            delta_pose = delta_pose.unsqueeze(0)
+        return delta_pose, bool(gripper_command)
+
+    command = torch.as_tensor(command, dtype=torch.float, device=device)
+    if command.ndim == 1:
+        command = command.unsqueeze(0)
+
+    delta_pose = command[:, :6]
+    gripper_command = bool(torch.any(command[:, 6] < 0.0).item()) if command.shape[1] > 6 else False
+    return delta_pose, gripper_command
+
+
+def simulation_is_running(env) -> bool:
+    """Return whether the active simulation loop should keep running."""
+    if simulation_app is not None:
+        return simulation_app.is_running()
+    if env.unwrapped.sim.visualizers:
+        return any(visualizer.is_running() and not visualizer.is_closed for visualizer in env.unwrapped.sim.visualizers)
+    return True
 
 
 async def run_teleop_robot(
@@ -230,10 +327,11 @@ async def run_teleop_robot(
             should_reset_teleop_instance = False
             success_step_count = 0
 
-        # get keyboard command
-        delta_pose, gripper_command = teleop_interface.advance()
-        # convert to torch
-        delta_pose = torch.tensor(delta_pose, dtype=torch.float, device=env.device).repeat(1, 1)
+        # get teleoperation command
+        delta_pose, gripper_command = split_teleop_command(teleop_interface.advance(), env.device)
+        if delta_pose is None:
+            await asyncio.sleep(0)
+            continue
         # compute actions based on environment
         teleop_action = pre_process_actions(delta_pose, gripper_command)
 
@@ -339,7 +437,7 @@ def env_loop(env, env_action_queue, shared_datagen_info_pool, asyncio_event_loop
                     break
 
             # check that simulation is stopped or not
-            if env.unwrapped.sim.is_stopped():
+            if env.unwrapped.sim.is_stopped() or not simulation_is_running(env):
                 break
 
             if rate_limiter:
@@ -400,8 +498,13 @@ def main():
         env_cfg.recorders.dataset_filename = generated_output_file_name
         env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
 
+    launch_context = None
+    if simulation_app is None:
+        launch_context = launch_simulation(env_cfg, args_cli)
+        launch_context.__enter__()
+
     # create environment
-    env = gym.make(args_cli.task, cfg=env_cfg)
+    env = gym.make(env_name, cfg=env_cfg)
 
     if not isinstance(env.unwrapped, ManagerBasedRLMimicEnv):
         raise ValueError("The environment should be derived from ManagerBasedRLMimicEnv")
@@ -462,7 +565,11 @@ def main():
     except asyncio.CancelledError:
         print("Tasks were cancelled.")
 
-    env_loop(env, env_action_queue, shared_datagen_info_pool, asyncio_event_loop)
+    try:
+        env_loop(env, env_action_queue, shared_datagen_info_pool, asyncio_event_loop)
+    finally:
+        if launch_context is not None:
+            launch_context.__exit__(None, None, None)
 
 
 if __name__ == "__main__":
@@ -471,4 +578,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nProgram interrupted by user. Exiting...")
     # close sim app
-    simulation_app.close()
+    if simulation_app is not None:
+        simulation_app.close()

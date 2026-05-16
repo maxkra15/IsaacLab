@@ -5,6 +5,16 @@
 
 from __future__ import annotations
 
+import os
+
+# Newton's USD importer is sensitive to import order, so initialize it before
+# the broader Isaac Lab stack is imported below.  Kit launches are the
+# exception: SimulationApp must start before Newton/PXR-facing imports.
+from . import waterhose_core as core  # isort: skip
+
+if os.environ.get("ISAACLAB_WATERHOSE_DEFER_NEWTON_IMPORT") != "1":
+    core.import_newton_dependencies()
+
 from isaaclab_newton.physics import NewtonCfg
 from isaaclab_newton.physics.newton_manager_cfg import NewtonSolverCfg
 
@@ -143,3 +153,5 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.num_envs = max(1, int(self.scene.num_envs))
         self.sim.dt = 1.0 / float(self.fps)
         self.sim.render_interval = self.decimation
+        self.sim.physics.num_substeps = int(self.sim_substeps)
+        self.sim.physics.use_cuda_graph = not bool(self.disable_cuda_graph)

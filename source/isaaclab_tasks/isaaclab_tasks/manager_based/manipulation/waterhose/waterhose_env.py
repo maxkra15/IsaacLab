@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -26,6 +27,8 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
     def __init__(self, cfg: RBY1DFWaterhoseEnvCfg, render_mode: str | None = None, **kwargs):
         self.waterhose_scene_builder = None
         self.waterhose_builder = None
+        self._waterhose_kit_scene_callback = None
+        self._waterhose_cable_xform_callback = None
         self._build_waterhose_model(cfg)
         super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
         self._finish_waterhose_runtime_setup()
@@ -62,7 +65,60 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
             use_cuda_graph=not bool(cfg.disable_cuda_graph),
         )
         core.NewtonManager.set_builder(self.waterhose_builder)
+        self._register_kit_scene_callback()
         self._register_cable_xform_callback()
+
+    def _register_kit_scene_callback(self) -> None:
+        def setup_kit_scene(_payload) -> None:
+            scene_builder = self.waterhose_scene_builder
+            if scene_builder is None:
+                return
+            core.prepare_kit_scene_for_newton_sync(self.sim, scene_builder, self.waterhose_builder)
+            handle = getattr(self, "_waterhose_kit_scene_callback", None)
+            if handle is not None:
+                handle.deregister()
+                self._waterhose_kit_scene_callback = None
+
+        self._waterhose_kit_scene_callback = core.NewtonManager.register_callback(
+            setup_kit_scene,
+            PhysicsEvent.MODEL_INIT,
+            order=-1000,
+            name="waterhose_kit_scene",
+            wrap_weak_ref=False,
+        )
+
+    def reset(
+        self, seed: int | None = None, env_ids: Sequence[int] | None = None, options: dict[str, Any] | None = None
+    ):
+        """Reset the environment and restore authored waterhose cable transforms."""
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
+
+        self.recorder_manager.record_pre_reset(env_ids)
+
+        if seed is not None:
+            self.seed(seed)
+
+        self._reset_idx(env_ids)
+
+        self.scene.write_data_to_sim()
+        self.sim.forward()
+        self._apply_waterhose_cable_asset_xform()
+
+        if self.has_rtx_sensors and self.cfg.num_rerenders_on_reset > 0:
+            for _ in range(self.cfg.num_rerenders_on_reset):
+                self.sim.render()
+
+        self.recorder_manager.record_post_reset(env_ids)
+
+        self.obs_buf = self.observation_manager.compute(update_history=True)
+
+        if self.cfg.wait_for_textures and self.has_rtx_sensors:
+            if hasattr(self.sim.physics_manager, "assets_loading"):
+                while self.sim.physics_manager.assets_loading():
+                    self.sim.render()
+
+        return self.obs_buf, self.extras
 
     def _register_cable_xform_callback(self) -> None:
         def apply_cable_xform(_payload) -> None:
@@ -84,11 +140,11 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
         scene_builder = self.waterhose_scene_builder
         if scene_builder is None:
             raise RuntimeError("Waterhose scene builder was not initialized.")
+        core.setup_kit_scene(self.sim, scene_builder)
         scene_builder.configure_runtime_vbd_solver()
         scene_builder.apply_runtime_cable_asset_xform()
         if self.sim.is_rendering:
             core.NewtonManager.sync_transforms_to_usd()
-        core.setup_kit_scene(self.sim, scene_builder)
         core.configure_newton_viewer(self.sim)
         self.waterhose_right_ee_body_ids = self._resolve_body_ids(core.RIGHT_EE)
         self.waterhose_tip_body_ids = self._resolve_matching_ids(
@@ -124,6 +180,12 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
         # The first implementation targets demonstration collection, where episodes
         # normally end after success. Full partial Newton state reset can be added
         # once the coupled solver exposes per-world reset hooks for VBD bodies.
+        self._apply_waterhose_cable_asset_xform()
+
+    def _apply_waterhose_cable_asset_xform(self) -> None:
+        self.waterhose_scene_builder.apply_runtime_cable_asset_xform(sync_solver_prev=True)
+        if self.sim.is_rendering:
+            core.NewtonManager.sync_transforms_to_usd()
 
     def get_task_space_action_term(self):
         return self.action_manager.get_term("task_space")

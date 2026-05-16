@@ -34,6 +34,7 @@ optional arguments:
 # Standard library imports
 import argparse
 import contextlib
+import os
 
 # Isaac Lab AppLauncher
 from isaaclab.app import AppLauncher
@@ -89,11 +90,46 @@ args_cli = parser.parse_args()
 if args_cli.task is None:
     parser.error("--task is required")
 
-app_launcher_args = vars(args_cli)
+
+def _get_visualizer_types() -> list[str]:
+    """Return normalized visualizer types from CLI arguments."""
+    visualizer_arg = getattr(args_cli, "visualizer", None)
+    if visualizer_arg is None:
+        return []
+    if isinstance(visualizer_arg, str):
+        visualizer_arg = [token.strip() for token in visualizer_arg.split(",")]
+    return [str(visualizer).strip().lower() for visualizer in visualizer_arg if str(visualizer).strip()]
+
+
+uses_waterhose_task = "waterhose" in args_cli.task.lower()
+uses_kit_visualizer = "kit" in _get_visualizer_types()
+uses_waterhose_newton_path = uses_waterhose_task and not uses_kit_visualizer
+
+if uses_waterhose_task and "newton" in _get_visualizer_types():
+    os.environ.setdefault("DISPLAY", ":1")
+if uses_waterhose_newton_path:
+    if args_cli.teleop_device is None:
+        args_cli.teleop_device = "spacemouse"
+    elif args_cli.teleop_device.lower() != "spacemouse":
+        parser.error(
+            "Waterhose recording with the Newton viewer requires --teleop_device spacemouse. "
+            "Keyboard teleoperation uses Omniverse input and requires --visualizer kit."
+        )
+if uses_waterhose_task and uses_kit_visualizer:
+    os.environ["ISAACLAB_WATERHOSE_DEFER_NEWTON_IMPORT"] = "1"
 
 # launch the simulator
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
+if uses_waterhose_newton_path:
+    app_launcher = None
+    simulation_app = None
+else:
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+
+if uses_waterhose_task and not uses_kit_visualizer:
+    from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core
+
+    core.import_newton_dependencies()
 
 """Rest everything follows."""
 
@@ -107,14 +143,8 @@ from collections.abc import Callable
 import gymnasium as gym
 import torch
 
-import omni.ui as ui
-
-from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
-from isaaclab.devices.openxr import remove_camera_configs
-from isaaclab.devices.teleop_device_factory import create_teleop_device
 from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
-from isaaclab.envs.ui import EmptyWindow
 from isaaclab.managers import DatasetExportMode
 
 import isaaclab_mimic.envs  # noqa: F401
@@ -122,6 +152,7 @@ from isaaclab_mimic.ui.instruction_display import InstructionDisplay, show_subta
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+from isaaclab_tasks.utils.sim_launcher import launch_simulation
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +173,13 @@ def _resolve_cloudxr_env(value: str | None) -> str | None:
         _CLOUDXR_ENV_SHORTHANDS["cloudxrjs"] = CLOUDXR_JS_ENV
         _CLOUDXR_ENV_SHORTHANDS["avp"] = CLOUDXR_AVP_ENV
     return _CLOUDXR_ENV_SHORTHANDS.get(value.lower(), value)
+
+
+def _simulation_is_running(env) -> bool:
+    """Return whether the active simulation loop should keep running."""
+    if simulation_app is not None:
+        return simulation_app.is_running()
+    return not env.sim.is_stopped()
 
 
 class RateLimiter:
@@ -248,6 +286,8 @@ def create_environment_config(
         )
 
     if use_isaac_teleop or args_cli.xr:
+        from isaaclab.devices.openxr import remove_camera_configs
+
         # If cameras are not enabled and XR is enabled, remove camera configs
         if not args_cli.enable_cameras:
             env_cfg = remove_camera_configs(env_cfg)
@@ -291,8 +331,14 @@ def _create_builtin_device(device_name: str) -> object | None:
     """Create a built-in teleop device by name, or return None if unrecognized."""
     name = device_name.lower()
     if name == "keyboard":
+        from isaaclab.devices.keyboard.se3_keyboard import Se3Keyboard
+        from isaaclab.devices.keyboard.se3_keyboard_cfg import Se3KeyboardCfg
+
         return Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
     elif name == "spacemouse":
+        from isaaclab.devices.spacemouse.se3_spacemouse import Se3SpaceMouse
+        from isaaclab.devices.spacemouse.se3_spacemouse_cfg import Se3SpaceMouseCfg
+
         return Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
     return None
 
@@ -331,6 +377,8 @@ def setup_teleop_device(callbacks: dict[str, Callable], use_isaac_teleop: bool =
         elif teleop_device_explicitly_set:
             device_name = args_cli.teleop_device
             if hasattr(env_cfg, "teleop_devices") and device_name in env_cfg.teleop_devices.devices:
+                from isaaclab.devices.teleop_device_factory import create_teleop_device
+
                 teleop_interface = create_teleop_device(device_name, env_cfg.teleop_devices.devices, callbacks)
             else:
                 teleop_interface = _create_builtin_device(device_name)
@@ -347,6 +395,9 @@ def setup_teleop_device(callbacks: dict[str, Callable], use_isaac_teleop: bool =
                     teleop_interface.add_callback(key, callback)
         else:
             # No --teleop_device and no isaac_teleop: fall back to keyboard
+            from isaaclab.devices.keyboard.se3_keyboard import Se3Keyboard
+            from isaaclab.devices.keyboard.se3_keyboard_cfg import Se3KeyboardCfg
+
             teleop_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
             for key, callback in callbacks.items():
                 teleop_interface.add_callback(key, callback)
@@ -374,8 +425,22 @@ def setup_ui(label_text: str, env: gym.Env) -> InstructionDisplay:
     Returns:
         InstructionDisplay: The configured instruction display object
     """
+    if simulation_app is None:
+        class _NullInstructionDisplay:
+            def show_demo(self, text):
+                pass
+
+            def show_subtask(self, text):
+                pass
+
+        return _NullInstructionDisplay()
+
     instruction_display = InstructionDisplay(args_cli.xr)
     if not args_cli.xr:
+        import omni.ui as ui
+
+        from isaaclab.envs.ui import EmptyWindow
+
         window = EmptyWindow(env, "Instruction")
         with window.ui_window_elements["main_vstack"]:
             demo_label = ui.Label(label_text)
@@ -532,7 +597,7 @@ def run_simulation_loop(
             from isaaclab_teleop import poll_control_events
 
         with contextlib.suppress(KeyboardInterrupt), torch.inference_mode():
-            while simulation_app.is_running():
+            while _simulation_is_running(env):
                 # Get teleop command (may be None while waiting for session start)
                 action = teleop_interface.advance()
 
@@ -636,6 +701,11 @@ def main() -> None:
     global env_cfg  # Make env_cfg available to setup_teleop_device
     env_cfg, success_term, use_isaac_teleop = create_environment_config(output_dir, output_file_name)
 
+    launch_context = None
+    if simulation_app is None:
+        launch_context = launch_simulation(env_cfg, args_cli)
+        launch_context.__enter__()
+
     # if handtracking or IsaacTeleop is selected, rate limiting is achieved via OpenXR
     if args_cli.xr or use_isaac_teleop:
         rate_limiter = None
@@ -647,15 +717,19 @@ def main() -> None:
         rate_limiter = RateLimiter(args_cli.step_hz)
 
     # Create environment
-    env = create_environment(env_cfg)
+    try:
+        env = create_environment(env_cfg)
 
-    # Run simulation loop
-    current_recorded_demo_count = run_simulation_loop(env, None, success_term, rate_limiter, use_isaac_teleop)
+        # Run simulation loop
+        current_recorded_demo_count = run_simulation_loop(env, None, success_term, rate_limiter, use_isaac_teleop)
 
-    # Clean up
-    env.close()
-    print(f"Recording session completed with {current_recorded_demo_count} successful demonstrations")
-    print(f"Demonstrations saved to: {args_cli.dataset_file}")
+        # Clean up
+        env.close()
+        print(f"Recording session completed with {current_recorded_demo_count} successful demonstrations")
+        print(f"Demonstrations saved to: {args_cli.dataset_file}")
+    finally:
+        if launch_context is not None:
+            launch_context.__exit__(None, None, None)
 
 
 if __name__ == "__main__":
@@ -663,5 +737,6 @@ if __name__ == "__main__":
     main()
     # env.close() already closes the USD stage via sim.clear_instance().
     # Pump the event loop so the viewport processes closure, then close the app.
-    simulation_app.update()
-    simulation_app.close()
+    if simulation_app is not None:
+        simulation_app.update()
+        simulation_app.close()

@@ -7,13 +7,19 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core  # isort: skip
+
+core.import_newton_dependencies()
+
 import torch
 
 import isaaclab.utils.math as PoseUtils
 from isaaclab.envs import ManagerBasedRLMimicEnv
 
+from isaaclab_tasks.manager_based.manipulation.waterhose.waterhose_env import RBY1DFWaterhoseEnv
 
-class RBY1DFWaterhoseIKRelMimicEnv(ManagerBasedRLMimicEnv):
+
+class RBY1DFWaterhoseIKRelMimicEnv(RBY1DFWaterhoseEnv, ManagerBasedRLMimicEnv):
     """Isaac Lab Mimic wrapper for the RBY1 waterhose IK-relative task."""
 
     def get_robot_eef_pose(self, eef_name: str, env_ids: Sequence[int] | None = None) -> torch.Tensor:

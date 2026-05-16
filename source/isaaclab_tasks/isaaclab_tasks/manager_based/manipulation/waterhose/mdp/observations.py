@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
-from isaaclab.envs import ManagerBasedRLEnv
-
 from .. import waterhose_core as core
+
+if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedRLEnv
 
 
 def _ensure_metadata(env: ManagerBasedRLEnv) -> None:

@@ -19,6 +19,7 @@ The script automatically detects which stack to use based on the environment con
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
@@ -39,6 +40,11 @@ parser.add_argument(
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
 parser.add_argument(
+    "--debug_teleop",
+    action="store_true",
+    help="Print periodic teleop command diagnostics.",
+)
+parser.add_argument(
     "--cloudxr_env",
     type=str,
     default="cloudxrjs",
@@ -58,11 +64,81 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 
+
+def _get_visualizer_types() -> list[str]:
+    """Return normalized visualizer types from CLI arguments."""
+    visualizer_arg = getattr(args_cli, "visualizer", None)
+    if visualizer_arg is None:
+        return []
+    if isinstance(visualizer_arg, str):
+        visualizer_arg = [token.strip() for token in visualizer_arg.split(",")]
+    return [str(visualizer).strip().lower() for visualizer in visualizer_arg if str(visualizer).strip()]
+
+
+def _prepare_native_teleop_visualizers() -> None:
+    """Ensure native Omniverse teleop devices have a Kit app window."""
+    visualizer_types = _get_visualizer_types()
+    uses_waterhose_task = args_cli.task is not None and "waterhose" in args_cli.task.lower()
+    uses_newton_only_waterhose = uses_waterhose_task and "newton" in visualizer_types and "kit" not in visualizer_types
+    if uses_newton_only_waterhose:
+        if args_cli.teleop_device is None:
+            args_cli.teleop_device = "spacemouse"
+        elif args_cli.teleop_device.lower() != "spacemouse":
+            parser.error(
+                "Waterhose teleoperation with the Newton viewer requires --teleop_device spacemouse. "
+                "Keyboard and gamepad teleoperation use Omniverse input and require --visualizer kit."
+            )
+        return
+
+    device_name = args_cli.teleop_device.lower() if args_cli.teleop_device is not None else "keyboard"
+    if device_name not in {"keyboard", "spacemouse", "gamepad"}:
+        return
+    if device_name == "spacemouse":
+        return
+    if getattr(args_cli, "headless_explicit", False) and args_cli.headless:
+        parser.error(
+            "Native teleop devices require a Kit app window; remove --headless or use an XR/IsaacTeleop device."
+        )
+
+    if "none" in visualizer_types:
+        parser.error("Native teleop devices require a Kit app window; use --visualizer kit or --visualizer kit,newton.")
+    if "kit" not in visualizer_types:
+        args_cli.visualizer = ["kit", *visualizer_types]
+        args_cli.visualizer_explicit = True
+
+
+_prepare_native_teleop_visualizers()
+
+if any(visualizer in {"kit", "newton"} for visualizer in _get_visualizer_types()) and "DISPLAY" not in os.environ:
+    os.environ["DISPLAY"] = ":1"
+
+uses_waterhose_task = args_cli.task is not None and "waterhose" in args_cli.task.lower()
+uses_kit_visualizer = "kit" in _get_visualizer_types()
+uses_standalone_waterhose_spacemouse = (
+    uses_waterhose_task
+    and args_cli.teleop_device is not None
+    and args_cli.teleop_device.lower() == "spacemouse"
+    and not uses_kit_visualizer
+    and not args_cli.xr
+)
+
+if uses_waterhose_task and uses_kit_visualizer:
+    os.environ["ISAACLAB_WATERHOSE_DEFER_NEWTON_IMPORT"] = "1"
+
 app_launcher_args = vars(args_cli)
 
 # launch omniverse app
-app_launcher = AppLauncher(app_launcher_args)
-simulation_app = app_launcher.app
+if uses_standalone_waterhose_spacemouse:
+    app_launcher = None
+    simulation_app = None
+else:
+    app_launcher = AppLauncher(app_launcher_args)
+    simulation_app = app_launcher.app
+
+if uses_waterhose_task and not uses_kit_visualizer:
+    from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core
+
+    core.import_newton_dependencies()
 
 """Rest everything follows."""
 
@@ -72,15 +148,12 @@ import logging
 import gymnasium as gym
 import torch
 
-from isaaclab.devices import Se3Gamepad, Se3GamepadCfg, Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
-from isaaclab.devices.openxr import remove_camera_configs
-from isaaclab.devices.teleop_device_factory import create_teleop_device
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.manager_based.manipulation.lift import mdp
-from isaaclab_tasks.utils import parse_env_cfg
+from isaaclab_tasks.utils import launch_simulation, parse_env_cfg
 
 logger = logging.getLogger(__name__)
 
@@ -107,12 +180,78 @@ def _create_builtin_device(device_name: str, sensitivity: float) -> object | Non
     """Create a built-in teleop device by name, or return None if unrecognized."""
     name = device_name.lower()
     if name == "keyboard":
+        from isaaclab.devices.keyboard.se3_keyboard import Se3Keyboard
+        from isaaclab.devices.keyboard.se3_keyboard_cfg import Se3KeyboardCfg
+
         return Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.05 * sensitivity, rot_sensitivity=0.05 * sensitivity))
     elif name == "spacemouse":
+        from isaaclab.devices.spacemouse.se3_spacemouse import Se3SpaceMouse
+        from isaaclab.devices.spacemouse.se3_spacemouse_cfg import Se3SpaceMouseCfg
+
         return Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=0.05 * sensitivity, rot_sensitivity=0.05 * sensitivity))
     elif name == "gamepad":
+        from isaaclab.devices.gamepad.se3_gamepad import Se3Gamepad
+        from isaaclab.devices.gamepad.se3_gamepad_cfg import Se3GamepadCfg
+
         return Se3Gamepad(Se3GamepadCfg(pos_sensitivity=0.1 * sensitivity, rot_sensitivity=0.1 * sensitivity))
     return None
+
+
+def _close_simulation_app() -> None:
+    if simulation_app is not None:
+        simulation_app.close()
+
+
+def _simulation_is_running(env) -> bool:
+    if simulation_app is not None:
+        return simulation_app.is_running()
+    if env.sim.visualizers:
+        return any(visualizer.is_running() and not visualizer.is_closed for visualizer in env.sim.visualizers)
+    return True
+
+
+def _create_teleop_interface(
+    env_cfg,
+    teleop_device_explicitly_set: bool,
+    teleoperation_callbacks: dict[str, Callable[[], None]],
+    use_isaac_teleop: bool,
+):
+    if use_isaac_teleop:
+        from isaaclab_teleop import create_isaac_teleop_device, poll_control_events
+
+        teleop_interface = create_isaac_teleop_device(
+            env_cfg.isaac_teleop,
+            sim_device=args_cli.device,
+            callbacks=teleoperation_callbacks,
+            cloudxr_env_file=_resolve_cloudxr_env(args_cli.cloudxr_env),
+            auto_launch_cloudxr=args_cli.auto_launch_cloudxr,
+        )
+        return teleop_interface, poll_control_events
+
+    if teleop_device_explicitly_set:
+        device_name = args_cli.teleop_device
+        if hasattr(env_cfg, "teleop_devices") and device_name in env_cfg.teleop_devices.devices:
+            from isaaclab.devices.teleop_device_factory import create_teleop_device
+
+            return create_teleop_device(device_name, env_cfg.teleop_devices.devices, teleoperation_callbacks), None
+        teleop_interface = _create_builtin_device(device_name, args_cli.sensitivity)
+        if teleop_interface is None:
+            raise ValueError(
+                f"--teleop_device={device_name} was passed but no matching entry exists in env_cfg.teleop_devices "
+                "and it is not a built-in device name. Either remove --teleop_device to use the IsaacTeleop "
+                "pipeline, or add an entry under teleop_devices in the environment config. Built-in devices: "
+                "keyboard, spacemouse, gamepad."
+            )
+    else:
+        teleop_interface = _create_builtin_device("keyboard", args_cli.sensitivity)
+
+    for key, callback in teleoperation_callbacks.items():
+        try:
+            teleop_interface.add_callback(key, callback)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to add callback for key {key}: {e}")
+
+    return teleop_interface, None
 
 
 def main() -> None:
@@ -149,8 +288,19 @@ def main() -> None:
     )
 
     if use_isaac_teleop or args_cli.xr:
+        from isaaclab.devices.openxr import remove_camera_configs
+
         env_cfg = remove_camera_configs(env_cfg)
         env_cfg.sim.render.antialiasing_mode = "DLSS"
+
+    launch_context = None
+    if simulation_app is None:
+        launch_context = launch_simulation(env_cfg, args_cli)
+        launch_context.__enter__()
+
+    def close_launch_context() -> None:
+        if launch_context is not None:
+            launch_context.__exit__(None, None, None)
 
     try:
         # create environment
@@ -163,7 +313,8 @@ def main() -> None:
             )
     except Exception as e:
         logger.error(f"Failed to create environment: {e}")
-        simulation_app.close()
+        close_launch_context()
+        _close_simulation_app()
         return
 
     # Flags for controlling teleoperation flow
@@ -227,64 +378,27 @@ def main() -> None:
 
     # Create teleop device based on configuration
     teleop_interface = None
+    poll_control_events = None
 
     try:
-        if use_isaac_teleop:
-            from isaaclab_teleop import create_isaac_teleop_device, poll_control_events
-
-            teleop_interface = create_isaac_teleop_device(
-                env_cfg.isaac_teleop,
-                sim_device=args_cli.device,
-                callbacks=teleoperation_callbacks,
-                cloudxr_env_file=_resolve_cloudxr_env(args_cli.cloudxr_env),
-                auto_launch_cloudxr=args_cli.auto_launch_cloudxr,
-            )
-
-        elif teleop_device_explicitly_set:
-            device_name = args_cli.teleop_device
-            if hasattr(env_cfg, "teleop_devices") and device_name in env_cfg.teleop_devices.devices:
-                teleop_interface = create_teleop_device(
-                    device_name, env_cfg.teleop_devices.devices, teleoperation_callbacks
-                )
-            else:
-                teleop_interface = _create_builtin_device(device_name, args_cli.sensitivity)
-                if teleop_interface is None:
-                    logger.error(
-                        f"--teleop_device={device_name} was passed but no matching entry exists in"
-                        " env_cfg.teleop_devices and it is not a built-in device name. Either remove"
-                        " --teleop_device to use the IsaacTeleop pipeline, or add a"
-                        f" '{device_name}' entry under teleop_devices in the environment config."
-                        " Built-in devices: keyboard, spacemouse, gamepad."
-                    )
-                    env.close()
-                    simulation_app.close()
-                    return
-                for key, callback in teleoperation_callbacks.items():
-                    try:
-                        teleop_interface.add_callback(key, callback)
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Failed to add callback for key {key}: {e}")
-        else:
-            # No --teleop_device and no isaac_teleop: fall back to keyboard
-            sensitivity = args_cli.sensitivity
-            teleop_interface = Se3Keyboard(
-                Se3KeyboardCfg(pos_sensitivity=0.05 * sensitivity, rot_sensitivity=0.05 * sensitivity)
-            )
-            for key, callback in teleoperation_callbacks.items():
-                try:
-                    teleop_interface.add_callback(key, callback)
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Failed to add callback for key {key}: {e}")
+        teleop_interface, poll_control_events = _create_teleop_interface(
+            env_cfg,
+            teleop_device_explicitly_set,
+            teleoperation_callbacks,
+            use_isaac_teleop,
+        )
     except Exception as e:
         logger.error(f"Failed to create teleop device: {e}")
         env.close()
-        simulation_app.close()
+        close_launch_context()
+        _close_simulation_app()
         return
 
     if teleop_interface is None:
         logger.error("Failed to create teleop interface")
         env.close()
-        simulation_app.close()
+        close_launch_context()
+        _close_simulation_app()
         return
 
     print(f"Using teleop device: {teleop_interface}")
@@ -300,13 +414,16 @@ def main() -> None:
         stack_name = "IsaacTeleop" if use_isaac_teleop else "native"
         print(f"{stack_name} teleoperation started. Press 'R' to reset the environment.")
 
+        step_count = 0
+
         # simulate environment
-        while simulation_app.is_running():
+        while _simulation_is_running(env):
             try:
                 # run everything in inference mode
                 with torch.inference_mode():
                     # get device command
                     action = teleop_interface.advance()
+                    step_count += 1
 
                     if use_isaac_teleop:
                         ctrl = poll_control_events(teleop_interface)
@@ -320,6 +437,13 @@ def main() -> None:
                     if action is None:
                         env.sim.render()
                     elif teleoperation_active:
+                        if args_cli.debug_teleop and step_count % 15 == 0:
+                            action_cpu = action.detach().cpu()
+                            print(
+                                "teleop action:",
+                                " ".join(f"{value:+.3f}" for value in action_cpu.tolist()),
+                                flush=True,
+                            )
                         # process actions
                         actions = action.repeat(env.num_envs, 1)
                         # apply actions
@@ -346,6 +470,7 @@ def main() -> None:
 
     # close the simulator
     env.close()
+    close_launch_context()
     print("Environment closed")
 
 
@@ -354,5 +479,6 @@ if __name__ == "__main__":
     main()
     # env.close() already closes the USD stage via sim.clear_instance().
     # Pump the event loop so the viewport processes closure, then close the app.
-    simulation_app.update()
-    simulation_app.close()
+    if simulation_app is not None:
+        simulation_app.update()
+        simulation_app.close()

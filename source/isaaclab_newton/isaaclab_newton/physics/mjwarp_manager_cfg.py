@@ -99,6 +99,12 @@ class MJWarpSolverCfg(NewtonSolverCfg):
     ls_parallel: bool = False
     """Whether to use parallel line search."""
 
+    broadphase: str | None = None
+    """MuJoCo Warp broadphase mode. Can be ``"NXN"``, ``"SAP_TILE"``, or ``"SAP_SEGMENTED"``."""
+
+    graph_conditional: bool | None = None
+    """Whether MuJoCo Warp uses CUDA graph conditional nodes for solver iteration loops."""
+
     use_mujoco_contacts: bool = True
     """Whether to use MuJoCo's internal contact solver.
 
