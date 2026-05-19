@@ -99,11 +99,12 @@ class AssetConverterBase(abc.ABC):
 
         # convert the asset to USD if the hash is different or USD file does not exist
         if cfg.force_usd_conversion or not self._usd_file_exists or not self._is_same_asset:
-            # write the updated hash
-            with open(self._dest_hash_path, "w") as f:
-                f.write(self._asset_hash)
             # convert the asset to USD
             self._convert_asset(cfg)
+            # write the updated hash only after conversion succeeds. Otherwise a failed conversion
+            # can leave a stale USD cache marked as current.
+            with open(self._dest_hash_path, "w") as f:
+                f.write(self._asset_hash)
             # dump the configuration to a file
             dump_yaml(os.path.join(self.usd_dir, "config.yaml"), cfg.to_dict())
             # add comment to top of the saved config file with information about the converter
@@ -180,6 +181,13 @@ class AssetConverterBase(abc.ABC):
         _ = config_dic.pop("asset_path")
         _ = config_dic.pop("usd_dir")
         _ = config_dic.pop("usd_file_name")
+        _ = config_dic.pop("force_usd_conversion")
+        return AssetConverterBase._config_dict_to_hash(config_dic, cfg.asset_path)
+
+    @staticmethod
+    def _config_dict_to_hash(config_dic: dict, asset_path: str) -> str:
+        """Converts conversion settings and the source asset file to an MD5 hash."""
+
         # convert config dic to bytes
         config_bytes = json.dumps(config_dic).encode()
         # hash config
@@ -187,7 +195,7 @@ class AssetConverterBase(abc.ABC):
         md5.update(config_bytes)
 
         # read the asset file to observe changes
-        with open(cfg.asset_path, "rb") as f:
+        with open(asset_path, "rb") as f:
             while True:
                 # read 64kb chunks to avoid memory issues for the large files!
                 data = f.read(65536)

@@ -7,12 +7,35 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 
 import carb
 import omni.kit.app
 
 from .asset_converter_base import AssetConverterBase
 from .urdf_converter_cfg import UrdfConverterCfg
+
+_URDF_SPAWNER_HASH_IGNORED_KEYS = (
+    "activate_contact_sensors",
+    "articulation_props",
+    "collision_props",
+    "copy_from_source",
+    "deformable_props",
+    "fixed_tendons_props",
+    "func",
+    "joint_drive_props",
+    "mass_props",
+    "physics_material",
+    "physics_material_path",
+    "rigid_props",
+    "scale",
+    "semantic_tags",
+    "spawn_path",
+    "spatial_tendons_props",
+    "visible",
+    "visual_material",
+    "visual_material_path",
+)
 
 
 class UrdfConverter(AssetConverterBase):
@@ -56,15 +79,19 @@ class UrdfConverter(AssetConverterBase):
         Args:
             cfg: The configuration instance for URDF to USD conversion.
         """
-        # enable the URDF importer extension
-        manager = omni.kit.app.get_app().get_extension_manager()
-        if not manager.is_extension_enabled("isaacsim.asset.importer.urdf"):
-            manager.set_extension_enabled_immediate("isaacsim.asset.importer.urdf", True)
-
         # set `usd_file_name` to match the importer's output path structure:
         # the importer generates `{usd_path}/{robot_name}/{robot_name}.usda`
         robot_name = pathlib.PurePath(cfg.asset_path).stem
         cfg.usd_file_name = os.path.join(robot_name, f"{robot_name}.usda")
+
+        # Enable the URDF importer extension when Kit is available. Kitless runs can still use an
+        # already-generated USD cache; conversion itself remains Kit-backed.
+        try:
+            manager = omni.kit.app.get_app().get_extension_manager()
+        except RuntimeError:
+            manager = None
+        if manager is not None and not manager.is_extension_enabled("isaacsim.asset.importer.urdf"):
+            manager.set_extension_enabled_immediate("isaacsim.asset.importer.urdf", True)
 
         super().__init__(cfg=cfg)
 
@@ -81,6 +108,8 @@ class UrdfConverter(AssetConverterBase):
             cfg: The URDF conversion configuration.
         """
         from isaacsim.asset.importer.urdf import URDFImporter, URDFImporterConfig
+
+        self._append_optional_importer_dependency_paths()
 
         # log warnings for features no longer supported by the URDF importer 3.0
         self._warn_unsupported_features(cfg)
@@ -113,6 +142,47 @@ class UrdfConverter(AssetConverterBase):
         if generated_usd_path:
             generated_usd_path = os.path.normpath(generated_usd_path)
             self._usd_file_name = os.path.relpath(generated_usd_path, self.usd_dir)
+
+    @staticmethod
+    def _config_to_hash(cfg: UrdfConverterCfg) -> str:
+        """Converts the URDF conversion inputs to a stable asset cache hash.
+
+        ``UrdfFileCfg`` also inherits spawn-time properties such as ``spawn_path`` and material
+        overrides. They are applied after the generated USD is referenced into the stage and should
+        not force a URDF re-import or make kitless runs miss a valid generated cache.
+        """
+        config_dic = cfg.to_dict()
+        for key in _URDF_SPAWNER_HASH_IGNORED_KEYS:
+            config_dic.pop(key, None)
+        config_dic.pop("asset_path")
+        config_dic.pop("usd_dir")
+        config_dic.pop("usd_file_name")
+        config_dic.pop("force_usd_conversion")
+        return AssetConverterBase._config_dict_to_hash(config_dic, cfg.asset_path)
+
+    @staticmethod
+    def _append_optional_importer_dependency_paths():
+        """Append optional converter dependency paths bundled with Isaac Sim target deps.
+
+        Keep these paths at the end of ``sys.path`` so Isaac Sim's packaged MuJoCo/MJWarp modules
+        keep precedence over older copies that may exist in target-deps.
+        """
+        isaac_path = os.environ.get("ISAAC_PATH")
+        if isaac_path is None:
+            return
+
+        try:
+            isaac_path = pathlib.Path(isaac_path).resolve()
+        except OSError:
+            return
+
+        for path in (isaac_path, *isaac_path.parents):
+            dependency_path = path / "target-deps" / "isaac_newton_prebundle"
+            if dependency_path.is_dir():
+                dependency_path_str = str(dependency_path)
+                if dependency_path_str not in sys.path:
+                    sys.path.append(dependency_path_str)
+                break
 
     @staticmethod
     def _warn_unsupported_features(cfg: UrdfConverterCfg):

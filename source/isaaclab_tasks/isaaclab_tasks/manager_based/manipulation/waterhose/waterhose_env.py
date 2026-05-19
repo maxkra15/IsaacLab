@@ -96,6 +96,7 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
                 while self.sim.physics_manager.assets_loading():
                     self.sim.render()
 
+        core.configure_kit_camera_view(self.sim)
         return self.obs_buf, self.extras
 
     def _register_cable_xform_callback(self) -> None:
@@ -122,8 +123,10 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
         scene_builder.configure_runtime_vbd_solver()
         scene_builder.apply_runtime_cable_asset_xform()
         if self.sim.is_rendering:
+            core.sync_kit_cable_curves_from_newton(scene_builder)
             core.NewtonManager.sync_transforms_to_usd()
         core.configure_newton_viewer(self.sim)
+        core.configure_kit_camera_view(self.sim)
         self.waterhose_right_ee_body_ids = self._resolve_body_ids(core.RIGHT_EE)
         self.waterhose_tip_body_ids = self._resolve_matching_ids(
             core.NewtonManager.get_model().body_label[scene_builder.tip_body_id]
@@ -163,7 +166,14 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
     def _apply_waterhose_cable_asset_xform(self) -> None:
         self.waterhose_scene_builder.apply_runtime_cable_asset_xform(sync_solver_prev=True)
         if self.sim.is_rendering:
+            core.sync_kit_cable_curves_from_newton(self.waterhose_scene_builder)
             core.NewtonManager.sync_transforms_to_usd()
+
+    def close(self) -> None:
+        scene_builder = getattr(self, "waterhose_scene_builder", None)
+        if scene_builder is not None:
+            core.remove_kit_cable_curve_pre_render_sync(scene_builder)
+        super().close()
 
     def get_task_space_action_term(self):
         return self.action_manager.get_term("task_space")

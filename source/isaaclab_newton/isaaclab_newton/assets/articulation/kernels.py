@@ -63,6 +63,18 @@ def get_joint_acc_from_joint_vel(
 
 
 @wp.kernel
+def write_joint_target_mode_data_index(
+    mode: wp.int32,
+    env_ids: wp.array(dtype=wp.int32),
+    joint_ids: wp.array(dtype=wp.int32),
+    joint_target_mode: wp.array2d(dtype=wp.int32),
+):
+    """Write a Newton joint target mode to selected joint indices."""
+    i, j = wp.tid()
+    joint_target_mode[env_ids[i], joint_ids[j]] = mode
+
+
+@wp.kernel
 def write_joint_vel_data_index(
     in_data: wp.array2d(dtype=wp.float32),
     env_ids: wp.array(dtype=wp.int32),

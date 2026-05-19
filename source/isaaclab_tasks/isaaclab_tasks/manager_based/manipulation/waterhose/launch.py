@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,7 +105,24 @@ def resolve_waterhose_task_name(task_name: str | None, input_file: str | None = 
 
 def should_defer_newton_import() -> bool:
     """Return whether waterhose Newton/PXR imports should wait for Kit startup."""
-    return os.environ.get(DEFER_NEWTON_IMPORT_ENV) == "1"
+    return os.environ.get(DEFER_NEWTON_IMPORT_ENV) == "1" or "kit" in get_cli_visualizer_types()
+
+
+def get_cli_visualizer_types(argv: list[str] | None = None) -> set[str]:
+    """Return visualizer types requested on the raw process command line."""
+    argv = sys.argv[1:] if argv is None else argv
+    visualizer_values: list[str] = []
+    visualizer_flags = {"--visualizer", "--viz", "--vis"}
+    for index, token in enumerate(argv):
+        if token in visualizer_flags and index + 1 < len(argv):
+            visualizer_values.append(argv[index + 1])
+        elif any(token.startswith(f"{flag}=") for flag in visualizer_flags):
+            visualizer_values.append(token.split("=", 1)[1])
+
+    visualizers: set[str] = set()
+    for value in visualizer_values:
+        visualizers.update(part.strip().lower() for part in value.split(",") if part.strip())
+    return visualizers
 
 
 def import_waterhose_newton_dependencies() -> None:

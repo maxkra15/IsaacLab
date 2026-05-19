@@ -13,6 +13,7 @@
 **/*.usda
 **/*.usdc
 **/*.usdz
+source/isaaclab_assets/data/Props/Waterhose/
 
 # Python
 .DS_Store

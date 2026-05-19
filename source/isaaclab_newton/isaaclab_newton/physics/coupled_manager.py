@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
 from newton import Model
-from newton.solvers import SolverAdmmCoupled, SolverCoupled, SolverProxyCoupled
+from newton.solvers.coupled_experimental import SolverAdmmCoupled, SolverCoupled, SolverProxyCoupled
 
 from .coupled_manager_cfg import (
     AdmmContactPairCfg,
@@ -89,6 +90,7 @@ class NewtonCoupledManager(NewtonManager):
             raise ValueError(f"Unsupported Newton coupling_type {solver_cfg.coupling_type!r}.")
 
         cls._apply_entry_solver_overrides(solver_cfg.entries)
+        cls._configure_fk_articulation_filter(model, solver_cfg.entries)
         if hasattr(NewtonManager._solver, "prepare_graph_capture"):
             NewtonManager._solver.prepare_graph_capture()
         NewtonManager._use_single_state = False
@@ -101,6 +103,36 @@ class NewtonCoupledManager(NewtonManager):
             if getattr(entry_cfg.solver_cfg, "solver_type", None) != "mujoco_warp":
                 continue
             apply_mujoco_warp_model_overrides(NewtonManager._solver.solver(entry_cfg.name), entry_cfg.solver_cfg)
+
+    @classmethod
+    def _configure_fk_articulation_filter(cls, model: Model, entries: list[CoupledSolverEntryCfg]) -> None:
+        """Exclude solver-owned VBD articulations from NewtonManager's generic FK path."""
+        if model.articulation_count <= 0 or getattr(model, "joint_articulation", None) is None:
+            NewtonManager._set_fk_articulation_filter(None)
+            return
+
+        fk_mask = np.ones(int(model.articulation_count), dtype=bool)
+        joint_articulation = model.joint_articulation.numpy()
+        disabled_any = False
+        for entry_cfg in entries:
+            solver_class, _ = resolve_newton_solver_class_and_kwargs(
+                entry_cfg.solver_cfg,
+                entry_cfg.solver_class,
+                entry_cfg.solver_kwargs,
+            )
+            if getattr(solver_class, "__name__", "") != "SolverVBD":
+                continue
+            for joint_id in entry_cfg.joints:
+                joint_index = int(joint_id)
+                if joint_index < 0 or joint_index >= joint_articulation.shape[0]:
+                    continue
+                articulation_id = int(joint_articulation[joint_index])
+                if articulation_id < 0:
+                    continue
+                fk_mask[articulation_id] = False
+                disabled_any = True
+
+        NewtonManager._set_fk_articulation_filter(fk_mask if disabled_any else None)
 
     @classmethod
     def _build_entry(cls, entry_cfg: CoupledSolverEntryCfg) -> SolverCoupled.Entry:

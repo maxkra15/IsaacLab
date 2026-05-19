@@ -15,6 +15,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import numpy as np
 import warp as wp
 
 # Load CUDA runtime for relaxed-mode graph capture (RTX-compatible).
@@ -99,6 +100,17 @@ def _scatter_reset_masks_from_ids(
     world = env_ids[i]
     world_mask[world] = wp.int32(1)
     fk_mask[articulation_ids[world, arti]] = True
+
+
+@wp.kernel(enable_backward=False)
+def _and_fk_mask_with_filter(
+    fk_mask: wp.array(dtype=wp.bool),
+    fk_filter: wp.array(dtype=wp.bool),
+):
+    """Clear FK mask entries that are not owned by generic FK."""
+    i = int(wp.tid())
+    if not fk_filter[i]:
+        fk_mask[i] = False
 
 
 class NewtonSceneDataBackend(SceneDataBackend):
@@ -197,6 +209,8 @@ class NewtonManager(PhysicsManager):
     # Per-world reset masks (allocated in start_simulation, consumed in step)
     _world_reset_mask: wp.array | None = None  # (num_envs,) wp.int32 — for SolverKamino.reset(world_mask=...)
     _fk_reset_mask: wp.array | None = None  # (articulation_count,) wp.bool — for eval_fk(mask=...)
+    _fk_articulation_filter: wp.array | None = None
+    """Optional articulation mask for generic FK. Solver-owned articulations are False."""
 
     # CUDA graphing
     _graph = None
@@ -208,6 +222,8 @@ class NewtonManager(PhysicsManager):
     _newton_index_attr = "newton:index"
     _clone_physics_only = False
     _transforms_dirty: bool = False
+    _pre_render_callbacks: dict[str, Callable[[], None]] = {}
+    _usd_xform_ops: dict[str, object] = {}
 
     # cubric GPU transform hierarchy (replaces CPU update_world_xforms)
     _cubric = None
@@ -286,18 +302,38 @@ class NewtonManager(PhysicsManager):
     def forward(cls) -> None:
         """Update articulation kinematics without stepping physics.
 
-        Runs Newton's generic forward kinematics (``eval_fk``) over **all**
-        articulations to compute body poses from joint coordinates. This is
-        the full (unmasked) FK path used during initial setup. For incremental
-        per-environment updates after resets, see :meth:`invalidate_fk` which
-        accumulates masks consumed by :meth:`step`.
+        Runs Newton's generic forward kinematics (``eval_fk``) for
+        articulations that are allowed to be FK-owned. Coupled solver entries
+        such as VBD rods own their body poses directly, so render-time FK must
+        not recompute those bodies from stale joint coordinates.
         """
-        eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, None)
+        if cls._model is None or cls._state_0 is None:
+            return
+        eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, cls._fk_articulation_filter)
+        if cls._usdrt_stage is not None:
+            cls._mark_transforms_dirty()
+            cls.sync_transforms_to_usd()
 
     @classmethod
     def pre_render(cls) -> None:
         """Flush deferred Fabric writes before cameras/visualizers read the scene."""
+        for name, callback in list(cls._pre_render_callbacks.items()):
+            try:
+                callback()
+            except Exception:
+                logger.exception("[NewtonManager] pre-render callback %s failed; deregistering", name)
+                NewtonManager._pre_render_callbacks.pop(name, None)
         cls.sync_transforms_to_usd()
+
+    @classmethod
+    def register_pre_render_callback(cls, name: str, callback: Callable[[], None]) -> None:
+        """Register a callback that runs before Newton writes render transforms to Fabric."""
+        NewtonManager._pre_render_callbacks[name] = callback
+
+    @classmethod
+    def deregister_pre_render_callback(cls, name: str) -> None:
+        """Remove a pre-render callback registered by name."""
+        NewtonManager._pre_render_callbacks.pop(name, None)
 
     @classmethod
     def sync_transforms_to_usd(cls) -> None:
@@ -328,6 +364,10 @@ class NewtonManager(PhysicsManager):
             return
         try:
             import usdrt
+
+            body_paths = getattr(cls._model, "body_label", None) or getattr(cls._model, "body_key", None)
+            if body_paths is not None:
+                cls._sync_transforms_to_usd_xform_ops(body_paths)
 
             # Lazy adapter creation: deferred from initialize_solver() to avoid
             # startup-ordering issues with the cubric plugin.
@@ -369,6 +409,11 @@ class NewtonManager(PhysicsManager):
                 if selection.GetCount() == 0:
                     NewtonManager._transforms_dirty = False
                     return
+
+                # Notify Fabric Scene Delegate that transform buffers are about
+                # to change. Without this, USDRT attributes read back correctly
+                # but Kit can keep rendering stale rigid-body transforms.
+                selection.PrepareForReuse()
 
                 fabric_transforms = wp.fabricarray(selection, "omni:fabric:worldMatrix")
                 newton_indices = wp.fabricarray(selection, cls._newton_index_attr)
@@ -438,7 +483,13 @@ class NewtonManager(PhysicsManager):
         # broadphase/narrowphase) is stale until FK runs.
         # Only runs FK for dirtied articulations via the accumulated mask.
         if cls._needs_collision_pipeline:
-            eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, cls._fk_reset_mask)
+            eval_fk(
+                cls._model,
+                cls._state_0.joint_q,
+                cls._state_0.joint_qd,
+                cls._state_0,
+                cls._filtered_fk_reset_mask(),
+            )
 
         # Zero both masks after consumption
         NewtonManager._world_reset_mask.zero_()
@@ -526,11 +577,14 @@ class NewtonManager(PhysicsManager):
         # Per-world reset masks
         NewtonManager._world_reset_mask = None
         NewtonManager._fk_reset_mask = None
+        NewtonManager._fk_articulation_filter = None
         NewtonManager._graph = None
         NewtonManager._graph_capture_pending = False
         NewtonManager._newton_stage_path = None
         NewtonManager._usdrt_stage = None
         NewtonManager._transforms_dirty = False
+        NewtonManager._pre_render_callbacks = {}
+        NewtonManager._usd_xform_ops = {}
         NewtonManager._up_axis = "Z"
         NewtonManager._visualization_scene_data = None
         NewtonManager._visualization_mapping = None
@@ -586,9 +640,119 @@ class NewtonManager(PhysicsManager):
 
             SolverImplicitMPM.register_custom_attributes(builder)
         if getattr(solver_cfg, "coupling_type", None) == "admm":
-            from newton.solvers import SolverAdmmCoupled
+            from newton.solvers.coupled_experimental import SolverAdmmCoupled
 
             SolverAdmmCoupled.register_custom_attributes(builder)
+
+    @classmethod
+    def _set_fk_articulation_filter(cls, mask: np.ndarray | list[bool] | None) -> None:
+        """Set the articulation allow-mask used by generic FK."""
+        if mask is None:
+            NewtonManager._fk_articulation_filter = None
+            return
+
+        mask_np = np.asarray(mask, dtype=bool)
+        if cls._model is not None and mask_np.shape != (int(cls._model.articulation_count),):
+            raise ValueError(
+                "FK articulation filter shape "
+                f"{mask_np.shape} does not match articulation_count={cls._model.articulation_count}."
+            )
+
+        device = PhysicsManager._device or getattr(cls._model, "device", "cpu") or "cpu"
+        NewtonManager._fk_articulation_filter = wp.array(mask_np, dtype=wp.bool, device=device)
+
+    @classmethod
+    def _filtered_fk_reset_mask(cls) -> wp.array | None:
+        """Return the reset FK mask after applying the optional articulation filter."""
+        if cls._fk_reset_mask is None or cls._fk_articulation_filter is None:
+            return cls._fk_reset_mask
+        if cls._fk_reset_mask.shape[0] != cls._fk_articulation_filter.shape[0]:
+            return cls._fk_reset_mask
+        wp.launch(
+            _and_fk_mask_with_filter,
+            dim=cls._fk_reset_mask.shape[0],
+            inputs=[cls._fk_reset_mask, cls._fk_articulation_filter],
+            device=PhysicsManager._device,
+        )
+        return cls._fk_reset_mask
+
+    @classmethod
+    def _sync_transforms_to_usd_xform_ops(cls, body_paths) -> None:
+        """Author Newton body world poses into USD local xformOps for Kit rendering."""
+        try:
+            from pxr import Gf, Sdf, UsdGeom  # noqa: PLC0415
+        except Exception:
+            return
+
+        stage = get_current_stage()
+        if stage is None:
+            return
+
+        try:
+            body_q = cls._state_0.body_q.numpy()
+        except Exception:
+            return
+
+        world_mats: dict[str, object] = {}
+        for body_id, prim_path in enumerate(body_paths):
+            if not isinstance(prim_path, str) or not prim_path.startswith("/") or body_id >= body_q.shape[0]:
+                continue
+            pose = body_q[body_id]
+            quat = np.asarray(pose[3:7], dtype=np.float64)
+            norm = float(np.linalg.norm(quat))
+            if not np.isfinite(norm) or norm <= 1.0e-12:
+                continue
+            quat /= norm
+
+            mat = Gf.Matrix4d(1.0)
+            mat.SetRotateOnly(Gf.Quatd(float(quat[3]), Gf.Vec3d(float(quat[0]), float(quat[1]), float(quat[2]))))
+            mat.SetTranslateOnly(Gf.Vec3d(float(pose[0]), float(pose[1]), float(pose[2])))
+            world_mats[prim_path] = mat
+
+        if not world_mats:
+            return
+
+        xform_cache = UsdGeom.XformCache()
+        xform_attr_name = "xformOp:transform:newton"
+        for prim_path, world_mat in world_mats.items():
+            prim = stage.GetPrimAtPath(prim_path)
+            if not prim.IsValid() or prim.IsInstanceProxy():
+                continue
+            parent = prim.GetParent()
+            parent_path = str(parent.GetPath()) if parent and parent.IsValid() else ""
+            parent_world = world_mats.get(parent_path)
+            if parent_world is None:
+                parent_world = (
+                    xform_cache.GetLocalToWorldTransform(parent) if parent and parent.IsValid() else Gf.Matrix4d(1.0)
+                )
+            local_mat = world_mat * parent_world.GetInverse()
+
+            transform_attr = NewtonManager._usd_xform_ops.get(prim_path)
+            if transform_attr is not None:
+                try:
+                    if (
+                        not transform_attr.IsValid()
+                        or transform_attr.GetPrim() != prim
+                        or transform_attr.GetName() != xform_attr_name
+                        or transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d
+                    ):
+                        transform_attr = None
+                except Exception:
+                    transform_attr = None
+            if transform_attr is None:
+                transform_attr = prim.GetAttribute(xform_attr_name)
+                if transform_attr.IsValid() and transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d:
+                    transform_attr.SetTypeName(Sdf.ValueTypeNames.Matrix4d)
+                if not transform_attr.IsValid() or transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d:
+                    transform_attr = prim.CreateAttribute(xform_attr_name, Sdf.ValueTypeNames.Matrix4d, False)
+                order_attr = prim.GetAttribute("xformOpOrder")
+                if order_attr.IsValid() and order_attr.GetTypeName() != Sdf.ValueTypeNames.TokenArray:
+                    order_attr.SetTypeName(Sdf.ValueTypeNames.TokenArray)
+                if not order_attr.IsValid():
+                    order_attr = prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray, False)
+                order_attr.Set([xform_attr_name])
+                NewtonManager._usd_xform_ops[prim_path] = transform_attr
+            transform_attr.Set(local_mat)
 
     @classmethod
     def cl_register_site(cls, body_pattern: str | None, xform: wp.transform) -> str:

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import warp as wp
-from newton import JointType
+from newton import JointTargetMode, JointType
 from newton.selection import ArticulationView
 from newton.solvers import SolverNotifyFlags
 from prettytable import PrettyTable
@@ -3470,11 +3470,17 @@ class Articulation(BaseArticulation):
                 # the gains and limits are set into the simulation since actuator model is implicit
                 self.write_joint_stiffness_to_sim_index(stiffness=actuator.stiffness, joint_ids=actuator.joint_indices)
                 self.write_joint_damping_to_sim_index(damping=actuator.damping, joint_ids=actuator.joint_indices)
+                self._write_joint_target_mode_to_sim_index(
+                    mode=int(JointTargetMode.POSITION), joint_ids=actuator.joint_indices
+                )
             else:
                 # the gains and limits are processed by the actuator model
                 # we set gains to zero, and torque limit to a high value in simulation to avoid any interference
                 self.write_joint_stiffness_to_sim_index(stiffness=0.0, joint_ids=actuator.joint_indices)
                 self.write_joint_damping_to_sim_index(damping=0.0, joint_ids=actuator.joint_indices)
+                self._write_joint_target_mode_to_sim_index(
+                    mode=int(JointTargetMode.EFFORT), joint_ids=actuator.joint_indices
+                )
 
             # Set common properties into the simulation
             self.write_joint_effort_limit_to_sim_index(
@@ -3575,6 +3581,27 @@ class Articulation(BaseArticulation):
         # parse fixed tendons properties if they exist
         if self.num_fixed_tendons > 0 or self.num_spatial_tendons > 0:
             raise NotImplementedError("Fixed and spatial tendons are not supported yet.")
+
+    def _write_joint_target_mode_to_sim_index(self, mode: int, joint_ids: slice | torch.Tensor):
+        """Set Newton target mode for the joints controlled by an actuator group."""
+        joint_target_mode = getattr(self.data, "_sim_bind_joint_target_mode", None)
+        if joint_target_mode is None:
+            return
+        if isinstance(joint_ids, slice):
+            joint_ids = self._ALL_JOINT_INDICES
+        wp.launch(
+            articulation_kernels.write_joint_target_mode_data_index,
+            dim=(self.num_instances, joint_ids.shape[0]),
+            inputs=[
+                mode,
+                self._ALL_INDICES,
+                joint_ids,
+            ],
+            outputs=[
+                joint_target_mode,
+            ],
+            device=self.device,
+        )
 
     def _apply_actuator_model(self):
         """Processes joint commands for the articulation by forwarding them to the actuators.

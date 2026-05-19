@@ -142,12 +142,27 @@ RBY1DF_CFG = ArticulationCfg(
 """Configuration of the RBY1DF robot imported from URDF."""
 
 
+RBY1DF_FIXED_BASE_CFG = RBY1DF_CFG.copy()
+RBY1DF_FIXED_BASE_CFG.spawn.fix_base = True
+RBY1DF_FIXED_BASE_CFG.spawn.usd_file_name = "rby1df_fixed_base.usd"
+"""Configuration of the RBY1DF robot imported from URDF with a fixed base."""
+
+
 RBY1DF_HIGH_PD_CFG = RBY1DF_CFG.copy()
 RBY1DF_HIGH_PD_CFG.spawn.rigid_props.disable_gravity = True
-RBY1DF_HIGH_PD_CFG.actuators["torso"].stiffness = 600.0
-RBY1DF_HIGH_PD_CFG.actuators["torso"].damping = 80.0
-RBY1DF_HIGH_PD_CFG.actuators["right_arm"].stiffness = 500.0
-RBY1DF_HIGH_PD_CFG.actuators["right_arm"].damping = 80.0
-RBY1DF_HIGH_PD_CFG.actuators["left_arm"].stiffness = 300.0
-RBY1DF_HIGH_PD_CFG.actuators["left_arm"].damping = 60.0
+for _actuator_name in ("torso", "right_arm", "left_arm", "head"):
+    RBY1DF_HIGH_PD_CFG.actuators[_actuator_name].stiffness = 45000.0
+    RBY1DF_HIGH_PD_CFG.actuators[_actuator_name].damping = 4500.0
+    RBY1DF_HIGH_PD_CFG.actuators[_actuator_name].effort_limit_sim = 1000.0
+    RBY1DF_HIGH_PD_CFG.actuators[_actuator_name].armature = 0.2
+RBY1DF_HIGH_PD_CFG.actuators["grippers"].stiffness = 10000.0
+RBY1DF_HIGH_PD_CFG.actuators["grippers"].damping = 1000.0
+RBY1DF_HIGH_PD_CFG.actuators["grippers"].effort_limit_sim = 100000.0
+RBY1DF_HIGH_PD_CFG.actuators["grippers"].armature = 0.5
 """Configuration of the RBY1DF robot with stiffer PD gains for task-space IK."""
+
+
+RBY1DF_FIXED_BASE_HIGH_PD_CFG = RBY1DF_HIGH_PD_CFG.copy()
+RBY1DF_FIXED_BASE_HIGH_PD_CFG.spawn.fix_base = True
+RBY1DF_FIXED_BASE_HIGH_PD_CFG.spawn.usd_file_name = "rby1df_fixed_base_high_pd.usd"
+"""Configuration of the fixed-base RBY1DF robot with stiffer PD gains for task-space IK."""

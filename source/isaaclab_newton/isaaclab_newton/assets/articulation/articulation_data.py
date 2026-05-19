@@ -1500,6 +1500,12 @@ class ArticulationData(BaseArticulationData):
             self._sim_bind_joint_effort_limits_sim = self._root_view.get_attribute(
                 "joint_effort_limit", SimulationManager.get_model()
             )[:, 0]
+            try:
+                self._sim_bind_joint_target_mode = self._root_view.get_attribute(
+                    "joint_target_mode", SimulationManager.get_model()
+                )[:, 0]
+            except Exception:
+                self._sim_bind_joint_target_mode = None
             # -- joint states
             self._sim_bind_joint_pos = self._root_view.get_dof_positions(SimulationManager.get_state_0())[:, 0]
             self._sim_bind_joint_vel = self._root_view.get_dof_velocities(SimulationManager.get_state_0())[:, 0]
@@ -1535,6 +1541,7 @@ class ArticulationData(BaseArticulationData):
             self._sim_bind_joint_effort_limits_sim = wp.zeros(
                 (self._num_instances, 0), dtype=wp.float32, device=self.device
             )
+            self._sim_bind_joint_target_mode = None
             self._sim_bind_joint_pos = wp.zeros((self._num_instances, 0), dtype=wp.float32, device=self.device)
             self._sim_bind_joint_vel = wp.zeros((self._num_instances, 0), dtype=wp.float32, device=self.device)
             self._sim_bind_joint_effort = wp.zeros((self._num_instances, 0), dtype=wp.float32, device=self.device)

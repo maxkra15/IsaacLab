@@ -748,7 +748,13 @@
     <limit effort="1000.0" lower="-0.002" upper="0.1" velocity="1.0"/>
   </joint>
 
-  <link name="left_gripper_dummy"/>
+  <link name="left_gripper_dummy">
+    <inertial>
+      <mass value="0.001"/>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
+    </inertial>
+  </link>
 
   <joint name="left_gripper_left_finger_joint" type="prismatic">
     <parent link="left_gripper_base"/>
@@ -770,9 +776,16 @@
         <mesh filename="./meshes/visual/EE_FINGER.obj"/>
       </geometry>
     </visual>
-    <collision name="left_gripper_leftfinger_collision">
+    <collision name="left_gripper_leftfinger_pad_collision">
+      <origin rpy="0 0 0" xyz="0.0015 0.0 -0.0305"/>
       <geometry>
-        <mesh filename="./meshes/collision/EE_FINGER.obj"/>
+        <box size="0.009 0.032 0.060"/>
+      </geometry>
+    </collision>
+    <collision name="left_gripper_leftfinger_tip_collision">
+      <origin rpy="0 0 0" xyz="0.0065 0.0 -0.0040"/>
+      <geometry>
+        <box size="0.013 0.015 0.011"/>
       </geometry>
     </collision>
   </link>
@@ -797,9 +810,16 @@
         <mesh filename="./meshes/visual/EE_FINGER.obj"/>
       </geometry>
     </visual>
-    <collision name="left_gripper_rightfinger">
+    <collision name="left_gripper_rightfinger_pad_collision">
+      <origin rpy="0 0 0" xyz="0.0015 0.0 -0.0305"/>
       <geometry>
-        <mesh filename="./meshes/collision/EE_FINGER.obj"/>
+        <box size="0.009 0.032 0.060"/>
+      </geometry>
+    </collision>
+    <collision name="left_gripper_rightfinger_tip_collision">
+      <origin rpy="0 0 0" xyz="0.0065 0.0 -0.0040"/>
+      <geometry>
+        <box size="0.013 0.015 0.011"/>
       </geometry>
     </collision>
   </link>
@@ -868,7 +888,13 @@
     <limit effort="1000.0" lower="-0.002" upper="0.1" velocity="1.0"/>
   </joint>
 
-  <link name="right_gripper_dummy"/>
+  <link name="right_gripper_dummy">
+    <inertial>
+      <mass value="0.001"/>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
+    </inertial>
+  </link>
 
   <joint name="right_gripper_left_finger_joint" type="prismatic">
     <parent link="right_gripper_base"/>
@@ -890,9 +916,16 @@
         <mesh filename="./meshes/visual/EE_FINGER.obj"/>
       </geometry>
     </visual>
-    <collision name="right_gripper_leftfinger_collision">
+    <collision name="right_gripper_leftfinger_pad_collision">
+      <origin rpy="0 0 0" xyz="0.0015 0.0 -0.0305"/>
       <geometry>
-        <mesh filename="./meshes/collision/EE_FINGER.obj"/>
+        <box size="0.009 0.032 0.060"/>
+      </geometry>
+    </collision>
+    <collision name="right_gripper_leftfinger_tip_collision">
+      <origin rpy="0 0 0" xyz="0.0065 0.0 -0.0040"/>
+      <geometry>
+        <box size="0.013 0.015 0.011"/>
       </geometry>
     </collision>
   </link>
@@ -917,9 +950,16 @@
         <mesh filename="./meshes/visual/EE_FINGER.obj"/>
       </geometry>
     </visual>
-    <collision name="right_gripper_rightfinger">
+    <collision name="right_gripper_rightfinger_pad_collision">
+      <origin rpy="0 0 0" xyz="0.0015 0.0 -0.0305"/>
       <geometry>
-        <mesh filename="./meshes/collision/EE_FINGER.obj"/>
+        <box size="0.009 0.032 0.060"/>
+      </geometry>
+    </collision>
+    <collision name="right_gripper_rightfinger_tip_collision">
+      <origin rpy="0 0 0" xyz="0.0065 0.0 -0.0040"/>
+      <geometry>
+        <box size="0.013 0.015 0.011"/>
       </geometry>
     </collision>
   </link>
