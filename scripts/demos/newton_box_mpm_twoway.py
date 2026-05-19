@@ -229,7 +229,6 @@ def build_box_sand_model() -> tuple[newton.ModelBuilder, CoupledSolverCfg, int]:
                     collider_velocity_mode="forward",
                 ),
                 particles=particle_indices,
-                shapes=[box_shape, ground_shape],
                 in_place=True,
             ),
         ],

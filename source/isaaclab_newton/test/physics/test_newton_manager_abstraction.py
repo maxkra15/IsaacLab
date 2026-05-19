@@ -53,7 +53,7 @@ from isaaclab_newton.physics import (
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
 
 try:
-    from newton.solvers import SolverAdmmCoupled, SolverProxyCoupled
+    from newton.solvers.coupled_experimental import SolverAdmmCoupled, SolverProxyCoupled
 except ImportError:
     SolverAdmmCoupled = None
     SolverProxyCoupled = None
@@ -289,6 +289,14 @@ def test_coupled_entry_threads_generic_entry_options():
     assert entry.in_place is True
 
 
+def test_coupled_proxy_int_mode_is_normalized():
+    """Integer proxy modes are normalized before constructing Newton proxy configs."""
+    proxy = NewtonCoupledManager._build_proxy(
+        CoupledProxyCfg(source="src", destination="dst", particles=[0], mode=1)
+    )
+    assert proxy.mode == "staggered"
+
+
 @pytest.mark.parametrize(
     "cfg, match",
     [
@@ -313,6 +321,15 @@ def test_coupled_entry_threads_generic_entry_options():
         (
             CoupledSolverCfg(
                 entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg(), shapes=[0]),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg(), shapes=[0]),
+                ],
+            ),
+            "shapes index 0 is owned by both",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
                     CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
                     CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
                 ],
@@ -321,6 +338,18 @@ def test_coupled_entry_threads_generic_entry_options():
                 ),
             ),
             "source 'missing'",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+                proxy_coupling=ProxyCouplingCfg(
+                    proxies=[CoupledProxyCfg(source="a", destination="b", particles=[0], mode=2)]
+                ),
+            ),
+            "Unsupported CoupledProxyCfg mode",
         ),
         (
             CoupledSolverCfg(

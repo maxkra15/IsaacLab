@@ -54,9 +54,11 @@ class CoupledSolverEntryCfg:
     """Parent-model joint indices owned by this entry."""
 
     shapes: list[int] = field(default_factory=list)
-    """Parent-model shape indices visible to this entry.
+    """Parent-model shape indices owned by this entry.
 
-    Leave empty to let Newton's coupled solver keep default shape visibility.
+    Shape ownership must be unique across entries. Leave empty to let Newton's
+    coupled solver keep default shape visibility; proxy destinations keep proxy
+    body shapes visible automatically.
     """
 
     solver_kwargs: dict[str, Any] = field(default_factory=dict)

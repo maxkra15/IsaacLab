@@ -170,8 +170,8 @@ class NewtonCoupledManager(NewtonManager):
         _factory.__name__ = getattr(solver_class, "__name__", type(solver_class).__name__)
         return _factory
 
-    @staticmethod
-    def _build_proxy(proxy_cfg: CoupledProxyCfg) -> SolverProxyCoupled.Proxy:
+    @classmethod
+    def _build_proxy(cls, proxy_cfg: CoupledProxyCfg) -> SolverProxyCoupled.Proxy:
         """Build a Newton proxy mapping from an Isaac Lab proxy cfg."""
         if not proxy_cfg.source or not proxy_cfg.destination:
             raise ValueError("CoupledProxyCfg source and destination must be non-empty.")
@@ -184,12 +184,23 @@ class NewtonCoupledManager(NewtonManager):
             bodies=list(proxy_cfg.bodies),
             proxy_bodies=None if proxy_cfg.proxy_bodies is None else list(proxy_cfg.proxy_bodies),
             mass_scale=proxy_cfg.mass_scale,
-            mode=proxy_cfg.mode,
+            mode=cls._build_proxy_mode(proxy_cfg.mode),
             particles=list(proxy_cfg.particles),
             proxy_particles=None if proxy_cfg.proxy_particles is None else list(proxy_cfg.proxy_particles),
             collision_pipeline=proxy_cfg.collision_pipeline_factory,
             collide_interval=proxy_cfg.collide_interval,
         )
+
+    @staticmethod
+    def _build_proxy_mode(mode: str | int) -> str:
+        """Return the Newton proxy mode string for an Isaac Lab proxy cfg mode."""
+        if isinstance(mode, str):
+            return mode
+        if mode == 0:
+            return "lagged"
+        if mode == 1:
+            return "staggered"
+        raise ValueError(f"Unsupported CoupledProxyCfg mode {mode!r}; expected 'lagged', 'staggered', 0, or 1.")
 
     @classmethod
     def _build_admm(
@@ -243,8 +254,8 @@ class NewtonCoupledManager(NewtonManager):
         else:
             cls._validate_admm_coupling(solver_cfg.admm_coupling)
 
-    @staticmethod
-    def _validate_entries(entries: list[CoupledSolverEntryCfg]) -> None:
+    @classmethod
+    def _validate_entries(cls, entries: list[CoupledSolverEntryCfg]) -> None:
         names: set[str] = set()
         for entry in entries:
             if not entry.name:
@@ -256,6 +267,22 @@ class NewtonCoupledManager(NewtonManager):
                 raise ValueError(f"CoupledSolverEntryCfg {entry.name!r} substeps must be >= 1.")
             if entry.in_place and entry.substeps != 1:
                 raise ValueError(f"CoupledSolverEntryCfg {entry.name!r} in_place requires substeps=1.")
+        for field_name in ("bodies", "particles", "joints", "shapes"):
+            cls._validate_unique_entry_ownership(entries, field_name)
+
+    @staticmethod
+    def _validate_unique_entry_ownership(entries: list[CoupledSolverEntryCfg], field_name: str) -> None:
+        owners: dict[int, str] = {}
+        for entry in entries:
+            for raw_index in getattr(entry, field_name):
+                index = int(raw_index)
+                owner = owners.get(index)
+                if owner is not None:
+                    raise ValueError(
+                        f"CoupledSolverEntryCfg {field_name} index {index} is owned by both "
+                        f"{owner!r} and {entry.name!r}."
+                    )
+                owners[index] = entry.name
 
     @classmethod
     def _validate_proxy_coupling(cls, solver_cfg: CoupledSolverCfg) -> None:
@@ -283,6 +310,7 @@ class NewtonCoupledManager(NewtonManager):
                 raise ValueError("CoupledProxyCfg mass_scale must be > 0.")
             if proxy.collide_interval is not None and proxy.collide_interval < 1:
                 raise ValueError("CoupledProxyCfg collide_interval must be >= 1.")
+            cls._build_proxy_mode(proxy.mode)
 
     @staticmethod
     def _validate_admm_coupling(admm_cfg: AdmmCouplingCfg) -> None:
