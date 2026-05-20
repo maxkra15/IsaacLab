@@ -39,8 +39,6 @@ gym.register(
     },
 )
 
-
-##
 # Operational Space Control
 ##
 
