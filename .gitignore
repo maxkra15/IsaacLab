@@ -13,6 +13,8 @@
 **/*.usda
 **/*.usdc
 **/*.usdz
+!source/isaaclab_assets/data/Robots/RBY1DF/usd/fixed_base/**/*.usd
+!source/isaaclab_assets/data/Robots/RBY1DF/usd/fixed_base/**/*.usda
 source/isaaclab_assets/data/Props/Waterhose/
 
 # Python

@@ -5,9 +5,9 @@
 
 """Configuration for the Rainbow Robotics RBY1DF mobile manipulator.
 
-The asset is imported from the vendored URDF in ``isaaclab_assets/data``.  The
-first training tasks use the robot as a fixed-base manipulator and control only
-one arm; the remaining joints are still actuated so they hold their default pose.
+The general asset remains importable from the vendored URDF.  Fixed-base
+training tasks use a pre-generated USD so large RL runs do not repeatedly invoke
+the URDF converter or depend on volatile ``/tmp`` converter caches.
 """
 
 import isaaclab.sim as sim_utils
@@ -15,6 +15,24 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
 from isaaclab_assets import ISAACLAB_ASSETS_DATA_DIR
+
+
+RBY1DF_FIXED_BASE_USD_PATH = f"{ISAACLAB_ASSETS_DATA_DIR}/Robots/RBY1DF/usd/fixed_base/robot_edited.usda"
+
+
+def _rby1df_fixed_base_usd_spawn_cfg() -> sim_utils.UsdFileCfg:
+    return sim_utils.UsdFileCfg(
+        usd_path=RBY1DF_FIXED_BASE_USD_PATH,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=True,
+            max_depenetration_velocity=5.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=0,
+        ),
+    )
 
 RBY1DF_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
@@ -143,9 +161,8 @@ RBY1DF_CFG = ArticulationCfg(
 
 
 RBY1DF_FIXED_BASE_CFG = RBY1DF_CFG.copy()
-RBY1DF_FIXED_BASE_CFG.spawn.fix_base = True
-RBY1DF_FIXED_BASE_CFG.spawn.usd_file_name = "rby1df_fixed_base.usd"
-"""Configuration of the RBY1DF robot imported from URDF with a fixed base."""
+RBY1DF_FIXED_BASE_CFG.spawn = _rby1df_fixed_base_usd_spawn_cfg()
+"""Configuration of the fixed-base RBY1DF robot spawned from a pre-generated USD."""
 
 
 RBY1DF_HIGH_PD_CFG = RBY1DF_CFG.copy()
@@ -163,6 +180,5 @@ RBY1DF_HIGH_PD_CFG.actuators["grippers"].armature = 0.5
 
 
 RBY1DF_FIXED_BASE_HIGH_PD_CFG = RBY1DF_HIGH_PD_CFG.copy()
-RBY1DF_FIXED_BASE_HIGH_PD_CFG.spawn.fix_base = True
-RBY1DF_FIXED_BASE_HIGH_PD_CFG.spawn.usd_file_name = "rby1df_fixed_base_high_pd.usd"
+RBY1DF_FIXED_BASE_HIGH_PD_CFG.spawn = _rby1df_fixed_base_usd_spawn_cfg()
 """Configuration of the fixed-base RBY1DF robot with stiffer PD gains for task-space IK."""
