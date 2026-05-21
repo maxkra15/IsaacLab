@@ -348,7 +348,18 @@ class NewtonManager(PhysicsManager):
 
             cameras_enabled = bool(get_settings_manager().get("/isaaclab/cameras_enabled", False))
             cls._clone_physics_only = "kit" not in requested and not cameras_enabled
-            if "newton" in requested and PhysicsManager._cfg is not None and PhysicsManager._cfg.use_cuda_graph:
+            disable_graph_for_viewer = os.getenv("ISAACLAB_NEWTON_DISABLE_CUDA_GRAPH_WITH_VIEWER", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if (
+                disable_graph_for_viewer
+                and "newton" in requested
+                and PhysicsManager._cfg is not None
+                and PhysicsManager._cfg.use_cuda_graph
+            ):
                 logger.info(
                     "Disabling Newton CUDA graph capture while the standalone Newton visualizer is active. "
                     "ViewerGL uses CUDA/OpenGL interop on the same context and must run against eager physics state."
@@ -2102,7 +2113,13 @@ class NewtonManager(PhysicsManager):
 
         if cls._use_single_state:
             for i in range(cls._num_substeps):
-                cls._step_solver(NewtonManager._state_0, NewtonManager._state_0, NewtonManager._control, contacts, cls._solver_dt)
+                cls._step_solver(
+                    NewtonManager._state_0,
+                    NewtonManager._state_0,
+                    NewtonManager._control,
+                    contacts,
+                    cls._solver_dt,
+                )
                 NewtonManager._state_0.clear_forces()
                 if collide_mid_loop and (i + 1) % collide_every == 0 and i + 1 < cls._num_substeps:
                     cls._collision_pipeline.collide(NewtonManager._state_0, contacts)
@@ -2110,7 +2127,13 @@ class NewtonManager(PhysicsManager):
             cfg = PhysicsManager._cfg
             need_copy_on_last = (cfg is not None and cfg.use_cuda_graph) and cls._num_substeps % 2 == 1  # type: ignore[union-attr]
             for i in range(cls._num_substeps):
-                cls._step_solver(NewtonManager._state_0, NewtonManager._state_1, NewtonManager._control, contacts, cls._solver_dt)
+                cls._step_solver(
+                    NewtonManager._state_0,
+                    NewtonManager._state_1,
+                    NewtonManager._control,
+                    contacts,
+                    cls._solver_dt,
+                )
                 if need_copy_on_last and i == cls._num_substeps - 1:
                     NewtonManager._state_0.assign(NewtonManager._state_1)
                 else:
@@ -2467,7 +2490,6 @@ class NewtonManager(PhysicsManager):
 
         if cls._backend_is_newton(scene_data_provider):
             if cls._model is not None and cls._state_0 is not None:
-                eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, None)
                 cls._debug_visualization_state("newton")
             return
         cls._ensure_visualization_model()
