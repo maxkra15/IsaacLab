@@ -179,7 +179,7 @@ SOLVER_MATRIX = [
         NewtonCoupledManager,
         SolverProxyCoupled,
         False,
-        True,
+        False,
         id="proxy_coupled_mjwarp_mpm",
     ),
     pytest.param(
@@ -586,7 +586,9 @@ def test_initialize_solver_populates_canonical_state(
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
         if SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
-            assert NewtonCoupledManager.get_entry_solver("rigid") is not None
+            rigid_solver = NewtonCoupledManager.get_entry_solver("rigid")
+            assert rigid_solver is not None
+            assert hasattr(rigid_solver, "_collision_pipeline")
             assert NewtonCoupledManager.get_entry_solver("sand") is not None
         if SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None

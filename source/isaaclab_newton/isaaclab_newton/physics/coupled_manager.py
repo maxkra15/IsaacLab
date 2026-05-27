@@ -13,8 +13,13 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
-from newton import Model
-from newton.solvers.coupled_experimental import SolverAdmmCoupled, SolverCoupled, SolverProxyCoupled
+from newton import CollisionPipeline, Model
+from newton.solvers.coupled_experimental import (
+    CouplingInterface,
+    SolverAdmmCoupled,
+    SolverCoupled,
+    SolverProxyCoupled,
+)
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.physics import PhysicsManager
@@ -36,6 +41,31 @@ from .solver_factory import (
 
 if TYPE_CHECKING:
     from isaaclab.scene import InteractiveSceneCfg
+
+
+class _EntryCollisionPipelineSolver(CouplingInterface):
+    """Run a solver with a collision pipeline scoped to its model view."""
+
+    def __init__(self, solver, model_view):
+        self._solver = solver
+        self._collision_pipeline = self._make_collision_pipeline(model_view)
+        self._contacts = self._collision_pipeline.contacts()
+        self.coupling_unsupported = getattr(solver, "coupling_unsupported", frozenset())
+
+    @staticmethod
+    def _make_collision_pipeline(model_view):
+        collision_cfg = NewtonManager._collision_cfg
+        if collision_cfg is not None:
+            return CollisionPipeline(model_view, **collision_cfg.to_pipeline_args())
+        return CollisionPipeline(model_view, broad_phase="explicit")
+
+    def __getattr__(self, name):
+        return getattr(self._solver, name)
+
+    def step(self, state_in, state_out, control, contacts, dt):
+        del contacts
+        self._collision_pipeline.collide(state_in, self._contacts)
+        self._solver.step(state_in, state_out, control, self._contacts, dt)
 
 
 class NewtonCoupledManager(NewtonManager):
@@ -465,7 +495,7 @@ class NewtonCoupledManager(NewtonManager):
 
         entry_kwargs = dict(
             name=entry_cfg.name,
-            solver=cls._make_entry_solver_factory(solver_class, solver_kwargs),
+            solver=cls._make_entry_solver_factory(entry_cfg, solver_class, solver_kwargs),
             bodies=list(entry_cfg.bodies),
             particles=list(entry_cfg.particles),
             joints=list(entry_cfg.joints),
@@ -477,15 +507,29 @@ class NewtonCoupledManager(NewtonManager):
 
         return SolverCoupled.Entry(**entry_kwargs)
 
-    @staticmethod
-    def _make_entry_solver_factory(solver_class: Callable, solver_kwargs: dict) -> Callable:
+    @classmethod
+    def _make_entry_solver_factory(
+        cls, entry_cfg: CoupledSolverEntryCfg, solver_class: Callable, solver_kwargs: dict
+    ) -> Callable:
         """Bind constructor kwargs into a Newton coupled entry solver factory."""
+        use_entry_collision_pipeline = cls._entry_uses_local_collision_pipeline(entry_cfg)
 
         def _factory(model_view):
-            return solver_class(model_view, **solver_kwargs)
+            solver = solver_class(model_view, **solver_kwargs)
+            if use_entry_collision_pipeline:
+                return _EntryCollisionPipelineSolver(solver, model_view)
+            return solver
 
         _factory.__name__ = getattr(solver_class, "__name__", type(solver_class).__name__)
         return _factory
+
+    @staticmethod
+    def _entry_uses_local_collision_pipeline(entry_cfg: CoupledSolverEntryCfg) -> bool:
+        solver_cfg = entry_cfg.solver_cfg
+        return (
+            getattr(solver_cfg, "solver_type", None) == "mujoco_warp"
+            and not getattr(solver_cfg, "use_mujoco_contacts", True)
+        )
 
     @classmethod
     def _build_proxy(cls, proxy_cfg: CoupledProxyCfg) -> SolverProxyCoupled.Proxy:
@@ -656,4 +700,8 @@ class NewtonCoupledManager(NewtonManager):
         """Return whether the coupled solver should receive external contacts."""
         if solver_cfg.use_collision_pipeline is not None:
             return solver_cfg.use_collision_pipeline
-        return any(solver_cfg_needs_external_contacts(entry.solver_cfg) for entry in solver_cfg.entries)
+        return any(
+            solver_cfg_needs_external_contacts(entry.solver_cfg)
+            and not cls._entry_uses_local_collision_pipeline(entry)
+            for entry in solver_cfg.entries
+        )

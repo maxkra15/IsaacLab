@@ -281,7 +281,8 @@ class CoupledSolverCfg(NewtonSolverCfg):
     use_collision_pipeline: bool | None = None
     """Whether Isaac Lab should run Newton's external collision pipeline.
 
-    If ``None``, the manager infers the value from the sub-solver cfgs. For
-    example, MuJoCo entries with ``use_mujoco_contacts=False`` and XPBD entries
-    need the external pipeline, while implicit MPM does not.
+    If ``None``, the manager infers the value from the sub-solver cfgs. XPBD
+    entries need the external pipeline, while implicit MPM does not. MuJoCo
+    entries with ``use_mujoco_contacts=False`` use a scoped entry-local pipeline
+    inside the coupled manager instead of the shared-model pipeline.
     """

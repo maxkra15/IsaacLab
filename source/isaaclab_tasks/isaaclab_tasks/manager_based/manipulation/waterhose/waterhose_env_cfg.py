@@ -132,34 +132,42 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     cable_usd: str | None = None
     cable_prims: str | None = None
     cable_prim: str | None = None
-    sim_substeps: int = 5
+    sim_substeps: int = 10
     rigid_substeps: int = 1
+    # Match the reference newton script: one MJC<->VBD pass per substep.
+    # WaterhoseSolverVBD drops the tangential friction component when
+    # harvesting proxy wrenches, so the lagged scheme behaves identically
+    # to the reference script's hand-rolled coupling at iterations=1.
     proxy_iterations: int = 1
     proxy_mass_scale: float = 1.0
-    vbd_iterations: int = 10
+    vbd_iterations: int = 15
     rigid_contact_max: int = 100000
-    mujoco_iterations: int = 12
-    mujoco_ls_iterations: int = 6
+    mujoco_iterations: int = 20
+    mujoco_ls_iterations: int = 10
     mujoco_ls_parallel: bool = True
     mujoco_impratio: float = 1000.0
-    mujoco_use_mujoco_contacts: bool = True
+    mujoco_use_mujoco_contacts: bool = False
     disable_cuda_graph: bool = False
     hose_radius: float = 0.003
-    gripper_drive_scale: float = 2.0
+    gripper_drive_scale: float = 1.0
     robot_shape_margin: float = 0.0
-    robot_shape_gap: float = 0.005
+    robot_shape_gap: float = 0.002
     robot_shape_ke: float = 5.0e4
     robot_shape_kd: float = 5.0e2
     robot_shape_mu: float = 2.0
-    robot_joint_target_ke: float = 45000.0
-    robot_joint_target_kd: float = 4500.0
-    robot_joint_effort_limit: float = 1000.0
+    robot_joint_target_ke: float = 120000.0
+    robot_joint_target_kd: float = 12000.0
+    robot_joint_effort_limit: float = 10000.0
     robot_joint_armature: float = 0.2
     gripper_joint_target_ke: float = 10000.0
     gripper_joint_target_kd: float = 1000.0
     gripper_joint_effort_limit: float = 100000.0
     gripper_joint_armature: float = 0.5
-    grasp_friction: float = 80.0
+    gripper_finger_target_ke: float = 500000.0
+    gripper_finger_target_kd: float = 10000.0
+    gripper_finger_effort_limit: float = 500000.0
+    gripper_finger_armature: float = 0.5
+    grasp_friction: float = 1.0e6
     grasp_margin: float = 0.001
     grasp_contact_ke: float = 1.0e3
     vbd_collide_substeps: int = 5
@@ -174,22 +182,39 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     vbd_cable_density: float = 1000.0
     vbd_cable_mu: float = 0.2
     vbd_cable_margin: float = 0.0
-    vbd_cable_gap: float = 0.001
-    vbd_static_margin: float = 1.0e-4
-    vbd_static_gap: float = 0.001
+    vbd_cable_gap: float = 0.002
+    vbd_static_margin: float = 0.0
+    vbd_static_gap: float = 0.002
+    # Head/plug mesh contact tuning - byte-for-byte match with the
+    # reference newton script. Tangential friction feedback to the MJC
+    # gripper is dropped inside WaterhoseSolverVBD, so ke=1.0e3 is enough
+    # to stop the closing finger without causing resonant bounce.
+    vbd_head_mesh_ke: float = 1.0e3
+    vbd_head_mesh_kd: float = 0.0
     vbd_head_mesh_mu: float = 1.0e1
+    vbd_head_mesh_margin: float = 0.0
     vbd_head_mesh_xy_scale: float = 0.95
+    # Proxy collision pipeline. Sticky / latest contact matching requires
+    # SolverVBD(rigid_contact_history=True) to actually warm-start; with
+    # history=False (our default) sticky just overwrites fresh contact
+    # offsets with stale rows. Keep matching disabled and size the buffer
+    # like the reference newton script (30000 contacts per VBD world).
+    vbd_proxy_rigid_contact_max: int = 30000
+    vbd_proxy_contact_matching: str = "disabled"
+    vbd_proxy_contact_matching_pos_threshold: float = 0.005
+    vbd_proxy_contact_matching_normal_dot_threshold: float = 0.95
     vbd_static_mesh_use_sdf: bool = True
     vbd_static_mesh_sdf_max_resolution: int = 64
     kit_static_contact_mode: str = "usd_sdf"
     vbd_near_tip_mu: float = 1.0e1
     vbd_far_tip_mu: float = 1.0e5
     vbd_ground_mu: float = 1.0e5
-    vbd_rigid_avbd_beta: float = 1.0e5
+    vbd_rigid_avbd_beta: float = 0.0
+    vbd_rigid_contact_history: bool = False
     vbd_rigid_contact_k_start: float = 1.0e2
     vbd_rigid_joint_linear_ke: float = 1.0e6
     vbd_rigid_joint_angular_ke: float = 1.0e6
-    vbd_rigid_joint_linear_k_start: float = 1.0e4
+    vbd_rigid_joint_linear_k_start: float = 1.0e2
     vbd_rigid_joint_angular_k_start: float = 1.0e1
     cable_stretch_stiffness: float = 1.0e6
     cable_stretch_damping: float = 1.0e-5
@@ -254,6 +279,10 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "gripper_joint_target_kd": float(self.gripper_joint_target_kd),
             "gripper_joint_effort_limit": float(self.gripper_joint_effort_limit),
             "gripper_joint_armature": float(self.gripper_joint_armature),
+            "gripper_finger_target_ke": float(self.gripper_finger_target_ke),
+            "gripper_finger_target_kd": float(self.gripper_finger_target_kd),
+            "gripper_finger_effort_limit": float(self.gripper_finger_effort_limit),
+            "gripper_finger_armature": float(self.gripper_finger_armature),
             "vbd_collide_substeps": int(self.vbd_collide_substeps),
             "vbd_default_contact_ke": float(self.vbd_default_contact_ke),
             "vbd_default_contact_kd": float(self.vbd_default_contact_kd),
@@ -263,13 +292,22 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "vbd_rigid_contact_buffer_size": int(self.vbd_rigid_contact_buffer_size),
             "vbd_rigid_body_particle_contact_buffer_size": int(self.vbd_rigid_body_particle_contact_buffer_size),
             "vbd_proxy_margin": float(self.vbd_proxy_margin),
+            "vbd_proxy_rigid_contact_max": int(self.vbd_proxy_rigid_contact_max),
+            "vbd_proxy_contact_matching": str(self.vbd_proxy_contact_matching),
+            "vbd_proxy_contact_matching_pos_threshold": float(self.vbd_proxy_contact_matching_pos_threshold),
+            "vbd_proxy_contact_matching_normal_dot_threshold": float(
+                self.vbd_proxy_contact_matching_normal_dot_threshold
+            ),
             "vbd_cable_density": float(self.vbd_cable_density),
             "vbd_cable_mu": float(self.vbd_cable_mu),
             "vbd_cable_margin": float(self.vbd_cable_margin),
             "vbd_cable_gap": float(self.vbd_cable_gap),
             "vbd_static_margin": float(self.vbd_static_margin),
             "vbd_static_gap": float(self.vbd_static_gap),
+            "vbd_head_mesh_ke": float(self.vbd_head_mesh_ke),
+            "vbd_head_mesh_kd": float(self.vbd_head_mesh_kd),
             "vbd_head_mesh_mu": float(self.vbd_head_mesh_mu),
+            "vbd_head_mesh_margin": float(self.vbd_head_mesh_margin),
             "vbd_head_mesh_xy_scale": float(self.vbd_head_mesh_xy_scale),
             "vbd_static_mesh_use_sdf": bool(self.vbd_static_mesh_use_sdf),
             "vbd_static_mesh_sdf_max_resolution": int(self.vbd_static_mesh_sdf_max_resolution),
@@ -278,6 +316,7 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "vbd_far_tip_mu": float(self.vbd_far_tip_mu),
             "vbd_ground_mu": float(self.vbd_ground_mu),
             "vbd_rigid_avbd_beta": float(self.vbd_rigid_avbd_beta),
+            "vbd_rigid_contact_history": bool(self.vbd_rigid_contact_history),
             "vbd_rigid_contact_k_start": float(self.vbd_rigid_contact_k_start),
             "vbd_rigid_joint_linear_ke": float(self.vbd_rigid_joint_linear_ke),
             "vbd_rigid_joint_angular_ke": float(self.vbd_rigid_joint_angular_ke),

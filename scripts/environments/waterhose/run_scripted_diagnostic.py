@@ -36,6 +36,7 @@ parser.add_argument(
 )
 parser.add_argument("--stop_after_phase", type=str, default=None, help="Stop after this scripted phase is reached.")
 parser.add_argument("--stop_on_done", action="store_true", help="Stop when the env reports done.")
+parser.add_argument("--disable_cuda_graph", action="store_true", help="Disable Newton CUDA graph capture.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -103,6 +104,7 @@ def _diagnostic_snapshot(env, step: int, phase: str) -> str:
     return (
         f"step={step:05d} phase={phase:<18} "
         f"ee_to_plug={ee_to_plug:.4f}m "
+        f"{_scripted_target_tracking_summary(env, ee_pos)} "
         f"tip=({tip_pos[0]:+.3f},{tip_pos[1]:+.3f},{tip_pos[2]:+.3f}) "
         f"plug=({plug_pos[0]:+.3f},{plug_pos[1]:+.3f},{plug_pos[2]:+.3f}) "
         f"max_cable_speed={max_cable_speed:.3f}m/s "
@@ -111,6 +113,23 @@ def _diagnostic_snapshot(env, step: int, phase: str) -> str:
         f"{_runtime_contact_summary(scene_builder, model)} "
         f"{_joint_target_delta_summary(model, state, core.NewtonManager.get_control(), scene_builder)}"
     )
+
+
+def _scripted_target_tracking_summary(env, ee_pos: np.ndarray) -> str:
+    controller = getattr(env, "_scripted_controller", None)
+    if controller is None:
+        return "target_err=<unavailable>"
+    filtered_target = getattr(controller, "last_filtered_target_pos", None)
+    raw_target = getattr(controller, "last_raw_target_pos", None)
+    if filtered_target is None:
+        return "target_err=<pending>"
+    ee_error = float(np.linalg.norm(np.asarray(filtered_target, dtype=np.float64) - ee_pos))
+    if raw_target is None:
+        return f"target_err={ee_error:.4f}m"
+    filter_error = float(
+        np.linalg.norm(np.asarray(raw_target, dtype=np.float64) - np.asarray(filtered_target, dtype=np.float64))
+    )
+    return f"target_err={ee_error:.4f}m filter_lag={filter_error:.4f}m"
 
 
 def _find_body_id(labels: list[str], short_name: str) -> int:
@@ -183,7 +202,7 @@ def _runtime_contact_summary(scene_builder, model) -> str:
     head_shapes = set(_shape_ids_for_bodies(model, scene_builder.cable_head_body_ids))
     scene_shapes = set(scene_builder.scene_shape_ids)
     proxy_shapes = set(scene_builder.proxy_shape_ids)
-    categories = {"cable_scene": 0, "head_scene": 0, "cable_proxy": 0, "head_proxy": 0}
+    categories = {"cable_scene": 0, "head_scene": 0, "cable_proxy": 0, "head_proxy": 0, "proxy_scene": 0}
     scene_hits: dict[int, int] = {}
     for a_raw, b_raw in zip(shape0[:count], shape1[:count], strict=False):
         a = int(a_raw)
@@ -199,6 +218,8 @@ def _runtime_contact_summary(scene_builder, model) -> str:
             categories["cable_proxy"] += 1
         if pair & head_shapes and pair & proxy_shapes:
             categories["head_proxy"] += 1
+        if pair & proxy_shapes and pair & scene_shapes:
+            categories["proxy_scene"] += 1
     top_scene = sorted(scene_hits.items(), key=lambda item: item[1], reverse=True)[:2]
     scene_labels = getattr(model, "shape_label", [])
     top_scene_str = ",".join(
@@ -232,7 +253,7 @@ def _shape_material_summary(model, shape_ids: list[int], label: str) -> str:
         return f"{label}: shapes=0"
     ids = np.asarray(shape_ids, dtype=np.int64)
     parts = [f"{label}: shapes={ids.size}"]
-    for attr in ("shape_material_ke", "shape_material_kd", "shape_material_mu", "shape_contact_margin", "shape_contact_gap"):
+    for attr in ("shape_material_ke", "shape_material_kd", "shape_material_mu", "shape_margin", "shape_gap", "shape_contact_gap"):
         values = _array_np(getattr(model, attr, None))
         if values is not None and values.shape[0] > int(ids.max()):
             parts.append(f"{attr}({_stats(values[ids], precision=3)})")
@@ -397,7 +418,52 @@ def _print_startup_report(env) -> None:
         f"mujoco_use_mujoco_contacts={getattr(cfg, 'mujoco_use_mujoco_contacts', '<missing>')} "
         f"vbd_iterations={getattr(cfg, 'vbd_iterations', '<missing>')} "
         f"vbd_collide_substeps={getattr(cfg, 'vbd_collide_substeps', '<missing>')} "
+        f"vbd_rigid_avbd_beta={getattr(cfg, 'vbd_rigid_avbd_beta', '<missing>')} "
+        f"vbd_rigid_contact_history={getattr(cfg, 'vbd_rigid_contact_history', '<missing>')} "
         f"vbd_rigid_contact_buffer_size={getattr(cfg, 'vbd_rigid_contact_buffer_size', '<missing>')}",
+        flush=True,
+    )
+    print(
+        "[INFO] proxy pipeline: "
+        f"vbd_proxy_contact_matching={getattr(cfg, 'vbd_proxy_contact_matching', '<missing>')} "
+        f"vbd_proxy_contact_matching_pos_threshold={getattr(cfg, 'vbd_proxy_contact_matching_pos_threshold', '<missing>')} "
+        f"vbd_proxy_contact_matching_normal_dot_threshold={getattr(cfg, 'vbd_proxy_contact_matching_normal_dot_threshold', '<missing>')} "
+        f"vbd_proxy_rigid_contact_max={getattr(cfg, 'vbd_proxy_rigid_contact_max', '<missing>')}",
+        flush=True,
+    )
+    print(
+        "[INFO] grip tuning: "
+        f"proxy_iterations={getattr(cfg, 'proxy_iterations', '<missing>')} "
+        f"vbd_head_mesh_ke={getattr(cfg, 'vbd_head_mesh_ke', '<missing>')} "
+        f"vbd_head_mesh_kd={getattr(cfg, 'vbd_head_mesh_kd', '<missing>')} "
+        f"vbd_head_mesh_mu={getattr(cfg, 'vbd_head_mesh_mu', '<missing>')} "
+        f"vbd_head_mesh_margin={getattr(cfg, 'vbd_head_mesh_margin', '<missing>')} "
+        f"grasp_contact_ke={getattr(cfg, 'grasp_contact_ke', '<missing>')} "
+        f"vbd_proxy_margin={getattr(cfg, 'vbd_proxy_margin', '<missing>')}",
+        flush=True,
+    )
+    # Verify the friction-dropping proxy harvest is actually live. The
+    # reference newton script projects each proxy-side rigid contact force
+    # onto its contact normal before feeding the wrench back to MJC; the
+    # IsaacLab port does the same via WaterhoseSolverVBD. If we see the
+    # stock SolverVBD here, the MJC gripper feels VBD's full friction force
+    # (mu_pair = avg(1e6, 10) = 5e5) and oscillates / slips off the plug.
+    try:
+        vbd_entry_solver = core.NewtonCoupledManager.get_entry_solver(core.HOSE_ENTRY)
+        vbd_solver_class = type(vbd_entry_solver).__name__
+        from isaaclab_tasks.manager_based.manipulation.waterhose.waterhose_vbd_solver import WaterhoseSolverVBD
+        harvest_owner = getattr(vbd_entry_solver, "coupling_harvest_proxy_wrenches", None)
+        harvest_qualname = getattr(harvest_owner, "__qualname__", "<missing>") if harvest_owner else "<none>"
+        normal_only = isinstance(vbd_entry_solver, WaterhoseSolverVBD)
+    except Exception as exc:
+        vbd_solver_class = f"<unavailable: {exc!s}>"
+        harvest_qualname = "<unavailable>"
+        normal_only = False
+    print(
+        "[INFO] proxy harvest: "
+        f"vbd_solver_class={vbd_solver_class} "
+        f"coupling_harvest_proxy_wrenches={harvest_qualname} "
+        f"normal_only_friction_drop={'yes' if normal_only else 'NO'}",
         flush=True,
     )
 
@@ -422,7 +488,9 @@ def _print_startup_report(env) -> None:
     cable_shape_ids = _shape_ids_for_bodies(model, scene_builder.cable_body_ids)
     cable_head_shape_ids = _shape_ids_for_bodies(model, scene_builder.cable_head_body_ids)
     print("[INFO] " + _shape_geometry_summary(model, cable_shape_ids, "cable_shapes_geometry"), flush=True)
+    print("[INFO] " + _shape_material_summary(model, cable_shape_ids, "cable_shapes"), flush=True)
     print("[INFO] " + _shape_geometry_summary(model, cable_head_shape_ids, "cable_head_shapes_geometry"), flush=True)
+    print("[INFO] " + _shape_material_summary(model, cable_head_shape_ids, "cable_head_shapes"), flush=True)
     print("[INFO] " + _shape_geometry_summary(model, scene_builder.proxy_shape_ids, "proxy_shapes_geometry"), flush=True)
     print("[INFO] " + _shape_geometry_summary(model, scene_builder._vbd_shape_ids, "vbd_shapes_geometry"), flush=True)
     print("[INFO] parent " + _contact_pair_summary(model, scene_builder), flush=True)
@@ -498,6 +566,9 @@ def main() -> None:
     if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
         raise ValueError(f"Expected ManagerBasedRLEnvCfg, got {type(env_cfg).__name__}.")
     env_cfg.terminations.time_out = None
+    if hasattr(env_cfg, "disable_cuda_graph"):
+        env_cfg.disable_cuda_graph = bool(args_cli.disable_cuda_graph)
+        env_cfg.sync_waterhose_sim_cfg()
 
     launch_context = None
     if simulation_app is None:
