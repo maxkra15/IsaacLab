@@ -113,10 +113,13 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     commands = None
 
     # The concrete coupled solver cfg is built from the waterhose assets in RBY1DFWaterhoseEnv.__init__.
+    # Keep `dt = 1/100` from the success demo; the reference cable_pendulum
+    # uses 1/60 but its cable / plug regime is much softer than ours, and
+    # the lower outer-step rate destabilised our stiff cable + heavy plug.
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 100.0,
         render_interval=1,
-        physics=NewtonCfg(num_substeps=3, use_cuda_graph=True),
+        physics=NewtonCfg(num_substeps=10, use_cuda_graph=True),
     )
     viewer = ViewerCfg(eye=(-1.2, -2.8, 1.6), lookat=(0.55, -0.42, 0.55))
 
@@ -134,12 +137,21 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     cable_prim: str | None = None
     sim_substeps: int = 10
     rigid_substeps: int = 1
-    # Match the reference newton script: one MJC<->VBD pass per substep.
-    # WaterhoseSolverVBD drops the tangential friction component when
-    # harvesting proxy wrenches, so the lagged scheme behaves identically
-    # to the reference script's hand-rolled coupling at iterations=1.
-    proxy_iterations: int = 1
-    proxy_mass_scale: float = 1.0
+    # Linearised ADMM cross-solver coupling. The MJC robot entry and the
+    # VBD cable / scene entry exchange Lagrange-multiplier forces on the
+    # configured contact pair every iteration; baumgarte stabilises the
+    # contact-distance constraint position-drift.
+    admm_iterations: int = 5
+    admm_rho: float = 30.0
+    admm_gamma: float = 0.1
+    admm_baumgarte: float = 0.005
+    admm_contact_distance: float = 0.003
+    admm_detection_margin: float = 0.01
+    # Fixed-k VBD (no AVBD ramping) with 15 iterations matches the
+    # success demo on our stiff (stretch=1e6) cable. The reference uses
+    # 20+ramping but for a much softer cable; ramping cable-joint
+    # stiffness from 1e2 toward 1e6 on a heavy chain shakes the cable
+    # apart on early iterations.
     vbd_iterations: int = 15
     rigid_contact_max: int = 100000
     mujoco_iterations: int = 20
@@ -167,10 +179,14 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     gripper_finger_target_kd: float = 10000.0
     gripper_finger_effort_limit: float = 500000.0
     gripper_finger_armature: float = 0.5
-    grasp_friction: float = 1.0e6
+    # ADMM applies Lagrange-multiplier forces consistently across solvers,
+    # so the mu=1.0 default is what we want — the 1e6 we needed under
+    # the lagged-proxy friction-drop hack is gone. Keeping ke aligned
+    # with the cable/head pair (1e3) gives a symmetric gripper<->plug
+    # contact instead of a 1e3-vs-1e5 mismatch.
+    grasp_friction: float = 1.0
     grasp_margin: float = 0.001
     grasp_contact_ke: float = 1.0e3
-    vbd_collide_substeps: int = 5
     vbd_default_contact_ke: float = 1.0e3
     vbd_default_contact_kd: float = 0.0
     vbd_default_contact_margin: float = 0.001
@@ -178,37 +194,52 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     vbd_rigid_contact_hard: bool = False
     vbd_rigid_contact_buffer_size: int = 1024
     vbd_rigid_body_particle_contact_buffer_size: int = 1
-    vbd_proxy_margin: float = 0.001
+    # Cable density 1000 kg/m^3 (matches the success demo and keeps the
+    # cable's spring period above substep_dt for our stretch=1e6 cable).
+    # mu=1.0 is ADMM-friendly — large mu values produce big Lagrange
+    # multipliers that destabilise the cross-solver solve.
     vbd_cable_density: float = 1000.0
-    vbd_cable_mu: float = 0.2
+    vbd_cable_mu: float = 1.0
     vbd_cable_margin: float = 0.0
     vbd_cable_gap: float = 0.002
     vbd_static_margin: float = 0.0
     vbd_static_gap: float = 0.002
-    # Head/plug mesh contact tuning - byte-for-byte match with the
-    # reference newton script. Tangential friction feedback to the MJC
-    # gripper is dropped inside WaterhoseSolverVBD, so ke=1.0e3 is enough
-    # to stop the closing finger without causing resonant bounce.
+    # Head/plug mesh tuning. Keep the success-demo mass (~3 g from
+    # density * volume) and ke=1e3 — bumping ke to 1e5 over a 3 g body
+    # pushed ke/m near the stability bound for substep_dt and made the
+    # plug bounce out of the jaw. mu=1.0 stays (ADMM-friendly).
+    vbd_head_mass: float = 0.0
     vbd_head_mesh_ke: float = 1.0e3
     vbd_head_mesh_kd: float = 0.0
-    vbd_head_mesh_mu: float = 1.0e1
+    vbd_head_mesh_mu: float = 1.0
     vbd_head_mesh_margin: float = 0.0
     vbd_head_mesh_xy_scale: float = 0.95
-    # Proxy collision pipeline. Sticky / latest contact matching requires
-    # SolverVBD(rigid_contact_history=True) to actually warm-start; with
-    # history=False (our default) sticky just overwrites fresh contact
-    # offsets with stale rows. Keep matching disabled and size the buffer
-    # like the reference newton script (30000 contacts per VBD world).
-    vbd_proxy_rigid_contact_max: int = 30000
-    vbd_proxy_contact_matching: str = "disabled"
-    vbd_proxy_contact_matching_pos_threshold: float = 0.005
-    vbd_proxy_contact_matching_normal_dot_threshold: float = 0.95
     vbd_static_mesh_use_sdf: bool = True
-    vbd_static_mesh_sdf_max_resolution: int = 64
-    kit_static_contact_mode: str = "usd_sdf"
+    # SDF query cost scales with res^3 per shape; the fridge scene has
+    # ~250 mesh shapes so halving from 64 -> 32 is a major perf win and
+    # has no visible impact on cable<->scene contact behavior.
+    vbd_static_mesh_sdf_max_resolution: int = 32
+    # Static scene collision representation for cable contacts:
+    #   - "proxy"   : 2 static boxes (tabletop + socket region). Default.
+    #                 Avoids 247 convex-hull collisions from the fridge
+    #                 USD's V-HACD authoring, giving ~100x fewer broad
+    #                 phase pairs and 247 fewer SDF builds at startup.
+    #   - "usd_sdf" : load `Cable008_Body.usda` colliders + build SDFs.
+    #                 Use only if the cable must contact arbitrary
+    #                 fridge geometry beyond the table + socket region.
+    kit_static_contact_mode: str = "proxy"
+    # When `kit_static_contact_mode="proxy"`, also load the fridge USD
+    # purely for visualisation (every loaded shape has its COLLIDE
+    # flags stripped, so the broad phase still only sees the proxy
+    # boxes). Lets the Newton GL viewer render the fridge alongside
+    # the cheap collision proxies. Disable for headless / null-viewer /
+    # Kit-visualiser runs.
+    kit_static_visual_meshes: bool = True
     vbd_near_tip_mu: float = 1.0e1
     vbd_far_tip_mu: float = 1.0e5
     vbd_ground_mu: float = 1.0e5
+    # Fixed-k AVBD (beta=0) matches the success demo. Ramping joint
+    # penalties on our stiff cable causes early-iteration wobble.
     vbd_rigid_avbd_beta: float = 0.0
     vbd_rigid_contact_history: bool = False
     vbd_rigid_contact_k_start: float = 1.0e2
@@ -257,8 +288,12 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "grasp_contact_ke": float(self.grasp_contact_ke),
             "sim_substeps": int(self.sim_substeps),
             "rigid_substeps": int(self.rigid_substeps),
-            "proxy_iterations": int(self.proxy_iterations),
-            "proxy_mass_scale": float(self.proxy_mass_scale),
+            "admm_iterations": int(self.admm_iterations),
+            "admm_rho": float(self.admm_rho),
+            "admm_gamma": float(self.admm_gamma),
+            "admm_baumgarte": float(self.admm_baumgarte),
+            "admm_contact_distance": float(self.admm_contact_distance),
+            "admm_detection_margin": float(self.admm_detection_margin),
             "vbd_iterations": int(self.vbd_iterations),
             "rigid_contact_max": int(self.rigid_contact_max),
             "mujoco_iterations": int(self.mujoco_iterations),
@@ -283,7 +318,6 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "gripper_finger_target_kd": float(self.gripper_finger_target_kd),
             "gripper_finger_effort_limit": float(self.gripper_finger_effort_limit),
             "gripper_finger_armature": float(self.gripper_finger_armature),
-            "vbd_collide_substeps": int(self.vbd_collide_substeps),
             "vbd_default_contact_ke": float(self.vbd_default_contact_ke),
             "vbd_default_contact_kd": float(self.vbd_default_contact_kd),
             "vbd_default_contact_margin": float(self.vbd_default_contact_margin),
@@ -291,19 +325,13 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "vbd_rigid_contact_hard": bool(self.vbd_rigid_contact_hard),
             "vbd_rigid_contact_buffer_size": int(self.vbd_rigid_contact_buffer_size),
             "vbd_rigid_body_particle_contact_buffer_size": int(self.vbd_rigid_body_particle_contact_buffer_size),
-            "vbd_proxy_margin": float(self.vbd_proxy_margin),
-            "vbd_proxy_rigid_contact_max": int(self.vbd_proxy_rigid_contact_max),
-            "vbd_proxy_contact_matching": str(self.vbd_proxy_contact_matching),
-            "vbd_proxy_contact_matching_pos_threshold": float(self.vbd_proxy_contact_matching_pos_threshold),
-            "vbd_proxy_contact_matching_normal_dot_threshold": float(
-                self.vbd_proxy_contact_matching_normal_dot_threshold
-            ),
             "vbd_cable_density": float(self.vbd_cable_density),
             "vbd_cable_mu": float(self.vbd_cable_mu),
             "vbd_cable_margin": float(self.vbd_cable_margin),
             "vbd_cable_gap": float(self.vbd_cable_gap),
             "vbd_static_margin": float(self.vbd_static_margin),
             "vbd_static_gap": float(self.vbd_static_gap),
+            "vbd_head_mass": float(self.vbd_head_mass),
             "vbd_head_mesh_ke": float(self.vbd_head_mesh_ke),
             "vbd_head_mesh_kd": float(self.vbd_head_mesh_kd),
             "vbd_head_mesh_mu": float(self.vbd_head_mesh_mu),
@@ -312,6 +340,7 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "vbd_static_mesh_use_sdf": bool(self.vbd_static_mesh_use_sdf),
             "vbd_static_mesh_sdf_max_resolution": int(self.vbd_static_mesh_sdf_max_resolution),
             "kit_static_contact_mode": self.kit_static_contact_mode,
+            "kit_static_visual_meshes": bool(self.kit_static_visual_meshes),
             "vbd_near_tip_mu": float(self.vbd_near_tip_mu),
             "vbd_far_tip_mu": float(self.vbd_far_tip_mu),
             "vbd_ground_mu": float(self.vbd_ground_mu),

@@ -92,14 +92,6 @@ def _diagnostic_snapshot(env, step: int, phase: str) -> str:
     right_ee_id = _find_body_id(model.body_label, core.RIGHT_EE)
     ee_pos = body_q[right_ee_id, :3]
 
-    proxy_force = 0.0
-    wrenches = core.NewtonCoupledManager.get_proxy_body_wrenches(core.ROBOT_ENTRY, core.HOSE_ENTRY)
-    if wrenches is not None and scene_builder.proxy_body_ids:
-        wrench_np = wrenches.numpy()
-        proxy_ids = [body_id for body_id in scene_builder.proxy_body_ids if body_id < wrench_np.shape[0]]
-        if proxy_ids:
-            proxy_force = float(np.linalg.norm(wrench_np[proxy_ids, :3]))
-
     ee_to_plug = float(np.linalg.norm(ee_pos - plug_pos))
     return (
         f"step={step:05d} phase={phase:<18} "
@@ -108,7 +100,6 @@ def _diagnostic_snapshot(env, step: int, phase: str) -> str:
         f"tip=({tip_pos[0]:+.3f},{tip_pos[1]:+.3f},{tip_pos[2]:+.3f}) "
         f"plug=({plug_pos[0]:+.3f},{plug_pos[1]:+.3f},{plug_pos[2]:+.3f}) "
         f"max_cable_speed={max_cable_speed:.3f}m/s "
-        f"|F_proxy|={proxy_force:.2f}N "
         f"finite={cable_finite} "
         f"{_runtime_contact_summary(scene_builder, model)} "
         f"{_joint_target_delta_summary(model, state, core.NewtonManager.get_control(), scene_builder)}"
@@ -181,10 +172,20 @@ def _joint_target_delta_summary(model, state, control, scene_builder, top_k: int
 
 
 def _runtime_contact_summary(scene_builder, model) -> str:
+    """Summarise the most recent VBD-side rigid contact buffer by group.
+
+    Under ADMM coupling there is no per-pair proxy collision pipeline to
+    introspect; we read the live VBD entry's rigid contact buffer via the
+    coupled solver's entry-local pipeline instead. Returns a compact
+    breakdown by body-group ownership (cable, head, finger, scene).
+    """
     solver = getattr(core.NewtonManager, "_solver", None)
+    entries = getattr(solver, "_entries", None) if solver is not None else None
     contacts = None
-    if solver is not None and hasattr(solver, "get_proxy_contacts"):
-        contacts = solver.get_proxy_contacts(core.ROBOT_ENTRY, core.HOSE_ENTRY)
+    if entries is not None and core.HOSE_ENTRY in entries:
+        contacts = getattr(entries[core.HOSE_ENTRY], "contacts", None)
+    if contacts is None:
+        contacts = getattr(core.NewtonManager, "_contacts", None)
     if contacts is None:
         return "contacts=<none>"
     count_array = _array_np(getattr(contacts, "rigid_contact_count", None))
@@ -201,8 +202,14 @@ def _runtime_contact_summary(scene_builder, model) -> str:
     cable_shapes = set(_shape_ids_for_bodies(model, scene_builder.cable_body_ids))
     head_shapes = set(_shape_ids_for_bodies(model, scene_builder.cable_head_body_ids))
     scene_shapes = set(scene_builder.scene_shape_ids)
-    proxy_shapes = set(scene_builder.proxy_shape_ids)
-    categories = {"cable_scene": 0, "head_scene": 0, "cable_proxy": 0, "head_proxy": 0, "proxy_scene": 0}
+    finger_shapes = set(_shape_ids_for_bodies(model, scene_builder.gripper_finger_body_ids))
+    categories = {
+        "cable_scene": 0,
+        "head_scene": 0,
+        "cable_finger": 0,
+        "head_finger": 0,
+        "finger_scene": 0,
+    }
     scene_hits: dict[int, int] = {}
     for a_raw, b_raw in zip(shape0[:count], shape1[:count], strict=False):
         a = int(a_raw)
@@ -214,12 +221,12 @@ def _runtime_contact_summary(scene_builder, model) -> str:
             categories["head_scene"] += 1
             for shape_id in pair & scene_shapes:
                 scene_hits[shape_id] = scene_hits.get(shape_id, 0) + 1
-        if pair & cable_shapes and pair & proxy_shapes:
-            categories["cable_proxy"] += 1
-        if pair & head_shapes and pair & proxy_shapes:
-            categories["head_proxy"] += 1
-        if pair & proxy_shapes and pair & scene_shapes:
-            categories["proxy_scene"] += 1
+        if pair & cable_shapes and pair & finger_shapes:
+            categories["cable_finger"] += 1
+        if pair & head_shapes and pair & finger_shapes:
+            categories["head_finger"] += 1
+        if pair & finger_shapes and pair & scene_shapes:
+            categories["finger_scene"] += 1
     top_scene = sorted(scene_hits.items(), key=lambda item: item[1], reverse=True)[:2]
     scene_labels = getattr(model, "shape_label", [])
     top_scene_str = ",".join(
@@ -298,9 +305,10 @@ def _shape_ids_for_bodies(model, body_ids: list[int]) -> list[int]:
     return shape_ids
 
 
-def _vbd_view_shape_material_summary(scene_builder, label: str) -> str:
+def _vbd_view_finger_shape_material_summary(scene_builder, model, label: str) -> str:
     view = core.NewtonCoupledManager.get_entry_view(core.HOSE_ENTRY)
-    return _shape_material_summary(view, scene_builder.proxy_shape_ids, label)
+    finger_shape_ids = _shape_ids_for_bodies(model, scene_builder.gripper_finger_body_ids)
+    return _shape_material_summary(view, finger_shape_ids, label)
 
 
 def _body_mass_summary(model, body_ids: list[int], label: str) -> str:
@@ -340,14 +348,14 @@ def _contact_pair_summary(model, scene_builder) -> str:
     cable_shapes = set(_shape_ids_for_bodies(model, scene_builder.cable_body_ids))
     head_shapes = set(_shape_ids_for_bodies(model, scene_builder.cable_head_body_ids))
     scene_shapes = set(scene_builder.scene_shape_ids)
-    proxy_shapes = set(scene_builder.proxy_shape_ids)
+    finger_shapes = set(_shape_ids_for_bodies(model, scene_builder.gripper_finger_body_ids))
 
     counts = {
         "total": int(pairs.shape[0]),
         "cable_scene": 0,
         "head_scene": 0,
-        "cable_proxy": 0,
-        "head_proxy": 0,
+        "cable_finger": 0,
+        "head_finger": 0,
     }
     for raw_a, raw_b in pairs:
         a = int(raw_a)
@@ -357,10 +365,10 @@ def _contact_pair_summary(model, scene_builder) -> str:
             counts["cable_scene"] += 1
         if pair & head_shapes and pair & scene_shapes:
             counts["head_scene"] += 1
-        if pair & cable_shapes and pair & proxy_shapes:
-            counts["cable_proxy"] += 1
-        if pair & head_shapes and pair & proxy_shapes:
-            counts["head_proxy"] += 1
+        if pair & cable_shapes and pair & finger_shapes:
+            counts["cable_finger"] += 1
+        if pair & head_shapes and pair & finger_shapes:
+            counts["head_finger"] += 1
     return "contact_pairs=" + " ".join(f"{key}={value}" for key, value in counts.items())
 
 
@@ -407,8 +415,7 @@ def _print_startup_report(env) -> None:
         f"vbd_default_ke={getattr(cfg, 'vbd_default_contact_ke', '<missing>')} "
         f"vbd_default_kd={getattr(cfg, 'vbd_default_contact_kd', '<missing>')} "
         f"grasp_mu={getattr(cfg, 'grasp_friction', '<missing>')} "
-        f"grasp_ke={getattr(cfg, 'grasp_contact_ke', '<missing>')} "
-        f"proxy_mass_scale={getattr(cfg, 'proxy_mass_scale', '<missing>')}",
+        f"grasp_ke={getattr(cfg, 'grasp_contact_ke', '<missing>')}",
         flush=True,
     )
     print(
@@ -417,53 +424,28 @@ def _print_startup_report(env) -> None:
         f"mujoco_ls_iterations={getattr(cfg, 'mujoco_ls_iterations', '<missing>')} "
         f"mujoco_use_mujoco_contacts={getattr(cfg, 'mujoco_use_mujoco_contacts', '<missing>')} "
         f"vbd_iterations={getattr(cfg, 'vbd_iterations', '<missing>')} "
-        f"vbd_collide_substeps={getattr(cfg, 'vbd_collide_substeps', '<missing>')} "
         f"vbd_rigid_avbd_beta={getattr(cfg, 'vbd_rigid_avbd_beta', '<missing>')} "
         f"vbd_rigid_contact_history={getattr(cfg, 'vbd_rigid_contact_history', '<missing>')} "
         f"vbd_rigid_contact_buffer_size={getattr(cfg, 'vbd_rigid_contact_buffer_size', '<missing>')}",
         flush=True,
     )
     print(
-        "[INFO] proxy pipeline: "
-        f"vbd_proxy_contact_matching={getattr(cfg, 'vbd_proxy_contact_matching', '<missing>')} "
-        f"vbd_proxy_contact_matching_pos_threshold={getattr(cfg, 'vbd_proxy_contact_matching_pos_threshold', '<missing>')} "
-        f"vbd_proxy_contact_matching_normal_dot_threshold={getattr(cfg, 'vbd_proxy_contact_matching_normal_dot_threshold', '<missing>')} "
-        f"vbd_proxy_rigid_contact_max={getattr(cfg, 'vbd_proxy_rigid_contact_max', '<missing>')}",
+        "[INFO] admm coupling: "
+        f"iterations={getattr(cfg, 'admm_iterations', '<missing>')} "
+        f"rho={getattr(cfg, 'admm_rho', '<missing>')} "
+        f"gamma={getattr(cfg, 'admm_gamma', '<missing>')} "
+        f"baumgarte={getattr(cfg, 'admm_baumgarte', '<missing>')} "
+        f"contact_distance={getattr(cfg, 'admm_contact_distance', '<missing>')} "
+        f"detection_margin={getattr(cfg, 'admm_detection_margin', '<missing>')}",
         flush=True,
     )
     print(
-        "[INFO] grip tuning: "
-        f"proxy_iterations={getattr(cfg, 'proxy_iterations', '<missing>')} "
+        "[INFO] head mesh: "
         f"vbd_head_mesh_ke={getattr(cfg, 'vbd_head_mesh_ke', '<missing>')} "
         f"vbd_head_mesh_kd={getattr(cfg, 'vbd_head_mesh_kd', '<missing>')} "
         f"vbd_head_mesh_mu={getattr(cfg, 'vbd_head_mesh_mu', '<missing>')} "
         f"vbd_head_mesh_margin={getattr(cfg, 'vbd_head_mesh_margin', '<missing>')} "
-        f"grasp_contact_ke={getattr(cfg, 'grasp_contact_ke', '<missing>')} "
-        f"vbd_proxy_margin={getattr(cfg, 'vbd_proxy_margin', '<missing>')}",
-        flush=True,
-    )
-    # Verify the friction-dropping proxy harvest is actually live. The
-    # reference newton script projects each proxy-side rigid contact force
-    # onto its contact normal before feeding the wrench back to MJC; the
-    # IsaacLab port does the same via WaterhoseSolverVBD. If we see the
-    # stock SolverVBD here, the MJC gripper feels VBD's full friction force
-    # (mu_pair = avg(1e6, 10) = 5e5) and oscillates / slips off the plug.
-    try:
-        vbd_entry_solver = core.NewtonCoupledManager.get_entry_solver(core.HOSE_ENTRY)
-        vbd_solver_class = type(vbd_entry_solver).__name__
-        from isaaclab_tasks.manager_based.manipulation.waterhose.waterhose_vbd_solver import WaterhoseSolverVBD
-        harvest_owner = getattr(vbd_entry_solver, "coupling_harvest_proxy_wrenches", None)
-        harvest_qualname = getattr(harvest_owner, "__qualname__", "<missing>") if harvest_owner else "<none>"
-        normal_only = isinstance(vbd_entry_solver, WaterhoseSolverVBD)
-    except Exception as exc:
-        vbd_solver_class = f"<unavailable: {exc!s}>"
-        harvest_qualname = "<unavailable>"
-        normal_only = False
-    print(
-        "[INFO] proxy harvest: "
-        f"vbd_solver_class={vbd_solver_class} "
-        f"coupling_harvest_proxy_wrenches={harvest_qualname} "
-        f"normal_only_friction_drop={'yes' if normal_only else 'NO'}",
+        f"vbd_head_mesh_xy_scale={getattr(cfg, 'vbd_head_mesh_xy_scale', '<missing>')}",
         flush=True,
     )
 
@@ -479,27 +461,30 @@ def _print_startup_report(env) -> None:
     print("[INFO] " + _body_inertia_summary(model, scene_builder.cable_body_ids, "cable"), flush=True)
     print("[INFO] " + _body_mass_summary(model, scene_builder.cable_head_body_ids, "cable_heads"), flush=True)
     print("[INFO] " + _body_inertia_summary(model, scene_builder.cable_head_body_ids, "cable_heads"), flush=True)
-    print("[INFO] " + _body_mass_summary(model, scene_builder.proxy_body_ids, "proxy_bodies_parent"), flush=True)
-    print("[INFO] " + _body_inertia_summary(model, scene_builder.proxy_body_ids, "proxy_bodies_parent"), flush=True)
+    print("[INFO] " + _body_mass_summary(model, scene_builder.gripper_finger_body_ids, "gripper_fingers"), flush=True)
+    print("[INFO] " + _body_inertia_summary(model, scene_builder.gripper_finger_body_ids, "gripper_fingers"), flush=True)
     vbd_view = core.NewtonCoupledManager.get_entry_view(core.HOSE_ENTRY)
-    print("[INFO] " + _body_mass_summary(vbd_view, scene_builder.proxy_body_ids, "proxy_bodies_vbd_view"), flush=True)
-    print("[INFO] " + _body_inertia_summary(vbd_view, scene_builder.proxy_body_ids, "proxy_bodies_vbd_view"), flush=True)
-    print("[INFO] proxy body labels: " + ", ".join(model.body_label[i] for i in scene_builder.proxy_body_ids), flush=True)
+    print(
+        "[INFO] gripper finger labels: "
+        + ", ".join(model.body_label[i] for i in scene_builder.gripper_finger_body_ids),
+        flush=True,
+    )
     cable_shape_ids = _shape_ids_for_bodies(model, scene_builder.cable_body_ids)
     cable_head_shape_ids = _shape_ids_for_bodies(model, scene_builder.cable_head_body_ids)
+    finger_shape_ids = _shape_ids_for_bodies(model, scene_builder.gripper_finger_body_ids)
     print("[INFO] " + _shape_geometry_summary(model, cable_shape_ids, "cable_shapes_geometry"), flush=True)
     print("[INFO] " + _shape_material_summary(model, cable_shape_ids, "cable_shapes"), flush=True)
     print("[INFO] " + _shape_geometry_summary(model, cable_head_shape_ids, "cable_head_shapes_geometry"), flush=True)
     print("[INFO] " + _shape_material_summary(model, cable_head_shape_ids, "cable_head_shapes"), flush=True)
-    print("[INFO] " + _shape_geometry_summary(model, scene_builder.proxy_shape_ids, "proxy_shapes_geometry"), flush=True)
+    print("[INFO] " + _shape_geometry_summary(model, finger_shape_ids, "finger_shapes_geometry"), flush=True)
+    print("[INFO] " + _shape_material_summary(model, finger_shape_ids, "finger_shapes"), flush=True)
     print("[INFO] " + _shape_geometry_summary(model, scene_builder._vbd_shape_ids, "vbd_shapes_geometry"), flush=True)
     print("[INFO] parent " + _contact_pair_summary(model, scene_builder), flush=True)
     print("[INFO] vbd_view " + _contact_pair_summary(vbd_view, scene_builder), flush=True)
     print("[INFO] " + _mesh_sdf_summary(vbd_view, scene_builder.scene_shape_ids, "scene_mesh_sdf"), flush=True)
     print("[INFO] " + _mesh_sdf_summary(vbd_view, cable_head_shape_ids, "cable_head_mesh_sdf"), flush=True)
-    print("[INFO] " + _mesh_sdf_summary(vbd_view, scene_builder.proxy_shape_ids, "proxy_mesh_sdf"), flush=True)
-    print("[INFO] " + _vbd_view_shape_material_summary(scene_builder, "proxy_shapes_vbd_view"), flush=True)
-    print("[INFO] " + _shape_material_summary(model, scene_builder.proxy_shape_ids, "proxy_shapes_parent"), flush=True)
+    print("[INFO] " + _mesh_sdf_summary(vbd_view, finger_shape_ids, "finger_mesh_sdf"), flush=True)
+    print("[INFO] " + _vbd_view_finger_shape_material_summary(scene_builder, model, "finger_shapes_vbd_view"), flush=True)
     print("[INFO] " + _shape_material_summary(model, scene_builder.scene_shape_ids, "scene_shapes"), flush=True)
     print("[INFO] " + _shape_material_summary(model, scene_builder._vbd_shape_ids, "vbd_shapes"), flush=True)
 
