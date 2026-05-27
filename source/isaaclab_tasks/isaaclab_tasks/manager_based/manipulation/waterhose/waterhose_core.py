@@ -56,34 +56,43 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         cable_prims=None,
         cable_prim=None,
         hose_radius=0.003,
-        gripper_drive_scale=2.0,
-        grasp_friction=80.0,
+        gripper_drive_scale=1.0,
+        grasp_friction=1.0e6,
         grasp_margin=0.001,
         grasp_contact_ke=1.0e3,
-        sim_substeps=5,
+        sim_substeps=10,
         rigid_substeps=1,
+        # Match the reference newton script: one MJC<->VBD pass per substep.
+        # WaterhoseSolverVBD already drops the tangential friction component
+        # when harvesting proxy wrenches (see waterhose_vbd_solver.py), so
+        # the lagged scheme behaves identically to the reference script's
+        # hand-rolled coupling at iterations=1.
         proxy_iterations=1,
         proxy_mass_scale=1.0,
-        vbd_iterations=10,
+        vbd_iterations=15,
         rigid_contact_max=100000,
-        mujoco_iterations=12,
-        mujoco_ls_iterations=6,
+        mujoco_iterations=20,
+        mujoco_ls_iterations=10,
         mujoco_ls_parallel=True,
         mujoco_impratio=1000.0,
-        mujoco_use_mujoco_contacts=True,
+        mujoco_use_mujoco_contacts=False,
         robot_shape_margin=0.0,
-        robot_shape_gap=0.005,
+        robot_shape_gap=0.002,
         robot_shape_ke=5.0e4,
         robot_shape_kd=5.0e2,
         robot_shape_mu=2.0,
-        robot_joint_target_ke=45000.0,
-        robot_joint_target_kd=4500.0,
-        robot_joint_effort_limit=1000.0,
+        robot_joint_target_ke=120000.0,
+        robot_joint_target_kd=12000.0,
+        robot_joint_effort_limit=10000.0,
         robot_joint_armature=0.2,
         gripper_joint_target_ke=10000.0,
         gripper_joint_target_kd=1000.0,
         gripper_joint_effort_limit=100000.0,
         gripper_joint_armature=0.5,
+        gripper_finger_target_ke=500000.0,
+        gripper_finger_target_kd=10000.0,
+        gripper_finger_effort_limit=500000.0,
+        gripper_finger_armature=0.5,
         vbd_collide_substeps=5,
         vbd_default_contact_ke=1.0e3,
         vbd_default_contact_kd=0.0,
@@ -93,13 +102,31 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         vbd_rigid_contact_buffer_size=1024,
         vbd_rigid_body_particle_contact_buffer_size=1,
         vbd_proxy_margin=0.001,
+        # Proxy collision pipeline. The reference newton script
+        # (example_waterhose_scene2_insert_extract_success.py) uses
+        # CollisionPipeline(broad_phase="explicit") with contact matching
+        # disabled and rigid_contact_max=30000 per VBD world. Keep matching
+        # disabled by default here so VBD's narrow phase always sees fresh
+        # contact points/normals; "sticky" and "latest" are only useful when
+        # SolverVBD(rigid_contact_history=True) consumes the match index.
+        vbd_proxy_rigid_contact_max=30000,
+        vbd_proxy_contact_matching="disabled",
+        vbd_proxy_contact_matching_pos_threshold=0.005,
+        vbd_proxy_contact_matching_normal_dot_threshold=0.95,
         vbd_cable_density=1000.0,
         vbd_cable_mu=0.2,
         vbd_cable_margin=0.0,
-        vbd_cable_gap=0.001,
-        vbd_static_margin=1.0e-4,
-        vbd_static_gap=0.001,
+        vbd_cable_gap=0.002,
+        vbd_static_margin=0.0,
+        vbd_static_gap=0.002,
+        # Head/plug mesh contact tuning - byte-for-byte match with the
+        # reference newton script. Tangential friction feedback to the MJC
+        # gripper is dropped inside WaterhoseSolverVBD, so ke=1.0e3 is enough
+        # to stop the closing finger without causing resonant bounce.
+        vbd_head_mesh_ke=1.0e3,
+        vbd_head_mesh_kd=0.0,
         vbd_head_mesh_mu=1.0e1,
+        vbd_head_mesh_margin=0.0,
         vbd_head_mesh_xy_scale=0.95,
         vbd_static_mesh_use_sdf=True,
         vbd_static_mesh_sdf_max_resolution=64,
@@ -107,11 +134,12 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         vbd_near_tip_mu=1.0e1,
         vbd_far_tip_mu=1.0e5,
         vbd_ground_mu=1.0e5,
-        vbd_rigid_avbd_beta=1.0e5,
+        vbd_rigid_avbd_beta=0.0,
+        vbd_rigid_contact_history=False,
         vbd_rigid_contact_k_start=1.0e2,
         vbd_rigid_joint_linear_ke=1.0e6,
         vbd_rigid_joint_angular_ke=1.0e6,
-        vbd_rigid_joint_linear_k_start=1.0e4,
+        vbd_rigid_joint_linear_k_start=1.0e2,
         vbd_rigid_joint_angular_k_start=1.0e1,
         cable_stretch_stiffness=1.0e6,
         cable_stretch_damping=1.0e-5,
@@ -236,10 +264,20 @@ def configure_mujoco_view(view) -> None:
 
 
 def configure_vbd_view(view) -> None:
-    """Apply gripper proxy contact material overrides."""
+    """Apply gripper proxy contact material overrides.
+
+    Proxy shapes already have COLLIDE_SHAPES / COLLIDE_PARTICLES forced on
+    at builder time by `_select_proxy_bodies` so the broad-phase pair list
+    `shape_contact_pairs` populated at finalize includes both URDF meshes
+    (visual + collision) per finger. Here we only need to overwrite the
+    material values on those shape ids in the VBD view so the
+    gripper<->plug pair sees `mu = grasp_friction`, `ke = grasp_contact_ke`
+    etc., independently of whatever the MJC view sets for robot contacts.
+    """
     scene_builder = _active_scene_builder()
     if not scene_builder.proxy_shape_ids:
         return
+
     proxy_shape_ids = np.asarray(scene_builder.proxy_shape_ids, dtype=np.int32)
     model = view.parent
     for attr, value in (
@@ -539,7 +577,7 @@ class WaterhoseSceneBuilder:
             gap=float(self.cfg.vbd_static_gap),
             ke=float(self.cfg.vbd_default_contact_ke),
             kd=float(self.cfg.vbd_default_contact_kd),
-            mu=float(self.cfg.vbd_near_tip_mu),
+            mu=float(self.cfg.vbd_cable_mu),
         )
         self.cable_stretch_stiffness = float(self.cfg.cable_stretch_stiffness)
         self.cable_stretch_damping = float(self.cfg.cable_stretch_damping)
@@ -567,6 +605,7 @@ class WaterhoseSceneBuilder:
         self.left_gripper_dofs: list[int] = []
         self.proxy_body_ids: list[int] = []
         self.proxy_shape_ids: list[int] = []
+        self.proxy_disabled_shape_ids: list[int] = []
         self.tip_body_id = 0
         self.plug_body_id = 0
         self.grasp_body_id = 0
@@ -574,7 +613,6 @@ class WaterhoseSceneBuilder:
         self.scene_shape_ids: list[int] = []
         self.cable_body_q_targets: dict[int, tuple[float, float, float, float, float, float, float]] = {}
         self.primary_cable_body_ids: list[int] = []
-
         self._mujoco_body_count = 0
         self._mujoco_shape_count = 0
         self._mujoco_joint_count = 0
@@ -589,10 +627,12 @@ class WaterhoseSceneBuilder:
         self._vbd_joint_ids: list[int] = []
         self.cable_body_ids: list[int] = []
         self.cable_head_body_ids: list[int] = []
+        self.cable_head_shape_ids: list[int] = []
         self.cable_body_ids_by_curve: list[list[int]] = []
         self.cable_segment_lengths_by_curve: list[list[float]] = []
         self.cable_curve_prim_paths: list[str] = []
         self.cable_head_body_ids_by_env: list[list[int]] = []
+        self._head_shape_scale_base: dict[int, tuple[float, float, float]] = {}
         self.cable_body_ids_by_env_by_curve: list[list[list[int]]] = []
         self.cable_segment_lengths_by_env_by_curve: list[list[list[float]]] = []
         self.robot_joint_coord_ids_by_env: list[list[int]] = []
@@ -775,10 +815,12 @@ class WaterhoseSceneBuilder:
             "vbd_joint_ids": list(self._vbd_joint_ids),
             "proxy_body_ids": list(self.proxy_body_ids),
             "proxy_shape_ids": list(self.proxy_shape_ids),
+            "proxy_disabled_shape_ids": list(self.proxy_disabled_shape_ids),
             "scene_body_ids": list(self.scene_body_ids),
             "scene_shape_ids": list(self.scene_shape_ids),
             "cable_body_ids": list(self.cable_body_ids),
             "cable_head_body_ids": list(self.cable_head_body_ids),
+            "cable_head_shape_ids": list(self.cable_head_shape_ids),
             "cable_body_ids_by_curve": [list(body_ids) for body_ids in self.cable_body_ids_by_curve],
             "cable_segment_lengths_by_curve": [
                 list(segment_lengths) for segment_lengths in self.cable_segment_lengths_by_curve
@@ -821,7 +863,6 @@ class WaterhoseSceneBuilder:
             self.robot_joint_coord_ids_by_env.append(
                 [joint_coord_offset + joint_id for joint_id in range(robot.joint_coord_count)]
             )
-
         self._select_proxy_bodies(builder)
 
         vbd_body_ids: list[int] = []
@@ -840,6 +881,7 @@ class WaterhoseSceneBuilder:
                     "scene_shape_ids": list(self.scene_shape_ids),
                     "cable_body_ids": list(self.cable_body_ids),
                     "cable_head_body_ids": list(self.cable_head_body_ids),
+                    "cable_head_shape_ids": list(self.cable_head_shape_ids),
                     "cable_body_ids_by_curve": [list(body_ids) for body_ids in self.cable_body_ids_by_curve],
                     "cable_segment_lengths_by_curve": [
                         list(segment_lengths) for segment_lengths in self.cable_segment_lengths_by_curve
@@ -859,6 +901,7 @@ class WaterhoseSceneBuilder:
             self.scene_shape_ids = primary_env_metadata["scene_shape_ids"]
             self.cable_body_ids = primary_env_metadata["cable_body_ids"]
             self.cable_head_body_ids = primary_env_metadata["cable_head_body_ids"]
+            self.cable_head_shape_ids = primary_env_metadata["cable_head_shape_ids"]
             self.cable_body_ids_by_curve = primary_env_metadata["cable_body_ids_by_curve"]
             self.cable_segment_lengths_by_curve = primary_env_metadata["cable_segment_lengths_by_curve"]
             self.cable_curve_prim_paths = primary_env_metadata["cable_curve_prim_paths"]
@@ -883,11 +926,14 @@ class WaterhoseSceneBuilder:
         self._vbd_joint_ids = []
         self.proxy_body_ids = []
         self.proxy_shape_ids = []
+        self.proxy_disabled_shape_ids = []
         self.cable_body_q_targets = {}
         self.cable_body_ids_by_curve = []
+        self.cable_head_shape_ids = []
         self.cable_segment_lengths_by_curve = []
         self.cable_curve_prim_paths = []
         self.cable_head_body_ids_by_env = []
+        self._head_shape_scale_base = {}
         self.cable_body_ids_by_env_by_curve = []
         self.cable_segment_lengths_by_env_by_curve = []
         self.robot_joint_coord_ids_by_env = []
@@ -952,6 +998,7 @@ class WaterhoseSceneBuilder:
         self._vbd_joint_ids.extend(offset_ids(proto_meta["vbd_joint_ids"], joint_offset))
         self.proxy_body_ids.extend(offset_ids(proto_meta["proxy_body_ids"], body_offset))
         self.proxy_shape_ids.extend(offset_ids(proto_meta["proxy_shape_ids"], shape_offset))
+        self.proxy_disabled_shape_ids.extend(offset_ids(proto_meta["proxy_disabled_shape_ids"], shape_offset))
 
         self._mujoco_body_count += len(proto_meta["mujoco_body_ids"])
         self._mujoco_shape_count += len(proto_meta["mujoco_shape_ids"])
@@ -976,6 +1023,7 @@ class WaterhoseSceneBuilder:
         self.scene_shape_ids = offset_ids(proto_meta["scene_shape_ids"], shape_offset)
         self.cable_body_ids = offset_ids(proto_meta["cable_body_ids"], body_offset)
         self.cable_head_body_ids = offset_ids(proto_meta["cable_head_body_ids"], body_offset)
+        self.cable_head_shape_ids = offset_ids(proto_meta["cable_head_shape_ids"], shape_offset)
         cable_body_ids_by_curve = [
             offset_ids(list(body_ids), body_offset) for body_ids in proto_meta["cable_body_ids_by_curve"]
         ]
@@ -1088,14 +1136,19 @@ class WaterhoseSceneBuilder:
         return dofs
 
     def _configure_robot_dofs(self, robot) -> None:
-        gripper_set = set(self.gripper_driver_dofs) | set(self.gripper_finger_dofs)
-        gripper_scale = float(self.cfg.gripper_drive_scale)
+        gripper_driver_set = set(self.gripper_driver_dofs)
+        gripper_finger_set = set(self.gripper_finger_dofs)
         for dof in range(robot.joint_dof_count):
-            if dof in gripper_set:
-                robot.joint_target_ke[dof] = float(self.cfg.gripper_joint_target_ke) * gripper_scale
-                robot.joint_target_kd[dof] = float(self.cfg.gripper_joint_target_kd) * gripper_scale
-                robot.joint_effort_limit[dof] = float(self.cfg.gripper_joint_effort_limit) * gripper_scale
+            if dof in gripper_driver_set:
+                robot.joint_target_ke[dof] = float(self.cfg.gripper_joint_target_ke)
+                robot.joint_target_kd[dof] = float(self.cfg.gripper_joint_target_kd)
+                robot.joint_effort_limit[dof] = float(self.cfg.gripper_joint_effort_limit)
                 robot.joint_armature[dof] = float(self.cfg.gripper_joint_armature)
+            elif dof in gripper_finger_set:
+                robot.joint_target_ke[dof] = float(self.cfg.gripper_finger_target_ke)
+                robot.joint_target_kd[dof] = float(self.cfg.gripper_finger_target_kd)
+                robot.joint_effort_limit[dof] = float(self.cfg.gripper_finger_effort_limit)
+                robot.joint_armature[dof] = float(self.cfg.gripper_finger_armature)
             else:
                 robot.joint_target_ke[dof] = float(self.cfg.robot_joint_target_ke)
                 robot.joint_target_kd[dof] = float(self.cfg.robot_joint_target_kd)
@@ -1167,6 +1220,7 @@ class WaterhoseSceneBuilder:
         fixed_body_ids: list[int] = []
         self.cable_body_ids = []
         self.cable_head_body_ids = []
+        self.cable_head_shape_ids = []
         self.cable_body_ids_by_curve = []
         self.cable_segment_lengths_by_curve = []
         self.cable_curve_prim_paths = []
@@ -1190,6 +1244,7 @@ class WaterhoseSceneBuilder:
                 resample_segments=int(self.cfg.cable_num_segments),
             )
             self.cable_body_ids.extend(result.cable_body_ids)
+            self.cable_body_ids.extend(result.head_body_ids)
             self.cable_head_body_ids.extend(result.head_body_ids)
             self.cable_body_ids_by_curve.append(list(result.cable_body_ids))
             self.cable_segment_lengths_by_curve.append(self._cable_segment_lengths(builder, result.cable_body_ids))
@@ -1199,7 +1254,7 @@ class WaterhoseSceneBuilder:
             self._sanitize_imported_labels(builder, result, cable_index)
             self._filter_cable_self_collisions(builder, [*result.cable_body_ids, *result.head_body_ids])
             self._filter_head_parent_neighbor_collisions(builder, result, cable_index)
-            self._apply_head_mesh_overrides(builder, result)
+            self.cable_head_shape_ids.extend(self._apply_head_mesh_material_overrides(builder, result))
             self._cache_asset_transformed_body_targets(builder, [*result.cable_body_ids, *result.head_body_ids], origin)
 
             if cable_index == 0:
@@ -1210,13 +1265,13 @@ class WaterhoseSceneBuilder:
 
         if not self.cable_body_ids:
             raise RuntimeError("At least one cable prim must be configured.")
-        if cable_joint_ids:
-            builder.add_articulation(cable_joint_ids, label="waterhose_articulation")
         for body_id in sorted(set(fixed_body_ids)):
             builder.body_mass[body_id] = 0.0
             builder.body_inv_mass[body_id] = 0.0
             builder.body_inertia[body_id] = wp.mat33()
             builder.body_inv_inertia[body_id] = wp.mat33()
+        if cable_joint_ids:
+            builder.add_articulation(cable_joint_ids, label="waterhose_articulation")
 
     def _cable_bend_stiffness(self, cable_asset: CableUsdAsset) -> float:
         """Return per-joint bend stiffness."""
@@ -1224,26 +1279,25 @@ class WaterhoseSceneBuilder:
             return float(self.cable_bend_stiffness)
         return self.cable_bend_rigidity / self._cable_mean_edge_length(cable_asset)
 
-    def _apply_head_mesh_overrides(self, builder, result) -> None:
-        """Apply plug mesh contact overrides."""
+    def _apply_head_mesh_material_overrides(self, builder, result) -> list[int]:
+        """Apply plug mesh material overrides before model finalization."""
         if not result.head_body_ids:
-            return
+            return []
+        head_ke = float(getattr(self.cfg, "vbd_head_mesh_ke", self.cfg.vbd_default_contact_ke))
+        head_kd = float(getattr(self.cfg, "vbd_head_mesh_kd", self.cfg.vbd_default_contact_kd))
         head_mu = float(getattr(self.cfg, "vbd_head_mesh_mu", 1.0e1))
-        xy_scale = float(getattr(self.cfg, "vbd_head_mesh_xy_scale", 0.95))
+        head_margin = float(getattr(self.cfg, "vbd_head_mesh_margin", self.cfg.vbd_default_contact_margin))
         head_shape_ids: list[int] = []
         for body_id in result.head_body_ids:
             for shape_id in builder.body_shapes.get(body_id, []):
                 if builder.shape_source[shape_id] is None:
                     continue
                 head_shape_ids.append(shape_id)
+                builder.shape_material_ke[shape_id] = head_ke
+                builder.shape_material_kd[shape_id] = head_kd
                 builder.shape_material_mu[shape_id] = head_mu
-                scale = builder.shape_scale[shape_id]
-                builder.shape_scale[shape_id] = wp.vec3(
-                    float(scale[0]) * xy_scale,
-                    float(scale[1]) * xy_scale,
-                    float(scale[2]),
-                )
-        self._build_mesh_sdfs(builder, head_shape_ids)
+                builder.shape_margin[shape_id] = head_margin
+        return head_shape_ids
 
     @staticmethod
     def _cable_segment_lengths(builder, body_ids: list[int]) -> list[float]:
@@ -1368,10 +1422,38 @@ class WaterhoseSceneBuilder:
         """Run VBD joints in soft penalty mode."""
         vbd_solver = NewtonCoupledManager.get_entry_solver(HOSE_ENTRY)
         set_mode = getattr(vbd_solver, "set_joint_constraint_mode", None)
-        if set_mode is None:
+        if set_mode is not None:
+            for joint_id in self._vbd_joint_ids:
+                set_mode(joint_id, hard=False)
+        self.apply_runtime_head_mesh_scale()
+
+    def apply_runtime_head_mesh_scale(self) -> None:
+        """Apply plug mesh collision scale after mass/inertia have been finalized."""
+        if not self.cable_head_shape_ids:
             return
-        for joint_id in self._vbd_joint_ids:
-            set_mode(joint_id, hard=False)
+
+        xy_scale = float(getattr(self.cfg, "vbd_head_mesh_xy_scale", 0.95))
+        models = [NewtonManager.get_model()]
+        try:
+            models.append(NewtonCoupledManager.get_entry_view(HOSE_ENTRY))
+        except RuntimeError:
+            pass
+
+        for model in models:
+            shape_scale = getattr(model, "shape_scale", None)
+            if shape_scale is None:
+                continue
+            scale_np = shape_scale.numpy()
+            for shape_id in self.cable_head_shape_ids:
+                index = int(shape_id)
+                if index < 0 or index >= scale_np.shape[0]:
+                    continue
+                if index not in self._head_shape_scale_base:
+                    scale = scale_np[index]
+                    self._head_shape_scale_base[index] = (float(scale[0]), float(scale[1]), float(scale[2]))
+                base = self._head_shape_scale_base[index]
+                scale_np[index] = (base[0] * xy_scale, base[1] * xy_scale, base[2])
+            wp.copy(shape_scale, wp.array(scale_np, dtype=wp.vec3, device=shape_scale.device))
 
     def _cache_asset_transformed_body_targets(self, builder, body_ids: list[int], origin=None) -> None:
         rot = wp.transform_get_rotation(self.asset_xform)
@@ -1497,8 +1579,33 @@ class WaterhoseSceneBuilder:
         self.scene_shape_ids = list(range(shape_start, builder.shape_count))
 
     def _select_proxy_bodies(self, builder) -> None:
+        """Collect every URDF-attached shape on each gripper finger as a proxy collider.
+
+        The reference newton script (`_create_proxy_bodies` in
+        `example_waterhose_scene2_insert_extract_success.py`) iterates ALL
+        shapes attached to each gripper finger MJC body (both `<visual>`
+        and `<collision>` URDF entries) and adds them as collidable shapes
+        in the VBD builder. The RBY1 URDF carries both a visual mesh and a
+        collision mesh per finger, BYTE-IDENTICAL files
+        (`meshes/visual/EE_FINGER.obj` vs `meshes/collision/EE_FINGER.obj`).
+        So success ends up with 2 collision-active mesh shapes per finger
+        in its VBD model, both at the same world pose.
+        With pair friction mu = (1e6 + 10)/2 = ~5e5, this doubles the
+        effective NORMAL and FRICTION force at the proxy<->plug contact,
+        which is what actually pins the 3 g plug between the fingers.
+        Newton's URDF parser tags the visual mesh with VISIBLE only (no
+        COLLIDE_SHAPES) because we pass `parse_visuals_as_colliders=False`,
+        so a vanilla `COLLIDE_SHAPES` filter here keeps only the collision
+        mesh and halves the gripper's holding force. Force the visual mesh
+        to act as a collider on the proxy bodies BEFORE finalize so it
+        ends up in `shape_contact_pairs` like the collision mesh does.
+        Robot self-collisions don't change: `enable_self_collisions=False`
+        already filtered all robot-vs-robot pairs at URDF parse time.
+        """
         self.proxy_body_ids = []
         self.proxy_shape_ids = []
+        self.proxy_disabled_shape_ids = []
+        collide_bits = int(newton.ShapeFlags.COLLIDE_SHAPES | newton.ShapeFlags.COLLIDE_PARTICLES)
         for body_id in self._mujoco_body_ids:
             label = builder.body_label[body_id] if body_id < len(builder.body_label) else ""
             short_label = label.rsplit("/", 1)[-1]
@@ -1506,31 +1613,61 @@ class WaterhoseSceneBuilder:
                 continue
             shape_ids = [
                 int(shape_id)
-                for shape_id in self._mujoco_shape_ids
-                for shape_body in [builder.shape_body[shape_id]]
-                if int(shape_body) == body_id
-                and (int(builder.shape_flags[shape_id]) & int(newton.ShapeFlags.COLLIDE_SHAPES))
+                for shape_id in builder.body_shapes.get(body_id, [])
+                if int(builder.shape_body[shape_id]) == body_id
             ]
-            if shape_ids:
-                self.proxy_body_ids.append(body_id)
-                self.proxy_shape_ids.extend(shape_ids)
+            if not shape_ids:
+                continue
+            # Promote the URDF visual mesh on this finger to a collider so
+            # both finger meshes contribute to proxy<->plug contacts, like
+            # the reference success demo. `enable_self_collisions=False`
+            # already keeps the robot from self-colliding through the
+            # duplicate.
+            for shape_id in shape_ids:
+                builder.shape_flags[shape_id] = int(builder.shape_flags[shape_id]) | collide_bits
+            self.proxy_body_ids.append(body_id)
+            self.proxy_shape_ids.extend(shape_ids)
         if not self.proxy_body_ids:
             raise RuntimeError("No RBY1 gripper proxy bodies found for waterhose coupling.")
-        self._build_mesh_sdfs(builder, self.proxy_shape_ids)
 
     def _make_solver_cfg(self):
         global _ACTIVE_SCENE_BUILDER
         _ACTIVE_SCENE_BUILDER = self
         rigid_contact_max_per_world = max(1, int(self.cfg.rigid_contact_max) // max(1, self.num_envs))
+        proxy_contact_matching = str(getattr(self.cfg, "vbd_proxy_contact_matching", "disabled")).lower()
+        if proxy_contact_matching not in ("disabled", "latest", "sticky"):
+            raise ValueError(
+                f"vbd_proxy_contact_matching must be 'disabled', 'latest', or 'sticky'; got {proxy_contact_matching!r}."
+            )
+        # Sticky / latest replay is only meaningful when SolverVBD consumes the
+        # match index for warm-starting. Refuse the inconsistent combination
+        # rather than silently overwriting fresh contact data with stale rows,
+        # and refuse the reverse mismatch (history needs a populated match
+        # index from the pipeline, otherwise SolverVBD.step raises at runtime).
+        history_enabled = bool(self.cfg.vbd_rigid_contact_history)
+        if proxy_contact_matching != "disabled" and not history_enabled:
+            raise ValueError(
+                f"vbd_proxy_contact_matching={proxy_contact_matching!r} requires "
+                "vbd_rigid_contact_history=True; set the history flag or disable contact matching."
+            )
+        if history_enabled and proxy_contact_matching == "disabled":
+            raise ValueError(
+                "vbd_rigid_contact_history=True requires vbd_proxy_contact_matching "
+                "in {'latest', 'sticky'}; the pipeline must populate rigid_contact_match_index."
+            )
+        proxy_rigid_contact_max = max(
+            1, int(getattr(self.cfg, "vbd_proxy_rigid_contact_max", 30000)) // max(1, self.num_envs)
+        )
 
         def create_proxy_collision_pipeline(model_view):
-            return newton.examples.create_collision_pipeline(
-                model_view,
-                self.cfg,
-                contact_matching="sticky",
-                contact_matching_pos_threshold=0.005,
-                contact_matching_normal_dot_threshold=0.95,
-            )
+            kwargs = dict(rigid_contact_max=proxy_rigid_contact_max)
+            if proxy_contact_matching != "disabled":
+                kwargs["contact_matching"] = proxy_contact_matching
+                kwargs["contact_matching_pos_threshold"] = float(self.cfg.vbd_proxy_contact_matching_pos_threshold)
+                kwargs["contact_matching_normal_dot_threshold"] = float(
+                    self.cfg.vbd_proxy_contact_matching_normal_dot_threshold
+                )
+            return newton.examples.create_collision_pipeline(model_view, self.cfg, **kwargs)
 
         return CoupledSolverCfg(
             entries=[
@@ -1563,7 +1700,7 @@ class WaterhoseSceneBuilder:
                         "friction_epsilon": float(self.cfg.vbd_solver_friction_epsilon),
                         "rigid_avbd_beta": float(self.cfg.vbd_rigid_avbd_beta),
                         "rigid_contact_hard": bool(self.cfg.vbd_rigid_contact_hard),
-                        "rigid_contact_history": True,
+                        "rigid_contact_history": bool(self.cfg.vbd_rigid_contact_history),
                         "rigid_contact_k_start": float(self.cfg.vbd_rigid_contact_k_start),
                         "rigid_body_contact_buffer_size": int(self.cfg.vbd_rigid_contact_buffer_size),
                         "rigid_body_particle_contact_buffer_size": int(
@@ -1652,13 +1789,21 @@ class WaterhoseIKController:
         self.phase_start_plug_pos = np.zeros(3, dtype=np.float64)
         self.phase_start_plug_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
         self.phase_target_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        self.last_raw_target_pos = None
+        self.last_raw_target_quat = None
+        self.last_filtered_target_pos = None
+        self.last_filtered_target_quat = None
         self.verify_align_retries = 0
-        self.max_verify_align_retries = 1000000
+        self.max_verify_align_retries = 2
         self.align_lateral_threshold = 0.010
-        self.align_axis_cosine_threshold = -0.90
+        self.align_axis_cosine_threshold = -0.75
         self.align_lateral_gain = 1.0
+        self.align_axis_gain = 0.25
+        self.align_depth_gain = 1.0
+        self.align_axis_lookahead = 0.035
         self.insert_start_depth = 0.005
         self.insert_final_depth = 0.035
+        self.insert_snap_margin = 0.001
         self.pull_distance = 0.06
         self.transfer_retract_standoff = 0.045
         self.transfer_retract_lift = 0.035
@@ -1666,6 +1811,8 @@ class WaterhoseIKController:
         self.socket_approach_lift = 0.035
         self.hose_approach_offset_local = np.array([0.0, 0.08, 0.0], dtype=np.float64)
         self.hose_engage_offset_local = np.array([0.01, 0.0, 0.0], dtype=np.float64)
+        self.hose_retract_offset_local = np.array([0.0, 0.05, 0.0], dtype=np.float64)
+        self.hose_withdraw_offset_world = np.array([-0.10, 0.0, 0.0], dtype=np.float64)
         self.socket_pos_np = np.array([float(scene_builder.socket_pos[i]) for i in range(3)], dtype=np.float64)
         self.socket_rot_np = np.array([float(scene_builder.socket_rot[i]) for i in range(4)], dtype=np.float64)
         self.insertion_dir_np = _np_quat_rotate(self.socket_rot_np, np.array([0.0, 0.0, 1.0]))
@@ -1687,6 +1834,8 @@ class WaterhoseIKController:
         )
         self.grasp_shift = 0.010
         self.grasp_local_offset = np.array([0.0, -self.cfg.hose_radius + 0.002, 0.0], dtype=np.float64)
+        self._setup_alignment_state()
+        self._setup_insert_state()
         self.right_open_driver, self.right_closed_driver = self._gripper_driver_targets(
             scene_builder.right_gripper_driver_dofs
         )
@@ -1708,6 +1857,47 @@ class WaterhoseIKController:
         self._setup_ik()
         self._seed_control_targets()
         self._enter_phase(0, 0.0)
+
+    def _setup_alignment_state(self) -> None:
+        arbitrary = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(np.dot(self.insertion_dir_np, arbitrary)) > 0.9:
+            arbitrary = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        perp1 = np.cross(self.insertion_dir_np, arbitrary)
+        perp1 /= max(np.linalg.norm(perp1), 1.0e-12)
+        perp2 = np.cross(self.insertion_dir_np, perp1)
+        perp2 /= max(np.linalg.norm(perp2), 1.0e-12)
+        self.align_axes_np = np.array([perp1, perp2], dtype=np.float64)
+        self.align_axis_idx = 0
+        self.align_phase = "done"
+        self.align_best_cos = 0.0
+        self.align_best_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        self.align_target_quat = self.align_best_quat.copy()
+        self.align_ee_pos = np.zeros(3, dtype=np.float64)
+        self.align_total_angle = 0.0
+        self.align_delta_angle = np.pi / 180.0
+        self.align_max_angle = 15.0 * np.pi / 180.0
+        self.align_settle_frames = 0
+        self.align_settle_wait = 5
+
+    def _setup_insert_state(self) -> None:
+        self.insert_ee_start_pos = np.zeros(3, dtype=np.float64)
+        self.insert_ee_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        self.insert_lateral_integral = np.zeros(3, dtype=np.float64)
+        self.insert_lateral_gain = 0.5
+        self.insert_lateral_integral_gain = 5.0
+        self.insert_orient_gain = 0.2
+        self.insert_cos_pause_threshold = -0.95
+        self.insert_cos_resume_threshold = -0.97
+        self.insert_depth_paused = False
+        self.insert_t_paused = 0.0
+
+    def _reset_target_filter(self) -> None:
+        self.last_target_pos = None
+        self.last_target_quat = None
+        self.last_raw_target_pos = None
+        self.last_raw_target_quat = None
+        self.last_filtered_target_pos = None
+        self.last_filtered_target_quat = None
 
     def _gripper_driver_targets(self, driver_dofs: list[int]) -> tuple[float, float]:
         if not driver_dofs:
@@ -1794,12 +1984,18 @@ class WaterhoseIKController:
         self.phase_start_time = sim_time
         self.phase_start_ee_pos, self.phase_start_ee_quat = self._ee_pose_np()
         self.phase_start_plug_pos, self.phase_start_plug_quat = self._plug_pose_np()
+        self._reset_target_filter()
         phase = self._PHASES[self.phase_index][0]
         if phase in ("approach_hose", "reapproach"):
             self._reset_live_hose_target()
             self._update_grasp_local_offset()
         if phase in ("engage_hose", "reengage"):
+            self._reset_live_hose_target()
             self._update_grasp_local_offset()
+        if phase == "align_axes":
+            self._init_axis_alignment()
+        if phase == "insert_hose":
+            self._init_insert()
         if phase in ("align_axes", "verify_align", "insert_hose", "release_hose") or phase in ("approach_socket",):
             self.phase_target_quat = _np_quat_multiply(self.socket_rot_np, self.grasp_orientation_offset)
         else:
@@ -1817,9 +2013,50 @@ class WaterhoseIKController:
                 return True
             if elapsed >= duration:
                 self.verify_align_retries += 1
-                self._enter_phase(self._phase_index("align_axes"), sim_time)
-                return False
-        return elapsed >= duration
+                if self.verify_align_retries < self.max_verify_align_retries:
+                    self._enter_phase(self._phase_index("align_axes"), sim_time)
+                    return False
+                return True
+        if elapsed < duration:
+            return False
+        return self._phase_converged(phase) or elapsed >= duration + self._phase_convergence_grace(phase)
+
+    def _phase_converged(self, phase: str) -> bool:
+        if phase not in {
+            "approach_hose",
+            "engage_hose",
+            "retract",
+            "approach_socket",
+            "align_axes",
+            "insert_hose",
+            "withdraw",
+            "reapproach",
+            "reengage",
+            "pull",
+            "final_release",
+        }:
+            return True
+        pos_error, rot_error = self._target_tracking_errors()
+        return pos_error < 0.010 and rot_error < 10.0 * np.pi / 180.0
+
+    def _phase_convergence_grace(self, phase: str) -> float:
+        if phase in {"approach_hose", "engage_hose", "retract", "approach_socket", "withdraw", "reapproach"}:
+            return 2.0
+        if phase in {"align_axes", "insert_hose"}:
+            return 4.0
+        if phase in {"reengage", "pull", "final_release"}:
+            return 1.0
+        return 0.0
+
+    def _target_tracking_errors(self) -> tuple[float, float]:
+        if self.last_filtered_target_pos is None or self.last_filtered_target_quat is None:
+            return 0.0, 0.0
+        ee_pos, ee_quat = self._ee_pose_np()
+        pos_error = float(np.linalg.norm(ee_pos - self.last_filtered_target_pos))
+        q_delta = _np_quat_multiply(self.last_filtered_target_quat, _np_quat_inverse(ee_quat))
+        q_delta /= max(np.linalg.norm(q_delta), 1.0e-12)
+        rot_error = 2.0 * np.arctan2(np.linalg.norm(q_delta[:3]), abs(float(q_delta[3])))
+        return pos_error, float(rot_error)
 
     def _target_for_phase(self, sim_time: float):
         phase, duration = self._PHASES[self.phase_index]
@@ -1836,7 +2073,7 @@ class WaterhoseIKController:
             target_quat = _np_quat_slerp(self.phase_start_ee_quat, hose_quat, alpha)
             grip = 0.0
         elif phase == "engage_hose":
-            hose_pos, hose_quat = self._hose_target_pose("engage", live=True)
+            hose_pos, hose_quat = self._hose_target_pose("engage", live=False)
             target_pos = self._lerp(
                 self.phase_start_ee_pos,
                 hose_pos,
@@ -1846,12 +2083,19 @@ class WaterhoseIKController:
             target_quat = hose_quat
             grip = 0.0
         elif phase == "grasp_hose":
-            target_pos, target_quat = self._hose_target_pose("engage", live=True)
-            target_pos = self._apply_gripper_centering(target_pos)
-            grip = _smoothstep(alpha / 0.35)
+            target_pos = self.phase_start_ee_pos
+            target_quat = self.phase_start_ee_quat
+            # Match the reference newton script: close the gripper over the
+            # full GRASP phase, not over the first 35% of it. With the ~285x
+            # proxy:plug mass ratio and the 1 ms lagged MJC<->VBD sync, a
+            # 2.5x faster closing speed (smoothstep(alpha/0.35) hits 1.0 at
+            # elapsed=0.20s vs 0.5s here) outruns the harvested normal
+            # wrench and the finger sweeps past the flange before VBD's
+            # counter-force reaches the gripper joint actuator.
+            grip = alpha
         elif phase == "hold_grasp":
-            target_pos, target_quat = self._hose_target_pose("engage", live=True)
-            target_pos = self._apply_gripper_centering(target_pos)
+            target_pos = self.phase_start_ee_pos
+            target_quat = self.phase_start_ee_quat
             grip = 1.0
         elif phase == "retract":
             target_pos = self.phase_start_ee_pos + alpha * self._transfer_retract_offset()
@@ -1866,8 +2110,7 @@ class WaterhoseIKController:
             target_quat = _np_quat_slerp(self.phase_start_ee_quat, self.phase_target_quat, alpha)
             grip = 1.0
         elif phase == "align_axes":
-            target_pos = self.phase_start_ee_pos
-            target_quat = self.phase_start_ee_quat
+            target_pos, target_quat = self._axis_alignment_target()
             grip = 1.0
         elif phase == "verify_align":
             target_pos, target_quat = self._verify_alignment_target()
@@ -1882,7 +2125,7 @@ class WaterhoseIKController:
         elif phase == "withdraw":
             target_pos = self._lerp(
                 self.phase_start_ee_pos,
-                self.phase_start_ee_pos + 0.055 * self.clearance_dir_np + np.array([0.0, 0.0, 0.035]),
+                self.phase_start_ee_pos + self.hose_withdraw_offset_world,
                 alpha,
             )
             target_quat = self.phase_start_ee_quat
@@ -1897,17 +2140,20 @@ class WaterhoseIKController:
             target_quat = _np_quat_slerp(self.phase_start_ee_quat, hose_quat, alpha)
             grip = 0.0
         elif phase == "reengage":
-            hose_pos, hose_quat = self._hose_target_pose("engage", live=True)
+            hose_pos, hose_quat = self._hose_target_pose("engage", live=False)
             target_pos = self._lerp(self.phase_start_ee_pos, hose_pos, alpha)
             target_pos = self._apply_gripper_centering(target_pos)
             target_quat = hose_quat
             grip = 0.0
         elif phase == "regrasp":
-            target_pos, target_quat = self._hose_target_pose("engage", live=True)
-            target_pos = self._apply_gripper_centering(target_pos)
-            grip = _smoothstep(alpha / 0.35)
+            target_pos = self.phase_start_ee_pos
+            target_quat = self.phase_start_ee_quat
+            # Same fix as grasp_hose: close the gripper over the full phase
+            # duration so the lagged coupling has time to harvest contact
+            # normals before the finger sweeps past the plug.
+            grip = alpha
         elif phase == "pull":
-            pull_vec = -self.pull_distance * self.insertion_dir_np + np.array([-0.03, 0.0, 0.0])
+            pull_vec = -self.pull_distance * self.insertion_dir_np
             target_pos = self.phase_start_ee_pos + alpha * pull_vec
             target_quat = self.phase_start_ee_quat
             grip = 1.0
@@ -1931,6 +2177,8 @@ class WaterhoseIKController:
     def _filter_ik_target(self, target_pos, target_quat):
         target_pos_np = np.array([float(target_pos[i]) for i in range(3)], dtype=np.float64)
         target_quat_np = np.array([float(target_quat[i]) for i in range(4)], dtype=np.float64)
+        self.last_raw_target_pos = target_pos_np.copy()
+        self.last_raw_target_quat = target_quat_np.copy()
         if self.last_target_pos is None:
             self.last_target_pos = target_pos_np
             self.last_target_quat = target_quat_np
@@ -1942,6 +2190,8 @@ class WaterhoseIKController:
             target_quat_np = _np_quat_slerp(self.last_target_quat, target_quat_np, 0.25)
             self.last_target_pos = target_pos_np
             self.last_target_quat = target_quat_np
+        self.last_filtered_target_pos = target_pos_np.copy()
+        self.last_filtered_target_quat = target_quat_np.copy()
         return self._vec3(target_pos_np), self._quat(target_quat_np)
 
     def _plug_pose_np(self) -> tuple[np.ndarray, np.ndarray]:
@@ -2073,11 +2323,25 @@ class WaterhoseIKController:
         tip_axis = _np_quat_rotate(tip_quat, np.array([0.0, 0.0, 1.0], dtype=np.float64))
         return tip_axis / max(np.linalg.norm(tip_axis), 1.0e-12)
 
+    def _cable_axis_np(self) -> np.ndarray:
+        body_ids = self.scene_builder.primary_cable_body_ids
+        if len(body_ids) >= 2:
+            body_q = self.state.body_q.numpy()
+            axis = body_q[body_ids[1], :3].astype(np.float64) - body_q[body_ids[0], :3].astype(np.float64)
+            axis_norm = np.linalg.norm(axis)
+            if axis_norm > 1.0e-8:
+                axis /= axis_norm
+                if np.dot(axis, -self.insertion_dir_np) < 0.0:
+                    axis = -axis
+                return axis
+        tip_axis = self._tip_axis_np()
+        return tip_axis if np.dot(tip_axis, -self.insertion_dir_np) >= 0.0 else -tip_axis
+
     def _alignment_errors(self) -> tuple[np.ndarray, float, float]:
         tip_pos, _ = self._tip_pose_np()
         delta = tip_pos - self._socket_start_pos()
         lateral = delta - np.dot(delta, self.insertion_dir_np) * self.insertion_dir_np
-        axis_cosine = float(np.dot(self._tip_axis_np(), self.insertion_dir_np))
+        axis_cosine = float(np.dot(self._cable_axis_np(), self.insertion_dir_np))
         return lateral, float(np.linalg.norm(lateral)), axis_cosine
 
     def _ee_target_for_desired_tip(
@@ -2090,16 +2354,62 @@ class WaterhoseIKController:
         tip_to_ee_pos, tip_to_ee_quat = _np_relative_transform(tip_pos, tip_quat, ee_pos, ee_quat)
         return _np_transform_point_quat(desired_tip_pos, desired_tip_quat, tip_to_ee_pos, tip_to_ee_quat)
 
-    def _verify_alignment_target(self) -> tuple[np.ndarray, np.ndarray]:
+    def _init_axis_alignment(self) -> None:
+        ee_pos, _ = self._ee_pose_np()
+        _, tip_quat = self._tip_pose_np()
+        self.align_ee_pos = ee_pos.copy()
+        self.align_axis_idx = 0
+        self.align_phase = "probe_plus"
+        self.align_total_angle = 0.0
+        self.align_settle_frames = 0
+        self.align_target_quat = self.phase_start_ee_quat.copy()
+        self.align_best_quat = self.phase_start_ee_quat.copy()
+        self.align_best_cos = float(np.dot(self._tip_axis_np(), self.insertion_dir_np))
+
+    def _axis_alignment_target(self) -> tuple[np.ndarray, np.ndarray]:
         ee_pos, _ = self._ee_pose_np()
         tip_pos, _ = self._tip_pose_np()
-        delta = tip_pos - self._socket_start_pos()
-        lateral = delta - np.dot(delta, self.insertion_dir_np) * self.insertion_dir_np
-        return ee_pos - self.align_lateral_gain * lateral, self.phase_start_ee_quat
+        socket_start = self._socket_start_pos()
+
+        tip_lateral = tip_pos - socket_start
+        tip_lateral -= np.dot(tip_lateral, self.insertion_dir_np) * self.insertion_dir_np
+
+        cable_axis = self._cable_axis_np()
+        desired_axis = -self.insertion_dir_np
+        cable_point = tip_pos + self.align_axis_lookahead * cable_axis
+        desired_point = socket_start + self.align_axis_lookahead * desired_axis
+        axis_lateral = cable_point - desired_point
+        axis_lateral -= np.dot(axis_lateral, self.insertion_dir_np) * self.insertion_dir_np
+
+        depth_error = np.dot(tip_pos - socket_start, self.insertion_dir_np)
+        correction = (
+            self.align_lateral_gain * tip_lateral
+            + self.align_axis_gain * axis_lateral
+            + self.align_depth_gain * depth_error * self.insertion_dir_np
+        )
+        return ee_pos - correction, self.phase_target_quat
+
+    def _rotate_align_target(self, axis_vec: np.ndarray, angle: float) -> np.ndarray:
+        half = 0.5 * angle
+        s, c = np.sin(half), np.cos(half)
+        dq = np.array([axis_vec[0] * s, axis_vec[1] * s, axis_vec[2] * s, c], dtype=np.float64)
+        quat = _np_quat_multiply(dq, self.align_target_quat)
+        return quat / max(np.linalg.norm(quat), 1.0e-12)
+
+    def _verify_alignment_target(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._axis_alignment_target()
 
     def _verify_alignment_ok(self) -> bool:
         _, lateral_error, axis_cosine = self._alignment_errors()
         return lateral_error < self.align_lateral_threshold and axis_cosine < self.align_axis_cosine_threshold
+
+    def _init_insert(self) -> None:
+        ee_pos, ee_quat = self._ee_pose_np()
+        self.insert_ee_start_pos = ee_pos.copy()
+        self.insert_ee_quat = ee_quat.copy()
+        self.insert_lateral_integral = np.zeros(3, dtype=np.float64)
+        self.insert_depth_paused = False
+        self.insert_t_paused = 0.0
 
     def _insert_target(self, alpha: float) -> tuple[np.ndarray, np.ndarray]:
         depth = self.insert_start_depth + alpha * (self.insert_final_depth - self.insert_start_depth)
