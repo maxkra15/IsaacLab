@@ -180,12 +180,8 @@ class RBY1DFWaterhoseEnv(ManagerBasedRLEnv):
         target_pos, target_quat = controller._filter_ik_target(target_pos, target_quat)
         target_pos_t = torch.as_tensor([float(target_pos[i]) for i in range(3)], device=self.device)
         target_quat_t = torch.as_tensor([float(target_quat[i]) for i in range(4)], device=self.device)
-        action = self.get_task_space_action_term().target_pose_to_action(
-            target_pos_t.to(torch.float32),
-            target_quat_t.to(torch.float32),
-            env_id=0,
-        )
-        action[-1] = 1.0 if gripper_value > 0.5 else -1.0
-        actions = action.unsqueeze(0).repeat(self.num_envs, 1)
+        action_term = self.get_task_space_action_term()
+        action_term.set_target_pose(target_pos_t, target_quat_t, gripper_value)
+        actions = torch.zeros((self.num_envs, action_term.action_dim), device=self.device, dtype=torch.float32)
         self.waterhose_last_scripted_phase = phase
         return actions

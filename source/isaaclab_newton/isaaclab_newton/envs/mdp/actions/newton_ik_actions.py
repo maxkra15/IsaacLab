@@ -20,7 +20,7 @@ import isaaclab.utils.string as string_utils
 from isaaclab.assets.articulation.base_articulation import BaseArticulation
 from isaaclab.managers.action_manager import ActionTerm
 
-from isaaclab_newton.ik.newton_ik_manager import NewtonIKManager
+from isaaclab_newton.ik.newton_ik_manager import NewtonIKManager, NewtonIKPoseObjective
 from isaaclab_newton.physics import NewtonManager
 
 if TYPE_CHECKING:
@@ -104,15 +104,21 @@ class NewtonInverseKinematicsAction(ActionTerm):
         self._prototype_link_index = self._resolve_prototype_link_index(prototype_view)
         self._prototype_joint_seed = wp.to_torch(prototype_model.joint_q).to(device=self.device, dtype=torch.float32)
         self._prototype_joint_seed = self._prototype_joint_seed.unsqueeze(0).repeat(self.num_envs, 1).contiguous()
+        self._ik_target_name = "target"
 
         self._ik_manager = NewtonIKManager(
             self.cfg.controller,
             model=prototype_model,
             num_envs=self.num_envs,
             device=self.device,
-            link_index=self._prototype_link_index,
-            link_offset_pos=link_offset_pos,
-            link_offset_rot=link_offset_rot,
+            pose_objectives=[
+                NewtonIKPoseObjective(
+                    name=self._ik_target_name,
+                    link_index=self._prototype_link_index,
+                    link_offset_pos=link_offset_pos,
+                    link_offset_rot=link_offset_rot,
+                )
+            ],
         )
 
         logger.info(
@@ -186,7 +192,7 @@ class NewtonInverseKinematicsAction(ActionTerm):
         target_pos_w, target_quat_w = math_utils.combine_frame_transforms(
             root_pos_proto, root_quat_proto, self._target_pos_b, self._target_quat_b
         )
-        self._ik_manager.set_target_pose(target_pos_w, target_quat_w)
+        self._ik_manager.set_target_pose(self._ik_target_name, target_pos_w, target_quat_w)
 
         joint_seed = self._prototype_joint_seed.clone()
         joint_seed[:, self._prototype_joint_coord_ids] = self._asset.data.joint_pos.torch
@@ -195,6 +201,7 @@ class NewtonInverseKinematicsAction(ActionTerm):
         self._asset.set_joint_position_target_index(target=joint_pos_des, joint_ids=self._joint_ids_warp)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        env_ids = slice(None) if env_ids is None else env_ids
         self._raw_actions[env_ids] = 0.0
 
     def _compute_frame_pose(self) -> tuple[torch.Tensor, torch.Tensor]:

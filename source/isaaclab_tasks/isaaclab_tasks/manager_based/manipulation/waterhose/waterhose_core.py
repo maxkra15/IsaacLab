@@ -57,17 +57,17 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         cable_prim=None,
         hose_radius=0.003,
         gripper_drive_scale=2.0,
-        grasp_friction=50.0,
+        grasp_friction=80.0,
         grasp_margin=0.001,
-        grasp_contact_ke=5.0e4,
-        sim_substeps=10,
+        grasp_contact_ke=1.0e3,
+        sim_substeps=5,
         rigid_substeps=1,
         proxy_iterations=1,
         proxy_mass_scale=1.0,
         vbd_iterations=10,
         rigid_contact_max=100000,
-        mujoco_iterations=20,
-        mujoco_ls_iterations=10,
+        mujoco_iterations=12,
+        mujoco_ls_iterations=6,
         mujoco_ls_parallel=True,
         mujoco_impratio=1000.0,
         mujoco_use_mujoco_contacts=True,
@@ -85,30 +85,40 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         gripper_joint_effort_limit=100000.0,
         gripper_joint_armature=0.5,
         vbd_collide_substeps=5,
-        vbd_default_contact_ke=1.0e5,
-        vbd_default_contact_kd=5.0,
+        vbd_default_contact_ke=1.0e3,
+        vbd_default_contact_kd=0.0,
         vbd_default_contact_margin=0.001,
         vbd_solver_friction_epsilon=0.1,
-        vbd_rigid_contact_buffer_size=2048,
+        vbd_rigid_contact_hard=False,
+        vbd_rigid_contact_buffer_size=1024,
+        vbd_rigid_body_particle_contact_buffer_size=1,
         vbd_proxy_margin=0.001,
-        vbd_cable_density=1200.0,
-        vbd_cable_mu=0.8,
+        vbd_cable_density=1000.0,
+        vbd_cable_mu=0.2,
         vbd_cable_margin=0.0,
         vbd_cable_gap=0.001,
         vbd_static_margin=1.0e-4,
         vbd_static_gap=0.001,
+        vbd_head_mesh_mu=1.0e1,
+        vbd_head_mesh_xy_scale=0.95,
+        vbd_static_mesh_use_sdf=True,
+        vbd_static_mesh_sdf_max_resolution=64,
+        kit_static_contact_mode="usd_sdf",
         vbd_near_tip_mu=1.0e1,
         vbd_far_tip_mu=1.0e5,
         vbd_ground_mu=1.0e5,
         vbd_rigid_avbd_beta=1.0e5,
         vbd_rigid_contact_k_start=1.0e2,
+        vbd_rigid_joint_linear_ke=1.0e6,
+        vbd_rigid_joint_angular_ke=1.0e6,
         vbd_rigid_joint_linear_k_start=1.0e4,
         vbd_rigid_joint_angular_k_start=1.0e1,
-        cable_stretch_stiffness=3.0e8,
-        cable_stretch_damping=8.0e-2,
-        cable_num_segments=60,
+        cable_stretch_stiffness=1.0e6,
+        cable_stretch_damping=1.0e-5,
+        cable_num_segments=0,
+        cable_bend_stiffness=2.0e1,
         cable_bend_rigidity=1.5e-1,
-        cable_bend_damping=3.5e-1,
+        cable_bend_damping=1.0e0,
         disable_cuda_graph=False,
         log_interval=0,
         headless=False,
@@ -175,12 +185,8 @@ RIGHT_EE = "right_gripper_end_effector"
 LEFT_EE = "left_gripper_end_effector"
 TORSO = "torso_hip_yaw"
 PROXY_BODY_NAMES = {
-    "right_gripper_base",
-    "right_gripper_camera_bracket",
     "right_gripper_leftfinger",
     "right_gripper_rightfinger",
-    "left_gripper_base",
-    "left_gripper_camera_bracket",
     "left_gripper_leftfinger",
     "left_gripper_rightfinger",
 }
@@ -230,7 +236,7 @@ def configure_mujoco_view(view) -> None:
 
 
 def configure_vbd_view(view) -> None:
-    """Match the reference script's gripper-finger proxy contact material."""
+    """Apply gripper proxy contact material overrides."""
     scene_builder = _active_scene_builder()
     if not scene_builder.proxy_shape_ids:
         return
@@ -287,12 +293,12 @@ def import_newton_dependencies() -> None:
     import numpy as np_module
     import warp as wp_module
     from newton import JointTargetMode as JointTargetModeClass
-    from newton.solvers import SolverVBD as SolverVBDClass
+    from .waterhose_vbd_solver import WaterhoseSolverVBD
 
     np = np_module
     wp = wp_module
     newton = newton_module
-    SolverVBD = SolverVBDClass
+    SolverVBD = WaterhoseSolverVBD
     JointTargetMode = JointTargetModeClass
 
 
@@ -487,7 +493,7 @@ def _create_launcher_sim_cfg():
     """Create the minimal config used by ``launch_simulation`` to decide whether Kit is needed."""
     device = str(args_cli.device)
     if not device.startswith("cuda"):
-        raise RuntimeError("The waterhose proxy-coupled demo requires a CUDA device.")
+        raise RuntimeError("The waterhose task requires a CUDA device.")
     dummy_newton_cfg = type("NewtonCfg", (), {"class_type": object})()
     return SimpleNamespace(
         dt=1.0 / args_cli.fps,
@@ -498,7 +504,7 @@ def _create_launcher_sim_cfg():
 
 
 class WaterhoseSceneBuilder:
-    """Build a shared model and Isaac Lab coupled-solver cfg for the demo."""
+    """Build the shared Newton model and coupled-solver configuration."""
 
     def __init__(self, cfg: SimpleNamespace | None = None):
         self.cfg = cfg if cfg is not None else args_cli
@@ -537,6 +543,9 @@ class WaterhoseSceneBuilder:
         )
         self.cable_stretch_stiffness = float(self.cfg.cable_stretch_stiffness)
         self.cable_stretch_damping = float(self.cfg.cable_stretch_damping)
+        self.cable_bend_stiffness = getattr(self.cfg, "cable_bend_stiffness", None)
+        if self.cable_bend_stiffness is not None:
+            self.cable_bend_stiffness = float(self.cable_bend_stiffness)
         self.cable_bend_rigidity = float(self.cfg.cable_bend_rigidity)
         self.cable_bend_damping = float(self.cfg.cable_bend_damping)
 
@@ -698,7 +707,7 @@ class WaterhoseSceneBuilder:
 
     @staticmethod
     def _compute_asset_xform():
-        """Match the bundle scripts' Cable008 placement relative to the robot."""
+        """Return the authored Cable008 placement relative to the robot."""
         table_half_z = 0.5 * (0.6 - 0.215)
         table_top_z = table_half_z + table_half_z
         z_offset = 0.902 + table_top_z
@@ -1050,7 +1059,7 @@ class WaterhoseSceneBuilder:
 
     @staticmethod
     def _disable_gripper_mimic_constraints(robot) -> None:
-        """Match the reference Newton waterhose examples' gripper behavior."""
+        """Drive gripper followers explicitly from the controller."""
         mimic_enabled = getattr(robot, "constraint_mimic_enabled", [])
         mimic_count = len(mimic_enabled)
         if mimic_count > 0:
@@ -1190,6 +1199,7 @@ class WaterhoseSceneBuilder:
             self._sanitize_imported_labels(builder, result, cable_index)
             self._filter_cable_self_collisions(builder, [*result.cable_body_ids, *result.head_body_ids])
             self._filter_head_parent_neighbor_collisions(builder, result, cable_index)
+            self._apply_head_mesh_overrides(builder, result)
             self._cache_asset_transformed_body_targets(builder, [*result.cable_body_ids, *result.head_body_ids], origin)
 
             if cable_index == 0:
@@ -1209,8 +1219,31 @@ class WaterhoseSceneBuilder:
             builder.body_inv_inertia[body_id] = wp.mat33()
 
     def _cable_bend_stiffness(self, cable_asset: CableUsdAsset) -> float:
-        """Convert the proxy-coupled example's bend rigidity to per-joint stiffness."""
+        """Return per-joint bend stiffness."""
+        if self.cable_bend_stiffness is not None:
+            return float(self.cable_bend_stiffness)
         return self.cable_bend_rigidity / self._cable_mean_edge_length(cable_asset)
+
+    def _apply_head_mesh_overrides(self, builder, result) -> None:
+        """Apply plug mesh contact overrides."""
+        if not result.head_body_ids:
+            return
+        head_mu = float(getattr(self.cfg, "vbd_head_mesh_mu", 1.0e1))
+        xy_scale = float(getattr(self.cfg, "vbd_head_mesh_xy_scale", 0.95))
+        head_shape_ids: list[int] = []
+        for body_id in result.head_body_ids:
+            for shape_id in builder.body_shapes.get(body_id, []):
+                if builder.shape_source[shape_id] is None:
+                    continue
+                head_shape_ids.append(shape_id)
+                builder.shape_material_mu[shape_id] = head_mu
+                scale = builder.shape_scale[shape_id]
+                builder.shape_scale[shape_id] = wp.vec3(
+                    float(scale[0]) * xy_scale,
+                    float(scale[1]) * xy_scale,
+                    float(scale[2]),
+                )
+        self._build_mesh_sdfs(builder, head_shape_ids)
 
     @staticmethod
     def _cable_segment_lengths(builder, body_ids: list[int]) -> list[float]:
@@ -1332,7 +1365,7 @@ class WaterhoseSceneBuilder:
                 apply_to_array(body_q_prev)
 
     def configure_runtime_vbd_solver(self) -> None:
-        """Match the waterhose reference: VBD joints run in soft penalty mode."""
+        """Run VBD joints in soft penalty mode."""
         vbd_solver = NewtonCoupledManager.get_entry_solver(HOSE_ENTRY)
         set_mode = getattr(vbd_solver, "set_joint_constraint_mode", None)
         if set_mode is None:
@@ -1362,10 +1395,26 @@ class WaterhoseSceneBuilder:
             )
 
     def _add_static_scene_contacts(self, builder) -> None:
-        if _requested_kit_visualizer():
+        if _requested_kit_visualizer() and self._kit_static_contact_mode() == "proxy":
             self._add_kit_static_contact_proxy(builder)
             return
         self._add_static_scene_from_usd(builder)
+
+    def _kit_static_contact_mode(self) -> str:
+        """Return how Newton should model static contacts when Kit renders the USD scene."""
+        mode = str(getattr(self.cfg, "kit_static_contact_mode", "usd_sdf")).strip().lower()
+        aliases = {
+            "usd": "usd_sdf",
+            "sdf": "usd_sdf",
+            "mesh": "usd_sdf",
+            "mesh_sdf": "usd_sdf",
+            "boxes": "proxy",
+            "box": "proxy",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"usd_sdf", "proxy"}:
+            raise ValueError("kit_static_contact_mode must be 'usd_sdf' or 'proxy'.")
+        return mode
 
     def _add_static_scene_from_usd(self, builder) -> None:
         scene_result = builder.add_usd(
@@ -1386,6 +1435,34 @@ class WaterhoseSceneBuilder:
             builder.body_inertia[body_id] = wp.mat33()
             builder.body_inv_inertia[body_id] = wp.mat33()
         self.scene_shape_ids = sorted(int(v) for v in scene_result["path_shape_map"].values())
+        self._build_static_scene_mesh_sdfs(builder)
+
+    def _build_static_scene_mesh_sdfs(self, builder) -> None:
+        """Precompute SDFs for static mesh contacts."""
+        self._build_mesh_sdfs(builder, self.scene_shape_ids)
+
+    def _build_mesh_sdfs(self, builder, shape_ids: list[int]) -> None:
+        if not bool(getattr(self.cfg, "vbd_static_mesh_use_sdf", True)):
+            return
+        resolution = int(getattr(self.cfg, "vbd_static_mesh_sdf_max_resolution", 64))
+        if resolution <= 0:
+            return
+        if resolution % 8 != 0:
+            raise ValueError("vbd_static_mesh_sdf_max_resolution must be positive and divisible by 8.")
+        if not wp.get_device(str(self.cfg.device)).is_cuda:
+            return
+
+        built_mesh_ids: set[int] = set()
+        for shape_id in shape_ids:
+            mesh = builder.shape_source[shape_id] if shape_id < len(builder.shape_source) else None
+            if mesh is None or not hasattr(mesh, "build_sdf"):
+                continue
+            mesh_id = id(mesh)
+            if mesh_id in built_mesh_ids or getattr(mesh, "sdf", None) is not None:
+                built_mesh_ids.add(mesh_id)
+                continue
+            mesh.build_sdf(max_resolution=resolution)
+            built_mesh_ids.add(mesh_id)
 
     def _add_kit_static_contact_proxy(self, builder) -> None:
         """Use simple Newton contact shapes while Kit owns the visual USD scene."""
@@ -1439,6 +1516,7 @@ class WaterhoseSceneBuilder:
                 self.proxy_shape_ids.extend(shape_ids)
         if not self.proxy_body_ids:
             raise RuntimeError("No RBY1 gripper proxy bodies found for waterhose coupling.")
+        self._build_mesh_sdfs(builder, self.proxy_shape_ids)
 
     def _make_solver_cfg(self):
         global _ACTIVE_SCENE_BUILDER
@@ -1484,9 +1562,15 @@ class WaterhoseSceneBuilder:
                         "iterations": self.cfg.vbd_iterations,
                         "friction_epsilon": float(self.cfg.vbd_solver_friction_epsilon),
                         "rigid_avbd_beta": float(self.cfg.vbd_rigid_avbd_beta),
+                        "rigid_contact_hard": bool(self.cfg.vbd_rigid_contact_hard),
                         "rigid_contact_history": True,
                         "rigid_contact_k_start": float(self.cfg.vbd_rigid_contact_k_start),
                         "rigid_body_contact_buffer_size": int(self.cfg.vbd_rigid_contact_buffer_size),
+                        "rigid_body_particle_contact_buffer_size": int(
+                            self.cfg.vbd_rigid_body_particle_contact_buffer_size
+                        ),
+                        "rigid_joint_linear_ke": float(self.cfg.vbd_rigid_joint_linear_ke),
+                        "rigid_joint_angular_ke": float(self.cfg.vbd_rigid_joint_angular_ke),
                         "rigid_joint_linear_k_start": float(self.cfg.vbd_rigid_joint_linear_k_start),
                         "rigid_joint_angular_k_start": float(self.cfg.vbd_rigid_joint_angular_k_start),
                     },
@@ -1496,7 +1580,7 @@ class WaterhoseSceneBuilder:
                     configure_view=configure_vbd_view,
                 ),
             ],
-            use_collision_pipeline=False,
+            use_collision_pipeline=None,
             proxy_coupling=ProxyCouplingCfg(
                 proxies=[
                     CoupledProxyCfg(
@@ -1518,21 +1602,21 @@ class WaterhoseIKController:
     """Scripted Newton IK controller layered on Isaac Lab's Newton state/control buffers."""
 
     _PHASES = [
-        ("approach_hose", 2.0),
-        ("engage_hose", 0.9),
-        ("grasp_hose", 0.4),
-        ("hold_grasp", 0.25),
-        ("retract", 0.9),
-        ("settle", 0.1),
-        ("approach_socket", 3.0),
-        ("align_axes", 1.5),
+        ("approach_hose", 3.0),
+        ("engage_hose", 1.5),
+        ("grasp_hose", 0.5),
+        ("hold_grasp", 0.5),
+        ("retract", 1.5),
+        ("settle", 0.3),
+        ("approach_socket", 5.0),
+        ("align_axes", 5.0),
         ("verify_align", 2.0),
-        ("insert_hose", 3.0),
+        ("insert_hose", 5.0),
         ("release_hose", 1.0),
         ("withdraw", 2.0),
         ("wait_after_withdraw", 1.0),
         ("reapproach", 2.0),
-        ("reengage", 0.4),
+        ("reengage", 0.1),
         ("regrasp", 3.0),
         ("pull", 4.0),
         ("final_release", 2.0),
@@ -1570,8 +1654,8 @@ class WaterhoseIKController:
         self.phase_target_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
         self.verify_align_retries = 0
         self.max_verify_align_retries = 1000000
-        self.align_lateral_threshold = 0.0005
-        self.align_axis_cosine_threshold = -0.997
+        self.align_lateral_threshold = 0.010
+        self.align_axis_cosine_threshold = -0.90
         self.align_lateral_gain = 1.0
         self.insert_start_depth = 0.005
         self.insert_final_depth = 0.035
@@ -1601,7 +1685,7 @@ class WaterhoseIKController:
             _np_quat_from_axis_angle([1.0, 0.0, 0.0], np.pi / 2.0),
             _np_quat_from_axis_angle([0.0, 0.0, 1.0], -np.pi / 2.0),
         )
-        self.grasp_shift = 0.004
+        self.grasp_shift = 0.010
         self.grasp_local_offset = np.array([0.0, -self.cfg.hose_radius + 0.002, 0.0], dtype=np.float64)
         self.right_open_driver, self.right_closed_driver = self._gripper_driver_targets(
             scene_builder.right_gripper_driver_dofs
@@ -1782,9 +1866,8 @@ class WaterhoseIKController:
             target_quat = _np_quat_slerp(self.phase_start_ee_quat, self.phase_target_quat, alpha)
             grip = 1.0
         elif phase == "align_axes":
-            ee_pos, ee_quat = self._ee_target_for_desired_tip(self._socket_start_pos(), self.desired_tip_quat_np)
-            target_pos = self._lerp(self.phase_start_ee_pos, ee_pos, alpha)
-            target_quat = _np_quat_slerp(self.phase_start_ee_quat, ee_quat, alpha)
+            target_pos = self.phase_start_ee_pos
+            target_quat = self.phase_start_ee_quat
             grip = 1.0
         elif phase == "verify_align":
             target_pos, target_quat = self._verify_alignment_target()
@@ -2008,7 +2091,11 @@ class WaterhoseIKController:
         return _np_transform_point_quat(desired_tip_pos, desired_tip_quat, tip_to_ee_pos, tip_to_ee_quat)
 
     def _verify_alignment_target(self) -> tuple[np.ndarray, np.ndarray]:
-        return self._ee_target_for_desired_tip(self._socket_start_pos(), self.desired_tip_quat_np)
+        ee_pos, _ = self._ee_pose_np()
+        tip_pos, _ = self._tip_pose_np()
+        delta = tip_pos - self._socket_start_pos()
+        lateral = delta - np.dot(delta, self.insertion_dir_np) * self.insertion_dir_np
+        return ee_pos - self.align_lateral_gain * lateral, self.phase_start_ee_quat
 
     def _verify_alignment_ok(self) -> bool:
         _, lateral_error, axis_cosine = self._alignment_errors()

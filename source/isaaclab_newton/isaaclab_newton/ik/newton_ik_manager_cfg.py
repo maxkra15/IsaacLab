@@ -16,7 +16,7 @@ class NewtonIKManagerCfg:
     """IK command type. Supported values are ``"position"`` and ``"pose"``."""
 
     use_relative_mode: bool = True
-    """Whether input commands are relative to the current end-effector pose."""
+    """Whether manager-based action commands are relative to the current target pose."""
 
     optimizer: str = "lm"
     """Newton IK optimizer backend. Supported values are ``"lm"`` and ``"lbfgs"``."""
@@ -24,20 +24,35 @@ class NewtonIKManagerCfg:
     jacobian_mode: str = "analytic"
     """Newton IK Jacobian backend. Supported values are ``"analytic"``, ``"autodiff"``, and ``"mixed"``."""
 
+    sampler: str = "none"
+    """Initial seed sampler. Supported values are ``"none"``, ``"gauss"``, ``"roberts"``, and ``"uniform"``."""
+
+    n_seeds: int = 1
+    """Number of candidate seeds per IK problem. Must be ``1`` when ``sampler="none"``."""
+
+    noise_std: float = 0.1
+    """Gaussian sampling standard deviation used when ``sampler="gauss"``."""
+
+    rng_seed: int = 12345
+    """Random seed used by stochastic samplers."""
+
     iterations: int = 24
     """Number of Newton IK solver iterations per action application."""
 
     step_size: float = 1.0
-    """Step size passed to Newton ``IKSolver.step``."""
+    """LM step scale passed to Newton ``IKSolver.step``. Ignored by L-BFGS."""
 
     lambda_initial: float = 0.1
     """Initial damping value for the Newton Levenberg-Marquardt optimizer."""
 
     position_weight: float = 1.0
-    """Residual weight for the end-effector position objective."""
+    """Default residual weight for pose position objectives."""
 
     rotation_weight: float = 1.0
-    """Residual weight for the end-effector rotation objective."""
+    """Default residual weight for pose rotation objectives."""
 
-    joint_limit_weight: float = 0.1
-    """Residual weight for the joint-limit objective."""
+    joint_limit_weight: float | None = 0.1
+    """Residual weight for the joint-limit objective. Set to ``None`` to disable it."""
+
+    use_persistent_seed: bool = False
+    """Whether solved joint coordinates should be reused as the next IK seed."""

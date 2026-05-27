@@ -116,7 +116,7 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 100.0,
         render_interval=1,
-        physics=NewtonCfg(num_substeps=10, use_cuda_graph=True),
+        physics=NewtonCfg(num_substeps=3, use_cuda_graph=True),
     )
     viewer = ViewerCfg(eye=(-1.2, -2.8, 1.6), lookat=(0.55, -0.42, 0.55))
 
@@ -132,14 +132,14 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     cable_usd: str | None = None
     cable_prims: str | None = None
     cable_prim: str | None = None
-    sim_substeps: int = 10
+    sim_substeps: int = 5
     rigid_substeps: int = 1
     proxy_iterations: int = 1
     proxy_mass_scale: float = 1.0
     vbd_iterations: int = 10
     rigid_contact_max: int = 100000
-    mujoco_iterations: int = 20
-    mujoco_ls_iterations: int = 10
+    mujoco_iterations: int = 12
+    mujoco_ls_iterations: int = 6
     mujoco_ls_parallel: bool = True
     mujoco_impratio: float = 1000.0
     mujoco_use_mujoco_contacts: bool = True
@@ -159,34 +159,44 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     gripper_joint_target_kd: float = 1000.0
     gripper_joint_effort_limit: float = 100000.0
     gripper_joint_armature: float = 0.5
-    grasp_friction: float = 50.0
+    grasp_friction: float = 80.0
     grasp_margin: float = 0.001
-    grasp_contact_ke: float = 5.0e4
+    grasp_contact_ke: float = 1.0e3
     vbd_collide_substeps: int = 5
-    vbd_default_contact_ke: float = 1.0e5
-    vbd_default_contact_kd: float = 5.0
+    vbd_default_contact_ke: float = 1.0e3
+    vbd_default_contact_kd: float = 0.0
     vbd_default_contact_margin: float = 0.001
     vbd_solver_friction_epsilon: float = 0.1
-    vbd_rigid_contact_buffer_size: int = 2048
+    vbd_rigid_contact_hard: bool = False
+    vbd_rigid_contact_buffer_size: int = 1024
+    vbd_rigid_body_particle_contact_buffer_size: int = 1
     vbd_proxy_margin: float = 0.001
-    vbd_cable_density: float = 1200.0
-    vbd_cable_mu: float = 0.8
+    vbd_cable_density: float = 1000.0
+    vbd_cable_mu: float = 0.2
     vbd_cable_margin: float = 0.0
     vbd_cable_gap: float = 0.001
     vbd_static_margin: float = 1.0e-4
     vbd_static_gap: float = 0.001
+    vbd_head_mesh_mu: float = 1.0e1
+    vbd_head_mesh_xy_scale: float = 0.95
+    vbd_static_mesh_use_sdf: bool = True
+    vbd_static_mesh_sdf_max_resolution: int = 64
+    kit_static_contact_mode: str = "usd_sdf"
     vbd_near_tip_mu: float = 1.0e1
     vbd_far_tip_mu: float = 1.0e5
     vbd_ground_mu: float = 1.0e5
     vbd_rigid_avbd_beta: float = 1.0e5
     vbd_rigid_contact_k_start: float = 1.0e2
+    vbd_rigid_joint_linear_ke: float = 1.0e6
+    vbd_rigid_joint_angular_ke: float = 1.0e6
     vbd_rigid_joint_linear_k_start: float = 1.0e4
     vbd_rigid_joint_angular_k_start: float = 1.0e1
-    cable_stretch_stiffness: float = 3.0e8
-    cable_stretch_damping: float = 8.0e-2
-    cable_num_segments: int = 60
+    cable_stretch_stiffness: float = 1.0e6
+    cable_stretch_damping: float = 1.0e-5
+    cable_num_segments: int = 0
+    cable_bend_stiffness: float = 2.0e1
     cable_bend_rigidity: float = 1.5e-1
-    cable_bend_damping: float = 3.5e-1
+    cable_bend_damping: float = 1.0e0
     success_lateral_threshold: float = 0.0008
     success_axis_cosine: float = -0.995
     success_insert_depth: float = 0.025
@@ -249,7 +259,9 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "vbd_default_contact_kd": float(self.vbd_default_contact_kd),
             "vbd_default_contact_margin": float(self.vbd_default_contact_margin),
             "vbd_solver_friction_epsilon": float(self.vbd_solver_friction_epsilon),
+            "vbd_rigid_contact_hard": bool(self.vbd_rigid_contact_hard),
             "vbd_rigid_contact_buffer_size": int(self.vbd_rigid_contact_buffer_size),
+            "vbd_rigid_body_particle_contact_buffer_size": int(self.vbd_rigid_body_particle_contact_buffer_size),
             "vbd_proxy_margin": float(self.vbd_proxy_margin),
             "vbd_cable_density": float(self.vbd_cable_density),
             "vbd_cable_mu": float(self.vbd_cable_mu),
@@ -257,16 +269,24 @@ class RBY1DFWaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             "vbd_cable_gap": float(self.vbd_cable_gap),
             "vbd_static_margin": float(self.vbd_static_margin),
             "vbd_static_gap": float(self.vbd_static_gap),
+            "vbd_head_mesh_mu": float(self.vbd_head_mesh_mu),
+            "vbd_head_mesh_xy_scale": float(self.vbd_head_mesh_xy_scale),
+            "vbd_static_mesh_use_sdf": bool(self.vbd_static_mesh_use_sdf),
+            "vbd_static_mesh_sdf_max_resolution": int(self.vbd_static_mesh_sdf_max_resolution),
+            "kit_static_contact_mode": self.kit_static_contact_mode,
             "vbd_near_tip_mu": float(self.vbd_near_tip_mu),
             "vbd_far_tip_mu": float(self.vbd_far_tip_mu),
             "vbd_ground_mu": float(self.vbd_ground_mu),
             "vbd_rigid_avbd_beta": float(self.vbd_rigid_avbd_beta),
             "vbd_rigid_contact_k_start": float(self.vbd_rigid_contact_k_start),
+            "vbd_rigid_joint_linear_ke": float(self.vbd_rigid_joint_linear_ke),
+            "vbd_rigid_joint_angular_ke": float(self.vbd_rigid_joint_angular_ke),
             "vbd_rigid_joint_linear_k_start": float(self.vbd_rigid_joint_linear_k_start),
             "vbd_rigid_joint_angular_k_start": float(self.vbd_rigid_joint_angular_k_start),
             "cable_stretch_stiffness": float(self.cable_stretch_stiffness),
             "cable_stretch_damping": float(self.cable_stretch_damping),
             "cable_num_segments": int(self.cable_num_segments),
+            "cable_bend_stiffness": float(self.cable_bend_stiffness),
             "cable_bend_rigidity": float(self.cable_bend_rigidity),
             "cable_bend_damping": float(self.cable_bend_damping),
             "disable_cuda_graph": bool(self.disable_cuda_graph),
