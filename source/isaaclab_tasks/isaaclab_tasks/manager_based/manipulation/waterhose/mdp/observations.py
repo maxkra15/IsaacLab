@@ -113,22 +113,16 @@ def alignment(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def proxy_wrench_norm(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Norm of proxy coupling forces [N]."""
+    """Norm of cross-solver coupling forces on the gripper fingers [N].
+
+    Under the previous lagged proxy coupling we read `coupling_forces` on
+    the per-proxy mapping. Under ADMM coupling the cross-solver force on
+    the gripper is the Lagrange-multiplier on the MJC<->VBD contact pair
+    and is not exposed as a per-body wrench yet, so this observation
+    returns zeros until ADMM surfaces that signal.
+    """
     _ensure_metadata(env)
-    wrenches = core.NewtonCoupledManager.get_proxy_body_wrenches(core.ROBOT_ENTRY, core.HOSE_ENTRY)
-    result = torch.zeros(env.num_envs, 1, device=env.device)
-    if wrenches is None:
-        return result
-    wrench_np = wrenches.numpy()
-    proxy_ids = [body_id for body_id in env.waterhose_scene_builder.proxy_body_ids if body_id < wrench_np.shape[0]]
-    if not proxy_ids:
-        return result
-    # The proxy ids are grouped by env because the builder appends robots env-by-env.
-    chunks = np.array_split(np.asarray(proxy_ids, dtype=np.int32), env.num_envs)
-    for env_id, ids in enumerate(chunks):
-        if ids.size:
-            result[env_id, 0] = float(np.linalg.norm(wrench_np[ids, :3]))
-    return result
+    return torch.zeros(env.num_envs, 1, device=env.device)
 
 
 def joint_pos(env: ManagerBasedRLEnv) -> torch.Tensor:

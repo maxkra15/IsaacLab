@@ -44,6 +44,12 @@ class CableUsdAsset:
 def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
     """Create the namespace expected by the shared Newton waterhose builder."""
     defaults = dict(
+        # Outer step matches the success demo (1/100 s). The
+        # reference cable_pendulum uses 1/60, but switching at the same
+        # time as the cable/plug mass / AVBD-ramping changes caused
+        # instability in our stiff-cable + heavy-plug regime. Keep
+        # 1/100 here; perf is reclaimed via the static_contact proxy
+        # and the lower SDF resolution.
         fps=100.0,
         max_steps=1400,
         num_envs=1,
@@ -57,18 +63,35 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         cable_prim=None,
         hose_radius=0.003,
         gripper_drive_scale=1.0,
-        grasp_friction=1.0e6,
+        # Gripper contact tuning. mu=1.0 is the ADMM-friendly value;
+        # the 1e6 we had under the lagged-proxy path produced huge Lagrange
+        # multipliers under ADMM. ke=1e3 matches our cable/head pair ke
+        # so the gripper<->plug contact has consistent stiffness on both
+        # sides instead of an asymmetric (1e5 vs 1e3) pair average.
+        grasp_friction=1.0,
         grasp_margin=0.001,
         grasp_contact_ke=1.0e3,
         sim_substeps=10,
         rigid_substeps=1,
-        # Match the reference newton script: one MJC<->VBD pass per substep.
-        # WaterhoseSolverVBD already drops the tangential friction component
-        # when harvesting proxy wrenches (see waterhose_vbd_solver.py), so
-        # the lagged scheme behaves identically to the reference script's
-        # hand-rolled coupling at iterations=1.
-        proxy_iterations=1,
-        proxy_mass_scale=1.0,
+        # Linearised ADMM coupling between the MJC robot entry and the VBD
+        # cable / scene entry. Bias toward more iterations + strong rho so
+        # the cross-solver contact constraints converge before the next
+        # substep advances. baumgarte=0.005 stabilises position drift on
+        # the contact pair without overshooting.
+        admm_iterations=5,
+        admm_rho=30.0,
+        admm_gamma=0.1,
+        admm_baumgarte=0.005,
+        admm_contact_distance=0.003,
+        admm_detection_margin=0.01,
+        # Keep the VBD iteration count + AVBD config we had on the previous
+        # stable proxy-coupled run. The franka_cable_pendulum reference
+        # uses iterations=20 + AVBD ramping (beta=1e3, k_start=1e3), but
+        # that's tuned for its softer cable (stretch=1e3, density=100,
+        # bend=5e-2); our waterhose cable is ~1000x stiffer in stretch and
+        # 10x denser, and ramping joint penalties from 1e2 toward
+        # 1e6 over 20 iterations destabilises the cable chain on the
+        # first frame. Fixed-k (beta=0) matches the success demo.
         vbd_iterations=15,
         rigid_contact_max=100000,
         mujoco_iterations=20,
@@ -93,7 +116,6 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         gripper_finger_target_kd=10000.0,
         gripper_finger_effort_limit=500000.0,
         gripper_finger_armature=0.5,
-        vbd_collide_substeps=5,
         vbd_default_contact_ke=1.0e3,
         vbd_default_contact_kd=0.0,
         vbd_default_contact_margin=0.001,
@@ -101,39 +123,58 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         vbd_rigid_contact_hard=False,
         vbd_rigid_contact_buffer_size=1024,
         vbd_rigid_body_particle_contact_buffer_size=1,
-        vbd_proxy_margin=0.001,
-        # Proxy collision pipeline. The reference newton script
-        # (example_waterhose_scene2_insert_extract_success.py) uses
-        # CollisionPipeline(broad_phase="explicit") with contact matching
-        # disabled and rigid_contact_max=30000 per VBD world. Keep matching
-        # disabled by default here so VBD's narrow phase always sees fresh
-        # contact points/normals; "sticky" and "latest" are only useful when
-        # SolverVBD(rigid_contact_history=True) consumes the match index.
-        vbd_proxy_rigid_contact_max=30000,
-        vbd_proxy_contact_matching="disabled",
-        vbd_proxy_contact_matching_pos_threshold=0.005,
-        vbd_proxy_contact_matching_normal_dot_threshold=0.95,
+        # Cable mass/friction. Density 1000 matches the success demo and
+        # keeps the cable's spring period above the substep_dt so the
+        # implicit VBD solver converges without oscillation. mu=1.0 is
+        # ADMM-friendly (huge mu values produce large Lagrange-multiplier
+        # projections that destabilise the cross-solver solve).
         vbd_cable_density=1000.0,
-        vbd_cable_mu=0.2,
+        vbd_cable_mu=1.0,
         vbd_cable_margin=0.0,
         vbd_cable_gap=0.002,
         vbd_static_margin=0.0,
         vbd_static_gap=0.002,
-        # Head/plug mesh contact tuning - byte-for-byte match with the
-        # reference newton script. Tangential friction feedback to the MJC
-        # gripper is dropped inside WaterhoseSolverVBD, so ke=1.0e3 is enough
-        # to stop the closing finger without causing resonant bounce.
+        # Head/plug mesh tuning. Keep the success-demo mass (~3 g from
+        # density * volume) and ke=1e3 — bumping ke to 1e5 over a 3 g body
+        # gave ke/m near the explicit-integration stability bound for our
+        # substep_dt. mu=1.0 stays (ADMM-friendly). `vbd_head_mass=0.0` is
+        # the initial body mass before the mesh shape adds its
+        # density-derived contribution.
+        vbd_head_mass=0.0,
         vbd_head_mesh_ke=1.0e3,
         vbd_head_mesh_kd=0.0,
-        vbd_head_mesh_mu=1.0e1,
+        vbd_head_mesh_mu=1.0,
         vbd_head_mesh_margin=0.0,
         vbd_head_mesh_xy_scale=0.95,
         vbd_static_mesh_use_sdf=True,
-        vbd_static_mesh_sdf_max_resolution=64,
-        kit_static_contact_mode="usd_sdf",
+        # The fridge scene has ~250 mesh shapes. SDF query cost scales with
+        # res^3 per shape, so halving the resolution from 64 to 32 saves
+        # ~8x SDF time. Empirically the cable<->scene contacts care about
+        # the surface, not interior precision; 32 is already used by other
+        # newton examples.
+        vbd_static_mesh_sdf_max_resolution=32,
+        # Static scene collision representation for cable contacts:
+        #   - "proxy"   : 2 static boxes (tabletop + socket region). Default.
+        #                 Avoids 247 convex-hull collisions from the fridge
+        #                 USD's V-HACD authoring, giving ~100x fewer broad
+        #                 phase pairs and 247 fewer SDF builds at startup.
+        #   - "usd_sdf" : load `Cable008_Body.usda` colliders + build SDFs.
+        #                 Use only if the cable must contact arbitrary
+        #                 fridge geometry beyond the table + socket region.
+        kit_static_contact_mode="proxy",
+        # When `kit_static_contact_mode="proxy"`, also load the fridge USD
+        # purely for visualisation (every loaded shape has its COLLIDE
+        # flags stripped, so the broad phase still only sees the proxy
+        # boxes). Lets the Newton GL viewer render the visible fridge
+        # next to the collision proxies. Disable to skip the USD entirely
+        # for headless / null-viewer / Kit-visualiser runs.
+        kit_static_visual_meshes=True,
         vbd_near_tip_mu=1.0e1,
         vbd_far_tip_mu=1.0e5,
         vbd_ground_mu=1.0e5,
+        # AVBD ramping disabled (beta=0). Fixed-k matches the success
+        # demo and avoids the early-iteration cable wobble that ramping
+        # produces on our stiff (stretch=1e6) cable.
         vbd_rigid_avbd_beta=0.0,
         vbd_rigid_contact_history=False,
         vbd_rigid_contact_k_start=1.0e2,
@@ -167,8 +208,6 @@ def make_waterhose_args(**overrides: Any) -> SimpleNamespace:
         max_visible_envs=None,
     )
     defaults.update(overrides)
-    if "grasp_margin" in overrides and "vbd_proxy_margin" not in overrides:
-        defaults["vbd_proxy_margin"] = defaults["grasp_margin"]
     for key in ("asset_root", "robot_urdf", "scene_usd", "cable_usd"):
         if defaults[key] is not None:
             defaults[key] = Path(defaults[key]).expanduser()
@@ -198,8 +237,9 @@ np = wp = newton = ik = sim_utils = None
 SolverVBD = None
 JointTargetMode = None
 add_cable_from_usd_curve = None
-CoupledProxyCfg = CoupledSolverCfg = CoupledSolverEntryCfg = None
-MJWarpSolverCfg = NewtonCfg = NewtonCoupledManager = NewtonManager = NewtonSolverCfg = ProxyCouplingCfg = None
+AdmmContactPairCfg = AdmmCouplingCfg = None
+CoupledSolverCfg = CoupledSolverEntryCfg = None
+MJWarpSolverCfg = NewtonCfg = NewtonCoupledManager = NewtonManager = NewtonSolverCfg = None
 
 ROBOT_ENTRY = "mjc"
 HOSE_ENTRY = "vbd"
@@ -212,7 +252,11 @@ KIT_CAMERA_ROTATION_XYZ_DEG = (47.78191, -0.0, -107.54558)
 RIGHT_EE = "right_gripper_end_effector"
 LEFT_EE = "left_gripper_end_effector"
 TORSO = "torso_hip_yaw"
-PROXY_BODY_NAMES = {
+# RBY1 gripper finger body short-names. These bodies stay in the MJC entry
+# but their shapes are the contact partners for the ADMM contact pair
+# against the VBD-owned plug/cable shapes. Diagnostics and observations
+# look these up via :attr:`WaterhoseSceneBuilder.gripper_finger_body_ids`.
+GRIPPER_FINGER_BODY_NAMES = {
     "right_gripper_leftfinger",
     "right_gripper_rightfinger",
     "left_gripper_leftfinger",
@@ -264,34 +308,15 @@ def configure_mujoco_view(view) -> None:
 
 
 def configure_vbd_view(view) -> None:
-    """Apply gripper proxy contact material overrides.
+    """Hook reserved for VBD-view runtime overrides.
 
-    Proxy shapes already have COLLIDE_SHAPES / COLLIDE_PARTICLES forced on
-    at builder time by `_select_proxy_bodies` so the broad-phase pair list
-    `shape_contact_pairs` populated at finalize includes both URDF meshes
-    (visual + collision) per finger. Here we only need to overwrite the
-    material values on those shape ids in the VBD view so the
-    gripper<->plug pair sees `mu = grasp_friction`, `ke = grasp_contact_ke`
-    etc., independently of whatever the MJC view sets for robot contacts.
+    With ADMM coupling the gripper finger shapes are owned by the MJC entry
+    (the proxy-body indirection from the lagged-coupling refactor is gone),
+    so there are no per-shape overrides to apply on this view today. The
+    callback stays in the entry cfg so a future tweak (e.g. cable-vs-scene
+    friction overrides) can hook in without touching the manager.
     """
-    scene_builder = _active_scene_builder()
-    if not scene_builder.proxy_shape_ids:
-        return
-
-    proxy_shape_ids = np.asarray(scene_builder.proxy_shape_ids, dtype=np.int32)
-    model = view.parent
-    for attr, value in (
-        ("shape_material_ke", float(scene_builder.cfg.grasp_contact_ke)),
-        ("shape_material_kd", float(scene_builder.cfg.vbd_default_contact_kd)),
-        ("shape_material_mu", float(scene_builder.cfg.grasp_friction)),
-        ("shape_margin", float(scene_builder.cfg.vbd_proxy_margin)),
-    ):
-        data = getattr(model, attr, None)
-        if data is None:
-            continue
-        data_np = data.numpy().copy()
-        data_np[proxy_shape_ids] = value
-        setattr(view, attr, wp.array(data_np, dtype=wp.float32, device=model.device))
+    del view
 
 
 LEROBOT_INITIAL_STATE_22 = [
@@ -331,12 +356,12 @@ def import_newton_dependencies() -> None:
     import numpy as np_module
     import warp as wp_module
     from newton import JointTargetMode as JointTargetModeClass
-    from .waterhose_vbd_solver import WaterhoseSolverVBD
+    from newton.solvers import SolverVBD as SolverVBDClass
 
     np = np_module
     wp = wp_module
     newton = newton_module
-    SolverVBD = WaterhoseSolverVBD
+    SolverVBD = SolverVBDClass
     JointTargetMode = JointTargetModeClass
 
 
@@ -368,8 +393,8 @@ def _load_cable_curve_importer():
 def import_isaaclab_runtime_dependencies() -> None:
     """Import Isaac Lab simulation/config modules after Newton USD import."""
     global ik, sim_utils
-    global CoupledProxyCfg, CoupledSolverCfg, CoupledSolverEntryCfg
-    global MJWarpSolverCfg, NewtonCfg, NewtonCoupledManager, NewtonManager, NewtonSolverCfg, ProxyCouplingCfg
+    global AdmmContactPairCfg, AdmmCouplingCfg, CoupledSolverCfg, CoupledSolverEntryCfg
+    global MJWarpSolverCfg, NewtonCfg, NewtonCoupledManager, NewtonManager, NewtonSolverCfg
 
     if sim_utils is not None:
         return
@@ -377,7 +402,10 @@ def import_isaaclab_runtime_dependencies() -> None:
     import newton.examples as newton_examples_module
     import newton.ik as ik_module
     from isaaclab_newton.physics import (
-        CoupledProxyCfg as CoupledProxyCfgClass,
+        AdmmContactPairCfg as AdmmContactPairCfgClass,
+    )
+    from isaaclab_newton.physics import (
+        AdmmCouplingCfg as AdmmCouplingCfgClass,
     )
     from isaaclab_newton.physics import (
         CoupledSolverCfg as CoupledSolverCfgClass,
@@ -397,9 +425,6 @@ def import_isaaclab_runtime_dependencies() -> None:
     from isaaclab_newton.physics import (
         NewtonManager as NewtonManagerClass,
     )
-    from isaaclab_newton.physics import (
-        ProxyCouplingCfg as ProxyCouplingCfgClass,
-    )
     from isaaclab_newton.physics.newton_manager_cfg import NewtonSolverCfg as NewtonSolverCfgClass
 
     import isaaclab.sim as sim_utils_module
@@ -407,7 +432,8 @@ def import_isaaclab_runtime_dependencies() -> None:
     newton.examples = newton_examples_module
     ik = ik_module
     sim_utils = sim_utils_module
-    CoupledProxyCfg = CoupledProxyCfgClass
+    AdmmContactPairCfg = AdmmContactPairCfgClass
+    AdmmCouplingCfg = AdmmCouplingCfgClass
     CoupledSolverCfg = CoupledSolverCfgClass
     CoupledSolverEntryCfg = CoupledSolverEntryCfgClass
     MJWarpSolverCfg = MJWarpSolverCfgClass
@@ -415,7 +441,6 @@ def import_isaaclab_runtime_dependencies() -> None:
     NewtonCoupledManager = NewtonCoupledManagerClass
     NewtonManager = NewtonManagerClass
     NewtonSolverCfg = NewtonSolverCfgClass
-    ProxyCouplingCfg = ProxyCouplingCfgClass
 
 
 def _lerobot_22_to_urdf_28(lr: list[float]) -> list[float]:
@@ -603,9 +628,11 @@ class WaterhoseSceneBuilder:
         self.left_gripper_driver_dofs: list[int] = []
         self.right_gripper_dofs: list[int] = []
         self.left_gripper_dofs: list[int] = []
-        self.proxy_body_ids: list[int] = []
-        self.proxy_shape_ids: list[int] = []
-        self.proxy_disabled_shape_ids: list[int] = []
+        # RBY1 gripper finger body indices in the shared model. Used by
+        # observations and diagnostics; ADMM does not require these to be
+        # explicit proxies but they are the natural targets for grip
+        # diagnostics (which fingers should be touching the plug).
+        self.gripper_finger_body_ids: list[int] = []
         self.tip_body_id = 0
         self.plug_body_id = 0
         self.grasp_body_id = 0
@@ -799,7 +826,7 @@ class WaterhoseSceneBuilder:
         self._mujoco_joint_ids = list(range(self._mujoco_joint_count))
 
         self._add_waterhose_world(builder, static_scene_builder)
-        self._select_proxy_bodies(builder)
+        self._collect_gripper_finger_body_ids(builder)
         return builder
 
     def _capture_proto_metadata(self, proto_builder, robot) -> dict[str, object]:
@@ -813,9 +840,7 @@ class WaterhoseSceneBuilder:
             "vbd_body_ids": list(self._vbd_body_ids),
             "vbd_shape_ids": list(self._vbd_shape_ids),
             "vbd_joint_ids": list(self._vbd_joint_ids),
-            "proxy_body_ids": list(self.proxy_body_ids),
-            "proxy_shape_ids": list(self.proxy_shape_ids),
-            "proxy_disabled_shape_ids": list(self.proxy_disabled_shape_ids),
+            "gripper_finger_body_ids": list(self.gripper_finger_body_ids),
             "scene_body_ids": list(self.scene_body_ids),
             "scene_shape_ids": list(self.scene_shape_ids),
             "cable_body_ids": list(self.cable_body_ids),
@@ -863,7 +888,7 @@ class WaterhoseSceneBuilder:
             self.robot_joint_coord_ids_by_env.append(
                 [joint_coord_offset + joint_id for joint_id in range(robot.joint_coord_count)]
             )
-        self._select_proxy_bodies(builder)
+        self._collect_gripper_finger_body_ids(builder)
 
         vbd_body_ids: list[int] = []
         vbd_shape_ids: list[int] = []
@@ -924,9 +949,7 @@ class WaterhoseSceneBuilder:
         self._vbd_body_ids = []
         self._vbd_shape_ids = []
         self._vbd_joint_ids = []
-        self.proxy_body_ids = []
-        self.proxy_shape_ids = []
-        self.proxy_disabled_shape_ids = []
+        self.gripper_finger_body_ids = []
         self.cable_body_q_targets = {}
         self.cable_body_ids_by_curve = []
         self.cable_head_shape_ids = []
@@ -996,9 +1019,7 @@ class WaterhoseSceneBuilder:
         self._vbd_body_ids.extend(offset_ids(proto_meta["vbd_body_ids"], body_offset))
         self._vbd_shape_ids.extend(offset_ids(proto_meta["vbd_shape_ids"], shape_offset))
         self._vbd_joint_ids.extend(offset_ids(proto_meta["vbd_joint_ids"], joint_offset))
-        self.proxy_body_ids.extend(offset_ids(proto_meta["proxy_body_ids"], body_offset))
-        self.proxy_shape_ids.extend(offset_ids(proto_meta["proxy_shape_ids"], shape_offset))
-        self.proxy_disabled_shape_ids.extend(offset_ids(proto_meta["proxy_disabled_shape_ids"], shape_offset))
+        self.gripper_finger_body_ids.extend(offset_ids(proto_meta["gripper_finger_body_ids"], body_offset))
 
         self._mujoco_body_count += len(proto_meta["mujoco_body_ids"])
         self._mujoco_shape_count += len(proto_meta["mujoco_shape_ids"])
@@ -1240,7 +1261,7 @@ class WaterhoseSceneBuilder:
                 wrap_in_articulation=False,
                 head_shape_mode="mesh",
                 head_cfg=head_cfg,
-                head_mass=0.0,
+                head_mass=float(self.cfg.vbd_head_mass),
                 resample_segments=int(self.cfg.cable_num_segments),
             )
             self.cable_body_ids.extend(result.cable_body_ids)
@@ -1477,14 +1498,41 @@ class WaterhoseSceneBuilder:
             )
 
     def _add_static_scene_contacts(self, builder) -> None:
-        if _requested_kit_visualizer() and self._kit_static_contact_mode() == "proxy":
+        """Install collision geometry for the cable's static environment.
+
+        ``proxy`` mode adds two static boxes (tabletop + socket region) — the
+        cable<->scene broad phase then sees ~2 candidate pairs per cable body
+        instead of the ~247 generated by `Cable008_Body.usda`'s V-HACD
+        decomposition (`physics:approximation = "convexHull"` on each chunk).
+        That gives roughly a 100x speed-up on the broad/narrow phase work and
+        skips ~247 SDF builds at startup, with no functional cost: the fridge
+        exterior isn't relevant to the grasp / insert task. When
+        ``kit_static_visual_meshes`` is True (the default), the fridge USD
+        is also loaded as a render-only asset (all collide flags stripped)
+        so the Newton GL viewer still shows it. The Kit visualiser spawns
+        the fridge on its own USD prim so this knob is moot there.
+
+        ``usd_sdf`` mode falls back to loading the full ``Cable008_Body.usda``
+        as collision geometry plus per-shape SDFs. Use it if you ever need
+        the cable to interact with arbitrary fridge geometry.
+        """
+        mode = self._kit_static_contact_mode()
+        if mode == "proxy":
             self._add_kit_static_contact_proxy(builder)
+            if bool(getattr(self.cfg, "kit_static_visual_meshes", True)):
+                self._add_static_scene_from_usd_visual_only(builder)
             return
         self._add_static_scene_from_usd(builder)
 
     def _kit_static_contact_mode(self) -> str:
-        """Return how Newton should model static contacts when Kit renders the USD scene."""
-        mode = str(getattr(self.cfg, "kit_static_contact_mode", "usd_sdf")).strip().lower()
+        """Return how Newton should model the static environment for cable contacts.
+
+        Despite the legacy ``kit_`` prefix on the cfg field, this is no longer
+        gated on Kit being the active visualizer: ``"proxy"`` here means "use
+        the simple table + socket boxes for cable<->scene contacts" no matter
+        which visualizer is in use.
+        """
+        mode = str(getattr(self.cfg, "kit_static_contact_mode", "proxy")).strip().lower()
         aliases = {
             "usd": "usd_sdf",
             "sdf": "usd_sdf",
@@ -1518,6 +1566,38 @@ class WaterhoseSceneBuilder:
             builder.body_inv_inertia[body_id] = wp.mat33()
         self.scene_shape_ids = sorted(int(v) for v in scene_result["path_shape_map"].values())
         self._build_static_scene_mesh_sdfs(builder)
+
+    def _add_static_scene_from_usd_visual_only(self, builder) -> None:
+        """Load `Cable008_Body.usda` for rendering, no collisions, no SDFs.
+
+        Used together with the proxy contact path: the 2 static boxes
+        carry the cable<->scene collisions, while these meshes only fill
+        in the visual context in the Newton GL viewer. We strip
+        `COLLIDE_SHAPES | COLLIDE_PARTICLES` on every loaded shape so the
+        247 V-HACD convex hulls never enter `shape_contact_pairs`, never
+        generate broad-phase pairs, and never build SDFs.
+        """
+        scene_result = builder.add_usd(
+            str(self.scene_usd),
+            xform=self.asset_xform,
+            root_path="/root",
+            load_sites=False,
+            load_visual_shapes=True,
+            hide_collision_shapes=False,
+            parse_mujoco_options=False,
+            only_load_enabled_joints=True,
+            only_load_enabled_rigid_bodies=False,
+        )
+        scene_body_ids = sorted({int(v) for v in scene_result["path_body_map"].values()})
+        for body_id in scene_body_ids:
+            builder.body_mass[body_id] = 0.0
+            builder.body_inv_mass[body_id] = 0.0
+            builder.body_inertia[body_id] = wp.mat33()
+            builder.body_inv_inertia[body_id] = wp.mat33()
+        visual_shape_ids = sorted(int(v) for v in scene_result["path_shape_map"].values())
+        collide_mask = int(newton.ShapeFlags.COLLIDE_SHAPES | newton.ShapeFlags.COLLIDE_PARTICLES)
+        for shape_id in visual_shape_ids:
+            builder.shape_flags[shape_id] = int(builder.shape_flags[shape_id]) & ~collide_mask
 
     def _build_static_scene_mesh_sdfs(self, builder) -> None:
         """Precompute SDFs for static mesh contacts."""
@@ -1578,98 +1658,37 @@ class WaterhoseSceneBuilder:
         self.scene_body_ids = []
         self.scene_shape_ids = list(range(shape_start, builder.shape_count))
 
-    def _select_proxy_bodies(self, builder) -> None:
-        """Collect every URDF-attached shape on each gripper finger as a proxy collider.
+    def _collect_gripper_finger_body_ids(self, builder) -> None:
+        """Record the RBY1 gripper finger body indices in the shared model.
 
-        The reference newton script (`_create_proxy_bodies` in
-        `example_waterhose_scene2_insert_extract_success.py`) iterates ALL
-        shapes attached to each gripper finger MJC body (both `<visual>`
-        and `<collision>` URDF entries) and adds them as collidable shapes
-        in the VBD builder. The RBY1 URDF carries both a visual mesh and a
-        collision mesh per finger, BYTE-IDENTICAL files
-        (`meshes/visual/EE_FINGER.obj` vs `meshes/collision/EE_FINGER.obj`).
-        So success ends up with 2 collision-active mesh shapes per finger
-        in its VBD model, both at the same world pose.
-        With pair friction mu = (1e6 + 10)/2 = ~5e5, this doubles the
-        effective NORMAL and FRICTION force at the proxy<->plug contact,
-        which is what actually pins the 3 g plug between the fingers.
-        Newton's URDF parser tags the visual mesh with VISIBLE only (no
-        COLLIDE_SHAPES) because we pass `parse_visuals_as_colliders=False`,
-        so a vanilla `COLLIDE_SHAPES` filter here keeps only the collision
-        mesh and halves the gripper's holding force. Force the visual mesh
-        to act as a collider on the proxy bodies BEFORE finalize so it
-        ends up in `shape_contact_pairs` like the collision mesh does.
-        Robot self-collisions don't change: `enable_self_collisions=False`
-        already filtered all robot-vs-robot pairs at URDF parse time.
+        These bodies belong to the MJC entry and their authored URDF
+        collision shapes participate in the ADMM cross-solver contact pair
+        directly (no proxy duplicates, no flag-tweaking). The list is
+        consumed by observations and diagnostics that report grip force /
+        contact statistics.
         """
-        self.proxy_body_ids = []
-        self.proxy_shape_ids = []
-        self.proxy_disabled_shape_ids = []
-        collide_bits = int(newton.ShapeFlags.COLLIDE_SHAPES | newton.ShapeFlags.COLLIDE_PARTICLES)
+        self.gripper_finger_body_ids = []
         for body_id in self._mujoco_body_ids:
             label = builder.body_label[body_id] if body_id < len(builder.body_label) else ""
             short_label = label.rsplit("/", 1)[-1]
-            if short_label not in PROXY_BODY_NAMES:
-                continue
-            shape_ids = [
-                int(shape_id)
-                for shape_id in builder.body_shapes.get(body_id, [])
-                if int(builder.shape_body[shape_id]) == body_id
-            ]
-            if not shape_ids:
-                continue
-            # Promote the URDF visual mesh on this finger to a collider so
-            # both finger meshes contribute to proxy<->plug contacts, like
-            # the reference success demo. `enable_self_collisions=False`
-            # already keeps the robot from self-colliding through the
-            # duplicate.
-            for shape_id in shape_ids:
-                builder.shape_flags[shape_id] = int(builder.shape_flags[shape_id]) | collide_bits
-            self.proxy_body_ids.append(body_id)
-            self.proxy_shape_ids.extend(shape_ids)
-        if not self.proxy_body_ids:
-            raise RuntimeError("No RBY1 gripper proxy bodies found for waterhose coupling.")
+            if short_label in GRIPPER_FINGER_BODY_NAMES:
+                self.gripper_finger_body_ids.append(body_id)
+        if not self.gripper_finger_body_ids:
+            raise RuntimeError("No RBY1 gripper finger bodies found for waterhose coupling.")
 
     def _make_solver_cfg(self):
+        """Build the ADMM-coupled MJC+VBD solver config.
+
+        The robot lives in the MJC entry, the cable / plug / fridge scene
+        in the VBD entry, and ADMM exchanges constraint forces on the
+        ``mjc <-> vbd`` contact pair directly (no proxy bodies, no lagged
+        force feedback, no friction-drop kernel).
+        """
         global _ACTIVE_SCENE_BUILDER
         _ACTIVE_SCENE_BUILDER = self
         rigid_contact_max_per_world = max(1, int(self.cfg.rigid_contact_max) // max(1, self.num_envs))
-        proxy_contact_matching = str(getattr(self.cfg, "vbd_proxy_contact_matching", "disabled")).lower()
-        if proxy_contact_matching not in ("disabled", "latest", "sticky"):
-            raise ValueError(
-                f"vbd_proxy_contact_matching must be 'disabled', 'latest', or 'sticky'; got {proxy_contact_matching!r}."
-            )
-        # Sticky / latest replay is only meaningful when SolverVBD consumes the
-        # match index for warm-starting. Refuse the inconsistent combination
-        # rather than silently overwriting fresh contact data with stale rows,
-        # and refuse the reverse mismatch (history needs a populated match
-        # index from the pipeline, otherwise SolverVBD.step raises at runtime).
-        history_enabled = bool(self.cfg.vbd_rigid_contact_history)
-        if proxy_contact_matching != "disabled" and not history_enabled:
-            raise ValueError(
-                f"vbd_proxy_contact_matching={proxy_contact_matching!r} requires "
-                "vbd_rigid_contact_history=True; set the history flag or disable contact matching."
-            )
-        if history_enabled and proxy_contact_matching == "disabled":
-            raise ValueError(
-                "vbd_rigid_contact_history=True requires vbd_proxy_contact_matching "
-                "in {'latest', 'sticky'}; the pipeline must populate rigid_contact_match_index."
-            )
-        proxy_rigid_contact_max = max(
-            1, int(getattr(self.cfg, "vbd_proxy_rigid_contact_max", 30000)) // max(1, self.num_envs)
-        )
-
-        def create_proxy_collision_pipeline(model_view):
-            kwargs = dict(rigid_contact_max=proxy_rigid_contact_max)
-            if proxy_contact_matching != "disabled":
-                kwargs["contact_matching"] = proxy_contact_matching
-                kwargs["contact_matching_pos_threshold"] = float(self.cfg.vbd_proxy_contact_matching_pos_threshold)
-                kwargs["contact_matching_normal_dot_threshold"] = float(
-                    self.cfg.vbd_proxy_contact_matching_normal_dot_threshold
-                )
-            return newton.examples.create_collision_pipeline(model_view, self.cfg, **kwargs)
-
         return CoupledSolverCfg(
+            coupling_type="admm",
             entries=[
                 CoupledSolverEntryCfg(
                     name=ROBOT_ENTRY,
@@ -1718,19 +1737,19 @@ class WaterhoseSceneBuilder:
                 ),
             ],
             use_collision_pipeline=None,
-            proxy_coupling=ProxyCouplingCfg(
-                proxies=[
-                    CoupledProxyCfg(
+            admm_coupling=AdmmCouplingCfg(
+                iterations=int(self.cfg.admm_iterations),
+                rho=float(self.cfg.admm_rho),
+                gamma=float(self.cfg.admm_gamma),
+                baumgarte=float(self.cfg.admm_baumgarte),
+                contact_pairs=[
+                    AdmmContactPairCfg(
                         source=ROBOT_ENTRY,
                         destination=HOSE_ENTRY,
-                        bodies=self.proxy_body_ids,
-                        mass_scale=float(self.cfg.proxy_mass_scale),
-                        mode="lagged",
-                        collision_pipeline_factory=create_proxy_collision_pipeline,
-                        collide_interval=int(self.cfg.vbd_collide_substeps),
-                    )
+                        contact_distance=float(self.cfg.admm_contact_distance),
+                        detection_margin=float(self.cfg.admm_detection_margin),
+                    ),
                 ],
-                iterations=self.cfg.proxy_iterations,
             ),
         )
 
@@ -3032,20 +3051,14 @@ def log_progress(step_count: int, task: str, scene_builder: WaterhoseSceneBuilde
     right_ee_id = _find_label_index(NewtonManager.get_model().body_label, RIGHT_EE)
     right_ee_pos = body_q[right_ee_id, 0:3]
     ee_to_hose = float(np.linalg.norm(right_ee_pos - hose_pos))
-    wrenches = NewtonCoupledManager.get_proxy_body_wrenches(ROBOT_ENTRY, HOSE_ENTRY)
-    wrench_norm = 0.0
-    if wrenches is not None:
-        wrench_np = wrenches.numpy()
-        proxy_body_ids = [body_id for body_id in scene_builder.proxy_body_ids if body_id < wrench_np.shape[0]]
-        if proxy_body_ids:
-            wrench_norm = float(np.linalg.norm(wrench_np[proxy_body_ids, 0:3]))
+    # ADMM coupling does not expose per-body proxy wrenches; future work
+    # could surface Lagrange-multiplier norms on the ADMM contact pair.
     print(
         "[INFO]: "
         f"step={step_count:05d} task={task:<15} "
         f"hose_grasp=({hose_pos[0]:.3f}, {hose_pos[1]:.3f}, {hose_pos[2]:.3f}) "
         f"ee_dist={ee_to_hose:.3f}m "
-        f"tip_lat={tip_lateral_mm:.2f}mm tip_dot={tip_axis_dot:.3f} "
-        f"|F_proxy|={wrench_norm:.2f}N",
+        f"tip_lat={tip_lateral_mm:.2f}mm tip_dot={tip_axis_dot:.3f}",
         flush=True,
     )
 
