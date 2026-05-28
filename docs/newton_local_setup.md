@@ -9,13 +9,15 @@ The waterhose demo depends on Newton PR 2848 until the coupled-solver APIs land 
 - Isaac Lab fork branch: `waterhose-demo`.
 - Newton PR 2848 branch: `pr-2848-coupled-solver-framework-latest`, tracking `origin/pr-2848-head`.
 
-The verified Newton PR 2848 commit is:
+The verified Newton PR 2848 dependency is:
 
 ```text
-c2f21df3acc0f06d207812810b2e27ca7c4da08c
+git+https://github.com/newton-physics/newton.git@refs/pull/2848/head
 ```
 
-`origin/pr-2848-head` was refreshed directly from `refs/pull/2848/head` and points at that same commit.
+This installs the current PR head from `refs/pull/2848/head`. The PR currently
+requires a Warp development build, so Isaac Lab's core Warp requirement must
+allow `warp-lang>=1.14.0.dev20260514`.
 
 ## Runtime Wiring
 

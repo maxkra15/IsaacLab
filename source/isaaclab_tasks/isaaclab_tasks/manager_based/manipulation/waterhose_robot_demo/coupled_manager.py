@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""ADMM-backed Newton manager for the waterhose robot demo."""
+"""Coupled Newton manager and solver configs for the waterhose robot demo."""
 
 from __future__ import annotations
 
@@ -28,14 +28,15 @@ from isaaclab_newton.physics import (
     NewtonManager,
     NewtonSolverCfg,
     OneWayCouplingCfg,
+    ProxyCouplingCfg,
 )
 from isaaclab_newton.physics.coupled_manager import NewtonCoupledManager
 
-from .admm_builder import (
+from .coupled_builder import (
     GRIPPER_DRIVER_DOFS,
     GRIPPER_FINGER_DOFS,
-    WaterhoseAdmmBuildInfo,
-    build_waterhose_admm_builder,
+    WaterhoseCoupledBuildInfo,
+    build_waterhose_coupled_builder,
     build_waterhose_robot_model,
 )
 
@@ -48,7 +49,7 @@ _DEFAULT_ASSET_ROOT = str(
 class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     """Newton coupled-manager path for the waterhose robot demo."""
 
-    _build_info: ClassVar[WaterhoseAdmmBuildInfo | None] = None
+    _build_info: ClassVar[WaterhoseCoupledBuildInfo | None] = None
     _plug_body_id: ClassVar[int | None] = None
     _tip_body_id: ClassVar[int | None] = None
     _right_ee_body_id: ClassVar[int | None] = None
@@ -88,13 +89,13 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     def instantiate_builder_from_stage(cls) -> None:
         cfg = cls._waterhose_cfg()
         num_envs = max(1, int(getattr(cfg, "num_envs", 1)))
-        if num_envs != 1 and getattr(cfg, "solver_type", "") in {"waterhose_admm", "waterhose_one_way"}:
+        if num_envs != 1:
             raise RuntimeError(
-                "The coupled-manager waterhose task is single-env until Newton's coupled ModelView supports "
-                "compact per-entry multi-world views for MJWarp. Use Isaac-Waterhose-Robot-Demo-v0 for "
-                "multi-env runs today."
+                "The coupled-manager waterhose task is single-env: Newton's coupled ModelView does not yet "
+                "support multi-world views for the MuJoCo (MJWarp) entry. Use Isaac-Waterhose-Robot-Demo-v0 "
+                "for multi-env runs today."
             )
-        builder, build_info = build_waterhose_admm_builder(
+        builder, build_info = build_waterhose_coupled_builder(
             getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT),
             include_proxy_bodies=bool(getattr(cfg, "include_proxy_bodies", False)),
             num_envs=num_envs,
@@ -602,9 +603,6 @@ class WaterhoseVBDSolverCfg(NewtonSolverCfg):
     rigid_joint_angular_ke: float = 1.0e6
 
 
-NewtonWaterhoseAdmmManager = NewtonWaterhoseCoupledManager
-
-
 @configclass
 class WaterhoseAdmmSolverCfg(CoupledSolverCfg):
     """ADMM coupled solver config for the waterhose robot demo."""
@@ -751,6 +749,28 @@ class WaterhoseOneWaySolverCfg(CoupledSolverCfg):
                 include_body_shapes=True,
             ),
         ]
+
+
+@configclass
+class WaterhoseTwoWaySolverCfg(WaterhoseOneWaySolverCfg):
+    """Experimental two-way proxy coupling for the waterhose robot demo.
+
+    Uses the same embedded gripper proxies as the one-way config, but harvested
+    proxy contact wrenches are fed back to the MuJoCo robot
+    (``coupling_type="proxy"``). Newton applies the full proxy wrench including
+    tangential friction, so the robot reacts more strongly than the one-way
+    default. Treat as experimental.
+    """
+
+    solver_type: str = "waterhose_two_way"
+    coupling_type: str = "proxy"
+    proxy_coupling: ProxyCouplingCfg = ProxyCouplingCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.proxy_coupling.proxies:
+            self.proxy_coupling.proxies = list(self.one_way_coupling.proxies)
+            self.proxy_coupling.iterations = 1
 
 
 def _find_body(labels: list[str], suffix_or_token: str) -> int | None:

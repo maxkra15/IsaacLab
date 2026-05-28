@@ -134,10 +134,10 @@ if args_cli.teleop:
     args_cli.mode = "teleop"
 if args_cli.num_envs < 1:
     parser.error("--num_envs must be at least 1.")
-if args_cli.num_envs != 1 and ("admm" in args_cli.task.lower() or "oneway-coupled" in args_cli.task.lower()):
+if args_cli.num_envs != 1 and ("admm" in args_cli.task.lower() or "coupled" in args_cli.task.lower()):
     parser.error(
-        "The coupled-manager waterhose tasks are single-env only until Newton's coupled ModelView supports "
-        "compact per-entry multi-world views. Use Isaac-Waterhose-Robot-Demo-v0 for multi-env runs today."
+        "The coupled-manager waterhose tasks are single-env only: Newton's coupled ModelView does not yet "
+        "support multi-world MuJoCo views. Use Isaac-Waterhose-Robot-Demo-v0 for multi-env runs today."
     )
 if args_cli.mode == "teleop" and args_cli.teleop_device not in (None, "spacemouse"):
     parser.error("This demo currently supports --teleop_device spacemouse.")
@@ -149,7 +149,7 @@ selected_visualizers = validate_visualizers(args_cli, parser)
 
 def _configure_env_cfg(env_cfg) -> None:
     from isaaclab_newton.physics import NewtonCfg  # noqa: PLC0415
-    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.admm_manager import (  # noqa: PLC0415
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_manager import (  # noqa: PLC0415
         WaterhoseAdmmSolverCfg,
         WaterhoseOneWaySolverCfg,
     )
@@ -225,8 +225,8 @@ def _set_task_teleop_enabled(env_cfg, enabled: bool) -> None:
     """Enable teleop on the selected waterhose Newton manager."""
 
     solver_cfg = env_cfg.sim.physics.solver_cfg
-    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.admm_manager import (  # noqa: PLC0415
-        NewtonWaterhoseAdmmManager,
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_manager import (  # noqa: PLC0415
+        NewtonWaterhoseCoupledManager,
         WaterhoseAdmmSolverCfg,
         WaterhoseOneWaySolverCfg,
     )
@@ -236,7 +236,7 @@ def _set_task_teleop_enabled(env_cfg, enabled: bool) -> None:
     )
 
     if isinstance(solver_cfg, (WaterhoseAdmmSolverCfg, WaterhoseOneWaySolverCfg)):
-        NewtonWaterhoseAdmmManager.set_teleop_enabled(enabled)
+        NewtonWaterhoseCoupledManager.set_teleop_enabled(enabled)
     elif isinstance(solver_cfg, WaterhoseNewtonSolverCfg):
         NewtonWaterhoseManager.set_teleop_enabled(enabled)
 

@@ -19,7 +19,7 @@ The Newton dependency is PR 2848. This branch was verified with:
 ```text
 branch: pr-2848-coupled-solver-framework-latest
 tracks: origin/pr-2848-head
-commit: c2f21df3acc0f06d207812810b2e27ca7c4da08c
+ref: refs/pull/2848/head
 ```
 
 For a separate Newton checkout:
@@ -241,26 +241,59 @@ Mimic task smoke run:
 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --task Isaac-Waterhose-Robot-Demo-Mimic-v0 --vis none --num_envs 2 --max_steps 1 --profile
 ```
 
+Coupled task (stable one-way proxy coupling, recommended):
+
+```bash
+DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --task Isaac-Waterhose-Robot-Demo-Coupled-v0 --vis newton --num_envs 1 --max_steps 1000
+```
+
+Experimental two-way coupled task (robot feels the cable):
+
+```bash
+DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --task Isaac-Waterhose-Robot-Demo-TwoWay-Coupled-Experimental-v0 --vis newton --num_envs 1 --max_steps 1000
+```
+
 Experimental ADMM task:
 
 ```bash
 DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --task Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0 --vis newton --num_envs 1 --max_steps 1000
 ```
 
-The ADMM task is single-env only in this runner.
+The coupled tasks (one-way, two-way, ADMM) are single-env only in this runner.
 
-## ADMM Coupling Architecture
+## Coupled Architecture
 
-The ADMM path is implemented in:
+The coupled waterhose path shares one task-local model builder and Newton
+coupled-manager, with thin per-coupling env configs on top:
 
 ```text
-admm_builder.py
-admm_manager.py
-admm_env_cfg.py
-admm_mdp.py
+coupled_builder.py   # task-local combined Newton model (robot + VBD cable/scene + gripper proxies)
+coupled_manager.py   # NewtonWaterhoseCoupledManager + VBD/OneWay/TwoWay/ADMM solver configs
+coupled_mdp.py       # observation / termination helpers
+coupled_env_cfg.py   # shared scene + MDP terms + WaterhoseRobotDemoCoupledEnvCfg base
+one_way_env_cfg.py   # canonical, stable one-way proxy coupling (recommended default)
+two_way_env_cfg.py   # experimental two-way proxy coupling (robot feels the cable)
+admm_env_cfg.py      # experimental ADMM cross-solver coupling
 ```
 
-It builds a task-local combined Newton model and uses the Newton coupled-solver framework through `NewtonCoupledManager`. The model contains the MuJoCo robot, VBD cable/fridge/plug scene, and contact/coupling definitions between the robot gripper side and the VBD cable side. The config uses `WaterhoseAdmmSolverCfg`, `CoupledSolverEntryCfg`, `AdmmCouplingCfg`, and a VBD sub-solver config.
+All variants build the same task-local combined Newton model through
+`NewtonCoupledManager`: the MuJoCo robot, the VBD cable/fridge/plug scene, and
+(for the proxy couplings) duplicated gripper-finger proxy bodies embedded in the
+VBD world. The coupling is chosen purely by the solver config —
+`WaterhoseOneWaySolverCfg` (canonical), `WaterhoseTwoWaySolverCfg`, or
+`WaterhoseAdmmSolverCfg`.
+
+The recommended, stable path is the one-way proxy coupling: the robot drives the
+gripper proxies, cable/gripper contact is resolved entirely inside the VBD
+solver, and harvested proxy feedback is discarded so the cable cannot push the
+robot. This mirrors the proven reference demo's contact architecture.
+
+### Experimental ADMM coupling
+
+The ADMM path steps the robot (MuJoCo) and cable (VBD) as separate solvers and
+reconciles their gripper/cable contact with linearized ADMM each step. It uses
+`WaterhoseAdmmSolverCfg`, `CoupledSolverEntryCfg`, `AdmmCouplingCfg`, and a VBD
+sub-solver config.
 
 This approach is architecturally attractive because it is closer to a single coupled Newton simulation. In the long term, that is the likely direction for a proper coupled, batched, Isaac Lab-native task.
 
