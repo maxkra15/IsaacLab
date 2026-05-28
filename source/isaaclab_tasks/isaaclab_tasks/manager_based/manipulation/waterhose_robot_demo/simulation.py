@@ -29,15 +29,11 @@ from pathlib import Path
 
 os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
 
-import mujoco_warp as _mjw
 import numpy as np
 import warp as wp
 
 import newton
-from isaaclab_newton.ik.newton_ik_manager import NewtonIKManager, NewtonIKPoseObjective
-from isaaclab_newton.ik.newton_ik_manager_cfg import NewtonIKManagerCfg
 from newton import GeoType
-from .cable_curve_import import add_cable_from_usd_curve
 
 # ---------------------------------------------------------------------------
 # Warp kernels - coupling
@@ -305,6 +301,11 @@ def _default_scene_usd_path() -> str:
     return str((_DEFAULT_ASSET_ROOT / "Waterhose" / "Cable008" / "Cable008_Body.usda").resolve())
 
 
+def _debug_startup(message: str) -> None:
+    if os.getenv("WATERHOSE_DEBUG_STARTUP", "").lower() in {"1", "true", "yes", "on"}:
+        print(f"[waterhose-startup] {message}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -455,7 +456,7 @@ def _get_initial_joint_q() -> list[float]:
 
 
 class WaterhoseRobotDemoSimulation:
-    def __init__(self, viewer, args):
+    def __init__(self, viewer, args, preloaded_vbd_scene=None):
         self.viewer = viewer
         self.args = args
         self.asset_root = Path(getattr(args, "asset_root", _DEFAULT_ASSET_ROOT)).expanduser().resolve()
@@ -531,6 +532,12 @@ class WaterhoseRobotDemoSimulation:
         self.pull_distance = 0.06  # [m] how far to pull along -insertion_dir
         self.pull_duration = 4.0  # [s] smoothstep duration for pull
 
+        if preloaded_vbd_scene is None:
+            self._preloaded_vbd_builder = self._create_vbd_builder()
+            self._load_vbd_static_scene(self._preloaded_vbd_builder)
+        else:
+            self._preloaded_vbd_builder, self.scene_body_ids, self._scene_shape_ids = preloaded_vbd_scene
+
         # ----- MuJoCo world (robot only) -----
         self._setup_mujoco_world(args)
 
@@ -566,6 +573,10 @@ class WaterhoseRobotDemoSimulation:
     # ------------------------------------------------------------------
 
     def _setup_mujoco_world(self, args):
+        import mujoco_warp as _mjw  # noqa: PLC0415
+
+        sim_device = wp.get_device(args.device)
+        _debug_startup("mujoco:build_robot")
         robot = self.setup_robot_builder()
         scene = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(scene)
@@ -573,11 +584,15 @@ class WaterhoseRobotDemoSimulation:
         scene.add_builder(robot)
 
         self._mujoco_display_builder = scene
-        self.single_robot_model = robot.finalize()
-        self.mujoco_model = scene.finalize()
+        _debug_startup("mujoco:finalize_single_robot")
+        self.single_robot_model = robot.finalize(device=sim_device)
+        _debug_startup("mujoco:finalize_scene")
+        self.mujoco_model = scene.finalize(device=sim_device)
 
+        _debug_startup("mujoco:eval_fk_model")
         newton.eval_fk(self.mujoco_model, self.mujoco_model.joint_q, self.mujoco_model.joint_qd, self.mujoco_model)
 
+        _debug_startup("mujoco:collision_pipeline")
         self.mujoco_collision_pipeline = newton.CollisionPipeline(
             self.mujoco_model,
             reduce_contacts=True,
@@ -587,6 +602,7 @@ class WaterhoseRobotDemoSimulation:
         if not hasattr(_mjw, "set_length_range"):
             _mjw.set_length_range = lambda m, d: None
 
+        _debug_startup("mujoco:solver")
         self.mujoco_solver = newton.solvers.SolverMuJoCo(
             self.mujoco_model,
             solver="newton",
@@ -605,15 +621,18 @@ class WaterhoseRobotDemoSimulation:
         self.state_1 = self.mujoco_model.state()
         self.control = self.mujoco_model.control()
 
+        _debug_startup("mujoco:eval_fk_state")
         newton.eval_fk(self.mujoco_model, self.mujoco_model.joint_q, self.mujoco_model.joint_qd, self.state_0)
+        _debug_startup("mujoco:collide_initial")
         self.mujoco_contacts = self.mujoco_collision_pipeline.contacts()
         self.mujoco_collision_pipeline.collide(self.state_0, self.mujoco_contacts)
+        _debug_startup("mujoco:done")
 
     # ------------------------------------------------------------------
     # VBD world (fridge scene + cable)
     # ------------------------------------------------------------------
 
-    def _setup_vbd_world(self, args):
+    def _create_vbd_builder(self):
         builder = newton.ModelBuilder()
         builder.rigid_contact_margin = 0.0
         builder.rigid_gap = 0.001
@@ -622,11 +641,15 @@ class WaterhoseRobotDemoSimulation:
         builder.default_shape_cfg.ke = VBD_KE
         builder.default_shape_cfg.kd = VBD_KD
         builder.default_shape_cfg.mu = 0.2
+        return builder
 
+    def _load_vbd_static_scene(self, builder):
         # Load fridge scene (static, zero mass).
         scene_usd_path = str(self.scene_usd_path)
         self.scene_body_ids: list[int] = []
+        self._scene_shape_ids = []
         if os.path.isfile(scene_usd_path):
+            _debug_startup("vbd:add_scene_usd")
             scene_result = builder.add_usd(
                 scene_usd_path,
                 xform=self.fridge_xform,
@@ -653,8 +676,21 @@ class WaterhoseRobotDemoSimulation:
                     builder.add_shape_collision_filter_pair(scene_shape_ids[i], scene_shape_ids[j])
 
             self._scene_shape_ids = scene_shape_ids
+            _debug_startup("vbd:add_scene_usd_done")
+
+    def _setup_vbd_world(self, args):
+        _debug_startup("vbd:builder")
+        builder = getattr(self, "_preloaded_vbd_builder", None)
+        if builder is None:
+            builder = self._create_vbd_builder()
+            self._load_vbd_static_scene(builder)
+        else:
+            self._preloaded_vbd_builder = None
 
         # Load cables from USD (two curves)
+        _debug_startup("vbd:add_cables")
+        from .cable_curve_import import add_cable_from_usd_curve  # noqa: PLC0415
+
         cable_usd_path = str(self.cable_usd_path)
         curve_prim_paths = ["/World/cable001/curve_0", "/World/cable002/curve_0"]
 
@@ -740,6 +776,7 @@ class WaterhoseRobotDemoSimulation:
 
         # Add proxy gripper bodies from MuJoCo robot into VBD world.
         if self.enable_proxy_sync:
+            _debug_startup("vbd:create_proxies")
             self._create_proxy_bodies(builder)
 
         # Pre-create a dormant fixed joint between the tip capsule and an anchor
@@ -793,10 +830,12 @@ class WaterhoseRobotDemoSimulation:
         builder.color()
         self._vbd_display_builder = builder
         sim_device = wp.get_device(args.device)
+        _debug_startup("vbd:finalize")
         self.vbd_model = builder.finalize(device=sim_device)
         self.vbd_model.set_gravity((0.0, 0.0, -9.81))
 
         if self.vbd_mesh_use_sdf:
+            _debug_startup("vbd:build_sdf")
             shape_type_np = self.vbd_model.shape_type.numpy()
             scene_shape_set = set(getattr(self, "_scene_shape_ids", []))
             for s in range(self.vbd_model.shape_count):
@@ -805,6 +844,7 @@ class WaterhoseRobotDemoSimulation:
                     if mesh is not None:
                         mesh.build_sdf(max_resolution=self.vbd_mesh_sdf_max_resolution)
 
+        _debug_startup("vbd:solver")
         self.vbd_solver = newton.solvers.SolverVBD(
             self.vbd_model,
             iterations=15,
@@ -855,9 +895,11 @@ class WaterhoseRobotDemoSimulation:
 
         # Initialize proxy sync buffers (GPU arrays for kernel launches).
         if self.enable_proxy_sync:
+            _debug_startup("vbd:init_coupling_buffers")
             self._init_coupling_buffers()
 
         # Explicit collision pipeline + pre-allocated contacts (capture-safe).
+        _debug_startup("vbd:collision_pipeline")
         self.vbd_collision_pipeline = newton.CollisionPipeline(
             self.vbd_model,
             broad_phase=getattr(args, "broad_phase", "explicit"),
@@ -866,11 +908,13 @@ class WaterhoseRobotDemoSimulation:
         self.vbd_contacts = self.vbd_collision_pipeline.contacts()
 
         # Warm up VBD collision pipeline (compile kernels before CUDA graph capture).
+        _debug_startup("vbd:collide_initial")
         self.vbd_collision_pipeline.collide(self.vbd_state_0, self.vbd_contacts)
 
         # Transform cable body positions by fridge_xform (cable was loaded at
         # USD-native position; scene was loaded with xform= so it's already
         # transformed).  VBD operates on body_q directly, so this persists.
+        _debug_startup("vbd:transform_cable")
         self._transform_cable_bodies(self.fridge_xform)
         if getattr(args, "print_cable_poses", False):
             self._print_cable_pose_summary("after_fridge_xform", cable_results)
@@ -892,7 +936,9 @@ class WaterhoseRobotDemoSimulation:
             self.tip_half_height = 0.022
 
         # Pre-compute rendering geometry for VBD overlay.
+        _debug_startup("vbd:render_data")
         self._setup_vbd_render_data(cable_results)
+        _debug_startup("vbd:done")
 
     # ------------------------------------------------------------------
     # VBD render data
@@ -1328,6 +1374,9 @@ class WaterhoseRobotDemoSimulation:
     # ------------------------------------------------------------------
 
     def setup_ik(self):
+        from isaaclab_newton.ik.newton_ik_manager import NewtonIKManager, NewtonIKPoseObjective  # noqa: PLC0415
+        from isaaclab_newton.ik.newton_ik_manager_cfg import NewtonIKManagerCfg  # noqa: PLC0415
+
         body_q_np = self.state_0.body_q.numpy()
 
         self.ee_tfs = []

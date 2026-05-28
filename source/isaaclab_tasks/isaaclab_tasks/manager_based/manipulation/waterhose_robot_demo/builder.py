@@ -8,8 +8,8 @@
 from __future__ import annotations
 
 
-def create_simulation(viewer, args):
+def create_simulation(viewer, args, preloaded_vbd_scene=None):
     """Create the local Newton simulation."""
     from .simulation import WaterhoseRobotDemoSimulation  # noqa: PLC0415
 
-    return WaterhoseRobotDemoSimulation(viewer, args)
+    return WaterhoseRobotDemoSimulation(viewer, args, preloaded_vbd_scene=preloaded_vbd_scene)

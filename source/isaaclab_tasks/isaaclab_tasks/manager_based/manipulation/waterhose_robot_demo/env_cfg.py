@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import isaaclab.sim as sim_utils
+from isaaclab.assets import AssetBaseCfg
 from isaaclab.devices.device_base import DevicesCfg
 from isaaclab.devices.keyboard import Se3KeyboardCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
@@ -84,10 +86,20 @@ class EventCfg:
 
 
 @configclass
+class WaterhoseSceneCfg(InteractiveSceneCfg):
+    """Scene-level assets for the waterhose robot demo."""
+
+    light = AssetBaseCfg(
+        prim_path="/World/Light",
+        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
+    )
+
+
+@configclass
 class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
     """Manager-style waterhose robot demo using a local Newton simulation."""
 
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1, env_spacing=2.5, replicate_physics=False)
+    scene: WaterhoseSceneCfg = WaterhoseSceneCfg(num_envs=1, env_spacing=2.5, replicate_physics=False)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     rewards: RewardsCfg = RewardsCfg()
@@ -137,11 +149,3 @@ class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
                 ),
             }
         )
-
-
-@configclass
-class WaterhoseRobotDemoEnvCfg_PLAY(WaterhoseRobotDemoEnvCfg):
-    """Play/debug variant for the waterhose robot demo."""
-
-    def __post_init__(self):
-        super().__post_init__()

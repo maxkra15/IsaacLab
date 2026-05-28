@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,9 @@ import torch
 from isaaclab.physics import PhysicsEvent, PhysicsManager, SceneDataBackend, SceneDataFormat
 from isaaclab.utils.configclass import configclass
 from isaaclab_newton.physics import NewtonManager, NewtonSolverCfg
+from isaaclab_newton.physics.newton_manager import NewtonSceneDataBackend
+
+from .kit_display import assign_display_prim_paths, author_display_usd
 
 
 _DEFAULT_ASSET_ROOT = str(
@@ -26,7 +30,7 @@ _DEFAULT_ASSET_ROOT = str(
 )
 
 
-class _WaterhoseSceneDataBackend(SceneDataBackend):
+class _WaterhoseSceneDataBackend(NewtonSceneDataBackend):
     """Scene-data adapter exposing the manager's current display model."""
 
     def __init__(self):
@@ -67,6 +71,10 @@ class NewtonWaterhoseManager(NewtonManager):
     _combined_state_1: Any | None = None
     _combined_control: Any | None = None
     _combined_robot_body_count: int = 0
+    _combined_robot_shape_count: int = 0
+    _kit_skipped_shape_ids: set[int] = set()
+    _kit_display_model_id: int | None = None
+    _kit_display_ready: bool = False
     _teleop_enabled: bool = False
     _is_playing: bool = True
 
@@ -82,6 +90,7 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._display_state_1 = None
         cls._display_control = None
         cls._clear_combined_display()
+        cls._clear_kit_display_state()
         cls._teleop_enabled = False
         cls._is_playing = True
 
@@ -95,6 +104,7 @@ class NewtonWaterhoseManager(NewtonManager):
     @classmethod
     def forward(cls) -> None:
         cls._publish_display_state()
+        NewtonManager.sync_transforms_to_usd()
 
     @classmethod
     def get_scene_data_backend(cls) -> SceneDataBackend:
@@ -114,6 +124,7 @@ class NewtonWaterhoseManager(NewtonManager):
     @classmethod
     def pre_render(cls) -> None:
         cls._publish_display_state()
+        NewtonManager.pre_render()
 
     @classmethod
     def close(cls) -> None:
@@ -124,6 +135,7 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._display_state_1 = None
         cls._display_control = None
         cls._clear_combined_display()
+        cls._clear_kit_display_state()
         cls._scene_data_backend = None
         super().close()
 
@@ -351,11 +363,14 @@ class NewtonWaterhoseManager(NewtonManager):
     def _rebuild_runtime(cls) -> None:
         cls._close_runtime()
         cls._ensure_newton_on_path()
-        from .builder import create_simulation  # noqa: PLC0415
+        runtime_args = cls._make_runtime_args()
 
         cls.dispatch_event(PhysicsEvent.MODEL_INIT)
+        preloaded_vbd_scene = cls._preload_vbd_static_scene(runtime_args)
+        from .builder import create_simulation  # noqa: PLC0415
+
         cls._viewer = cls._make_viewer()
-        cls._runtime = create_simulation(cls._viewer, cls._make_runtime_args())
+        cls._runtime = create_simulation(cls._viewer, runtime_args, preloaded_vbd_scene=preloaded_vbd_scene)
         cls._publish_display_state()
         PhysicsManager._sim_time = cls.get_sim_time()
         cls.dispatch_event(PhysicsEvent.PHYSICS_READY)
@@ -414,6 +429,62 @@ class NewtonWaterhoseManager(NewtonManager):
         return getattr(cfg, "solver_cfg", cfg)
 
     @classmethod
+    def _preload_vbd_static_scene(cls, args):
+        import newton  # noqa: PLC0415
+        import warp as wp  # noqa: PLC0415
+
+        asset_root = Path(getattr(args, "asset_root", _DEFAULT_ASSET_ROOT)).expanduser().resolve()
+        scene_usd_path = asset_root / "Waterhose" / "Cable008" / "Cable008_Body.usda"
+
+        builder = newton.ModelBuilder()
+        builder.rigid_contact_margin = 0.0
+        builder.rigid_gap = 0.001
+        builder.default_shape_cfg.density = 1000.0
+        builder.default_shape_cfg.ke = 1.0e3
+        builder.default_shape_cfg.kd = 0.0
+        builder.default_shape_cfg.mu = 0.2
+
+        scene_body_ids: list[int] = []
+        scene_shape_ids: list[int] = []
+        if os.path.isfile(scene_usd_path):
+            cls._debug_startup("vbd:preload_scene_usd")
+            scene_result = builder.add_usd(
+                str(scene_usd_path),
+                xform=cls._compute_fridge_xform(wp),
+                root_path="/root",
+                load_sites=False,
+                load_visual_shapes=True,
+                hide_collision_shapes=False,
+                parse_mujoco_options=False,
+                only_load_enabled_joints=True,
+                only_load_enabled_rigid_bodies=False,
+            )
+            scene_body_ids = sorted({int(v) for v in scene_result["path_body_map"].values()})
+            for body_id in scene_body_ids:
+                builder.body_mass[body_id] = 0.0
+                builder.body_inv_mass[body_id] = 0.0
+                builder.body_inertia[body_id] = wp.mat33()
+                builder.body_inv_inertia[body_id] = wp.mat33()
+
+            scene_shape_ids = sorted(int(v) for v in scene_result["path_shape_map"].values())
+            for i in range(len(scene_shape_ids)):
+                for j in range(i + 1, len(scene_shape_ids)):
+                    builder.add_shape_collision_filter_pair(scene_shape_ids[i], scene_shape_ids[j])
+            cls._debug_startup("vbd:preload_scene_usd_done")
+
+        return builder, scene_body_ids, scene_shape_ids
+
+    @staticmethod
+    def _compute_fridge_xform(wp):
+        table_half_z = 0.5 * (0.6 - 0.215)
+        table_z = table_half_z
+        table_top_z = table_z + table_half_z
+        fridge_z_offset = 0.902 + table_top_z
+        fridge_y_offset = (0.293 - 0.395) / 2
+        quat = wp.quat_from_axis_angle(wp.vec3(0, 0, 1), wp.pi / 2)
+        return wp.transform(wp.vec3(0.95, fridge_y_offset, fridge_z_offset), quat)
+
+    @classmethod
     def _publish_display_state(cls) -> None:
         runtime = cls._runtime
         if runtime is None:
@@ -448,6 +519,7 @@ class NewtonWaterhoseManager(NewtonManager):
         builder.add_builder(runtime._mujoco_display_builder, label_prefix="mujoco")
         builder.add_builder(runtime._vbd_display_builder, label_prefix="vbd")
         cls._prepare_display_builder(builder)
+        assign_display_prim_paths(builder)
         model = builder.finalize(device=PhysicsManager._device)
         model.num_envs = 1
 
@@ -457,6 +529,10 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._combined_state_1 = model.state()
         cls._combined_control = model.control()
         cls._combined_robot_body_count = int(runtime.mujoco_model.body_count)
+        cls._combined_robot_shape_count = int(runtime.mujoco_model.shape_count)
+        cls._kit_skipped_shape_ids = {
+            cls._combined_robot_shape_count + int(shape_id) for shape_id in getattr(runtime, "_scene_shape_ids", [])
+        }
 
     @staticmethod
     def _prepare_display_builder(builder) -> None:
@@ -520,6 +596,10 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._combined_state_1 = None
         cls._combined_control = None
         cls._combined_robot_body_count = 0
+        cls._combined_robot_shape_count = 0
+        cls._kit_skipped_shape_ids = set()
+        cls._kit_display_model_id = None
+        cls._kit_display_ready = False
 
     @classmethod
     def _publish_to_newton_visualizer(cls, model, state_0, state_1, control) -> None:
@@ -533,6 +613,82 @@ class NewtonWaterhoseManager(NewtonManager):
         NewtonManager._control = control
         NewtonManager._num_envs = 1
         NewtonManager._scene_data_backend = cls.get_scene_data_backend()
+        if cls._kit_visualizer_requested():
+            cls._ensure_kit_display(model)
+        NewtonManager._mark_transforms_dirty()
+
+    @classmethod
+    def _kit_visualizer_requested(cls) -> bool:
+        sim = PhysicsManager._sim
+        if sim is None:
+            return False
+        try:
+            return "kit" in set(sim.resolve_visualizer_types())
+        except Exception:
+            return False
+
+    @classmethod
+    def _ensure_kit_display(cls, model) -> None:
+        if cls._kit_display_model_id != id(model) or not cls._kit_display_ready:
+            start = time.perf_counter()
+            cls._debug_kit(f"ensure_kit_display:author_start skipped_shapes={len(cls._kit_skipped_shape_ids)}")
+            author_display_usd(
+                model,
+                skipped_shape_ids=cls._kit_skipped_shape_ids,
+            )
+            cls._debug_kit(f"ensure_kit_display:author_done dt={time.perf_counter() - start:.3f}s")
+            cls._kit_display_model_id = id(model)
+            cls._kit_display_ready = True
+            start = time.perf_counter()
+            cls._debug_kit("ensure_kit_display:fabric_start")
+            cls._initialize_kit_fabric_sync(model)
+            cls._debug_kit(f"ensure_kit_display:fabric_done dt={time.perf_counter() - start:.3f}s")
+        elif NewtonManager._usdrt_stage is None:
+            cls._initialize_kit_fabric_sync(model)
+
+    @classmethod
+    def _initialize_kit_fabric_sync(cls, model) -> None:
+        import usdrt  # noqa: PLC0415
+        from isaaclab.sim.utils.stage import get_current_stage  # noqa: PLC0415
+        from isaaclab_newton.physics import NewtonManager  # noqa: PLC0415
+
+        usdrt_stage = get_current_stage(fabric=True)
+        if usdrt_stage is None:
+            raise RuntimeError("Cannot initialize waterhose Kit display: no Fabric stage is available.")
+
+        NewtonManager._usdrt_stage = usdrt_stage
+        body_paths = list(getattr(model, "body_label", []) or [])
+        missing_paths = []
+        for body_id, prim_path in enumerate(body_paths):
+            prim = usdrt_stage.GetPrimAtPath(prim_path)
+            if not prim.IsValid():
+                missing_paths.append(prim_path)
+                continue
+            prim.CreateAttribute(NewtonManager._newton_index_attr, usdrt.Sdf.ValueTypeNames.UInt, True)
+            prim.GetAttribute(NewtonManager._newton_index_attr).Set(body_id)
+            prim.AddAppliedSchema("PhysicsRigidBodyAPI")
+            xformable = usdrt.Rt.Xformable(prim)
+            if not xformable.HasWorldXform():
+                xformable.SetWorldXformFromUsd()
+        if missing_paths:
+            sample = ", ".join(missing_paths[:5])
+            raise RuntimeError(f"Waterhose Kit display prims were not found in Fabric stage: {sample}")
+
+        NewtonManager._usd_xform_ops.clear()
+        NewtonManager._mark_transforms_dirty()
+        NewtonManager.sync_transforms_to_usd()
+
+    @classmethod
+    def _clear_kit_display_state(cls) -> None:
+        cls._kit_display_model_id = None
+        cls._kit_display_ready = False
+        try:
+            from isaaclab_newton.physics import NewtonManager  # noqa: PLC0415
+        except Exception:
+            return
+        NewtonManager._usdrt_stage = None
+        NewtonManager._transforms_dirty = False
+        NewtonManager._usd_xform_ops.clear()
 
     @classmethod
     def _clear_newton_visualizer_state(cls) -> None:
@@ -545,12 +701,23 @@ class NewtonWaterhoseManager(NewtonManager):
         NewtonManager._state_1 = None
         NewtonManager._control = None
         NewtonManager._scene_data_backend = None
+        cls._clear_kit_display_state()
 
     @classmethod
     def _require_runtime(cls):
         if cls._runtime is None:
             raise RuntimeError("Waterhose physics runtime is not initialized.")
         return cls._runtime
+
+    @staticmethod
+    def _debug_kit(message: str) -> None:
+        if os.getenv("WATERHOSE_DEBUG_KIT_DISPLAY", "").lower() in {"1", "true", "yes", "on"}:
+            print(f"[waterhose-kit] {message}", flush=True)
+
+    @staticmethod
+    def _debug_startup(message: str) -> None:
+        if os.getenv("WATERHOSE_DEBUG_STARTUP", "").lower() in {"1", "true", "yes", "on"}:
+            print(f"[waterhose-startup] {message}", flush=True)
 
 
 @configclass
