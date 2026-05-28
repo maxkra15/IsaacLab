@@ -22,7 +22,7 @@ from isaaclab.utils.configclass import configclass
 from isaaclab_newton.physics import NewtonManager, NewtonSolverCfg
 from isaaclab_newton.physics.newton_manager import NewtonSceneDataBackend
 
-from .kit_display import assign_display_prim_paths, author_display_usd
+from .kit_display import assign_display_prim_paths, author_display_usd, author_static_scene_references
 
 
 _DEFAULT_ASSET_ROOT = str(
@@ -59,7 +59,9 @@ class NewtonWaterhoseManager(NewtonManager):
     """Owns the local Newton waterhose runtime through IsaacLab's physics lifecycle."""
 
     _runtime: Any | None = None
+    _runtimes: list[Any] = []
     _viewer: Any | None = None
+    _viewers: list[Any] = []
     _scene_data_backend: _WaterhoseSceneDataBackend | None = None
     _visualization_model: Any | None = None
     _display_state_0: Any | None = None
@@ -70,8 +72,8 @@ class NewtonWaterhoseManager(NewtonManager):
     _combined_state_0: Any | None = None
     _combined_state_1: Any | None = None
     _combined_control: Any | None = None
-    _combined_robot_body_count: int = 0
-    _combined_robot_shape_count: int = 0
+    _combined_body_slices: list[tuple[int, int, int]] = []
+    _combined_env_origins: np.ndarray | None = None
     _kit_skipped_shape_ids: set[int] = set()
     _kit_display_model_id: int | None = None
     _kit_display_ready: bool = False
@@ -84,7 +86,9 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._scene_data_backend = _WaterhoseSceneDataBackend()
         NewtonManager._scene_data_backend = cls._scene_data_backend
         cls._runtime = None
+        cls._runtimes = []
         cls._viewer = None
+        cls._viewers = []
         cls._visualization_model = None
         cls._display_state_0 = None
         cls._display_state_1 = None
@@ -117,15 +121,15 @@ class NewtonWaterhoseManager(NewtonManager):
 
     @classmethod
     def step(cls) -> None:
-        runtime = cls._runtime
-        if runtime is None or not cls._is_playing:
+        if not cls._runtimes or not cls._is_playing:
             return
         import warp as wp  # noqa: PLC0415
 
         with wp.ScopedDevice(PhysicsManager._device):
-            runtime.step()
+            for runtime in cls._runtimes:
+                runtime.step()
             cls._publish_display_state()
-        PhysicsManager._sim_time = float(getattr(runtime, "sim_time", PhysicsManager._sim_time))
+        PhysicsManager._sim_time = cls.get_sim_time()
 
     @classmethod
     def pre_render(cls) -> None:
@@ -187,6 +191,10 @@ class NewtonWaterhoseManager(NewtonManager):
         return cls._runtime
 
     @classmethod
+    def get_runtimes(cls) -> list[Any]:
+        return list(cls._runtimes)
+
+    @classmethod
     def get_visualization_model(cls):
         return cls._visualization_model
 
@@ -200,15 +208,25 @@ class NewtonWaterhoseManager(NewtonManager):
         return float(getattr(runtime, "sim_time", PhysicsManager._sim_time))
 
     @classmethod
+    def get_sim_times(cls) -> np.ndarray:
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(), 1), dtype=np.float32)
+        return np.asarray([[float(getattr(runtime, "sim_time", 0.0))] for runtime in cls._runtimes], dtype=np.float32)
+
+    @classmethod
     def set_teleop_enabled(cls, enabled: bool) -> None:
         cls._teleop_enabled = bool(enabled)
-        runtime = cls._runtime
-        if cls._teleop_enabled and runtime is not None and getattr(runtime, "auto_mode", True):
-            import warp as wp  # noqa: PLC0415
+        if not cls._teleop_enabled:
+            return
+        if not cls._runtimes:
+            return
+        import warp as wp  # noqa: PLC0415
 
-            with wp.ScopedDevice(PhysicsManager._device):
-                runtime.auto_mode = False
-                runtime._stop_auto_mode()
+        with wp.ScopedDevice(PhysicsManager._device):
+            for runtime in cls._runtimes:
+                if getattr(runtime, "auto_mode", True):
+                    runtime.auto_mode = False
+                    runtime._stop_auto_mode()
 
     @classmethod
     def teleop_enabled(cls) -> bool:
@@ -216,8 +234,23 @@ class NewtonWaterhoseManager(NewtonManager):
 
     @classmethod
     def apply_teleop_command(cls, command: torch.Tensor) -> None:
-        """Apply a 7D relative end-effector command to the manual IK target."""
-        runtime = cls._runtime
+        """Apply relative end-effector commands to the manual IK targets."""
+        if not cls._runtimes:
+            return
+        commands = command.detach()
+        if commands.ndim == 1:
+            commands = commands.reshape(1, -1)
+        commands = commands.to("cpu", dtype=torch.float32)
+
+        import warp as wp  # noqa: PLC0415
+
+        with wp.ScopedDevice(PhysicsManager._device):
+            for env_id, runtime in enumerate(cls._runtimes):
+                command_id = min(env_id, commands.shape[0] - 1)
+                cls._apply_teleop_command_to_runtime(runtime, commands[command_id])
+
+    @classmethod
+    def _apply_teleop_command_to_runtime(cls, runtime, command: torch.Tensor) -> None:
         if runtime is None:
             return
         if getattr(runtime, "auto_mode", True):
@@ -226,36 +259,38 @@ class NewtonWaterhoseManager(NewtonManager):
 
         import warp as wp  # noqa: PLC0415
 
-        with wp.ScopedDevice(PhysicsManager._device):
-            cmd = command.detach().to("cpu", dtype=torch.float32).numpy().reshape(-1)
-            if cmd.shape[0] < 6:
-                return
+        cmd = command.numpy().reshape(-1)
+        if cmd.shape[0] < 6:
+            return
 
-            tf = runtime.ee_tfs[0]
-            pos = wp.transform_get_translation(tf)
-            quat = wp.transform_get_rotation(tf)
-            dp = cmd[:3]
-            pos = pos + wp.vec3(float(dp[0]), float(dp[1]), float(dp[2]))
+        tf = runtime.ee_tfs[0]
+        pos = wp.transform_get_translation(tf)
+        quat = wp.transform_get_rotation(tf)
+        dp = cmd[:3]
+        pos = pos + wp.vec3(float(dp[0]), float(dp[1]), float(dp[2]))
 
-            axis_angle_eef = cmd[3:6]
-            angle = float(np.linalg.norm(axis_angle_eef))
-            if angle > 1.0e-8:
-                axis = axis_angle_eef / angle
-                dq = wp.quat_from_axis_angle(wp.vec3(float(axis[0]), float(axis[1]), float(axis[2])), angle)
-                quat = wp.normalize(quat * dq)
-            runtime.ee_tfs[0] = wp.transform(pos, quat)
+        axis_angle_eef = cmd[3:6]
+        angle = float(np.linalg.norm(axis_angle_eef))
+        if angle > 1.0e-8:
+            axis = axis_angle_eef / angle
+            dq = wp.quat_from_axis_angle(wp.vec3(float(axis[0]), float(axis[1]), float(axis[2])), angle)
+            quat = wp.normalize(quat * dq)
+        runtime.ee_tfs[0] = wp.transform(pos, quat)
 
-            if cmd.shape[0] >= 7:
-                gripper_value = float(runtime.sm_gripper_open_value if cmd[6] > 0.0 else runtime.sm_gripper_closed_value)
-                gripper_np = runtime.gripper_targets.numpy()
-                gripper_np[0] = gripper_value
-                wp.copy(runtime.gripper_targets, wp.array(gripper_np, dtype=wp.float32, device=runtime.gripper_targets.device))
-                runtime.gripper_targets_list[0] = gripper_value
-                runtime._sync_gripper_followers()
+        if cmd.shape[0] >= 7:
+            gripper_value = float(runtime.sm_gripper_open_value if cmd[6] > 0.0 else runtime.sm_gripper_closed_value)
+            gripper_np = runtime.gripper_targets.numpy()
+            gripper_np[0] = gripper_value
+            wp.copy(
+                runtime.gripper_targets,
+                wp.array(gripper_np, dtype=wp.float32, device=runtime.gripper_targets.device),
+            )
+            runtime.gripper_targets_list[0] = gripper_value
+            runtime._sync_gripper_followers()
 
     @classmethod
-    def current_phase(cls) -> int:
-        runtime = cls._runtime
+    def current_phase(cls, env_id: int = 0) -> int:
+        runtime = cls._runtime_for_env(env_id)
         if runtime is None or not hasattr(runtime, "sm_task_idx") or not hasattr(runtime, "sm_task_schedule"):
             return 0
         task_idx = int(runtime.sm_task_idx.numpy()[0])
@@ -263,32 +298,164 @@ class NewtonWaterhoseManager(NewtonManager):
         return int(schedule[min(task_idx, len(schedule) - 1)])
 
     @classmethod
+    def current_phases(cls) -> np.ndarray:
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(), 1), dtype=np.float32)
+        return np.asarray([[float(cls.current_phase(env_id))] for env_id in range(len(cls._runtimes))], dtype=np.float32)
+
+    @classmethod
+    def _body_pose(cls, runtime, state_name: str, body_id: int) -> np.ndarray:
+        state = getattr(runtime, state_name)
+        return state.body_q.numpy()[body_id].copy()
+
+    @classmethod
     def get_plug_pose(cls) -> np.ndarray:
-        runtime = cls._require_runtime()
-        body_id = int(getattr(runtime, "cable_head_body_idx", 0))
-        return runtime.vbd_state_0.body_q.numpy()[body_id].copy()
+        return cls.get_plug_poses()[0].copy()
+
+    @classmethod
+    def get_plug_poses(cls) -> np.ndarray:
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(), 7), dtype=np.float32)
+        return np.stack(
+            [
+                cls._body_pose(runtime, "vbd_state_0", int(getattr(runtime, "cable_head_body_idx", 0)))
+                for runtime in cls._runtimes
+            ]
+        ).astype(np.float32)
 
     @classmethod
     def get_tip_pose(cls) -> np.ndarray:
-        runtime = cls._require_runtime()
-        body_id = int(getattr(runtime, "tip_capsule_body_idx", 0))
-        return runtime.vbd_state_0.body_q.numpy()[body_id].copy()
+        return cls.get_tip_poses()[0].copy()
+
+    @classmethod
+    def get_tip_poses(cls) -> np.ndarray:
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(), 7), dtype=np.float32)
+        return np.stack(
+            [
+                cls._body_pose(runtime, "vbd_state_0", int(getattr(runtime, "tip_capsule_body_idx", 0)))
+                for runtime in cls._runtimes
+            ]
+        ).astype(np.float32)
+
+    @classmethod
+    def get_socket_poses(cls) -> np.ndarray:
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(), 7), dtype=np.float32)
+        return np.stack(
+            [
+                np.concatenate(
+                    (
+                        np.asarray(getattr(runtime, "_socket_pos_np", np.zeros(3)), dtype=np.float32),
+                        np.asarray(getattr(runtime, "_socket_rot_np", np.array([0.0, 0.0, 0.0, 1.0])), dtype=np.float32),
+                    )
+                )
+                for runtime in cls._runtimes
+            ]
+        ).astype(np.float32)
+
+    @classmethod
+    def get_object_poses(cls) -> dict[str, np.ndarray]:
+        return {
+            "hose_plug": cls.get_plug_poses(),
+            "hose_tip": cls.get_tip_poses(),
+            "socket": cls.get_socket_poses(),
+        }
 
     @classmethod
     def get_right_ee_pose(cls) -> np.ndarray:
-        runtime = cls._require_runtime()
-        labels = getattr(runtime.mujoco_model, "body_label", [])
-        suffix = "/right_gripper_end_effector"
-        for body_id, label in enumerate(labels):
-            if label == "right_gripper_end_effector" or str(label).endswith(suffix):
-                return runtime.state_0.body_q.numpy()[body_id].copy()
-        raise RuntimeError("Body 'right_gripper_end_effector' not found in waterhose robot model.")
+        return cls.get_right_ee_poses()[0].copy()
 
     @classmethod
-    def is_finite(cls) -> bool:
-        runtime = cls._runtime
-        if runtime is None:
-            return False
+    def get_right_ee_poses(cls) -> np.ndarray:
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(), 7), dtype=np.float32)
+        poses = []
+        for runtime in cls._runtimes:
+            labels = getattr(runtime.mujoco_model, "body_label", [])
+            suffix = "/right_gripper_end_effector"
+            body_id = None
+            for candidate_id, label in enumerate(labels):
+                if label == "right_gripper_end_effector" or str(label).endswith(suffix):
+                    body_id = candidate_id
+                    break
+            if body_id is None:
+                raise RuntimeError("Body 'right_gripper_end_effector' not found in waterhose robot model.")
+            poses.append(runtime.state_0.body_q.numpy()[body_id].copy())
+        return np.stack(poses).astype(np.float32)
+
+    @classmethod
+    def get_alignment_metrics(cls) -> np.ndarray:
+        """Return tip lateral error, insertion depth, and axis alignment per env."""
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(), 3), dtype=np.float32)
+        values = []
+        for runtime in cls._runtimes:
+            try:
+                tip_pose = runtime.vbd_state_0.body_q.numpy()[int(runtime.tip_capsule_body_idx)]
+                tip_pos = np.asarray(tip_pose[:3], dtype=np.float64)
+                tip_quat = np.asarray(tip_pose[3:7], dtype=np.float64)
+                socket_pos = np.asarray(runtime._socket_pos_np, dtype=np.float64)
+                insertion_dir = np.asarray(runtime._insertion_dir_np, dtype=np.float64)
+                insertion_dir /= max(float(np.linalg.norm(insertion_dir)), 1.0e-12)
+                delta = tip_pos - socket_pos
+                axial_depth = float(np.dot(delta, insertion_dir))
+                lateral = float(np.linalg.norm(delta - axial_depth * insertion_dir))
+                tip_axis = cls._quat_rotate_np(tip_quat, np.array([0.0, 0.0, 1.0], dtype=np.float64))
+                tip_axis /= max(float(np.linalg.norm(tip_axis)), 1.0e-12)
+                axis_cos = float(np.dot(tip_axis, insertion_dir))
+                values.append((lateral, axial_depth, axis_cos))
+            except (AttributeError, IndexError, TypeError, ValueError):
+                values.append((np.inf, -np.inf, 0.0))
+        return np.asarray(values, dtype=np.float32)
+
+    @classmethod
+    def get_subtask_term_signals(cls) -> dict[str, np.ndarray]:
+        """Return Mimic-style subtask completion flags for each environment."""
+        num_envs = len(cls._runtimes) if cls._runtimes else cls._configured_num_envs()
+        if not cls._runtimes:
+            false = np.zeros((num_envs,), dtype=bool)
+            return {"approach": false, "grasp": false, "align": false, "insert": false}
+
+        phases = cls.current_phases().reshape(-1).astype(np.int32)
+        ee_pos = cls.get_right_ee_poses()[:, :3].astype(np.float64)
+        plug_pos = cls.get_plug_poses()[:, :3].astype(np.float64)
+        metrics = cls.get_alignment_metrics().astype(np.float64)
+        lateral = metrics[:, 0]
+        axial_depth = metrics[:, 1]
+        axis_cos = metrics[:, 2]
+
+        approach_by_pose = np.linalg.norm(ee_pos - plug_pos, axis=1) < 0.055
+        grasp_by_state = approach_by_pose & cls._gripper_closed_mask()
+        align_by_pose = (lateral < 0.045) & (axial_depth > -0.035) & (np.abs(axis_cos) > 0.80)
+        insert_by_pose = cls.success_mask()
+
+        approach = (phases >= 1) | approach_by_pose
+        grasp = (phases >= 4) | grasp_by_state
+        align = (phases >= 9) | align_by_pose
+        insert = (phases >= 10) | insert_by_pose
+        return {
+            "approach": approach.astype(bool),
+            "grasp": grasp.astype(bool),
+            "align": align.astype(bool),
+            "insert": insert.astype(bool),
+        }
+
+    @classmethod
+    def is_finite(cls, env_id: int | None = None) -> bool:
+        if env_id is not None:
+            runtime = cls._runtime_for_env(env_id)
+            return False if runtime is None else cls._runtime_is_finite(runtime)
+        return bool(all(cls._runtime_is_finite(runtime) for runtime in cls._runtimes)) if cls._runtimes else False
+
+    @classmethod
+    def finite_mask(cls) -> np.ndarray:
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(), 1), dtype=np.float32)
+        return np.asarray([[float(cls._runtime_is_finite(runtime))] for runtime in cls._runtimes], dtype=np.float32)
+
+    @staticmethod
+    def _runtime_is_finite(runtime) -> bool:
         return bool(
             np.isfinite(runtime.state_0.body_q.numpy()).all()
             and np.isfinite(runtime.state_0.body_qd.numpy()).all()
@@ -296,14 +463,52 @@ class NewtonWaterhoseManager(NewtonManager):
             and np.isfinite(runtime.vbd_state_0.body_qd.numpy()).all()
         )
 
+    @staticmethod
+    def _quat_rotate_np(quat: np.ndarray, vec: np.ndarray) -> np.ndarray:
+        quat = np.asarray(quat, dtype=np.float64)
+        vec = np.asarray(vec, dtype=np.float64)
+        norm = float(np.linalg.norm(quat))
+        if not np.isfinite(norm) or norm <= 1.0e-12:
+            return vec.copy()
+        x, y, z, w = quat / norm
+        q_vec = np.array([x, y, z], dtype=np.float64)
+        t = 2.0 * np.cross(q_vec, vec)
+        return vec + w * t + np.cross(q_vec, t)
+
     @classmethod
-    def is_success(cls) -> bool:
-        """Return whether the plug has reached the task success condition."""
-        runtime = cls._runtime
-        if runtime is None or not cls.is_finite():
+    def _gripper_closed_mask(cls) -> np.ndarray:
+        mask = []
+        for runtime in cls._runtimes:
+            try:
+                target = float(runtime.gripper_targets.numpy()[0])
+                open_value = float(runtime.sm_gripper_open_value)
+                closed_value = float(runtime.sm_gripper_closed_value)
+                mask.append(abs(target - closed_value) <= abs(target - open_value))
+            except (AttributeError, IndexError, TypeError, ValueError):
+                mask.append(False)
+        return np.asarray(mask, dtype=bool)
+
+    @classmethod
+    def is_success(cls, env_id: int | None = None) -> bool:
+        if env_id is not None:
+            runtime = cls._runtime_for_env(env_id)
+            return False if runtime is None else cls._runtime_is_success(runtime)
+        return bool(all(cls._runtime_is_success(runtime) for runtime in cls._runtimes)) if cls._runtimes else False
+
+    @classmethod
+    def success_mask(cls) -> np.ndarray:
+        if not cls._runtimes:
+            return np.zeros((cls._configured_num_envs(),), dtype=bool)
+        return np.asarray([cls._runtime_is_success(runtime) for runtime in cls._runtimes], dtype=bool)
+
+    @classmethod
+    def _runtime_is_success(cls, runtime) -> bool:
+        if runtime is None or not cls._runtime_is_finite(runtime):
             return False
         if bool(getattr(runtime, "auto_mode", True)):
-            return cls.current_phase() == 18
+            task_idx = int(runtime.sm_task_idx.numpy()[0]) if hasattr(runtime, "sm_task_idx") else 0
+            schedule = runtime.sm_task_schedule.numpy() if hasattr(runtime, "sm_task_schedule") else np.asarray([0])
+            return int(schedule[min(task_idx, len(schedule) - 1)]) == 18
         try:
             tip_pos = runtime.vbd_state_0.body_q.numpy()[int(runtime.tip_capsule_body_idx), :3]
             socket_pos = np.asarray(runtime._socket_pos_np, dtype=np.float64)
@@ -318,16 +523,132 @@ class NewtonWaterhoseManager(NewtonManager):
             return False
 
     @classmethod
-    def get_recording_state(cls, device: str | torch.device | None = None) -> dict[str, torch.Tensor]:
-        """Return a batched tensor snapshot of the local Newton runtime."""
-        runtime = cls._runtime
-        if runtime is None:
-            return {}
-        device = PhysicsManager._device if device is None else device
+    def is_done(cls, max_demo_steps: int = 0, env_id: int | None = None) -> bool:
+        if env_id is not None:
+            runtime = cls._runtime_for_env(env_id)
+            return True if runtime is None else cls._runtime_is_done(runtime, max_demo_steps=max_demo_steps)
+        return bool(all(cls._runtime_is_done(runtime, max_demo_steps=max_demo_steps) for runtime in cls._runtimes)) if cls._runtimes else True
 
+    @classmethod
+    def done_mask(cls, max_demo_steps: int = 0) -> np.ndarray:
+        if not cls._runtimes:
+            return np.ones((cls._configured_num_envs(),), dtype=bool)
+        return np.asarray([cls._runtime_is_done(runtime, max_demo_steps=max_demo_steps) for runtime in cls._runtimes], dtype=bool)
+
+    @classmethod
+    def _runtime_is_done(cls, runtime, max_demo_steps: int = 0) -> bool:
+        if runtime is None:
+            return True
+        if max_demo_steps > 0 and int(getattr(runtime, "frame_count", 0)) >= int(max_demo_steps):
+            return True
+        task_idx = int(runtime.sm_task_idx.numpy()[0]) if hasattr(runtime, "sm_task_idx") else 0
+        schedule = runtime.sm_task_schedule.numpy() if hasattr(runtime, "sm_task_schedule") else np.asarray([0])
+        return int(schedule[min(task_idx, len(schedule) - 1)]) == 18
+
+    @classmethod
+    def reset_runtime(cls, env_ids=None) -> None:
+        if env_ids is None or isinstance(env_ids, slice):
+            if cls._publish_existing_fresh_runtime():
+                return
+            cls._rebuild_runtime()
+            return
+        env_id_list = cls._normalize_env_ids(env_ids)
+        if not cls._runtimes or len(env_id_list) >= len(cls._runtimes):
+            if cls._publish_existing_fresh_runtime():
+                return
+            cls._rebuild_runtime()
+            return
+        for env_id in env_id_list:
+            cls._replace_runtime(env_id)
+        cls._runtime = cls._runtimes[0] if cls._runtimes else None
+        cls._viewer = cls._viewers[0] if cls._viewers else None
+        cls._clear_combined_display()
+        cls._publish_display_state()
+        PhysicsManager._sim_time = cls.get_sim_time()
+
+    @classmethod
+    def _publish_existing_fresh_runtime(cls) -> bool:
+        if not cls._runtimes:
+            return False
+        if any(int(getattr(runtime, "frame_count", 0)) != 0 for runtime in cls._runtimes):
+            return False
+        cls._publish_display_state()
+        PhysicsManager._sim_time = cls.get_sim_time()
+        return True
+
+    @classmethod
+    def _normalize_env_ids(cls, env_ids) -> list[int]:
+        if isinstance(env_ids, torch.Tensor):
+            return [int(v) for v in env_ids.detach().cpu().flatten().tolist()]
+        if isinstance(env_ids, np.ndarray):
+            return [int(v) for v in env_ids.reshape(-1).tolist()]
+        return [int(v) for v in list(env_ids)]
+
+    @classmethod
+    def _runtime_for_env(cls, env_id: int):
+        if 0 <= int(env_id) < len(cls._runtimes):
+            return cls._runtimes[int(env_id)]
+        return None
+
+    @classmethod
+    def _configured_num_envs(cls) -> int:
+        cfg = cls._waterhose_cfg()
+        return max(1, int(getattr(cfg, "num_envs", 1)))
+
+    @classmethod
+    def _configured_env_spacing(cls) -> float:
+        cfg = cls._waterhose_cfg()
+        return float(getattr(cfg, "env_spacing", 2.5))
+
+    @classmethod
+    def _env_origins(cls, num_envs: int | None = None) -> np.ndarray:
+        num_envs = cls._configured_num_envs() if num_envs is None else max(1, int(num_envs))
+        try:
+            from isaaclab.cloner.cloner_utils import grid_transforms  # noqa: PLC0415
+
+            origins, _ = grid_transforms(num_envs, cls._configured_env_spacing(), device="cpu")
+            return origins.numpy().astype(np.float32)
+        except Exception:
+            cols = int(np.ceil(np.sqrt(num_envs)))
+            rows = int(np.ceil(num_envs / cols))
+            spacing = cls._configured_env_spacing()
+            origins = np.zeros((num_envs, 3), dtype=np.float32)
+            for env_id in range(num_envs):
+                row = env_id // cols
+                col = env_id % cols
+                origins[env_id, 0] = -(row - (rows - 1) / 2.0) * spacing
+                origins[env_id, 1] = (col - (cols - 1) / 2.0) * spacing
+            return origins
+
+    @classmethod
+    def _replace_runtime(cls, env_id: int) -> None:
+        old_viewer = cls._viewers[env_id] if env_id < len(cls._viewers) else None
+        if old_viewer is not None and hasattr(old_viewer, "close"):
+            old_viewer.close()
+        viewer = cls._make_viewer()
+        import warp as wp  # noqa: PLC0415
+
+        with wp.ScopedDevice(PhysicsManager._device):
+            runtime = cls._create_runtime_for_env(env_id, viewer)
+        cls._runtimes[env_id] = runtime
+        cls._viewers[env_id] = viewer
+
+    @classmethod
+    def _create_runtime_for_env(cls, env_id: int, viewer):
+        runtime_args = cls._make_runtime_args(env_id=env_id)
+        runtime_args.use_procedural_static_scene = cls._kit_visualizer_requested()
+        preloaded_vbd_scene = None
+        if not runtime_args.use_procedural_static_scene:
+            preloaded_vbd_scene = cls._preload_vbd_static_scene(runtime_args)
+        from .builder import create_simulation  # noqa: PLC0415
+
+        return create_simulation(viewer, runtime_args, preloaded_vbd_scene=preloaded_vbd_scene)
+
+    @classmethod
+    def _runtime_recording_state(cls, runtime, device: str | torch.device) -> dict[str, torch.Tensor]:
         def tensor(value, dtype=torch.float32) -> torch.Tensor:
             array = np.array(value, copy=True)
-            return torch.as_tensor(array, dtype=dtype, device=device).unsqueeze(0)
+            return torch.as_tensor(array, dtype=dtype, device=device)
 
         task_idx = 0
         task_elapsed = 0.0
@@ -336,6 +657,16 @@ class NewtonWaterhoseManager(NewtonManager):
         if hasattr(runtime, "sm_task_time_elapsed"):
             task_elapsed = float(runtime.sm_task_time_elapsed.numpy()[0])
 
+        labels = getattr(runtime.mujoco_model, "body_label", [])
+        suffix = "/right_gripper_end_effector"
+        right_ee_pose = None
+        for body_id, label in enumerate(labels):
+            if label == "right_gripper_end_effector" or str(label).endswith(suffix):
+                right_ee_pose = runtime.state_0.body_q.numpy()[body_id].copy()
+                break
+        if right_ee_pose is None:
+            right_ee_pose = np.zeros(7, dtype=np.float32)
+
         return {
             "robot_body_q": tensor(runtime.state_0.body_q.numpy()),
             "robot_body_qd": tensor(runtime.state_0.body_qd.numpy()),
@@ -343,65 +674,71 @@ class NewtonWaterhoseManager(NewtonManager):
             "vbd_body_qd": tensor(runtime.vbd_state_0.body_qd.numpy()),
             "joint_target_pos": tensor(runtime.control.joint_target_pos.numpy()),
             "gripper_targets": tensor(runtime.gripper_targets.numpy()),
-            "right_ee_pose": tensor(cls.get_right_ee_pose()),
-            "plug_pose": tensor(cls.get_plug_pose()),
-            "tip_pose": tensor(cls.get_tip_pose()),
-            "phase": torch.tensor([[float(cls.current_phase())]], dtype=torch.float32, device=device),
-            "task_index": torch.tensor([[task_idx]], dtype=torch.int64, device=device),
-            "task_elapsed": torch.tensor([[task_elapsed]], dtype=torch.float32, device=device),
-            "frame_count": torch.tensor([[int(getattr(runtime, "frame_count", 0))]], dtype=torch.int64, device=device),
-            "sim_time": torch.tensor([[float(getattr(runtime, "sim_time", 0.0))]], dtype=torch.float32, device=device),
-            "auto_mode": torch.tensor([[bool(getattr(runtime, "auto_mode", True))]], dtype=torch.bool, device=device),
+            "right_ee_pose": tensor(right_ee_pose),
+            "plug_pose": tensor(
+                runtime.vbd_state_0.body_q.numpy()[int(getattr(runtime, "cable_head_body_idx", 0))].copy()
+            ),
+            "tip_pose": tensor(
+                runtime.vbd_state_0.body_q.numpy()[int(getattr(runtime, "tip_capsule_body_idx", 0))].copy()
+            ),
+            "phase": torch.tensor([float(cls._runtime_phase(runtime))], dtype=torch.float32, device=device),
+            "task_index": torch.tensor([task_idx], dtype=torch.int64, device=device),
+            "task_elapsed": torch.tensor([task_elapsed], dtype=torch.float32, device=device),
+            "frame_count": torch.tensor([int(getattr(runtime, "frame_count", 0))], dtype=torch.int64, device=device),
+            "sim_time": torch.tensor([float(getattr(runtime, "sim_time", 0.0))], dtype=torch.float32, device=device),
+            "auto_mode": torch.tensor([bool(getattr(runtime, "auto_mode", True))], dtype=torch.bool, device=device),
         }
 
-    @classmethod
-    def is_done(cls, max_demo_steps: int = 0) -> bool:
-        runtime = cls._runtime
-        if runtime is None:
-            return True
-        if max_demo_steps > 0 and int(getattr(runtime, "frame_count", 0)) >= int(max_demo_steps):
-            return True
-        return cls.current_phase() == 18
+    @staticmethod
+    def _runtime_phase(runtime) -> int:
+        if runtime is None or not hasattr(runtime, "sm_task_idx") or not hasattr(runtime, "sm_task_schedule"):
+            return 0
+        task_idx = int(runtime.sm_task_idx.numpy()[0])
+        schedule = runtime.sm_task_schedule.numpy()
+        return int(schedule[min(task_idx, len(schedule) - 1)])
 
     @classmethod
-    def reset_runtime(cls) -> None:
-        runtime = cls._runtime
-        if runtime is not None and int(getattr(runtime, "frame_count", 0)) == 0:
-            cls._publish_display_state()
-            PhysicsManager._sim_time = cls.get_sim_time()
-            return
-        cls._rebuild_runtime()
+    def get_recording_state(cls, device: str | torch.device | None = None) -> dict[str, torch.Tensor]:
+        if not cls._runtimes:
+            return {}
+        device = PhysicsManager._device if device is None else device
+        per_env = [cls._runtime_recording_state(runtime, device) for runtime in cls._runtimes]
+        result: dict[str, torch.Tensor] = {}
+        for key in per_env[0]:
+            result[key] = torch.stack([state[key] for state in per_env], dim=0)
+        return result
 
     @classmethod
     def _rebuild_runtime(cls) -> None:
         cls._close_runtime()
         cls._ensure_newton_on_path()
-        runtime_args = cls._make_runtime_args()
-        runtime_args.use_procedural_static_scene = cls._kit_visualizer_requested()
-
+        num_envs = cls._configured_num_envs()
+        NewtonManager._num_envs = num_envs
         cls.dispatch_event(PhysicsEvent.MODEL_INIT)
-        preloaded_vbd_scene = None
-        if not runtime_args.use_procedural_static_scene:
-            preloaded_vbd_scene = cls._preload_vbd_static_scene(runtime_args)
-        from .builder import create_simulation  # noqa: PLC0415
+        cls._viewers = []
+        cls._runtimes = []
+        import warp as wp  # noqa: PLC0415
 
-        cls._viewer = cls._make_viewer()
-        if runtime_args.use_procedural_static_scene:
-            cls._runtime = create_simulation(cls._viewer, runtime_args, preloaded_vbd_scene=preloaded_vbd_scene)
-        else:
-            import warp as wp  # noqa: PLC0415
+        with wp.ScopedDevice(PhysicsManager._device):
+            for env_id in range(num_envs):
+                viewer = cls._make_viewer()
+                runtime = cls._create_runtime_for_env(env_id, viewer)
+                cls._viewers.append(viewer)
+                cls._runtimes.append(runtime)
 
-            with wp.ScopedDevice(PhysicsManager._device):
-                cls._runtime = create_simulation(cls._viewer, runtime_args, preloaded_vbd_scene=preloaded_vbd_scene)
+        cls._viewer = cls._viewers[0] if cls._viewers else None
+        cls._runtime = cls._runtimes[0] if cls._runtimes else None
         cls._publish_display_state()
         PhysicsManager._sim_time = cls.get_sim_time()
         cls.dispatch_event(PhysicsEvent.PHYSICS_READY)
 
     @classmethod
     def _close_runtime(cls) -> None:
-        viewer = cls._viewer
-        if viewer is not None and hasattr(viewer, "close"):
-            viewer.close()
+        for viewer in cls._viewers or [cls._viewer]:
+            if viewer is not None and hasattr(viewer, "close"):
+                viewer.close()
+        cls._runtimes = []
+        cls._viewers = []
         cls._runtime = None
         cls._viewer = None
 
@@ -423,10 +760,12 @@ class NewtonWaterhoseManager(NewtonManager):
         return newton.viewer.ViewerNull(num_frames=int(getattr(cfg, "num_frames", 100000)))
 
     @classmethod
-    def _make_runtime_args(cls) -> Namespace:
+    def _make_runtime_args(cls, env_id: int = 0) -> Namespace:
         cfg = cls._waterhose_cfg()
         return Namespace(
             device=PhysicsManager._device,
+            env_id=int(env_id),
+            num_envs=cls._configured_num_envs(),
             viewer="null",
             rerun_address=None,
             output_path=str(getattr(cfg, "output_path", "waterhose_robot_demo_output.usd")),
@@ -509,15 +848,14 @@ class NewtonWaterhoseManager(NewtonManager):
 
     @classmethod
     def _publish_display_state(cls) -> None:
-        runtime = cls._runtime
-        if runtime is None:
+        if not cls._runtimes:
             cls._visualization_model = None
             cls._display_state_0 = None
             cls._display_state_1 = None
             cls._display_control = None
             return
 
-        model, state_0, state_1, control = cls._combined_display(runtime)
+        model, state_0, state_1, control = cls._combined_display()
 
         cls._visualization_model = model
         cls._display_state_0 = state_0
@@ -526,36 +864,58 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._publish_to_newton_visualizer(model, state_0, state_1, control)
 
     @classmethod
-    def _combined_display(cls, runtime):
-        if cls._combined_runtime is not runtime or cls._combined_model is None:
-            cls._build_combined_display(runtime)
-        cls._update_combined_display_state(runtime)
+    def _combined_display(cls):
+        runtime_ids = tuple(id(runtime) for runtime in cls._runtimes)
+        if cls._combined_runtime != runtime_ids or cls._combined_model is None:
+            cls._build_combined_display()
+        cls._update_combined_display_state()
         return cls._combined_model, cls._combined_state_0, cls._combined_state_1, cls._combined_control
 
     @classmethod
-    def _build_combined_display(cls, runtime) -> None:
+    def _build_combined_display(cls) -> None:
         cls._clear_combined_display()
         import newton  # noqa: PLC0415
+        import warp as wp  # noqa: PLC0415
 
         builder = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
-        builder.add_builder(runtime._mujoco_display_builder, label_prefix="mujoco")
-        builder.add_builder(runtime._vbd_display_builder, label_prefix="vbd")
+        origins = cls._env_origins(len(cls._runtimes))
+        body_slices: list[tuple[int, int, int]] = []
+        skipped_shape_ids: set[int] = set()
+        skip_static_scene_shapes = cls._kit_visualizer_requested()
+
+        for env_id, runtime in enumerate(cls._runtimes):
+            origin = origins[env_id]
+            xform = wp.transform(wp.vec3(float(origin[0]), float(origin[1]), float(origin[2])), wp.quat_identity())
+            if len(cls._runtimes) > 1:
+                builder.begin_world(label=f"env_{env_id}")
+
+            body_start = int(builder.body_count)
+            builder.add_builder(runtime._mujoco_display_builder, xform=xform, label_prefix=f"env_{env_id}/mujoco")
+            vbd_shape_start = int(builder.shape_count)
+            builder.add_builder(runtime._vbd_display_builder, xform=xform, label_prefix=f"env_{env_id}/vbd")
+            body_slices.append((body_start, int(runtime.mujoco_model.body_count), int(runtime.vbd_model.body_count)))
+            if skip_static_scene_shapes:
+                skipped_shape_ids.update(
+                    vbd_shape_start + int(shape_id) for shape_id in getattr(runtime, "_scene_shape_ids", [])
+                )
+
+            if len(cls._runtimes) > 1:
+                builder.end_world()
+
         cls._prepare_display_builder(builder)
         assign_display_prim_paths(builder)
         model = builder.finalize(device=PhysicsManager._device)
-        model.num_envs = 1
+        model.num_envs = len(cls._runtimes)
 
-        cls._combined_runtime = runtime
+        cls._combined_runtime = tuple(id(runtime) for runtime in cls._runtimes)
         cls._combined_model = model
         cls._combined_state_0 = model.state()
         cls._combined_state_1 = model.state()
         cls._combined_control = model.control()
-        cls._combined_robot_body_count = int(runtime.mujoco_model.body_count)
-        cls._combined_robot_shape_count = int(runtime.mujoco_model.shape_count)
-        cls._kit_skipped_shape_ids = {
-            cls._combined_robot_shape_count + int(shape_id) for shape_id in getattr(runtime, "_scene_shape_ids", [])
-        }
+        cls._combined_body_slices = body_slices
+        cls._combined_env_origins = origins
+        cls._kit_skipped_shape_ids = skipped_shape_ids
 
     @staticmethod
     def _prepare_display_builder(builder) -> None:
@@ -596,16 +956,24 @@ class NewtonWaterhoseManager(NewtonManager):
         builder.shape_source = prepared_sources
 
     @classmethod
-    def _update_combined_display_state(cls, runtime) -> None:
+    def _update_combined_display_state(cls) -> None:
         if cls._combined_state_0 is None:
             return
         import warp as wp  # noqa: PLC0415
 
-        robot_q = runtime.state_0.body_q.numpy()
-        vbd_q = runtime.vbd_state_0.body_q.numpy()
-        body_q = np.empty((robot_q.shape[0] + vbd_q.shape[0], 7), dtype=robot_q.dtype)
-        body_q[: robot_q.shape[0]] = robot_q
-        body_q[robot_q.shape[0] :] = vbd_q
+        body_q = cls._combined_state_0.body_q.numpy()
+        origins = cls._combined_env_origins
+        if origins is None:
+            origins = cls._env_origins(len(cls._runtimes))
+        for env_id, (runtime, (body_start, robot_body_count, vbd_body_count)) in enumerate(
+            zip(cls._runtimes, cls._combined_body_slices, strict=False)
+        ):
+            origin = origins[env_id]
+            robot_q = runtime.state_0.body_q.numpy()
+            vbd_q = runtime.vbd_state_0.body_q.numpy()
+            body_q[body_start : body_start + robot_body_count] = robot_q
+            body_q[body_start + robot_body_count : body_start + robot_body_count + vbd_body_count] = vbd_q
+            body_q[body_start : body_start + robot_body_count + vbd_body_count, :3] += origin.reshape(1, 3)
         wp.copy(
             cls._combined_state_0.body_q,
             wp.array(body_q, dtype=wp.transform, device=cls._combined_state_0.body_q.device),
@@ -618,8 +986,8 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._combined_state_0 = None
         cls._combined_state_1 = None
         cls._combined_control = None
-        cls._combined_robot_body_count = 0
-        cls._combined_robot_shape_count = 0
+        cls._combined_body_slices = []
+        cls._combined_env_origins = None
         cls._kit_skipped_shape_ids = set()
         cls._kit_display_model_id = None
         cls._kit_display_ready = False
@@ -634,7 +1002,7 @@ class NewtonWaterhoseManager(NewtonManager):
         NewtonManager._state_0 = state_0
         NewtonManager._state_1 = state_1
         NewtonManager._control = control
-        NewtonManager._num_envs = 1
+        NewtonManager._num_envs = len(cls._runtimes)
         NewtonManager._scene_data_backend = cls.get_scene_data_backend()
         if cls._kit_visualizer_requested():
             cls._ensure_kit_display(model)
@@ -659,6 +1027,7 @@ class NewtonWaterhoseManager(NewtonManager):
                 model,
                 skipped_shape_ids=cls._kit_skipped_shape_ids,
             )
+            cls._author_kit_static_scene()
             cls._debug_kit(f"ensure_kit_display:author_done dt={time.perf_counter() - start:.3f}s")
             cls._kit_display_model_id = id(model)
             cls._kit_display_ready = True
@@ -700,6 +1069,26 @@ class NewtonWaterhoseManager(NewtonManager):
         NewtonManager._usd_xform_ops.clear()
         NewtonManager._mark_transforms_dirty()
         NewtonManager.sync_transforms_to_usd()
+
+    @classmethod
+    def _author_kit_static_scene(cls) -> None:
+        cfg = cls._waterhose_cfg()
+        asset_root = Path(getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT)).expanduser().resolve()
+        scene_usd_path = asset_root / "Waterhose" / "Cable008" / "Cable008_Body.usda"
+        if not scene_usd_path.is_file():
+            cls._debug_kit(f"static_scene:missing path={scene_usd_path}")
+            return
+
+        import warp as wp  # noqa: PLC0415
+
+        origins = cls._combined_env_origins
+        if origins is None:
+            origins = cls._env_origins(len(cls._runtimes))
+        author_static_scene_references(
+            scene_usd_path=str(scene_usd_path),
+            env_origins=origins,
+            fridge_xform=cls._compute_fridge_xform(wp),
+        )
 
     @classmethod
     def _clear_kit_display_state(cls) -> None:
@@ -752,6 +1141,8 @@ class WaterhoseNewtonSolverCfg(NewtonSolverCfg):
 
     newton_root: str = "/home/maximiliank/Work/newton"
     asset_root: str = _DEFAULT_ASSET_ROOT
+    num_envs: int = 1
+    env_spacing: float = 2.5
     num_frames: int = 100000
     quiet: bool = True
     broad_phase: str = "explicit"

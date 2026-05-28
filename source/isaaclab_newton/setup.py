@@ -44,7 +44,7 @@ EXTRAS_REQUIRE = {
         "pycollada",
         # Newton PR 2848 coupled-solver framework. Keep this aligned with
         # docs/newton_local_setup.md until the API lands in a Newton release.
-        "newton[sim] @ git+https://github.com/newton-physics/newton.git@e9851d3e11ad35e879e818c789570eb4fa5b0264",
+        "newton[sim] @ git+https://github.com/newton-physics/newton.git@c2f21df3acc0f06d207812810b2e27ca7c4da08c",
     ],
 }
 
