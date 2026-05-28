@@ -3,13 +3,14 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Manager-style task config for the literal Newton waterhose robot success demo."""
+"""Configuration for the waterhose robot demo task."""
 
 from __future__ import annotations
 
-from isaaclab_newton.physics import NewtonCfg, XPBDSolverCfg
+from pathlib import Path
 
 from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -17,21 +18,28 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils.configclass import configclass
+from isaaclab_newton.physics import NewtonCfg
 
 from . import mdp
-from .actions import ReferenceDemoNoOpAction, ReferenceDemoNoOpActionCfg
+from .actions import ScriptedDemoAction, ScriptedDemoActionCfg
+from .manager import WaterhoseNewtonSolverCfg
+
+
+_DEFAULT_ASSET_ROOT = str(
+    Path(__file__).resolve().parents[5] / "isaaclab_assets" / "data" / "WaterhoseDemo"
+)
 
 
 @configclass
 class ActionsCfg:
-    """No-op action term; the reference demo state machine owns control."""
+    """Action terms for the scripted demo."""
 
-    demo = ReferenceDemoNoOpActionCfg(class_type=ReferenceDemoNoOpAction)
+    demo = ScriptedDemoActionCfg(class_type=ScriptedDemoAction)
 
 
 @configclass
 class ObservationsCfg:
-    """Observations exposing key reference-demo state."""
+    """Observations exposing key demo state."""
 
     @configclass
     class PolicyCfg(ObsGroup):
@@ -58,21 +66,21 @@ class RewardsCfg:
 
 @configclass
 class TerminationsCfg:
-    """Terminate when reference demo finishes or max frame count is reached."""
+    """Terminate when the scripted rollout finishes or an optional step cap is reached."""
 
     demo_done = DoneTerm(func=mdp.done)
 
 
 @configclass
 class EventCfg:
-    """No reset events; the reference Newton demo owns all state."""
+    """Reset hooks for the local Newton simulation."""
 
-    pass
+    reset_demo = EventTerm(func=mdp.reset_demo, mode="reset")
 
 
 @configclass
 class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
-    """Manager-style wrapper around `example_waterhose_scene2_insert_extract_success.py`."""
+    """Manager-style waterhose robot demo using a local Newton simulation."""
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1, env_spacing=2.5, replicate_physics=False)
     observations: ObservationsCfg = ObservationsCfg()
@@ -83,48 +91,33 @@ class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
     curriculum = None
     commands = None
 
-    # IsaacLab still owns an app/sim context for manager lifecycle, but the
-    # reference Newton Example owns the actual robot/cable simulation.
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 100.0,
         render_interval=1,
-        # Dummy kitless physics manager for IsaacLab lifecycle only. The real
-        # robot/cable simulation is owned by the reference Newton Example.
-        # XPBD tolerates the empty IsaacLab scene; the default MJWarp solver
-        # does not because it requires at least one joint.
-        physics=NewtonCfg(solver_cfg=XPBDSolverCfg(), use_cuda_graph=False),
+        physics=NewtonCfg(
+            solver_cfg=WaterhoseNewtonSolverCfg(asset_root=_DEFAULT_ASSET_ROOT),
+            num_substeps=1,
+            use_cuda_graph=False,
+        ),
     )
     viewer = ViewerCfg(eye=(-2.55, -7.1, 2.3), lookat=(0.55, -0.42, 0.9))
 
     episode_length_s = 30.0
     decimation = 1
 
-    # Path to the local Newton checkout containing the reference script.
-    reference_newton_root: str = "/home/maximiliank/Work/newton"
-    reference_module: str = "newton.examples.cable_robot.example_waterhose_scene2_insert_extract_success"
-    reference_viewer: str = "gl"
-    reference_primary_view: str = "mujoco"
-    reference_headless: bool = False
-    reference_num_frames: int = 100000
-    reference_quiet: bool = True
-    reference_device: str | None = None
-
-    # Safety bound for scripted rollouts. 0 means run until state machine DONE.
+    # Safety bound for scripted rollouts. 0 means run until the controller's DONE phase.
     max_demo_steps: int = 0
 
     def __post_init__(self):
         self.scene.num_envs = 1
         self.sim.dt = 1.0 / 100.0
         self.sim.render_interval = self.decimation
+        self.sim.physics.solver_cfg.max_demo_steps = int(self.max_demo_steps)
 
 
 @configclass
 class WaterhoseRobotDemoEnvCfg_PLAY(WaterhoseRobotDemoEnvCfg):
-    """Play/debug variant using Newton GL + MuJoCo primary view."""
+    """Play/debug variant for the waterhose robot demo."""
 
     def __post_init__(self):
         super().__post_init__()
-        self.reference_viewer = "gl"
-        self.reference_primary_view = "mujoco"
-        self.reference_headless = False
-

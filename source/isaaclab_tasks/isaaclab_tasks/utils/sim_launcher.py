@@ -68,7 +68,9 @@ def _scan_config(cfg, predicates: list[Callable[[Any], bool]]) -> list[bool]:
 
 def _is_kitless_physics(node) -> bool:
     """True when the node is a kitless physics config (Newton or OvPhysX)."""
-    return isinstance(node, PhysicsCfg) and type(node).__name__ in ("NewtonCfg", "OvPhysxCfg")
+    return isinstance(node, PhysicsCfg) and (
+        type(node).__name__ in ("NewtonCfg", "OvPhysxCfg") or bool(getattr(node, "is_kitless", False))
+    )
 
 
 def _get_visualizer_types(launcher_args: argparse.Namespace | dict | None) -> set[str]:
