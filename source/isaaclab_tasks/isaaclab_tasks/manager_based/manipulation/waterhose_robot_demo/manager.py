@@ -103,8 +103,11 @@ class NewtonWaterhoseManager(NewtonManager):
 
     @classmethod
     def forward(cls) -> None:
-        cls._publish_display_state()
-        NewtonManager.sync_transforms_to_usd()
+        import warp as wp  # noqa: PLC0415
+
+        with wp.ScopedDevice(PhysicsManager._device):
+            cls._publish_display_state()
+            NewtonManager.sync_transforms_to_usd()
 
     @classmethod
     def get_scene_data_backend(cls) -> SceneDataBackend:
@@ -117,14 +120,20 @@ class NewtonWaterhoseManager(NewtonManager):
         runtime = cls._runtime
         if runtime is None or not cls._is_playing:
             return
-        runtime.step()
-        cls._publish_display_state()
+        import warp as wp  # noqa: PLC0415
+
+        with wp.ScopedDevice(PhysicsManager._device):
+            runtime.step()
+            cls._publish_display_state()
         PhysicsManager._sim_time = float(getattr(runtime, "sim_time", PhysicsManager._sim_time))
 
     @classmethod
     def pre_render(cls) -> None:
-        cls._publish_display_state()
-        NewtonManager.pre_render()
+        import warp as wp  # noqa: PLC0415
+
+        with wp.ScopedDevice(PhysicsManager._device):
+            cls._publish_display_state()
+            NewtonManager.pre_render()
 
     @classmethod
     def close(cls) -> None:
@@ -195,8 +204,11 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._teleop_enabled = bool(enabled)
         runtime = cls._runtime
         if cls._teleop_enabled and runtime is not None and getattr(runtime, "auto_mode", True):
-            runtime.auto_mode = False
-            runtime._stop_auto_mode()
+            import warp as wp  # noqa: PLC0415
+
+            with wp.ScopedDevice(PhysicsManager._device):
+                runtime.auto_mode = False
+                runtime._stop_auto_mode()
 
     @classmethod
     def teleop_enabled(cls) -> bool:
@@ -214,31 +226,32 @@ class NewtonWaterhoseManager(NewtonManager):
 
         import warp as wp  # noqa: PLC0415
 
-        cmd = command.detach().to("cpu", dtype=torch.float32).numpy().reshape(-1)
-        if cmd.shape[0] < 6:
-            return
+        with wp.ScopedDevice(PhysicsManager._device):
+            cmd = command.detach().to("cpu", dtype=torch.float32).numpy().reshape(-1)
+            if cmd.shape[0] < 6:
+                return
 
-        tf = runtime.ee_tfs[0]
-        pos = wp.transform_get_translation(tf)
-        quat = wp.transform_get_rotation(tf)
-        dp = cmd[:3]
-        pos = pos + wp.vec3(float(dp[0]), float(dp[1]), float(dp[2]))
+            tf = runtime.ee_tfs[0]
+            pos = wp.transform_get_translation(tf)
+            quat = wp.transform_get_rotation(tf)
+            dp = cmd[:3]
+            pos = pos + wp.vec3(float(dp[0]), float(dp[1]), float(dp[2]))
 
-        axis_angle_eef = cmd[3:6]
-        angle = float(np.linalg.norm(axis_angle_eef))
-        if angle > 1.0e-8:
-            axis = axis_angle_eef / angle
-            dq = wp.quat_from_axis_angle(wp.vec3(float(axis[0]), float(axis[1]), float(axis[2])), angle)
-            quat = wp.normalize(quat * dq)
-        runtime.ee_tfs[0] = wp.transform(pos, quat)
+            axis_angle_eef = cmd[3:6]
+            angle = float(np.linalg.norm(axis_angle_eef))
+            if angle > 1.0e-8:
+                axis = axis_angle_eef / angle
+                dq = wp.quat_from_axis_angle(wp.vec3(float(axis[0]), float(axis[1]), float(axis[2])), angle)
+                quat = wp.normalize(quat * dq)
+            runtime.ee_tfs[0] = wp.transform(pos, quat)
 
-        if cmd.shape[0] >= 7:
-            gripper_value = float(runtime.sm_gripper_open_value if cmd[6] > 0.0 else runtime.sm_gripper_closed_value)
-            gripper_np = runtime.gripper_targets.numpy()
-            gripper_np[0] = gripper_value
-            wp.copy(runtime.gripper_targets, wp.array(gripper_np, dtype=wp.float32))
-            runtime.gripper_targets_list[0] = gripper_value
-            runtime._sync_gripper_followers()
+            if cmd.shape[0] >= 7:
+                gripper_value = float(runtime.sm_gripper_open_value if cmd[6] > 0.0 else runtime.sm_gripper_closed_value)
+                gripper_np = runtime.gripper_targets.numpy()
+                gripper_np[0] = gripper_value
+                wp.copy(runtime.gripper_targets, wp.array(gripper_np, dtype=wp.float32, device=runtime.gripper_targets.device))
+                runtime.gripper_targets_list[0] = gripper_value
+                runtime._sync_gripper_followers()
 
     @classmethod
     def current_phase(cls) -> int:
@@ -364,13 +377,22 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._close_runtime()
         cls._ensure_newton_on_path()
         runtime_args = cls._make_runtime_args()
+        runtime_args.use_procedural_static_scene = cls._kit_visualizer_requested()
 
         cls.dispatch_event(PhysicsEvent.MODEL_INIT)
-        preloaded_vbd_scene = cls._preload_vbd_static_scene(runtime_args)
+        preloaded_vbd_scene = None
+        if not runtime_args.use_procedural_static_scene:
+            preloaded_vbd_scene = cls._preload_vbd_static_scene(runtime_args)
         from .builder import create_simulation  # noqa: PLC0415
 
         cls._viewer = cls._make_viewer()
-        cls._runtime = create_simulation(cls._viewer, runtime_args, preloaded_vbd_scene=preloaded_vbd_scene)
+        if runtime_args.use_procedural_static_scene:
+            cls._runtime = create_simulation(cls._viewer, runtime_args, preloaded_vbd_scene=preloaded_vbd_scene)
+        else:
+            import warp as wp  # noqa: PLC0415
+
+            with wp.ScopedDevice(PhysicsManager._device):
+                cls._runtime = create_simulation(cls._viewer, runtime_args, preloaded_vbd_scene=preloaded_vbd_scene)
         cls._publish_display_state()
         PhysicsManager._sim_time = cls.get_sim_time()
         cls.dispatch_event(PhysicsEvent.PHYSICS_READY)
@@ -421,6 +443,7 @@ class NewtonWaterhoseManager(NewtonManager):
             print_robot_poses=False,
             broad_phase=str(getattr(cfg, "broad_phase", "explicit")),
             asset_root=str(Path(getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT)).expanduser()),
+            use_procedural_static_scene=False,
         )
 
     @classmethod

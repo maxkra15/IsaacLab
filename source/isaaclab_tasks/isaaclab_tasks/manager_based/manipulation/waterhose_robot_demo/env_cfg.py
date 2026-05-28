@@ -34,6 +34,7 @@ from .teleop import WaterhoseSpaceMouseCfg
 _DEFAULT_ASSET_ROOT = str(
     Path(__file__).resolve().parents[5] / "isaaclab_assets" / "data" / "WaterhoseDemo"
 )
+_DEFAULT_SCENE_USD = str(Path(_DEFAULT_ASSET_ROOT) / "Waterhose" / "Cable008" / "Cable008_Body.usda")
 
 
 @configclass
@@ -92,6 +93,14 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     light = AssetBaseCfg(
         prim_path="/World/Light",
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
+    )
+    static_scene = AssetBaseCfg(
+        prim_path="/World/WaterhoseDemo/Static",
+        init_state=AssetBaseCfg.InitialStateCfg(
+            pos=(0.95, -0.051, 1.287),
+            rot=(0.0, 0.0, 0.7071067811865475, 0.7071067811865476),
+        ),
+        spawn=sim_utils.UsdFileCfg(usd_path=_DEFAULT_SCENE_USD),
     )
 
 

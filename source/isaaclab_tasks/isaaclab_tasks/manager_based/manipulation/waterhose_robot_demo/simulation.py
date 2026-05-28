@@ -645,6 +645,10 @@ class WaterhoseRobotDemoSimulation:
 
     def _load_vbd_static_scene(self, builder):
         # Load fridge scene (static, zero mass).
+        if bool(getattr(self.args, "use_procedural_static_scene", False)):
+            self._load_procedural_static_scene(builder)
+            return
+
         scene_usd_path = str(self.scene_usd_path)
         self.scene_body_ids: list[int] = []
         self._scene_shape_ids = []
@@ -677,6 +681,45 @@ class WaterhoseRobotDemoSimulation:
 
             self._scene_shape_ids = scene_shape_ids
             _debug_startup("vbd:add_scene_usd_done")
+
+    def _load_procedural_static_scene(self, builder):
+        """Use static collision proxies when Kit owns the visual scene USD."""
+        _debug_startup("vbd:add_procedural_static_scene")
+        shape_start = builder.shape_count
+
+        table_cfg = builder.default_shape_cfg.copy()
+        table_cfg.density = 0.0
+        table_cfg.mu = 0.2
+
+        socket_cfg = builder.default_shape_cfg.copy()
+        socket_cfg.density = 0.0
+        socket_cfg.mu = 10.0
+
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform(wp.vec3(0.95, -0.051, 0.1925), wp.quat_identity()),
+            hx=0.55,
+            hy=0.35,
+            hz=0.1925,
+            cfg=table_cfg,
+            label="waterhose_static_table_proxy",
+        )
+
+        insertion_dir = wp.quat_rotate(self.sm_socket_rot, wp.vec3(0.0, 0.0, 1.0))
+        socket_center = self.sm_socket_pos - insertion_dir * 0.025
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform(socket_center, self.sm_socket_rot),
+            hx=0.045,
+            hy=0.045,
+            hz=0.025,
+            cfg=socket_cfg,
+            label="waterhose_static_socket_proxy",
+        )
+
+        self.scene_body_ids = []
+        self._scene_shape_ids = list(range(shape_start, builder.shape_count))
+        _debug_startup("vbd:add_procedural_static_scene_done")
 
     def _setup_vbd_world(self, args):
         _debug_startup("vbd:builder")
@@ -2566,6 +2609,11 @@ class WaterhoseRobotDemoSimulation:
     # ------------------------------------------------------------------
 
     def capture(self):
+        device = wp.get_device(self.args.device)
+        with wp.ScopedDevice(device):
+            self._capture_on_device()
+
+    def _capture_on_device(self):
         """Record CUDA graphs for simulation and IK, restoring state afterward."""
         self.graph_sim = None
         self.graph_ik = None
