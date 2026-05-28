@@ -447,6 +447,7 @@ class NewtonWaterhoseManager(NewtonManager):
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
         builder.add_builder(runtime._mujoco_display_builder, label_prefix="mujoco")
         builder.add_builder(runtime._vbd_display_builder, label_prefix="vbd")
+        cls._prepare_display_builder(builder)
         model = builder.finalize(device=PhysicsManager._device)
         model.num_envs = 1
 
@@ -456,6 +457,44 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._combined_state_1 = model.state()
         cls._combined_control = model.control()
         cls._combined_robot_body_count = int(runtime.mujoco_model.body_count)
+
+    @staticmethod
+    def _prepare_display_builder(builder) -> None:
+        """Give the combined display model independent mesh ownership."""
+        import newton  # noqa: PLC0415
+
+        cloned_sources: dict[int, Any] = {}
+        prepared_sources = []
+        for source in builder.shape_source:
+            if isinstance(source, newton.Mesh):
+                source_key = id(source)
+                if source_key not in cloned_sources:
+                    texture = source.texture
+                    if isinstance(texture, np.ndarray):
+                        texture = texture.copy()
+                    mesh = newton.Mesh(
+                        vertices=source.vertices.copy(),
+                        indices=source.indices.copy(),
+                        normals=source.normals.copy() if source.normals is not None else None,
+                        uvs=source.uvs.copy() if source.uvs is not None else None,
+                        compute_inertia=False,
+                        is_solid=bool(source.is_solid),
+                        maxhullvert=source.maxhullvert,
+                        color=source.color,
+                        roughness=source.roughness,
+                        metallic=source.metallic,
+                        texture=texture,
+                        sdf=None,
+                    )
+                    mesh.mass = source.mass
+                    mesh.com = source.com
+                    mesh.inertia = source.inertia
+                    mesh.has_inertia = source.has_inertia
+                    cloned_sources[source_key] = mesh
+                prepared_sources.append(cloned_sources[source_key])
+            else:
+                prepared_sources.append(source)
+        builder.shape_source = prepared_sources
 
     @classmethod
     def _update_combined_display_state(cls, runtime) -> None:

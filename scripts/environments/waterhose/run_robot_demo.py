@@ -11,24 +11,15 @@ import argparse
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
 
-import gymnasium as gym
-import torch
-
-import isaaclab_tasks  # noqa: F401
-from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab_newton.physics import NewtonCfg
-from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (
-    NewtonWaterhoseManager,
-    WaterhoseNewtonSolverCfg,
-)
 from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.teleop import (
     add_waterhose_spacemouse_args,
     create_waterhose_spacemouse_device,
 )
-from isaaclab_tasks.utils import add_launcher_args, launch_simulation, parse_env_cfg
+from isaaclab_tasks.utils import add_launcher_args, launch_simulation
 
 
 DEFAULT_TASK = "Isaac-Waterhose-Robot-Demo-Play-v0"
@@ -134,6 +125,10 @@ selected_visualizers = validate_visualizers(args_cli, parser)
 
 
 def _startup_report() -> None:
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
+        NewtonWaterhoseManager,
+    )
+
     sim = NewtonWaterhoseManager.get_runtime()
     if sim is None:
         print("[DEMO] startup: runtime is not initialized", flush=True)
@@ -152,7 +147,13 @@ def _startup_report() -> None:
     )
 
 
-def _configure_env_cfg(env_cfg: ManagerBasedRLEnvCfg) -> None:
+def _configure_env_cfg(env_cfg) -> None:
+    from isaaclab.envs import ManagerBasedRLEnvCfg  # noqa: PLC0415
+    from isaaclab_newton.physics import NewtonCfg  # noqa: PLC0415
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
+        WaterhoseNewtonSolverCfg,
+    )
+
     env_cfg.scene.num_envs = 1
     env_cfg.max_demo_steps = int(args_cli.max_demo_steps)
     physics_cfg = env_cfg.sim.physics
@@ -180,63 +181,87 @@ def _configure_env_cfg(env_cfg: ManagerBasedRLEnvCfg) -> None:
         env_cfg.sim.visualizer_cfgs.append(newton_viz_cfg)
 
 
+def _parse_configured_env_cfg():
+    import isaaclab_tasks  # noqa: F401, PLC0415
+    from isaaclab.envs import ManagerBasedRLEnvCfg  # noqa: PLC0415
+    from isaaclab_tasks.utils import parse_env_cfg  # noqa: PLC0415
+
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
+    if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
+        raise TypeError(f"Expected ManagerBasedRLEnvCfg, got {type(env_cfg).__name__}.")
+    _configure_env_cfg(env_cfg)
+    return env_cfg
+
+
 def _simulation_is_running(env) -> bool:
     if env.sim.visualizers:
         return any(visualizer.is_running() and not visualizer.is_closed for visualizer in env.sim.visualizers)
     return True
 
 
-def main() -> None:
-    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
-    if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
-        raise TypeError(f"Expected ManagerBasedRLEnvCfg, got {type(env_cfg).__name__}.")
-    _configure_env_cfg(env_cfg)
+def _run_env(env_cfg) -> None:
+    import gymnasium as gym  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
+        NewtonWaterhoseManager,
+    )
 
     env = None
     step = 0
     start = time.perf_counter()
     teleop_interface = None
-    with launch_simulation(env_cfg, args_cli):
-        try:
-            env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
-            env.reset()
-            _startup_report()
-            actions = torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device)
-            if args_cli.mode == "teleop":
-                teleop_interface = create_waterhose_spacemouse_device(args_cli, args_cli.sensitivity)
-                teleop_interface.reset()
-                NewtonWaterhoseManager.set_teleop_enabled(True)
-                print(f"[INFO] Teleop device: {teleop_interface}", flush=True)
+    try:
+        env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
+        env.reset()
+        _startup_report()
+        actions = torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device)
+        if args_cli.mode == "teleop":
+            teleop_interface = create_waterhose_spacemouse_device(args_cli, args_cli.sensitivity)
+            teleop_interface.reset()
+            NewtonWaterhoseManager.set_teleop_enabled(True)
+            print(f"[INFO] Teleop device: {teleop_interface}", flush=True)
 
-            while _simulation_is_running(env) and step < args_cli.max_steps:
-                if teleop_interface is not None:
-                    command = teleop_interface.advance()
-                    actions.zero_()
-                    command = command.to(device=env.device, dtype=actions.dtype).reshape(-1)
-                    width = min(actions.shape[1], command.numel())
-                    actions[:, :width] = command[:width].reshape(1, width).repeat(env.num_envs, 1)
-                    if args_cli.debug_teleop and step % 15 == 0:
-                        command_cpu = command.detach().cpu()
-                        print(
-                            "teleop command:",
-                            " ".join(f"{float(value):+.3f}" for value in command_cpu.tolist()),
-                            flush=True,
-                        )
-                obs, rew, terminated, truncated, extras = env.step(actions)
-                del obs, rew, extras
-                if bool(torch.any(terminated | truncated).item()):
-                    break
-                step += 1
-        finally:
-            elapsed = time.perf_counter() - start
-            if env is not None:
-                sim_time = step * float(env.step_dt)
-                print(
-                    f"[PROFILE] steps={step} sim_time={sim_time:.3f}s wall_time={elapsed:.3f}s "
-                    f"rtf={sim_time / max(elapsed, 1e-12):.3f} steps_per_s={step / max(elapsed, 1e-12):.1f}",
-                    flush=True,
-                )
-                env.close()
+        while _simulation_is_running(env) and step < args_cli.max_steps:
+            if teleop_interface is not None:
+                command = teleop_interface.advance()
+                actions.zero_()
+                command = command.to(device=env.device, dtype=actions.dtype).reshape(-1)
+                width = min(actions.shape[1], command.numel())
+                actions[:, :width] = command[:width].reshape(1, width).repeat(env.num_envs, 1)
+                if args_cli.debug_teleop and step % 15 == 0:
+                    command_cpu = command.detach().cpu()
+                    print(
+                        "teleop command:",
+                        " ".join(f"{float(value):+.3f}" for value in command_cpu.tolist()),
+                        flush=True,
+                    )
+            obs, rew, terminated, truncated, extras = env.step(actions)
+            del obs, rew, extras
+            if bool(torch.any(terminated | truncated).item()):
+                break
+            step += 1
+    finally:
+        elapsed = time.perf_counter() - start
+        if env is not None:
+            sim_time = step * float(env.step_dt)
+            print(
+                f"[PROFILE] steps={step} sim_time={sim_time:.3f}s wall_time={elapsed:.3f}s "
+                f"rtf={sim_time / max(elapsed, 1e-12):.3f} steps_per_s={step / max(elapsed, 1e-12):.1f}",
+                flush=True,
+            )
+            env.close()
+
+
+def main() -> None:
+    if "kit" in selected_visualizers:
+        bootstrap_cfg = SimpleNamespace(sim=SimpleNamespace(device=args_cli.device, visualizer_cfgs=[]))
+        with launch_simulation(bootstrap_cfg, args_cli):
+            env_cfg = _parse_configured_env_cfg()
+            _run_env(env_cfg)
+    else:
+        env_cfg = _parse_configured_env_cfg()
+        with launch_simulation(env_cfg, args_cli):
+            _run_env(env_cfg)
 
 
 if __name__ == "__main__":
