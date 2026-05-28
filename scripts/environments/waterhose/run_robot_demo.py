@@ -24,6 +24,10 @@ from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager impo
     NewtonWaterhoseManager,
     WaterhoseNewtonSolverCfg,
 )
+from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.teleop import (
+    add_waterhose_spacemouse_args,
+    create_waterhose_spacemouse_device,
+)
 from isaaclab_tasks.utils import add_launcher_args, launch_simulation, parse_env_cfg
 
 
@@ -94,96 +98,6 @@ def validate_visualizers(args_cli: argparse.Namespace, parser: argparse.Argument
     return selected
 
 
-class SimpleSpaceMouse:
-    """Restrict SpaceMouse commands to translation and yaw for easier waterhose teleop."""
-
-    def __init__(
-        self,
-        device,
-        translation_signs: tuple[float, float, float],
-        yaw_sign: float,
-        deadzone: float,
-        yaw_translation_lock: bool,
-    ):
-        self._device = device
-        self._translation_signs = translation_signs
-        self._yaw_sign = yaw_sign
-        self._deadzone = max(0.0, float(deadzone))
-        self._yaw_translation_lock = yaw_translation_lock
-
-    def __str__(self) -> str:
-        return f"{self._device} (simple XYZ+gripper-spin mode)"
-
-    def reset(self) -> None:
-        self._device.reset()
-
-    def add_callback(self, key: str, func) -> None:
-        self._device.add_callback(key, func)
-
-    def advance(self):
-        command = self._device.advance().clone()
-        if self._deadzone > 0.0:
-            command[torch.abs(command) < self._deadzone] = 0.0
-        for axis, sign in enumerate(self._translation_signs):
-            command[axis] *= sign
-        command[3:5] = 0.0
-        command[5] *= self._yaw_sign
-        translation_norm = torch.linalg.vector_norm(command[:3])
-        yaw_abs = torch.abs(command[5])
-        if translation_norm > self._deadzone:
-            command[5] = 0.0
-        elif yaw_abs > self._deadzone:
-            command[:3] = 0.0
-        if self._yaw_translation_lock and abs(float(command[5].detach().cpu())) > self._deadzone:
-            command[:3] = 0.0
-        return command
-
-
-def add_spacemouse_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--spacemouse_mode", choices=("auto", "simple", "full"), default="auto")
-    parser.add_argument("--spacemouse_pos_sensitivity", type=float, default=None)
-    parser.add_argument("--spacemouse_rot_sensitivity", type=float, default=None)
-    parser.add_argument("--spacemouse_simple_x_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
-    parser.add_argument("--spacemouse_simple_y_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
-    parser.add_argument("--spacemouse_simple_z_sign", type=float, choices=(-1.0, 1.0), default=1.0)
-    parser.add_argument("--spacemouse_simple_yaw_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
-    parser.add_argument("--spacemouse_simple_deadzone", type=float, default=1.0e-3)
-    parser.add_argument("--spacemouse_simple_yaw_translation_lock", action=argparse.BooleanOptionalAction, default=False)
-
-
-def create_spacemouse_device(args_cli, sensitivity: float):
-    from isaaclab.devices.spacemouse.se3_spacemouse import Se3SpaceMouse  # noqa: PLC0415
-    from isaaclab.devices.spacemouse.se3_spacemouse_cfg import Se3SpaceMouseCfg  # noqa: PLC0415
-
-    mode = str(args_cli.spacemouse_mode or "auto")
-    if mode == "auto":
-        mode = "simple"
-    pos_sensitivity = (
-        float(args_cli.spacemouse_pos_sensitivity)
-        if args_cli.spacemouse_pos_sensitivity is not None
-        else 0.05 * sensitivity
-    )
-    rot_sensitivity = (
-        float(args_cli.spacemouse_rot_sensitivity)
-        if args_cli.spacemouse_rot_sensitivity is not None
-        else (0.15 if mode == "simple" else 0.05) * sensitivity
-    )
-    device = Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=pos_sensitivity, rot_sensitivity=rot_sensitivity))
-    if mode != "simple":
-        return device
-    return SimpleSpaceMouse(
-        device,
-        (
-            float(args_cli.spacemouse_simple_x_sign),
-            float(args_cli.spacemouse_simple_y_sign),
-            float(args_cli.spacemouse_simple_z_sign),
-        ),
-        float(args_cli.spacemouse_simple_yaw_sign),
-        float(args_cli.spacemouse_simple_deadzone),
-        bool(args_cli.spacemouse_simple_yaw_translation_lock),
-    )
-
-
 parser = argparse.ArgumentParser(description="Run the waterhose robot demo through IsaacLab.")
 parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--mode", choices=("scripted", "teleop"), default="scripted", help="Control mode.")
@@ -196,7 +110,7 @@ parser.add_argument("--asset_root", type=str, default=DEFAULT_ASSET_ROOT, help="
 parser.add_argument("--teleop_device", type=str, default=None, help="Teleop device. Use spacemouse.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Teleop sensitivity scale.")
 parser.add_argument("--debug_teleop", action="store_true", help="Print periodic teleop commands.")
-add_spacemouse_args(parser)
+add_waterhose_spacemouse_args(parser)
 add_launcher_args(parser)
 parser.add_argument(
     "--vis",
@@ -289,7 +203,7 @@ def main() -> None:
             _startup_report()
             actions = torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device)
             if args_cli.mode == "teleop":
-                teleop_interface = create_spacemouse_device(args_cli, args_cli.sensitivity)
+                teleop_interface = create_waterhose_spacemouse_device(args_cli, args_cli.sensitivity)
                 teleop_interface.reset()
                 NewtonWaterhoseManager.set_teleop_enabled(True)
                 print(f"[INFO] Teleop device: {teleop_interface}", flush=True)
