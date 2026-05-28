@@ -23,10 +23,11 @@ gym.register(
     disable_env_checker=True,
 )
 
+# Canonical coupled task: stable one-way proxy coupling (robot drives the cable).
 gym.register(
-    id="Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0",
+    id="Isaac-Waterhose-Robot-Demo-Coupled-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={"env_cfg_entry_point": f"{_PKG}.admm_env_cfg:WaterhoseRobotDemoAdmmEnvCfg"},
+    kwargs={"env_cfg_entry_point": f"{_PKG}.one_way_env_cfg:WaterhoseRobotDemoOneWayEnvCfg"},
     disable_env_checker=True,
 )
 
@@ -34,5 +35,21 @@ gym.register(
     id="Isaac-Waterhose-Robot-Demo-OneWay-Coupled-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={"env_cfg_entry_point": f"{_PKG}.one_way_env_cfg:WaterhoseRobotDemoOneWayEnvCfg"},
+    disable_env_checker=True,
+)
+
+# Experimental couplings: two-way feeds cable reaction back to the robot; ADMM
+# resolves gripper/cable contact across solvers and can be unstable on contact.
+gym.register(
+    id="Isaac-Waterhose-Robot-Demo-TwoWay-Coupled-Experimental-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": f"{_PKG}.two_way_env_cfg:WaterhoseRobotDemoTwoWayEnvCfg"},
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": f"{_PKG}.admm_env_cfg:WaterhoseRobotDemoAdmmEnvCfg"},
     disable_env_checker=True,
 )

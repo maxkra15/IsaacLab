@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Task-local Newton model construction for the ADMM waterhose task."""
+"""Task-local Newton model construction for the coupled waterhose task."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ LEROBOT_INITIAL_STATE_22 = (
 
 
 @dataclass
-class WaterhoseAdmmBuildInfo:
+class WaterhoseCoupledBuildInfo:
     """Bookkeeping from task-local model construction."""
 
     num_envs: int = 1
@@ -108,13 +108,13 @@ class WaterhoseAssetPaths:
                 raise FileNotFoundError(f"Waterhose asset not found: {path}")
 
 
-def build_waterhose_admm_builder(
+def build_waterhose_coupled_builder(
     asset_root: str | Path,
     *,
     include_proxy_bodies: bool = False,
     num_envs: int = 1,
     env_spacing: float = 2.5,
-) -> tuple[newton.ModelBuilder, WaterhoseAdmmBuildInfo]:
+) -> tuple[newton.ModelBuilder, WaterhoseCoupledBuildInfo]:
     """Build a single Newton model containing the robot and VBD waterhose scene.
 
     The model is owned and stepped by the standard
@@ -153,7 +153,7 @@ def build_waterhose_admm_builder(
     _sanitize_builder_labels(builder)
     builder.color()
 
-    info = WaterhoseAdmmBuildInfo(
+    info = WaterhoseCoupledBuildInfo(
         num_envs=1,
         env_body_count=int(builder.body_count),
         env_shape_count=int(builder.shape_count),
@@ -188,11 +188,11 @@ def build_waterhose_admm_builder(
 
 def _replicate_waterhose_builder(
     prototype: newton.ModelBuilder,
-    info: WaterhoseAdmmBuildInfo,
+    info: WaterhoseCoupledBuildInfo,
     *,
     num_envs: int,
     env_spacing: float,
-) -> tuple[newton.ModelBuilder, WaterhoseAdmmBuildInfo]:
+) -> tuple[newton.ModelBuilder, WaterhoseCoupledBuildInfo]:
     """Replicate the task prototype into one Newton multi-world builder."""
 
     origins = _grid_origins(num_envs, env_spacing)
@@ -219,7 +219,7 @@ def _replicate_waterhose_builder(
 
     env_body_count = int(info.env_body_count or prototype.body_count)
     env_shape_count = int(info.env_shape_count or prototype.shape_count)
-    return replicated, WaterhoseAdmmBuildInfo(
+    return replicated, WaterhoseCoupledBuildInfo(
         num_envs=num_envs,
         env_body_count=env_body_count,
         env_shape_count=env_shape_count,
@@ -688,14 +688,11 @@ def _filter_robot_vbd_cross_contacts(
     robot_shape_count: int,
     cable_results: list[CableCurveImportResult],
 ) -> None:
-    """Match the legacy one-way contact surface for ADMM.
+    """Restrict robot/VBD cross contacts to gripper fingers against cable shapes.
 
-    The original successful demo exposes only duplicated gripper-finger proxy
-    shapes to the VBD cable world. A naive ADMM contact pair between the whole
-    MuJoCo robot and the whole VBD scene creates robot-vs-fridge and
-    robot-vs-cable contacts for every robot body, which is both much slower and
-    behaviorally different. Keep ADMM cross contacts to finger shapes against
-    cable/plug shapes.
+    Only the gripper-finger shapes should interact with the cable/plug world.
+    Filtering every other robot-vs-VBD pair (e.g. robot-vs-fridge) keeps the
+    cross-solver contact set small and well behaved.
     """
 
     robot_shapes = set(range(int(robot_builder.shape_count)))
@@ -729,7 +726,7 @@ def _robot_finger_shape_ids(robot_builder: newton.ModelBuilder) -> set[int]:
             continue
         shape_ids.update(int(shape_id) for shape_id in robot_builder.body_shapes.get(body_id, []))
     if not shape_ids:
-        raise RuntimeError("No RBY1 gripper finger shapes found for ADMM coupling.")
+        raise RuntimeError("No RBY1 gripper finger shapes found for coupled cross contacts.")
     return shape_ids
 
 

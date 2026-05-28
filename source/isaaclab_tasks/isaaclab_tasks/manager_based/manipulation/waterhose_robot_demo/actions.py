@@ -90,27 +90,27 @@ class ScriptedDemoAction(ActionTerm):
 
 
 @configclass
-class AdmmScriptedDemoActionCfg(ScriptedDemoActionCfg):
-    """SE(3) command action for the ADMM demo task."""
+class CoupledScriptedDemoActionCfg(ScriptedDemoActionCfg):
+    """SE(3) command action for the coupled demo task."""
 
     pass
 
 
-class AdmmScriptedDemoAction(ScriptedDemoAction):
-    """Runs the ADMM scripted controller, or routes non-zero commands to teleop."""
+class CoupledScriptedDemoAction(ScriptedDemoAction):
+    """Runs the coupled scripted controller, or routes non-zero commands to teleop."""
 
-    cfg: AdmmScriptedDemoActionCfg
+    cfg: CoupledScriptedDemoActionCfg
 
     def apply_actions(self) -> None:
-        from .admm_manager import NewtonWaterhoseAdmmManager  # noqa: PLC0415
+        from .coupled_manager import NewtonWaterhoseCoupledManager  # noqa: PLC0415
 
         command = self._processed_actions[0]
-        if NewtonWaterhoseAdmmManager.teleop_enabled():
-            NewtonWaterhoseAdmmManager.apply_teleop_command(command)
+        if NewtonWaterhoseCoupledManager.teleop_enabled():
+            NewtonWaterhoseCoupledManager.apply_teleop_command(command)
             return
         has_user_command = bool(torch.any(torch.abs(command) > float(self.cfg.input_deadzone)).item())
         if has_user_command:
-            NewtonWaterhoseAdmmManager.set_teleop_enabled(True)
-            NewtonWaterhoseAdmmManager.apply_teleop_command(command)
+            NewtonWaterhoseCoupledManager.set_teleop_enabled(True)
+            NewtonWaterhoseCoupledManager.apply_teleop_command(command)
             return
-        NewtonWaterhoseAdmmManager.apply_scripted_control()
+        NewtonWaterhoseCoupledManager.apply_scripted_control()
