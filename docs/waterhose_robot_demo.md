@@ -17,7 +17,6 @@ git checkout waterhose-demo
 The Newton dependency is PR 2848. This branch was verified with:
 
 ```text
-/home/maximiliank/Work/newton
 branch: pr-2848-coupled-solver-framework-latest
 tracks: origin/pr-2848-head
 commit: c2f21df3acc0f06d207812810b2e27ca7c4da08c
@@ -32,19 +31,11 @@ git fetch origin pull/2848/head:pr-2848-head
 git checkout pr-2848-head
 ```
 
-The Isaac Lab packages in this fork pin `newton[sim]` to the verified PR commit above. The demo runner also accepts `--newton_root /path/to/newton` for workflows that use a local Newton checkout.
+The Isaac Lab packages in this fork pin `newton[sim]` to the verified PR commit above. The demo runner also accepts `--newton_root /path/to/newton` for workflows that use a separate Newton checkout.
 
 ## Assets
 
-The asset archive exists locally at:
-
-```text
-/home/maximiliank/Downloads/waterhose_demo_assets.tar.gz
-```
-
-The requested typo path `/home/maximiliank/Donwloads/waterhose_demo_assets.tar.gz` does not exist.
-
-The archive contains a top-level `WaterhoseDemo/` directory with the RBY1DF URDF, robot meshes, fridge scene USD, cable curve USD, and plug meshes. Extract it into the Isaac Lab asset data directory:
+The demo assets are distributed as `waterhose_demo_assets.tar.gz`. The archive contains a top-level `WaterhoseDemo/` directory with the RBY1DF URDF, robot meshes, fridge scene USD, cable curve USD, and plug meshes. Extract it into the Isaac Lab asset data directory:
 
 ```bash
 cd /path/to/IsaacLab-waterhose-demo
@@ -325,4 +316,3 @@ This is task-specific because the cable, plug, and socket are not regular Isaac 
 - The Mimic task has task-local object pose overrides rather than default scene object APIs.
 - The ADMM task is experimental and single-env.
 - XR/Apple Vision Pro support should be layered through the standard Isaac Lab teleop/XR stack, but it has not been validated in this task yet.
-
