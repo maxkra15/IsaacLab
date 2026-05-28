@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""No-op action term for the scripted Newton reference demo wrapper."""
+"""Action terms for the scripted waterhose robot demo."""
 
 from __future__ import annotations
 
@@ -17,30 +17,38 @@ from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.managers.manager_base import ManagerTermBase
 from isaaclab.utils.configclass import configclass
 
+from .manager import NewtonWaterhoseManager
+
 
 @configclass
-class ReferenceDemoNoOpActionCfg(ActionTermCfg):
-    """Single-dimension no-op action for manager compatibility."""
+class ScriptedDemoActionCfg(ActionTermCfg):
+    """SE(3) teleop command action for the scripted demo task."""
 
     class_type: type[ActionTerm] = MISSING
-    asset_name: str = "reference_demo"
+    asset_name: str = "waterhose_demo"
+    command_dim: int = 7
+    position_scale: float = 0.04
+    rotation_scale: float = 0.25
+    max_target_step: float = 0.018
 
 
-class ReferenceDemoNoOpAction(ActionTerm):
-    """Accepts actions but leaves the reference Newton demo fully scripted."""
+class ScriptedDemoAction(ActionTerm):
+    """Accepts relative end-effector commands when teleoperation is enabled."""
 
-    cfg: ReferenceDemoNoOpActionCfg
+    cfg: ScriptedDemoActionCfg
 
-    def __init__(self, cfg: ReferenceDemoNoOpActionCfg, env):
+    def __init__(self, cfg: ScriptedDemoActionCfg, env):
         ManagerTermBase.__init__(self, cfg, env)
         self._IO_descriptor = GenericActionIODescriptor()
         self._export_IO_descriptor = True
-        self._raw_actions = torch.zeros(self.num_envs, 1, device=self.device)
+        self._raw_actions = torch.zeros(self.num_envs, int(self.cfg.command_dim), device=self.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
+        self._position_step_norm = torch.empty((self.num_envs, 1), device=self.device)
+        self._position_step_scale = torch.empty_like(self._position_step_norm)
 
     @property
     def action_dim(self) -> int:
-        return 1
+        return int(self.cfg.command_dim)
 
     @property
     def raw_actions(self) -> torch.Tensor:
@@ -51,16 +59,25 @@ class ReferenceDemoNoOpAction(ActionTerm):
         return self._processed_actions
 
     def process_actions(self, actions: torch.Tensor) -> None:
-        self._raw_actions[:] = actions.reshape(self.num_envs, self.action_dim)
-        self._processed_actions.copy_(self._raw_actions)
+        self._raw_actions[:] = actions.reshape(self.num_envs, self.action_dim).clamp(-1.0, 1.0)
+        self._processed_actions[:, :3] = self._raw_actions[:, :3] * float(self.cfg.position_scale)
+        max_target_step = float(self.cfg.max_target_step)
+        if max_target_step > 0.0:
+            position_step = self._processed_actions[:, :3]
+            torch.linalg.vector_norm(position_step, dim=-1, keepdim=True, out=self._position_step_norm)
+            self._position_step_norm.clamp_min_(1.0e-12)
+            torch.div(max_target_step, self._position_step_norm, out=self._position_step_scale)
+            self._position_step_scale.clamp_(max=1.0)
+            position_step.mul_(self._position_step_scale)
+        self._processed_actions[:, 3:6] = self._raw_actions[:, 3:6] * float(self.cfg.rotation_scale)
+        self._processed_actions[:, 6:] = self._raw_actions[:, 6:]
 
     def apply_actions(self) -> None:
-        # The reference demo's state machine writes all robot controls.
-        return
+        if NewtonWaterhoseManager.teleop_enabled():
+            NewtonWaterhoseManager.apply_teleop_command(self._processed_actions[0])
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:
             env_ids = slice(None)
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
-

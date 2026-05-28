@@ -138,7 +138,8 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.core.lift import mdp
-from isaaclab_tasks.utils import launch_simulation, parse_env_cfg
+from isaaclab.app import launch_simulation
+from isaaclab_tasks.utils import parse_env_cfg
 
 logger = logging.getLogger(__name__)
 

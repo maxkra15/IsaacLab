@@ -56,7 +56,8 @@ import torch
 import isaaclab_tasks  # noqa: F401
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab_tasks.manager_based.manipulation.waterhose import waterhose_core as core
-from isaaclab_tasks.utils import launch_simulation, parse_env_cfg
+from isaaclab.app import launch_simulation
+from isaaclab_tasks.utils import parse_env_cfg
 
 
 def _simulation_is_running(env) -> bool:
