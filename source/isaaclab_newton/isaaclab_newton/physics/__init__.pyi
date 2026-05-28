@@ -25,17 +25,20 @@ __all__ = [
     "NewtonShapeCfg",
     "NewtonSolverCfg",
     "NewtonXPBDManager",
+    "OneWayCouplingCfg",
     "ProxyCouplingCfg",
+    "SolverOneWayCoupled",
     "XPBDSolverCfg",
 ]
 
-from .coupled_manager import NewtonCoupledManager
+from .coupled_manager import NewtonCoupledManager, SolverOneWayCoupled
 from .coupled_manager_cfg import (
     AdmmContactPairCfg,
     AdmmCouplingCfg,
     CoupledProxyCfg,
     CoupledSolverCfg,
     CoupledSolverEntryCfg,
+    OneWayCouplingCfg,
     ProxyCouplingCfg,
 )
 from .featherstone_manager import NewtonFeatherstoneManager

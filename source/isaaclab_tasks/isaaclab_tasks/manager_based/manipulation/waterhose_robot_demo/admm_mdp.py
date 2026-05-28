@@ -13,7 +13,12 @@ from .admm_manager import NewtonWaterhoseAdmmManager
 
 
 def _pose_tensor(env, pose) -> torch.Tensor:
-    return torch.as_tensor(pose, dtype=torch.float32, device=env.device).reshape(1, 7).repeat(env.num_envs, 1)
+    tensor = torch.as_tensor(pose, dtype=torch.float32, device=env.device)
+    if tensor.ndim == 1:
+        return tensor.reshape(1, 7).repeat(env.num_envs, 1)
+    if tensor.shape[0] == env.num_envs:
+        return tensor.reshape(env.num_envs, 7)
+    return tensor[:1].reshape(1, 7).repeat(env.num_envs, 1)
 
 
 def sim_time(env) -> torch.Tensor:
@@ -25,14 +30,20 @@ def phase(env) -> torch.Tensor:
 
 
 def right_ee_pose(env) -> torch.Tensor:
+    if hasattr(NewtonWaterhoseAdmmManager, "get_right_ee_poses"):
+        return _pose_tensor(env, NewtonWaterhoseAdmmManager.get_right_ee_poses())
     return _pose_tensor(env, NewtonWaterhoseAdmmManager.get_right_ee_pose())
 
 
 def plug_pose(env) -> torch.Tensor:
+    if hasattr(NewtonWaterhoseAdmmManager, "get_plug_poses"):
+        return _pose_tensor(env, NewtonWaterhoseAdmmManager.get_plug_poses())
     return _pose_tensor(env, NewtonWaterhoseAdmmManager.get_plug_pose())
 
 
 def tip_pose(env) -> torch.Tensor:
+    if hasattr(NewtonWaterhoseAdmmManager, "get_tip_poses"):
+        return _pose_tensor(env, NewtonWaterhoseAdmmManager.get_tip_poses())
     return _pose_tensor(env, NewtonWaterhoseAdmmManager.get_tip_pose())
 
 

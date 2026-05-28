@@ -13,6 +13,7 @@ from typing import ClassVar
 
 import numpy as np
 import warp as wp
+import newton
 from newton import GeoType
 
 from isaaclab.physics import PhysicsManager
@@ -20,11 +21,13 @@ from isaaclab.utils.configclass import configclass
 from isaaclab_newton.physics import (
     AdmmContactPairCfg,
     AdmmCouplingCfg,
+    CoupledProxyCfg,
     CoupledSolverCfg,
     CoupledSolverEntryCfg,
     MJWarpSolverCfg,
     NewtonManager,
     NewtonSolverCfg,
+    OneWayCouplingCfg,
 )
 from isaaclab_newton.physics.coupled_manager import NewtonCoupledManager
 
@@ -42,7 +45,7 @@ _DEFAULT_ASSET_ROOT = str(
 )
 
 
-class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
+class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     """Newton coupled-manager path for the waterhose robot demo."""
 
     _build_info: ClassVar[WaterhoseAdmmBuildInfo | None] = None
@@ -50,6 +53,10 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
     _tip_body_id: ClassVar[int | None] = None
     _right_ee_body_id: ClassVar[int | None] = None
     _cable0_last_body_id: ClassVar[int | None] = None
+    _plug_body_ids: ClassVar[list[int | None]] = []
+    _tip_body_ids: ClassVar[list[int | None]] = []
+    _right_ee_body_ids: ClassVar[list[int | None]] = []
+    _cable0_last_body_ids: ClassVar[list[int | None]] = []
     _controller_ready: ClassVar[bool] = False
     _teleop_enabled: ClassVar[bool] = False
     _script_phase: ClassVar[int] = 0
@@ -80,9 +87,21 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
     @classmethod
     def instantiate_builder_from_stage(cls) -> None:
         cfg = cls._waterhose_cfg()
-        builder, build_info = build_waterhose_admm_builder(getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT))
+        num_envs = max(1, int(getattr(cfg, "num_envs", 1)))
+        if num_envs != 1 and getattr(cfg, "solver_type", "") in {"waterhose_admm", "waterhose_one_way"}:
+            raise RuntimeError(
+                "The coupled-manager waterhose task is single-env until Newton's coupled ModelView supports "
+                "compact per-entry multi-world views for MJWarp. Use Isaac-Waterhose-Robot-Demo-v0 for "
+                "multi-env runs today."
+            )
+        builder, build_info = build_waterhose_admm_builder(
+            getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT),
+            include_proxy_bodies=bool(getattr(cfg, "include_proxy_bodies", False)),
+            num_envs=num_envs,
+            env_spacing=float(getattr(cfg, "env_spacing", 2.5)),
+        )
         NewtonManager.set_builder(builder)
-        NewtonManager._num_envs = 1
+        NewtonManager._num_envs = num_envs
         cls._build_info = build_info
 
     @classmethod
@@ -101,6 +120,10 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
         cls._tip_body_id = None
         cls._right_ee_body_id = None
         cls._cable0_last_body_id = None
+        cls._plug_body_ids = []
+        cls._tip_body_ids = []
+        cls._right_ee_body_ids = []
+        cls._cable0_last_body_ids = []
         cls._controller_ready = False
         cls._teleop_enabled = False
         cls._script_phase = 0
@@ -125,14 +148,21 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
         if build_info is None:
             return
         shape_type = model.shape_type.numpy()
+        built_meshes: set[int] = set()
         for shape_id in build_info.scene_shape_ids:
             if shape_id < 0 or shape_id >= int(model.shape_count):
                 continue
             if int(shape_type[shape_id]) != int(GeoType.MESH):
                 continue
             mesh = model.shape_source[shape_id]
-            if mesh is not None:
+            if mesh is None or id(mesh) in built_meshes:
+                continue
+            try:
                 mesh.build_sdf(max_resolution=64)
+            except RuntimeError as exc:
+                if "already has an SDF" not in str(exc):
+                    raise
+            built_meshes.add(id(mesh))
 
     @classmethod
     def _configure_vbd_solver(cls) -> None:
@@ -161,9 +191,15 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
         if build_info is None or build_info.vbd_initial_body_q is None:
             return
 
-        vbd_body_q = np.asarray(build_info.vbd_initial_body_q, dtype=np.float32)
-        start = int(build_info.robot_body_count)
-        end = start + int(vbd_body_q.shape[0])
+        if build_info.vbd_initial_body_q_by_env is not None:
+            vbd_body_q_by_env = np.asarray(build_info.vbd_initial_body_q_by_env, dtype=np.float32)
+        else:
+            vbd_body_q = np.asarray(build_info.vbd_initial_body_q, dtype=np.float32)
+            vbd_body_q_by_env = vbd_body_q.reshape(1, int(vbd_body_q.shape[0]), 7)
+
+        num_envs = int(build_info.num_envs)
+        env_body_count = int(build_info.env_body_count or (build_info.robot_body_count + build_info.vbd_body_count))
+        vbd_body_count = int(build_info.vbd_body_count)
 
         for array in (
             getattr(NewtonManager._model, "body_q", None),
@@ -173,12 +209,15 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
             if array is None:
                 continue
             body_q_np = array.numpy()
-            if end > int(body_q_np.shape[0]):
-                raise RuntimeError(
-                    f"Cannot restore VBD body poses: requested body range [{start}, {end}) "
-                    f"but model has {body_q_np.shape[0]} bodies."
-                )
-            body_q_np[start:end] = vbd_body_q
+            for env_id in range(num_envs):
+                start = env_id * env_body_count + int(build_info.robot_body_count)
+                end = start + vbd_body_count
+                if end > int(body_q_np.shape[0]):
+                    raise RuntimeError(
+                        f"Cannot restore VBD body poses for env {env_id}: requested body range [{start}, {end}) "
+                        f"but model has {body_q_np.shape[0]} bodies."
+                    )
+                body_q_np[start:end] = vbd_body_q_by_env[env_id]
             wp.copy(array, wp.array(body_q_np, dtype=wp.transform, device=array.device))
 
         try:
@@ -186,16 +225,30 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
         except Exception:
             return
         body_q_prev = getattr(vbd_solver, "body_q_prev", None)
-        if body_q_prev is not None and int(body_q_prev.shape[0]) == int(vbd_body_q.shape[0]):
-            wp.copy(body_q_prev, wp.array(vbd_body_q, dtype=wp.transform, device=body_q_prev.device))
+        if body_q_prev is not None:
+            vbd_body_q_flat = vbd_body_q_by_env.reshape(num_envs * vbd_body_count, 7)
+            if int(body_q_prev.shape[0]) == int(vbd_body_q_flat.shape[0]):
+                wp.copy(body_q_prev, wp.array(vbd_body_q_flat, dtype=wp.transform, device=body_q_prev.device))
 
     @classmethod
     def _resolve_tracked_bodies(cls, model) -> None:
         labels = [str(label) for label in getattr(model, "body_label", [])]
-        cls._right_ee_body_id = _find_body(labels, "right_gripper_end_effector")
-        cls._plug_body_id = _find_body(labels, "authored_head_0")
-        cls._tip_body_id = _find_body(labels, "water_hose_cable_0_edge_body_0")
-        cls._cable0_last_body_id = _find_body(labels, "water_hose_cable_0_edge_body_42")
+        build_info = cls._build_info
+        num_envs = max(1, int(getattr(build_info, "num_envs", 1)))
+        cls._right_ee_body_ids = [
+            _find_body_for_env(labels, "right_gripper_end_effector", env_id) for env_id in range(num_envs)
+        ]
+        cls._plug_body_ids = [_find_body_for_env(labels, "authored_head_0", env_id) for env_id in range(num_envs)]
+        cls._tip_body_ids = [
+            _find_body_for_env(labels, "water_hose_cable_0_edge_body_0", env_id) for env_id in range(num_envs)
+        ]
+        cls._cable0_last_body_ids = [
+            _find_body_for_env(labels, "water_hose_cable_0_edge_body_42", env_id) for env_id in range(num_envs)
+        ]
+        cls._right_ee_body_id = cls._right_ee_body_ids[0]
+        cls._plug_body_id = cls._plug_body_ids[0]
+        cls._tip_body_id = cls._tip_body_ids[0]
+        cls._cable0_last_body_id = cls._cable0_last_body_ids[0]
 
     @classmethod
     def _initialize_robot_control_targets(cls) -> None:
@@ -207,11 +260,18 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
         target = getattr(control, "joint_target_pos", None)
         if target is None:
             return
-        count = min(int(build_info.robot_joint_q_count), int(target.shape[0]), int(state.joint_q.shape[0]))
-        if count <= 0:
+        robot_q_count = int(build_info.robot_joint_q_count)
+        env_q_count = int(build_info.env_joint_q_count or robot_q_count)
+        num_envs = int(build_info.num_envs)
+        if robot_q_count <= 0 or env_q_count <= 0:
             return
         target_np = target.numpy()
-        target_np[:count] = state.joint_q.numpy()[:count]
+        joint_q_np = state.joint_q.numpy()
+        for env_id in range(num_envs):
+            start = env_id * env_q_count
+            end = start + robot_q_count
+            if end <= int(target_np.shape[0]) and end <= int(joint_q_np.shape[0]):
+                target_np[start:end] = joint_q_np[start:end]
         wp.copy(target, wp.array(target_np, dtype=wp.float32, device=target.device))
 
     @classmethod
@@ -227,12 +287,24 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
         return cls._body_pose(cls._right_ee_body_id, "right_gripper_end_effector")
 
     @classmethod
+    def get_right_ee_poses(cls) -> np.ndarray:
+        return cls._body_poses(cls._right_ee_body_ids, "right_gripper_end_effector")
+
+    @classmethod
     def get_plug_pose(cls) -> np.ndarray:
         return cls._body_pose(cls._plug_body_id, "plug head")
 
     @classmethod
+    def get_plug_poses(cls) -> np.ndarray:
+        return cls._body_poses(cls._plug_body_ids, "plug head")
+
+    @classmethod
     def get_tip_pose(cls) -> np.ndarray:
         return cls._body_pose(cls._tip_body_id, "cable tip")
+
+    @classmethod
+    def get_tip_poses(cls) -> np.ndarray:
+        return cls._body_poses(cls._tip_body_ids, "cable tip")
 
     @classmethod
     def is_finite(cls) -> bool:
@@ -441,20 +513,28 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
         target = control.joint_target_pos
         target_np = target.numpy()
         robot_q_count = int(build_info.robot_joint_q_count)
-        target_np[:robot_q_count] = cls._ik_joint_q.numpy().reshape(-1)[:robot_q_count]
-        cls._write_gripper_targets(target_np, gripper_value)
+        env_q_count = int(build_info.env_joint_q_count or robot_q_count)
+        num_envs = int(build_info.num_envs)
+        ik_joint_q = cls._ik_joint_q.numpy().reshape(-1)[:robot_q_count]
+        for env_id in range(num_envs):
+            start = env_id * env_q_count
+            end = start + robot_q_count
+            if end > int(target_np.shape[0]):
+                continue
+            target_np[start:end] = ik_joint_q
+            cls._write_gripper_targets(target_np, gripper_value, offset=start)
         wp.copy(target, wp.array(target_np, dtype=wp.float32, device=target.device))
 
     @classmethod
-    def _write_gripper_targets(cls, target_np: np.ndarray, gripper_value: float) -> None:
+    def _write_gripper_targets(cls, target_np: np.ndarray, gripper_value: float, *, offset: int = 0) -> None:
         right_value = float(gripper_value)
         left_value = cls._gripper_open_value
-        target_np[GRIPPER_DRIVER_DOFS[0]] = right_value
-        target_np[GRIPPER_DRIVER_DOFS[1]] = left_value
-        target_np[GRIPPER_FINGER_DOFS[0]] = -right_value
-        target_np[GRIPPER_FINGER_DOFS[1]] = right_value
-        target_np[GRIPPER_FINGER_DOFS[2]] = -left_value
-        target_np[GRIPPER_FINGER_DOFS[3]] = left_value
+        target_np[offset + GRIPPER_DRIVER_DOFS[0]] = right_value
+        target_np[offset + GRIPPER_DRIVER_DOFS[1]] = left_value
+        target_np[offset + GRIPPER_FINGER_DOFS[0]] = -right_value
+        target_np[offset + GRIPPER_FINGER_DOFS[1]] = right_value
+        target_np[offset + GRIPPER_FINGER_DOFS[2]] = -left_value
+        target_np[offset + GRIPPER_FINGER_DOFS[3]] = left_value
 
     @classmethod
     def _compute_grasp_offset(cls) -> None:
@@ -482,6 +562,22 @@ class NewtonWaterhoseAdmmManager(NewtonCoupledManager):
             raise RuntimeError("Waterhose ADMM state is not initialized.")
         return state.body_q.numpy()[int(body_id)].copy()
 
+    @classmethod
+    def _body_poses(cls, body_ids: list[int], name: str) -> np.ndarray:
+        if not body_ids:
+            num_envs = max(1, int(getattr(cls._build_info, "num_envs", 1)))
+            return np.zeros((num_envs, 7), dtype=np.float32)
+        state = NewtonManager._state_0
+        if state is None:
+            raise RuntimeError("Waterhose ADMM state is not initialized.")
+        body_q = state.body_q.numpy()
+        poses = np.zeros((len(body_ids), 7), dtype=np.float32)
+        for index, body_id in enumerate(body_ids):
+            if body_id is None:
+                raise RuntimeError(f"Waterhose ADMM body '{name}' is not available for env {index}.")
+            poses[index] = body_q[int(body_id)]
+        return poses
+
     @staticmethod
     def _waterhose_cfg():
         cfg = PhysicsManager._cfg
@@ -506,11 +602,14 @@ class WaterhoseVBDSolverCfg(NewtonSolverCfg):
     rigid_joint_angular_ke: float = 1.0e6
 
 
+NewtonWaterhoseAdmmManager = NewtonWaterhoseCoupledManager
+
+
 @configclass
 class WaterhoseAdmmSolverCfg(CoupledSolverCfg):
     """ADMM coupled solver config for the waterhose robot demo."""
 
-    class_type: type[NewtonManager] | str = NewtonWaterhoseAdmmManager
+    class_type: type[NewtonManager] | str = NewtonWaterhoseCoupledManager
     solver_type: str = "waterhose_admm"
     coupling_type: str = "admm"
     requires_graph_coloring: ClassVar[bool] = True
@@ -557,11 +656,118 @@ class WaterhoseAdmmSolverCfg(CoupledSolverCfg):
         ]
 
 
+def waterhose_vbd_proxy_collision_pipeline(model_view):
+    """Create the VBD collision pipeline used by one-way gripper proxies."""
+
+    return newton.CollisionPipeline(model_view, broad_phase="explicit", rigid_contact_max=30000)
+
+
+def waterhose_mujoco_single_model_view(model_view) -> None:
+    """Run MJWarp as one combined model when the parent Newton model has worlds.
+
+    The coupled ModelView disables non-owned VBD bodies but keeps parent-model
+    indexing intact for state reconciliation. MJWarp's separate-world converter
+    expects a compact homogeneous robot-only model, so the one-way source entry
+    uses a single MJWarp model over the view instead.
+    """
+
+    model_view.world_count = 1
+
+
+@configclass
+class WaterhoseOneWaySolverCfg(CoupledSolverCfg):
+    """One-way coupled solver config for the waterhose robot demo.
+
+    The MuJoCo robot entry is authoritative. Its gripper finger states are
+    copied into duplicated VBD proxy bodies; the VBD cable/plug entry collides
+    against those proxies, and proxy feedback is discarded by
+    ``coupling_type="one_way"``.
+    """
+
+    class_type: type[NewtonManager] | str = NewtonWaterhoseCoupledManager
+    solver_type: str = "waterhose_one_way"
+    coupling_type: str = "one_way"
+    requires_graph_coloring: ClassVar[bool] = True
+
+    asset_root: str = _DEFAULT_ASSET_ROOT
+    include_proxy_bodies: bool = True
+    num_envs: int = 1
+    env_spacing: float = 2.5
+    entries: list[CoupledSolverEntryCfg] = field(default_factory=list)
+    one_way_coupling: OneWayCouplingCfg = OneWayCouplingCfg(
+        proxies=[
+            CoupledProxyCfg(
+                source="mujoco",
+                destination="vbd",
+                body_name_patterns=[rf"{name}" for name in (
+                    "right_gripper_leftfinger",
+                    "right_gripper_rightfinger",
+                    "left_gripper_leftfinger",
+                    "left_gripper_rightfinger",
+                )],
+                proxy_body_name_patterns=[rf"proxy_{name}" for name in (
+                    "right_gripper_leftfinger",
+                    "right_gripper_rightfinger",
+                    "left_gripper_leftfinger",
+                    "left_gripper_rightfinger",
+                )],
+                mode="lagged",
+                mass_scale=1.0,
+                collision_pipeline_factory=waterhose_vbd_proxy_collision_pipeline,
+                collide_interval=5,
+            )
+        ]
+    )
+    use_collision_pipeline: bool | None = False
+
+    def __post_init__(self) -> None:
+        if self.entries:
+            return
+        self.entries = [
+            CoupledSolverEntryCfg(
+                name="mujoco",
+                solver_cfg=MJWarpSolverCfg(
+                    solver="newton",
+                    integrator="implicitfast",
+                    cone="elliptic",
+                    iterations=20,
+                    ls_iterations=10,
+                    ls_parallel=True,
+                    use_mujoco_contacts=False,
+                    impratio=1000.0,
+                ),
+                body_label_patterns=[r".*mujoco/.*"],
+                include_child_joints=True,
+                include_body_shapes=True,
+                configure_view=waterhose_mujoco_single_model_view,
+                solver_kwargs={"separate_worlds": False},
+            ),
+            CoupledSolverEntryCfg(
+                name="vbd",
+                solver_cfg=WaterhoseVBDSolverCfg(iterations=15, rigid_contact_hard=False),
+                solver_class="newton.solvers:SolverVBD",
+                body_label_patterns=[r".*vbd/.*"],
+                include_child_joints=True,
+                include_body_shapes=True,
+            ),
+        ]
+
+
 def _find_body(labels: list[str], suffix_or_token: str) -> int | None:
     for body_id, label in enumerate(labels):
         if label.endswith(suffix_or_token) or suffix_or_token in label:
             return body_id
     return None
+
+
+def _find_body_for_env(labels: list[str], suffix_or_token: str, env_id: int) -> int | None:
+    env_prefix = f"env_{env_id}/"
+    for body_id, label in enumerate(labels):
+        if not label.startswith(env_prefix):
+            continue
+        if label.endswith(suffix_or_token) or suffix_or_token in label:
+            return body_id
+    return _find_body(labels, suffix_or_token) if env_id == 0 else None
 
 
 def _normalize_quat(quat: np.ndarray) -> np.ndarray:

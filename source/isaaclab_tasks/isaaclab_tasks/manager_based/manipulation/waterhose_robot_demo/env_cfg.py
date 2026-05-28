@@ -23,9 +23,11 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils.configclass import configclass
 from isaaclab_newton.physics import NewtonCfg
+from isaaclab_teleop.xr_cfg import XrCfg
 
 from . import mdp
 from .actions import ScriptedDemoAction, ScriptedDemoActionCfg
+from .isaac_teleop import make_waterhose_isaac_teleop_cfg
 from .manager import WaterhoseNewtonSolverCfg
 from .recorders import WaterhoseActionStateRecorderManagerCfg
 from .teleop import WaterhoseSpaceMouseCfg
@@ -109,7 +111,7 @@ class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
     commands = None
 
     sim: SimulationCfg = SimulationCfg(
-        dt=1.0 / 100.0,
+        dt=1.0 / 60.0,
         render_interval=1,
         physics=NewtonCfg(
             solver_cfg=WaterhoseNewtonSolverCfg(asset_root=_DEFAULT_ASSET_ROOT),
@@ -118,9 +120,11 @@ class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
         ),
     )
     viewer = ViewerCfg(eye=(-2.55, -7.1, 2.3), lookat=(0.55, -0.42, 0.9))
+    xr: XrCfg = XrCfg(anchor_pos=(0.55, -0.42, 0.9), anchor_rot=(0.0, 0.0, 0.0, 1.0))
 
     episode_length_s = 30.0
     decimation = 1
+    isaac_teleop: object | None = None
 
     # Safety bound for scripted rollouts. 0 means run until the controller's DONE phase.
     max_demo_steps: int = 0
@@ -141,12 +145,13 @@ class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
                 "keyboard": Se3KeyboardCfg(
                     pos_sensitivity=0.02,
                     rot_sensitivity=0.05,
-                    sim_device=self.sim.device,
+                    sim_device="cpu",
                 ),
                 "spacemouse": WaterhoseSpaceMouseCfg(
                     pos_sensitivity=0.05,
                     rot_sensitivity=0.15,
-                    sim_device=self.sim.device,
+                    sim_device="cpu",
                 ),
             }
         )
+        self.isaac_teleop = make_waterhose_isaac_teleop_cfg(self.sim.device, self.xr)

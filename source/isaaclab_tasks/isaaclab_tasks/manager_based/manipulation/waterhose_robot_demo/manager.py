@@ -107,6 +107,8 @@ class NewtonWaterhoseManager(NewtonManager):
 
     @classmethod
     def forward(cls) -> None:
+        if not cls._visualization_requested():
+            return
         import warp as wp  # noqa: PLC0415
 
         with wp.ScopedDevice(PhysicsManager._device):
@@ -128,11 +130,13 @@ class NewtonWaterhoseManager(NewtonManager):
         with wp.ScopedDevice(PhysicsManager._device):
             for runtime in cls._runtimes:
                 runtime.step()
-            cls._publish_display_state()
+            cls._publish_display_state_if_needed()
         PhysicsManager._sim_time = cls.get_sim_time()
 
     @classmethod
     def pre_render(cls) -> None:
+        if not cls._visualization_requested():
+            return
         import warp as wp  # noqa: PLC0415
 
         with wp.ScopedDevice(PhysicsManager._device):
@@ -212,6 +216,39 @@ class NewtonWaterhoseManager(NewtonManager):
         if not cls._runtimes:
             return np.zeros((cls._configured_num_envs(), 1), dtype=np.float32)
         return np.asarray([[float(getattr(runtime, "sim_time", 0.0))] for runtime in cls._runtimes], dtype=np.float32)
+
+    @classmethod
+    def get_policy_state(cls) -> dict[str, np.ndarray]:
+        """Return the standard observation state with one host read per runtime state buffer."""
+
+        num_envs = len(cls._runtimes) if cls._runtimes else cls._configured_num_envs()
+        state = {
+            "sim_time": np.zeros((num_envs, 1), dtype=np.float32),
+            "phase": np.zeros((num_envs, 1), dtype=np.float32),
+            "right_ee_pose": np.zeros((num_envs, 7), dtype=np.float32),
+            "plug_pose": np.zeros((num_envs, 7), dtype=np.float32),
+            "tip_pose": np.zeros((num_envs, 7), dtype=np.float32),
+            "finite": np.zeros((num_envs, 1), dtype=np.float32),
+        }
+        for env_id, runtime in enumerate(cls._runtimes):
+            robot_q = runtime.state_0.body_q.numpy()
+            robot_qd = runtime.state_0.body_qd.numpy()
+            vbd_q = runtime.vbd_state_0.body_q.numpy()
+            vbd_qd = runtime.vbd_state_0.body_qd.numpy()
+            right_ee_body_id = cls._right_ee_body_id(runtime)
+            if right_ee_body_id is not None:
+                state["right_ee_pose"][env_id] = robot_q[right_ee_body_id]
+            state["plug_pose"][env_id] = vbd_q[int(getattr(runtime, "cable_head_body_idx", 0))]
+            state["tip_pose"][env_id] = vbd_q[int(getattr(runtime, "tip_capsule_body_idx", 0))]
+            state["sim_time"][env_id, 0] = float(getattr(runtime, "sim_time", 0.0))
+            state["phase"][env_id, 0] = float(cls._runtime_phase(runtime))
+            state["finite"][env_id, 0] = float(
+                np.isfinite(robot_q).all()
+                and np.isfinite(robot_qd).all()
+                and np.isfinite(vbd_q).all()
+                and np.isfinite(vbd_qd).all()
+            )
+        return state
 
     @classmethod
     def set_teleop_enabled(cls, enabled: bool) -> None:
@@ -372,17 +409,24 @@ class NewtonWaterhoseManager(NewtonManager):
             return np.zeros((cls._configured_num_envs(), 7), dtype=np.float32)
         poses = []
         for runtime in cls._runtimes:
-            labels = getattr(runtime.mujoco_model, "body_label", [])
-            suffix = "/right_gripper_end_effector"
-            body_id = None
-            for candidate_id, label in enumerate(labels):
-                if label == "right_gripper_end_effector" or str(label).endswith(suffix):
-                    body_id = candidate_id
-                    break
+            body_id = cls._right_ee_body_id(runtime)
             if body_id is None:
                 raise RuntimeError("Body 'right_gripper_end_effector' not found in waterhose robot model.")
             poses.append(runtime.state_0.body_q.numpy()[body_id].copy())
         return np.stack(poses).astype(np.float32)
+
+    @staticmethod
+    def _right_ee_body_id(runtime) -> int | None:
+        cached = getattr(runtime, "_waterhose_right_ee_body_id", None)
+        if cached is not None:
+            return int(cached)
+        labels = getattr(runtime.mujoco_model, "body_label", [])
+        suffix = "/right_gripper_end_effector"
+        for body_id, label in enumerate(labels):
+            if label == "right_gripper_end_effector" or str(label).endswith(suffix):
+                setattr(runtime, "_waterhose_right_ee_body_id", int(body_id))
+                return int(body_id)
+        return None
 
     @classmethod
     def get_alignment_metrics(cls) -> np.ndarray:
@@ -417,18 +461,58 @@ class NewtonWaterhoseManager(NewtonManager):
             false = np.zeros((num_envs,), dtype=bool)
             return {"approach": false, "grasp": false, "align": false, "insert": false}
 
-        phases = cls.current_phases().reshape(-1).astype(np.int32)
-        ee_pos = cls.get_right_ee_poses()[:, :3].astype(np.float64)
-        plug_pos = cls.get_plug_poses()[:, :3].astype(np.float64)
-        metrics = cls.get_alignment_metrics().astype(np.float64)
-        lateral = metrics[:, 0]
-        axial_depth = metrics[:, 1]
-        axis_cos = metrics[:, 2]
+        phases = np.zeros((num_envs,), dtype=np.int32)
+        approach_by_pose = np.zeros((num_envs,), dtype=bool)
+        grasp_by_state = np.zeros((num_envs,), dtype=bool)
+        align_by_pose = np.zeros((num_envs,), dtype=bool)
+        insert_by_pose = np.zeros((num_envs,), dtype=bool)
 
-        approach_by_pose = np.linalg.norm(ee_pos - plug_pos, axis=1) < 0.055
-        grasp_by_state = approach_by_pose & cls._gripper_closed_mask()
-        align_by_pose = (lateral < 0.045) & (axial_depth > -0.035) & (np.abs(axis_cos) > 0.80)
-        insert_by_pose = cls.success_mask()
+        for env_id, runtime in enumerate(cls._runtimes):
+            try:
+                phase = cls._runtime_phase(runtime)
+                phases[env_id] = int(phase)
+                robot_q = runtime.state_0.body_q.numpy()
+                robot_qd = runtime.state_0.body_qd.numpy()
+                vbd_q = runtime.vbd_state_0.body_q.numpy()
+                vbd_qd = runtime.vbd_state_0.body_qd.numpy()
+                finite = bool(
+                    np.isfinite(robot_q).all()
+                    and np.isfinite(robot_qd).all()
+                    and np.isfinite(vbd_q).all()
+                    and np.isfinite(vbd_qd).all()
+                )
+                right_ee_body_id = cls._right_ee_body_id(runtime)
+                if right_ee_body_id is None:
+                    continue
+                ee_pos = np.asarray(robot_q[right_ee_body_id, :3], dtype=np.float64)
+                plug_pos = np.asarray(vbd_q[int(runtime.cable_head_body_idx), :3], dtype=np.float64)
+                tip_pose = vbd_q[int(runtime.tip_capsule_body_idx)]
+                tip_pos = np.asarray(tip_pose[:3], dtype=np.float64)
+                tip_quat = np.asarray(tip_pose[3:7], dtype=np.float64)
+                socket_pos = np.asarray(runtime._socket_pos_np, dtype=np.float64)
+                insertion_dir = np.asarray(runtime._insertion_dir_np, dtype=np.float64)
+                insertion_dir /= max(float(np.linalg.norm(insertion_dir)), 1.0e-12)
+                delta = tip_pos - socket_pos
+                axial_depth = float(np.dot(delta, insertion_dir))
+                lateral = float(np.linalg.norm(delta - axial_depth * insertion_dir))
+                tip_axis = cls._quat_rotate_np(tip_quat, np.array([0.0, 0.0, 1.0], dtype=np.float64))
+                tip_axis /= max(float(np.linalg.norm(tip_axis)), 1.0e-12)
+                axis_cos = float(np.dot(tip_axis, insertion_dir))
+
+                approach_by_pose[env_id] = np.linalg.norm(ee_pos - plug_pos) < 0.055
+                target = float(runtime.gripper_targets.numpy()[0])
+                open_value = float(runtime.sm_gripper_open_value)
+                closed_value = float(runtime.sm_gripper_closed_value)
+                gripper_closed = abs(target - closed_value) <= abs(target - open_value)
+                grasp_by_state[env_id] = approach_by_pose[env_id] and gripper_closed
+                align_by_pose[env_id] = lateral < 0.045 and axial_depth > -0.035 and abs(axis_cos) > 0.80
+                if finite and bool(getattr(runtime, "auto_mode", True)):
+                    insert_by_pose[env_id] = phase == 18
+                elif finite:
+                    target_depth = float(getattr(runtime, "_insert_snap_depth", runtime.insert_final_depth))
+                    insert_by_pose[env_id] = axial_depth >= target_depth and lateral <= 0.025
+            except (AttributeError, IndexError, TypeError, ValueError):
+                continue
 
         approach = (phases >= 1) | approach_by_pose
         grasp = (phases >= 4) | grasp_by_state
@@ -657,13 +741,10 @@ class NewtonWaterhoseManager(NewtonManager):
         if hasattr(runtime, "sm_task_time_elapsed"):
             task_elapsed = float(runtime.sm_task_time_elapsed.numpy()[0])
 
-        labels = getattr(runtime.mujoco_model, "body_label", [])
-        suffix = "/right_gripper_end_effector"
         right_ee_pose = None
-        for body_id, label in enumerate(labels):
-            if label == "right_gripper_end_effector" or str(label).endswith(suffix):
-                right_ee_pose = runtime.state_0.body_q.numpy()[body_id].copy()
-                break
+        body_id = cls._right_ee_body_id(runtime)
+        if body_id is not None:
+            right_ee_pose = runtime.state_0.body_q.numpy()[body_id].copy()
         if right_ee_pose is None:
             right_ee_pose = np.zeros(7, dtype=np.float32)
 
@@ -745,8 +826,9 @@ class NewtonWaterhoseManager(NewtonManager):
     @classmethod
     def _ensure_newton_on_path(cls) -> None:
         cfg = cls._waterhose_cfg()
-        root = Path(getattr(cfg, "newton_root", "/home/maximiliank/Work/newton")).expanduser().resolve()
-        if (root / "newton").is_dir():
+        root_value = str(getattr(cfg, "newton_root", "") or os.getenv("NEWTON_ROOT", ""))
+        root = Path(root_value).expanduser().resolve() if root_value else None
+        if root is not None and (root / "newton").is_dir():
             root_s = str(root)
             if root_s not in sys.path:
                 sys.path.insert(0, root_s)
@@ -862,6 +944,11 @@ class NewtonWaterhoseManager(NewtonManager):
         cls._display_state_1 = state_1
         cls._display_control = control
         cls._publish_to_newton_visualizer(model, state_0, state_1, control)
+
+    @classmethod
+    def _publish_display_state_if_needed(cls) -> None:
+        if cls._visualization_requested():
+            cls._publish_display_state()
 
     @classmethod
     def _combined_display(cls):
@@ -1019,6 +1106,16 @@ class NewtonWaterhoseManager(NewtonManager):
             return False
 
     @classmethod
+    def _visualization_requested(cls) -> bool:
+        sim = PhysicsManager._sim
+        if sim is None:
+            return False
+        try:
+            return bool(sim.resolve_visualizer_types())
+        except Exception:
+            return bool(getattr(sim, "visualizers", None))
+
+    @classmethod
     def _ensure_kit_display(cls, model) -> None:
         if cls._kit_display_model_id != id(model) or not cls._kit_display_ready:
             start = time.perf_counter()
@@ -1139,7 +1236,7 @@ class WaterhoseNewtonSolverCfg(NewtonSolverCfg):
     class_type: type[NewtonManager] | str = NewtonWaterhoseManager
     solver_type: str = "waterhose_robot_demo"
 
-    newton_root: str = "/home/maximiliank/Work/newton"
+    newton_root: str = ""
     asset_root: str = _DEFAULT_ASSET_ROOT
     num_envs: int = 1
     env_spacing: float = 2.5
