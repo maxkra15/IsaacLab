@@ -94,7 +94,7 @@ parser = argparse.ArgumentParser(description="Run the waterhose robot demo throu
 parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--mode", choices=("scripted", "teleop"), default="scripted", help="Control mode.")
 parser.add_argument("--teleop", action="store_true", help="Alias for --mode teleop.")
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments. Only 1 is supported today.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--max_steps", type=int, default=2000, help="Maximum manager steps to run.")
 parser.add_argument("--max_demo_steps", type=int, default=0, help="Optional env-level termination bound; 0 disables it.")
 parser.add_argument("--newton_root", type=str, default="/home/maximiliank/Work/newton", help="Newton repo root.")
@@ -127,11 +127,10 @@ args_cli = parser.parse_args()
 
 if args_cli.teleop:
     args_cli.mode = "teleop"
-if args_cli.num_envs != 1:
-    parser.error(
-        "The stable waterhose demo currently supports exactly one environment. "
-        "Multi-env replication is planned after the one-way Kit demo path is stable."
-    )
+if args_cli.num_envs < 1:
+    parser.error("--num_envs must be at least 1.")
+if args_cli.num_envs != 1 and "admm" in args_cli.task.lower():
+    parser.error("The experimental ADMM waterhose task is single-env only; use Isaac-Waterhose-Robot-Demo-v0.")
 if args_cli.mode == "teleop" and args_cli.teleop_device not in (None, "spacemouse"):
     parser.error("This demo currently supports --teleop_device spacemouse.")
 if args_cli.mode == "teleop" and args_cli.teleop_device is None:
@@ -161,13 +160,11 @@ def _configure_env_cfg(env_cfg) -> None:
             f"got {type(physics_cfg).__name__}."
         )
     solver_cfg = physics_cfg.solver_cfg
+    solver_cfg.num_envs = int(env_cfg.scene.num_envs)
+    solver_cfg.env_spacing = float(env_cfg.scene.env_spacing)
     if hasattr(solver_cfg, "newton_root"):
         solver_cfg.newton_root = args_cli.newton_root
     solver_cfg.asset_root = args_cli.asset_root
-    if hasattr(env_cfg.scene, "static_scene") and hasattr(env_cfg.scene.static_scene.spawn, "usd_path"):
-        env_cfg.scene.static_scene.spawn.usd_path = str(
-            Path(args_cli.asset_root).expanduser() / "Waterhose" / "Cable008" / "Cable008_Body.usda"
-        )
     if hasattr(solver_cfg, "max_demo_steps"):
         solver_cfg.max_demo_steps = int(args_cli.max_demo_steps)
 

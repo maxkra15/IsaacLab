@@ -24,17 +24,17 @@ EXTRAS_REQUIRE = {
     "kit": [],
     "newton": [
         "warp-lang",
-        "newton[sim] @ git+https://github.com/newton-physics/newton.git@e9851d3e11ad35e879e818c789570eb4fa5b0264",
+        "newton[sim] @ git+https://github.com/newton-physics/newton.git@c2f21df3acc0f06d207812810b2e27ca7c4da08c",
         "PyOpenGL-accelerate",
         "imgui-bundle>=1.92.5",
     ],
     "rerun": [
-        "newton[sim] @ git+https://github.com/newton-physics/newton.git@e9851d3e11ad35e879e818c789570eb4fa5b0264",
+        "newton[sim] @ git+https://github.com/newton-physics/newton.git@c2f21df3acc0f06d207812810b2e27ca7c4da08c",
         "rerun-sdk>=0.29.0",
         "pyarrow==22.0.0",
     ],
     "viser": [
-        "newton[sim] @ git+https://github.com/newton-physics/newton.git@e9851d3e11ad35e879e818c789570eb4fa5b0264",
+        "newton[sim] @ git+https://github.com/newton-physics/newton.git@c2f21df3acc0f06d207812810b2e27ca7c4da08c",
         "viser>=1.0.16",
     ],
 }

@@ -74,12 +74,11 @@ class ScriptedDemoAction(ActionTerm):
         self._processed_actions[:, 6:] = self._raw_actions[:, 6:]
 
     def apply_actions(self) -> None:
-        command = self._processed_actions[0]
-        has_user_command = bool(torch.any(torch.abs(command) > float(self.cfg.input_deadzone)).item())
+        has_user_command = bool(torch.any(torch.abs(self._processed_actions) > float(self.cfg.input_deadzone)).item())
         if has_user_command:
             NewtonWaterhoseManager.set_teleop_enabled(True)
         if NewtonWaterhoseManager.teleop_enabled():
-            NewtonWaterhoseManager.apply_teleop_command(command)
+            NewtonWaterhoseManager.apply_teleop_command(self._processed_actions)
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:

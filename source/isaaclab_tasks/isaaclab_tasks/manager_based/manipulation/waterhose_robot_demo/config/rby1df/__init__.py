@@ -11,8 +11,15 @@ _PKG = "isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo"
 
 gym.register(
     id="Isaac-Waterhose-Robot-Demo-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=f"{_PKG}.env:WaterhoseRobotDemoEnv",
     kwargs={"env_cfg_entry_point": f"{_PKG}.env_cfg:WaterhoseRobotDemoEnvCfg"},
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Waterhose-Robot-Demo-Mimic-v0",
+    entry_point=f"{_PKG}.mimic_env:WaterhoseRobotDemoMimicEnv",
+    kwargs={"env_cfg_entry_point": f"{_PKG}.mimic_env_cfg:WaterhoseRobotDemoMimicEnvCfg"},
     disable_env_checker=True,
 )
 

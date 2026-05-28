@@ -16,6 +16,8 @@ import numpy as np
 
 
 DISPLAY_ROOT_PATH = "/World/WaterhoseDemo/Dynamic"
+STATIC_SCENE_ROOT_PATH = "/World/WaterhoseDemo/StaticScenes"
+LEGACY_STATIC_SCENE_PATH = "/World/WaterhoseDemo/Static"
 
 
 def assign_display_prim_paths(builder: Any, root_path: str = DISPLAY_ROOT_PATH) -> None:
@@ -74,6 +76,54 @@ def author_display_usd(
     _debug(f"author_display_usd:bodies dt={time.perf_counter() - start:.3f}s")
     _author_shapes(stage, model, newton, Gf, UsdGeom, Vt, skipped_shape_ids or set())
     _debug(f"author_display_usd:done dt={time.perf_counter() - start:.3f}s")
+
+
+def author_static_scene_references(
+    scene_usd_path: str,
+    env_origins: Any,
+    fridge_xform: Any,
+    root_path: str = STATIC_SCENE_ROOT_PATH,
+) -> None:
+    """Author one referenced static fridge scene per environment for Kit visualization."""
+
+    from isaaclab.sim import SimulationContext  # noqa: PLC0415
+    from isaaclab.sim.utils.stage import get_current_stage  # noqa: PLC0415
+    from pxr import Gf, UsdGeom  # noqa: PLC0415
+
+    sim = SimulationContext.instance()
+    stage = getattr(sim, "stage", None) if sim is not None else get_current_stage()
+    if stage is None:
+        raise RuntimeError("Cannot author waterhose static scene: no USD stage is available.")
+
+    origins = np.asarray(env_origins, dtype=np.float64).reshape(-1, 3)
+    if origins.size == 0:
+        return
+
+    start = time.perf_counter()
+    if stage.GetPrimAtPath(LEGACY_STATIC_SCENE_PATH).IsValid():
+        stage.RemovePrim(LEGACY_STATIC_SCENE_PATH)
+    if stage.GetPrimAtPath(root_path).IsValid():
+        stage.RemovePrim(root_path)
+
+    _define_xform_path(stage, root_path, UsdGeom)
+    base_transform = np.asarray(fridge_xform, dtype=np.float64).reshape(7)
+    for env_id, origin in enumerate(origins):
+        transform = base_transform.copy()
+        transform[:3] += origin
+        prim_path = f"{root_path}/env_{env_id}"
+        prim = UsdGeom.Xform.Define(stage, prim_path).GetPrim()
+        prim.GetReferences().AddReference(scene_usd_path)
+        prim.SetInstanceable(True)
+        xformable = UsdGeom.Xformable(prim)
+        xformable.ClearXformOpOrder()
+        xformable.AddTransformOp(UsdGeom.XformOp.PrecisionDouble, "waterhose_static").Set(
+            _matrix_from_transform(transform, Gf)
+        )
+
+    _debug(
+        "author_static_scene_references:done "
+        f"envs={len(origins)} path={scene_usd_path} dt={time.perf_counter() - start:.3f}s"
+    )
 
 
 def _author_shapes(
