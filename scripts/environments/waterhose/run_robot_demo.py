@@ -11,18 +11,13 @@ import argparse
 import os
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
 
-from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.teleop import (
-    add_waterhose_spacemouse_args,
-    create_waterhose_spacemouse_device,
-)
-from isaaclab_tasks.utils import add_launcher_args, launch_simulation
+from isaaclab.app import AppLauncher
 
 
-DEFAULT_TASK = "Isaac-Waterhose-Robot-Demo-Play-v0"
+DEFAULT_TASK = "Isaac-Waterhose-Robot-Demo-v0"
 DEFAULT_ASSET_ROOT = str(
     Path(__file__).resolve().parents[3] / "source" / "isaaclab_assets" / "data" / "WaterhoseDemo"
 )
@@ -58,10 +53,16 @@ def visualizer_types(args_cli: argparse.Namespace) -> set[str]:
     return {str(item).strip().lower() for item in visualizer if str(item).strip()}
 
 
+def _debug_runner(message: str) -> None:
+    if os.getenv("WATERHOSE_DEBUG_RUNNER", "").lower() in {"1", "true", "yes", "on"}:
+        print(f"[waterhose-runner] {message}", flush=True)
+
+
 def validate_visualizers(args_cli: argparse.Namespace, parser: argparse.ArgumentParser) -> set[str]:
     """Resolve display selection using IsaacLab visualizer names."""
     if getattr(args_cli, "visualizer", None) is None:
         args_cli.visualizer = ["none"] if bool(getattr(args_cli, "headless", False)) else ["newton"]
+        setattr(args_cli, "visualizer_explicit", True)
 
     selected = visualizer_types(args_cli)
     if "none" in selected and len(selected) > 1:
@@ -100,9 +101,21 @@ parser.add_argument("--newton_root", type=str, default="/home/maximiliank/Work/n
 parser.add_argument("--asset_root", type=str, default=DEFAULT_ASSET_ROOT, help="WaterhoseDemo asset root.")
 parser.add_argument("--teleop_device", type=str, default=None, help="Teleop device. Use spacemouse.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Teleop sensitivity scale.")
+parser.add_argument("--profile", action="store_true", help="Print rollout timing after the run.")
 parser.add_argument("--debug_teleop", action="store_true", help="Print periodic teleop commands.")
-add_waterhose_spacemouse_args(parser)
-add_launcher_args(parser)
+AppLauncher.add_app_launcher_args(parser)
+parser.add_argument("--spacemouse_pos_sensitivity", type=float, default=None)
+parser.add_argument("--spacemouse_rot_sensitivity", type=float, default=None)
+parser.add_argument("--spacemouse_simple_x_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
+parser.add_argument("--spacemouse_simple_y_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
+parser.add_argument("--spacemouse_simple_z_sign", type=float, choices=(-1.0, 1.0), default=1.0)
+parser.add_argument("--spacemouse_simple_yaw_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
+parser.add_argument("--spacemouse_simple_deadzone", type=float, default=1.0e-3)
+parser.add_argument(
+    "--spacemouse_simple_yaw_translation_lock",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+)
 parser.add_argument(
     "--vis",
     dest="visualizer",
@@ -124,31 +137,7 @@ if args_cli.mode == "teleop" and args_cli.teleop_device is None:
 selected_visualizers = validate_visualizers(args_cli, parser)
 
 
-def _startup_report() -> None:
-    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
-        NewtonWaterhoseManager,
-    )
-
-    sim = NewtonWaterhoseManager.get_runtime()
-    if sim is None:
-        print("[DEMO] startup: runtime is not initialized", flush=True)
-        return
-    visualization_model = NewtonWaterhoseManager.get_visualization_model()
-    display_bodies = 0 if visualization_model is None else int(visualization_model.body_count)
-    display_shapes = 0 if visualization_model is None else int(visualization_model.shape_count)
-    print(
-        "[DEMO] startup: "
-        f"robot_bodies={sim.mujoco_model.body_count} robot_shapes={sim.mujoco_model.shape_count} "
-        f"vbd_bodies={sim.vbd_model.body_count} vbd_shapes={sim.vbd_model.shape_count} "
-        f"display_bodies={display_bodies} display_shapes={display_shapes} "
-        f"proxies={len(getattr(sim, 'proxy_body_ids', []))} "
-        f"proxy_shapes={len(getattr(sim, '_proxy_shape_ids', []))}",
-        flush=True,
-    )
-
-
 def _configure_env_cfg(env_cfg) -> None:
-    from isaaclab.envs import ManagerBasedRLEnvCfg  # noqa: PLC0415
     from isaaclab_newton.physics import NewtonCfg  # noqa: PLC0415
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
         WaterhoseNewtonSolverCfg,
@@ -166,19 +155,30 @@ def _configure_env_cfg(env_cfg) -> None:
     solver_cfg.newton_root = args_cli.newton_root
     solver_cfg.asset_root = args_cli.asset_root
     solver_cfg.max_demo_steps = int(args_cli.max_demo_steps)
+
+
+def _configure_visualizers(env_cfg) -> None:
+    visualizer_cfgs = []
+    if "kit" in selected_visualizers:
+        from isaaclab_visualizers.kit import KitVisualizerCfg  # noqa: PLC0415
+
+        visualizer_cfgs.append(
+            KitVisualizerCfg(
+                eye=(-2.55, -7.1, 2.3),
+                lookat=(0.55, -0.42, 0.9),
+            )
+        )
     if "newton" in selected_visualizers:
         from isaaclab_visualizers.newton import NewtonVisualizerCfg  # noqa: PLC0415
 
-        newton_viz_cfg = NewtonVisualizerCfg(
-            eye=(-2.55, -7.1, 2.3),
-            lookat=(0.55, -0.42, 0.9),
-            show_static=True,
+        visualizer_cfgs.append(
+            NewtonVisualizerCfg(
+                eye=(-2.55, -7.1, 2.3),
+                lookat=(0.55, -0.42, 0.9),
+                show_static=True,
+            )
         )
-        existing_cfgs = env_cfg.sim.visualizer_cfgs or []
-        if not isinstance(existing_cfgs, list):
-            existing_cfgs = [existing_cfgs]
-        env_cfg.sim.visualizer_cfgs = [cfg for cfg in existing_cfgs if cfg.visualizer_type != "newton"]
-        env_cfg.sim.visualizer_cfgs.append(newton_viz_cfg)
+    env_cfg.sim.visualizer_cfgs = visualizer_cfgs or None
 
 
 def _parse_configured_env_cfg():
@@ -187,6 +187,7 @@ def _parse_configured_env_cfg():
     from isaaclab_tasks.utils import parse_env_cfg  # noqa: PLC0415
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
+
     if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
         raise TypeError(f"Expected ManagerBasedRLEnvCfg, got {type(env_cfg).__name__}.")
     _configure_env_cfg(env_cfg)
@@ -205,15 +206,23 @@ def _run_env(env_cfg) -> None:
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
         NewtonWaterhoseManager,
     )
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.teleop import (  # noqa: PLC0415
+        create_waterhose_spacemouse_device,
+    )
 
     env = None
     step = 0
     start = time.perf_counter()
     teleop_interface = None
     try:
+        if "kit" in selected_visualizers:
+            time.sleep(0.1)
+        _debug_runner("gym_make:start")
         env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
+        _debug_runner("gym_make:done")
+        _debug_runner("reset:start")
         env.reset()
-        _startup_report()
+        _debug_runner("reset:done")
         actions = torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device)
         if args_cli.mode == "teleop":
             teleop_interface = create_waterhose_spacemouse_device(args_cli, args_cli.sensitivity)
@@ -221,6 +230,7 @@ def _run_env(env_cfg) -> None:
             NewtonWaterhoseManager.set_teleop_enabled(True)
             print(f"[INFO] Teleop device: {teleop_interface}", flush=True)
 
+        _debug_runner(f"loop:start running={_simulation_is_running(env)} max_steps={args_cli.max_steps}")
         while _simulation_is_running(env) and step < args_cli.max_steps:
             if teleop_interface is not None:
                 command = teleop_interface.advance()
@@ -240,28 +250,43 @@ def _run_env(env_cfg) -> None:
             if bool(torch.any(terminated | truncated).item()):
                 break
             step += 1
+        _debug_runner(f"loop:done steps={step} running={_simulation_is_running(env)}")
+    except BaseException as exc:
+        _debug_runner(f"exception type={type(exc).__name__} value={exc!r}")
+        raise
     finally:
         elapsed = time.perf_counter() - start
-        if env is not None:
+        _debug_runner(f"finally env={env is not None} profile={bool(args_cli.profile)} steps={step}")
+        if env is not None and args_cli.profile:
             sim_time = step * float(env.step_dt)
             print(
                 f"[PROFILE] steps={step} sim_time={sim_time:.3f}s wall_time={elapsed:.3f}s "
                 f"rtf={sim_time / max(elapsed, 1e-12):.3f} steps_per_s={step / max(elapsed, 1e-12):.1f}",
                 flush=True,
             )
+        if env is not None:
             env.close()
 
 
 def main() -> None:
     if "kit" in selected_visualizers:
-        bootstrap_cfg = SimpleNamespace(sim=SimpleNamespace(device=args_cli.device, visualizer_cfgs=[]))
-        with launch_simulation(bootstrap_cfg, args_cli):
+        app_launcher = AppLauncher(args_cli)
+        try:
             env_cfg = _parse_configured_env_cfg()
+            _configure_visualizers(env_cfg)
+            if hasattr(app_launcher, "device"):
+                env_cfg.sim.device = app_launcher.device
             _run_env(env_cfg)
-    else:
-        env_cfg = _parse_configured_env_cfg()
-        with launch_simulation(env_cfg, args_cli):
-            _run_env(env_cfg)
+        finally:
+            app_launcher.app.close()
+        return
+
+    from isaaclab_tasks.utils import launch_simulation  # noqa: PLC0415
+
+    env_cfg = _parse_configured_env_cfg()
+    with launch_simulation(env_cfg, args_cli):
+        _configure_visualizers(env_cfg)
+        _run_env(env_cfg)
 
 
 if __name__ == "__main__":
