@@ -175,13 +175,31 @@ def _mesh_for_shape(newton: Any, shape_type: int, scale: np.ndarray, source: Any
         mesh = newton.Mesh.create_ellipsoid(float(scale[0]), float(scale[1]), float(scale[2]), compute_inertia=False)
         scale = np.ones(3, dtype=np.float32)
     elif geo_type == newton.GeoType.CAPSULE:
-        mesh = newton.Mesh.create_capsule(float(scale[0]), float(scale[1]), segments=24, compute_inertia=False)
+        mesh = newton.Mesh.create_capsule(
+            float(scale[0]),
+            float(scale[1]),
+            up_axis=newton.Axis.Z,
+            segments=24,
+            compute_inertia=False,
+        )
         scale = np.ones(3, dtype=np.float32)
     elif geo_type == newton.GeoType.CYLINDER:
-        mesh = newton.Mesh.create_cylinder(float(scale[0]), float(scale[1]), segments=24, compute_inertia=False)
+        mesh = newton.Mesh.create_cylinder(
+            float(scale[0]),
+            float(scale[1]),
+            up_axis=newton.Axis.Z,
+            segments=24,
+            compute_inertia=False,
+        )
         scale = np.ones(3, dtype=np.float32)
     elif geo_type == newton.GeoType.CONE:
-        mesh = newton.Mesh.create_cone(float(scale[0]), float(scale[1]), segments=24, compute_inertia=False)
+        mesh = newton.Mesh.create_cone(
+            float(scale[0]),
+            float(scale[1]),
+            up_axis=newton.Axis.Z,
+            segments=24,
+            compute_inertia=False,
+        )
         scale = np.ones(3, dtype=np.float32)
     elif geo_type == newton.GeoType.BOX:
         mesh = newton.Mesh.create_box(float(scale[0]), float(scale[1]), float(scale[2]), compute_inertia=False)

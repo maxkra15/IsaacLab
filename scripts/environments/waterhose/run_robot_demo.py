@@ -61,7 +61,7 @@ def _debug_runner(message: str) -> None:
 def validate_visualizers(args_cli: argparse.Namespace, parser: argparse.ArgumentParser) -> set[str]:
     """Resolve display selection using IsaacLab visualizer names."""
     if getattr(args_cli, "visualizer", None) is None:
-        args_cli.visualizer = ["none"] if bool(getattr(args_cli, "headless", False)) else ["newton"]
+        args_cli.visualizer = ["none"] if bool(getattr(args_cli, "headless", False)) else ["kit"]
         setattr(args_cli, "visualizer_explicit", True)
 
     selected = visualizer_types(args_cli)
@@ -94,7 +94,7 @@ parser = argparse.ArgumentParser(description="Run the waterhose robot demo throu
 parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--mode", choices=("scripted", "teleop"), default="scripted", help="Control mode.")
 parser.add_argument("--teleop", action="store_true", help="Alias for --mode teleop.")
-parser.add_argument("--num_envs", type=int, default=1, help="Only 1 is supported.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments. Only 1 is supported today.")
 parser.add_argument("--max_steps", type=int, default=2000, help="Maximum manager steps to run.")
 parser.add_argument("--max_demo_steps", type=int, default=0, help="Optional env-level termination bound; 0 disables it.")
 parser.add_argument("--newton_root", type=str, default="/home/maximiliank/Work/newton", help="Newton repo root.")
@@ -128,7 +128,10 @@ args_cli = parser.parse_args()
 if args_cli.teleop:
     args_cli.mode = "teleop"
 if args_cli.num_envs != 1:
-    parser.error("The waterhose robot demo currently supports exactly one environment.")
+    parser.error(
+        "The stable waterhose demo currently supports exactly one environment. "
+        "Multi-env replication is planned after the one-way Kit demo path is stable."
+    )
 if args_cli.mode == "teleop" and args_cli.teleop_device not in (None, "spacemouse"):
     parser.error("This demo currently supports --teleop_device spacemouse.")
 if args_cli.mode == "teleop" and args_cli.teleop_device is None:
@@ -139,22 +142,34 @@ selected_visualizers = validate_visualizers(args_cli, parser)
 
 def _configure_env_cfg(env_cfg) -> None:
     from isaaclab_newton.physics import NewtonCfg  # noqa: PLC0415
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.admm_manager import (  # noqa: PLC0415
+        WaterhoseAdmmSolverCfg,
+    )
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
         WaterhoseNewtonSolverCfg,
     )
 
-    env_cfg.scene.num_envs = 1
-    env_cfg.max_demo_steps = int(args_cli.max_demo_steps)
+    env_cfg.scene.num_envs = int(args_cli.num_envs)
+    if hasattr(env_cfg, "max_demo_steps"):
+        env_cfg.max_demo_steps = int(args_cli.max_demo_steps)
     physics_cfg = env_cfg.sim.physics
-    if not isinstance(physics_cfg, NewtonCfg) or not isinstance(physics_cfg.solver_cfg, WaterhoseNewtonSolverCfg):
+    if not isinstance(physics_cfg, NewtonCfg) or not isinstance(
+        physics_cfg.solver_cfg, (WaterhoseNewtonSolverCfg, WaterhoseAdmmSolverCfg)
+    ):
         raise TypeError(
-            "Expected NewtonCfg(solver_cfg=WaterhoseNewtonSolverCfg), "
+            "Expected NewtonCfg(solver_cfg=WaterhoseNewtonSolverCfg|WaterhoseAdmmSolverCfg), "
             f"got {type(physics_cfg).__name__}."
         )
     solver_cfg = physics_cfg.solver_cfg
-    solver_cfg.newton_root = args_cli.newton_root
+    if hasattr(solver_cfg, "newton_root"):
+        solver_cfg.newton_root = args_cli.newton_root
     solver_cfg.asset_root = args_cli.asset_root
-    solver_cfg.max_demo_steps = int(args_cli.max_demo_steps)
+    if hasattr(env_cfg.scene, "static_scene") and hasattr(env_cfg.scene.static_scene.spawn, "usd_path"):
+        env_cfg.scene.static_scene.spawn.usd_path = str(
+            Path(args_cli.asset_root).expanduser() / "Waterhose" / "Cable008" / "Cable008_Body.usda"
+        )
+    if hasattr(solver_cfg, "max_demo_steps"):
+        solver_cfg.max_demo_steps = int(args_cli.max_demo_steps)
 
 
 def _configure_visualizers(env_cfg) -> None:
@@ -186,7 +201,7 @@ def _parse_configured_env_cfg():
     from isaaclab.envs import ManagerBasedRLEnvCfg  # noqa: PLC0415
     from isaaclab_tasks.utils import parse_env_cfg  # noqa: PLC0415
 
-    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=int(args_cli.num_envs))
 
     if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
         raise TypeError(f"Expected ManagerBasedRLEnvCfg, got {type(env_cfg).__name__}.")
@@ -200,12 +215,28 @@ def _simulation_is_running(env) -> bool:
     return True
 
 
+def _set_task_teleop_enabled(env_cfg, enabled: bool) -> None:
+    """Enable teleop on the selected waterhose Newton manager."""
+
+    solver_cfg = env_cfg.sim.physics.solver_cfg
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.admm_manager import (  # noqa: PLC0415
+        WaterhoseAdmmSolverCfg,
+        NewtonWaterhoseAdmmManager,
+    )
+    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
+        WaterhoseNewtonSolverCfg,
+        NewtonWaterhoseManager,
+    )
+
+    if isinstance(solver_cfg, WaterhoseAdmmSolverCfg):
+        NewtonWaterhoseAdmmManager.set_teleop_enabled(enabled)
+    elif isinstance(solver_cfg, WaterhoseNewtonSolverCfg):
+        NewtonWaterhoseManager.set_teleop_enabled(enabled)
+
+
 def _run_env(env_cfg) -> None:
     import gymnasium as gym  # noqa: PLC0415
     import torch  # noqa: PLC0415
-    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
-        NewtonWaterhoseManager,
-    )
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.teleop import (  # noqa: PLC0415
         create_waterhose_spacemouse_device,
     )
@@ -213,10 +244,9 @@ def _run_env(env_cfg) -> None:
     env = None
     step = 0
     start = time.perf_counter()
+    rollout_start = start
     teleop_interface = None
     try:
-        if "kit" in selected_visualizers:
-            time.sleep(0.1)
         _debug_runner("gym_make:start")
         env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
         _debug_runner("gym_make:done")
@@ -227,9 +257,10 @@ def _run_env(env_cfg) -> None:
         if args_cli.mode == "teleop":
             teleop_interface = create_waterhose_spacemouse_device(args_cli, args_cli.sensitivity)
             teleop_interface.reset()
-            NewtonWaterhoseManager.set_teleop_enabled(True)
+            _set_task_teleop_enabled(env_cfg, True)
             print(f"[INFO] Teleop device: {teleop_interface}", flush=True)
 
+        rollout_start = time.perf_counter()
         _debug_runner(f"loop:start running={_simulation_is_running(env)} max_steps={args_cli.max_steps}")
         while _simulation_is_running(env) and step < args_cli.max_steps:
             if teleop_interface is not None:
@@ -258,10 +289,17 @@ def _run_env(env_cfg) -> None:
         elapsed = time.perf_counter() - start
         _debug_runner(f"finally env={env is not None} profile={bool(args_cli.profile)} steps={step}")
         if env is not None and args_cli.profile:
+            setup_time = max(0.0, rollout_start - start)
+            rollout_time = max(time.perf_counter() - rollout_start, 1e-12)
             sim_time = step * float(env.step_dt)
+            from isaaclab_newton.physics import NewtonManager  # noqa: PLC0415
+
+            graph_state = "captured" if getattr(NewtonManager, "_graph", None) is not None else "eager"
             print(
-                f"[PROFILE] steps={step} sim_time={sim_time:.3f}s wall_time={elapsed:.3f}s "
-                f"rtf={sim_time / max(elapsed, 1e-12):.3f} steps_per_s={step / max(elapsed, 1e-12):.1f}",
+                f"[PROFILE] steps={step} sim_time={sim_time:.3f}s setup_time={setup_time:.3f}s "
+                f"rollout_time={rollout_time:.3f}s wall_time={elapsed:.3f}s "
+                f"rtf={sim_time / rollout_time:.3f} steps_per_s={step / rollout_time:.1f} "
+                f"cuda_graph={graph_state}",
                 flush=True,
             )
         if env is not None:
@@ -281,11 +319,11 @@ def main() -> None:
             app_launcher.app.close()
         return
 
+    env_cfg = _parse_configured_env_cfg()
+    _configure_visualizers(env_cfg)
     from isaaclab_tasks.utils import launch_simulation  # noqa: PLC0415
 
-    env_cfg = _parse_configured_env_cfg()
     with launch_simulation(env_cfg, args_cli):
-        _configure_visualizers(env_cfg)
         _run_env(env_cfg)
 
 

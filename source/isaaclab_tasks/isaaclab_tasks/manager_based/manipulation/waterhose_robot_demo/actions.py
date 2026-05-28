@@ -86,3 +86,28 @@ class ScriptedDemoAction(ActionTerm):
             env_ids = slice(None)
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
+
+
+@configclass
+class AdmmScriptedDemoActionCfg(ScriptedDemoActionCfg):
+    """SE(3) command action for the ADMM demo task."""
+
+    pass
+
+
+class AdmmScriptedDemoAction(ScriptedDemoAction):
+    """Runs the ADMM scripted controller, or routes non-zero commands to teleop."""
+
+    cfg: AdmmScriptedDemoActionCfg
+
+    def apply_actions(self) -> None:
+        from .admm_manager import NewtonWaterhoseAdmmManager  # noqa: PLC0415
+
+        command = self._processed_actions[0]
+        has_user_command = bool(torch.any(torch.abs(command) > float(self.cfg.input_deadzone)).item())
+        if has_user_command:
+            NewtonWaterhoseAdmmManager.set_teleop_enabled(True)
+        if NewtonWaterhoseAdmmManager.teleop_enabled():
+            NewtonWaterhoseAdmmManager.apply_teleop_command(command)
+        else:
+            NewtonWaterhoseAdmmManager.apply_scripted_control()

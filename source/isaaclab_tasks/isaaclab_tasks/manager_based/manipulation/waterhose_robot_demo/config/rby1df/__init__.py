@@ -15,3 +15,10 @@ gym.register(
     kwargs={"env_cfg_entry_point": f"{_PKG}.env_cfg:WaterhoseRobotDemoEnvCfg"},
     disable_env_checker=True,
 )
+
+gym.register(
+    id="Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": f"{_PKG}.admm_env_cfg:WaterhoseRobotDemoAdmmEnvCfg"},
+    disable_env_checker=True,
+)
