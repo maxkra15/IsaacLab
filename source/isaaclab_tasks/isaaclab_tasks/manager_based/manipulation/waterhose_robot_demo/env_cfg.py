@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from isaaclab.devices.device_base import DevicesCfg
+from isaaclab.devices.keyboard import Se3KeyboardCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -23,6 +25,8 @@ from isaaclab_newton.physics import NewtonCfg
 from . import mdp
 from .actions import ScriptedDemoAction, ScriptedDemoActionCfg
 from .manager import WaterhoseNewtonSolverCfg
+from .recorders import WaterhoseActionStateRecorderManagerCfg
+from .teleop import WaterhoseSpaceMouseCfg
 
 
 _DEFAULT_ASSET_ROOT = str(
@@ -68,6 +72,7 @@ class RewardsCfg:
 class TerminationsCfg:
     """Terminate when the scripted rollout finishes or an optional step cap is reached."""
 
+    success = DoneTerm(func=mdp.success)
     demo_done = DoneTerm(func=mdp.done)
 
 
@@ -108,11 +113,30 @@ class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
     # Safety bound for scripted rollouts. 0 means run until the controller's DONE phase.
     max_demo_steps: int = 0
 
+    def make_recorder_manager_cfg(self) -> WaterhoseActionStateRecorderManagerCfg:
+        """Return the recorder config used by standard demo-recording scripts."""
+
+        return WaterhoseActionStateRecorderManagerCfg()
+
     def __post_init__(self):
         self.scene.num_envs = 1
         self.sim.dt = 1.0 / 100.0
         self.sim.render_interval = self.decimation
         self.sim.physics.solver_cfg.max_demo_steps = int(self.max_demo_steps)
+        self.teleop_devices = DevicesCfg(
+            devices={
+                "keyboard": Se3KeyboardCfg(
+                    pos_sensitivity=0.02,
+                    rot_sensitivity=0.05,
+                    sim_device=self.sim.device,
+                ),
+                "spacemouse": WaterhoseSpaceMouseCfg(
+                    pos_sensitivity=0.05,
+                    rot_sensitivity=0.15,
+                    sim_device=self.sim.device,
+                ),
+            }
+        )
 
 
 @configclass

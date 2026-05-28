@@ -272,6 +272,64 @@ class NewtonWaterhoseManager(NewtonManager):
         )
 
     @classmethod
+    def is_success(cls) -> bool:
+        """Return whether the plug has reached the task success condition."""
+        runtime = cls._runtime
+        if runtime is None or not cls.is_finite():
+            return False
+        if bool(getattr(runtime, "auto_mode", True)):
+            return cls.current_phase() == 18
+        try:
+            tip_pos = runtime.vbd_state_0.body_q.numpy()[int(runtime.tip_capsule_body_idx), :3]
+            socket_pos = np.asarray(runtime._socket_pos_np, dtype=np.float64)
+            insertion_dir = np.asarray(runtime._insertion_dir_np, dtype=np.float64)
+            insertion_dir /= max(float(np.linalg.norm(insertion_dir)), 1.0e-12)
+            delta = np.asarray(tip_pos, dtype=np.float64) - socket_pos
+            axial_depth = float(np.dot(delta, insertion_dir))
+            lateral = float(np.linalg.norm(delta - axial_depth * insertion_dir))
+            target_depth = float(getattr(runtime, "_insert_snap_depth", runtime.insert_final_depth))
+            return axial_depth >= target_depth and lateral <= 0.025
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return False
+
+    @classmethod
+    def get_recording_state(cls, device: str | torch.device | None = None) -> dict[str, torch.Tensor]:
+        """Return a batched tensor snapshot of the local Newton runtime."""
+        runtime = cls._runtime
+        if runtime is None:
+            return {}
+        device = PhysicsManager._device if device is None else device
+
+        def tensor(value, dtype=torch.float32) -> torch.Tensor:
+            array = np.array(value, copy=True)
+            return torch.as_tensor(array, dtype=dtype, device=device).unsqueeze(0)
+
+        task_idx = 0
+        task_elapsed = 0.0
+        if hasattr(runtime, "sm_task_idx"):
+            task_idx = int(runtime.sm_task_idx.numpy()[0])
+        if hasattr(runtime, "sm_task_time_elapsed"):
+            task_elapsed = float(runtime.sm_task_time_elapsed.numpy()[0])
+
+        return {
+            "robot_body_q": tensor(runtime.state_0.body_q.numpy()),
+            "robot_body_qd": tensor(runtime.state_0.body_qd.numpy()),
+            "vbd_body_q": tensor(runtime.vbd_state_0.body_q.numpy()),
+            "vbd_body_qd": tensor(runtime.vbd_state_0.body_qd.numpy()),
+            "joint_target_pos": tensor(runtime.control.joint_target_pos.numpy()),
+            "gripper_targets": tensor(runtime.gripper_targets.numpy()),
+            "right_ee_pose": tensor(cls.get_right_ee_pose()),
+            "plug_pose": tensor(cls.get_plug_pose()),
+            "tip_pose": tensor(cls.get_tip_pose()),
+            "phase": torch.tensor([[float(cls.current_phase())]], dtype=torch.float32, device=device),
+            "task_index": torch.tensor([[task_idx]], dtype=torch.int64, device=device),
+            "task_elapsed": torch.tensor([[task_elapsed]], dtype=torch.float32, device=device),
+            "frame_count": torch.tensor([[int(getattr(runtime, "frame_count", 0))]], dtype=torch.int64, device=device),
+            "sim_time": torch.tensor([[float(getattr(runtime, "sim_time", 0.0))]], dtype=torch.float32, device=device),
+            "auto_mode": torch.tensor([[bool(getattr(runtime, "auto_mode", True))]], dtype=torch.bool, device=device),
+        }
+
+    @classmethod
     def is_done(cls, max_demo_steps: int = 0) -> bool:
         runtime = cls._runtime
         if runtime is None:

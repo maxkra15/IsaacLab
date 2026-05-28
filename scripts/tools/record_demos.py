@@ -270,7 +270,8 @@ def create_environment_config(
     env_cfg.terminations.time_out = None
     env_cfg.observations.policy.concatenate_terms = False
 
-    env_cfg.recorders: ActionStateRecorderManagerCfg = ActionStateRecorderManagerCfg()
+    recorder_cfg_factory = getattr(env_cfg, "make_recorder_manager_cfg", None)
+    env_cfg.recorders = recorder_cfg_factory() if callable(recorder_cfg_factory) else ActionStateRecorderManagerCfg()
     env_cfg.recorders.dataset_export_dir_path = output_dir
     env_cfg.recorders.dataset_filename = output_file_name
     env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY

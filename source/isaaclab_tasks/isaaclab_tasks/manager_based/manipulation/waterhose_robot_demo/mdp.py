@@ -63,6 +63,16 @@ def done(env) -> torch.Tensor:
     )
 
 
+def success(env) -> torch.Tensor:
+    """Task success flag used by standard recording and imitation-learning scripts."""
+    return torch.full(
+        (env.num_envs,),
+        bool(NewtonWaterhoseManager.is_success()),
+        device=env.device,
+        dtype=torch.bool,
+    )
+
+
 def reset_demo(env, env_ids) -> None:
     """Rebuild the local Newton demo state on full environment resets."""
     if env_ids is None or isinstance(env_ids, slice) or len(env_ids) >= env.num_envs:

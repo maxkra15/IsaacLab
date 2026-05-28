@@ -22,7 +22,7 @@ from .manager import NewtonWaterhoseManager
 
 @configclass
 class ScriptedDemoActionCfg(ActionTermCfg):
-    """SE(3) teleop command action for the scripted demo task."""
+    """SE(3) command action for the demo task."""
 
     class_type: type[ActionTerm] = MISSING
     asset_name: str = "waterhose_demo"
@@ -30,10 +30,11 @@ class ScriptedDemoActionCfg(ActionTermCfg):
     position_scale: float = 0.04
     rotation_scale: float = 0.25
     max_target_step: float = 0.018
+    input_deadzone: float = 1.0e-6
 
 
 class ScriptedDemoAction(ActionTerm):
-    """Accepts relative end-effector commands when teleoperation is enabled."""
+    """Accepts relative end-effector commands from standard IsaacLab teleop scripts."""
 
     cfg: ScriptedDemoActionCfg
 
@@ -73,8 +74,12 @@ class ScriptedDemoAction(ActionTerm):
         self._processed_actions[:, 6:] = self._raw_actions[:, 6:]
 
     def apply_actions(self) -> None:
+        command = self._processed_actions[0]
+        has_user_command = bool(torch.any(torch.abs(command) > float(self.cfg.input_deadzone)).item())
+        if has_user_command:
+            NewtonWaterhoseManager.set_teleop_enabled(True)
         if NewtonWaterhoseManager.teleop_enabled():
-            NewtonWaterhoseManager.apply_teleop_command(self._processed_actions[0])
+            NewtonWaterhoseManager.apply_teleop_command(command)
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:

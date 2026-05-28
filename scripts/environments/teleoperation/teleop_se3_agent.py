@@ -23,13 +23,6 @@ from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
 
-from isaaclab_tasks.manager_based.manipulation.waterhose.launch import (
-    add_waterhose_teleop_args,
-    create_waterhose_spacemouse_device,
-    get_visualizer_types,
-    prepare_waterhose_launch,
-)
-
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Teleoperation for Isaac Lab environments.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
@@ -45,7 +38,6 @@ parser.add_argument(
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
-add_waterhose_teleop_args(parser)
 parser.add_argument(
     "--debug_teleop",
     action="store_true",
@@ -72,18 +64,20 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 
+def _get_visualizer_types(launcher_args: argparse.Namespace) -> set[str]:
+    visualizers = getattr(launcher_args, "visualizer", None)
+    if not visualizers:
+        return set()
+    if isinstance(visualizers, str):
+        visualizers = [token.strip() for token in visualizers.split(",")]
+    return {str(visualizer).strip().lower() for visualizer in visualizers if str(visualizer).strip()}
+
+
 def _prepare_native_teleop_visualizers() -> None:
     """Ensure native Omniverse teleop devices have a Kit app window."""
-    visualizer_types = get_visualizer_types(args_cli)
-    uses_waterhose_task = args_cli.task is not None and "waterhose" in args_cli.task.lower()
-    uses_newton_only_waterhose = uses_waterhose_task and "newton" in visualizer_types and "kit" not in visualizer_types
-    if uses_newton_only_waterhose:
-        return
-
+    visualizer_types = _get_visualizer_types(args_cli)
     device_name = args_cli.teleop_device.lower() if args_cli.teleop_device is not None else "keyboard"
     if device_name not in {"keyboard", "spacemouse", "gamepad"}:
-        return
-    if device_name == "spacemouse":
         return
     if getattr(args_cli, "headless_explicit", False) and args_cli.headless:
         parser.error(
@@ -98,32 +92,11 @@ def _prepare_native_teleop_visualizers() -> None:
 
 
 _prepare_native_teleop_visualizers()
-waterhose_launch = prepare_waterhose_launch(
-    args_cli,
-    parser=parser,
-    default_standalone_spacemouse=True,
-    require_standalone_spacemouse=True,
-    standalone_spacemouse_error=(
-        "Waterhose teleoperation with the Newton viewer requires --teleop_device spacemouse. "
-        "Keyboard and gamepad teleoperation use Omniverse input and require --visualizer kit."
-    ),
-)
-uses_standalone_waterhose_spacemouse = (
-    waterhose_launch.uses_kitless_waterhose
-    and args_cli.teleop_device is not None
-    and args_cli.teleop_device.lower() == "spacemouse"
-    and not args_cli.xr
-)
-
 app_launcher_args = vars(args_cli)
 
 # launch omniverse app
-if uses_standalone_waterhose_spacemouse:
-    app_launcher = None
-    simulation_app = None
-else:
-    app_launcher = AppLauncher(app_launcher_args)
-    simulation_app = app_launcher.app
+app_launcher = AppLauncher(app_launcher_args)
+simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
@@ -171,11 +144,10 @@ def _create_builtin_device(device_name: str, sensitivity: float) -> object | Non
 
         return Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.05 * sensitivity, rot_sensitivity=0.05 * sensitivity))
     elif name == "spacemouse":
-        return create_waterhose_spacemouse_device(
-            args_cli,
-            sensitivity,
-            simple_by_default=waterhose_launch.uses_waterhose_task,
-        )
+        from isaaclab.devices.spacemouse.se3_spacemouse import Se3SpaceMouse
+        from isaaclab.devices.spacemouse.se3_spacemouse_cfg import Se3SpaceMouseCfg
+
+        return Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=0.05 * sensitivity, rot_sensitivity=0.05 * sensitivity))
     elif name == "gamepad":
         from isaaclab.devices.gamepad.se3_gamepad import Se3Gamepad
         from isaaclab.devices.gamepad.se3_gamepad_cfg import Se3GamepadCfg
