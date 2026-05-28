@@ -50,7 +50,9 @@ from isaaclab_newton.physics import (
     NewtonMPMManager,
     NewtonSolverCfg,
     NewtonXPBDManager,
+    OneWayCouplingCfg,
     ProxyCouplingCfg,
+    SolverOneWayCoupled,
     XPBDSolverCfg,
 )
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
@@ -150,37 +152,65 @@ SOLVER_MATRIX = [
             entries=[
                 CoupledSolverEntryCfg(
                     name="rigid",
-                    solver_cfg=MJWarpSolverCfg(
-                        use_mujoco_contacts=False,
-                        njmax=100,
-                        nconmax=100,
-                        iterations=2,
-                        ls_iterations=2,
-                    ),
+                    solver_cfg=XPBDSolverCfg(iterations=1),
                     bodies=[0],
-                    joints=[0],
                 ),
                 CoupledSolverEntryCfg(
-                    name="sand",
-                    solver_cfg=MPMSolverCfg(max_iterations=2, voxel_size=0.05),
-                    particles=list(range(8)),
+                    name="particle",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    particles=[0],
+                    in_place=True,
                 ),
             ],
             proxy_coupling=ProxyCouplingCfg(
                 proxies=[
                     CoupledProxyCfg(
                         source="rigid",
-                        destination="sand",
+                        destination="particle",
                         bodies=[0],
                     )
                 ],
             ),
+            use_collision_pipeline=True,
         ),
         NewtonCoupledManager,
         SolverProxyCoupled,
         False,
+        True,
+        id="proxy_coupled_xpbd_body_particle",
+    ),
+    pytest.param(
+        lambda: CoupledSolverCfg(
+            coupling_type="one_way",
+            entries=[
+                CoupledSolverEntryCfg(
+                    name="rigid",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    bodies=[0],
+                ),
+                CoupledSolverEntryCfg(
+                    name="particle",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    particles=[0],
+                    in_place=True,
+                ),
+            ],
+            one_way_coupling=OneWayCouplingCfg(
+                proxies=[
+                    CoupledProxyCfg(
+                        source="rigid",
+                        destination="particle",
+                        bodies=[0],
+                    )
+                ],
+            ),
+            use_collision_pipeline=True,
+        ),
+        NewtonCoupledManager,
+        SolverOneWayCoupled,
         False,
-        id="proxy_coupled_mjwarp_mpm",
+        True,
+        id="one_way_coupled_xpbd_body_particle",
     ),
     pytest.param(
         lambda: CoupledSolverCfg(
@@ -442,6 +472,17 @@ def test_coupled_scene_entity_selectors_require_scene_cfg():
         ),
         (
             CoupledSolverCfg(
+                coupling_type="one_way",
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+                one_way_coupling=OneWayCouplingCfg(),
+            ),
+            "one-way coupling requires",
+        ),
+        (
+            CoupledSolverCfg(
                 coupling_type="admm",
                 entries=[
                     CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
@@ -531,24 +572,18 @@ def test_initialize_solver_populates_canonical_state(
                 jitter=0.0,
                 radius_mean=0.02,
             )
-        elif SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
-            assert builder.has_custom_attribute("mpm:young_modulus")
+        elif (
+            SolverProxyCoupled is not None
+            and issubclass(expected_solver_cls, SolverProxyCoupled)
+        ):
             body = builder.add_body(mass=1.0)
             builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
             builder.add_ground_plane()
-            builder.add_particle_grid(
-                pos=wp.vec3(-0.05, -0.05, 0.10),
-                rot=wp.quat_identity(),
+            builder.add_particle(
+                pos=wp.vec3(0.0, 0.0, 0.1),
                 vel=wp.vec3(0.0),
-                dim_x=2,
-                dim_y=2,
-                dim_z=2,
-                cell_x=0.05,
-                cell_y=0.05,
-                cell_z=0.05,
-                mass=0.01,
-                jitter=0.0,
-                radius_mean=0.02,
+                mass=0.1,
+                radius=0.02,
             )
         elif SolverCoupled is not None and expected_solver_cls is SolverCoupled:
             body = builder.add_body(mass=1.0)
@@ -585,11 +620,10 @@ def test_initialize_solver_populates_canonical_state(
         if SolverCoupled is not None and expected_solver_cls is SolverCoupled:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
-        if SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
+        if SolverProxyCoupled is not None and issubclass(expected_solver_cls, SolverProxyCoupled):
             rigid_solver = NewtonCoupledManager.get_entry_solver("rigid")
             assert rigid_solver is not None
-            assert hasattr(rigid_solver, "_collision_pipeline")
-            assert NewtonCoupledManager.get_entry_solver("sand") is not None
+            assert NewtonCoupledManager.get_entry_solver("particle") is not None
         if SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None

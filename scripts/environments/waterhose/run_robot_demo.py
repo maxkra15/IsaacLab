@@ -97,7 +97,12 @@ parser.add_argument("--teleop", action="store_true", help="Alias for --mode tele
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--max_steps", type=int, default=2000, help="Maximum manager steps to run.")
 parser.add_argument("--max_demo_steps", type=int, default=0, help="Optional env-level termination bound; 0 disables it.")
-parser.add_argument("--newton_root", type=str, default="/home/maximiliank/Work/newton", help="Newton repo root.")
+parser.add_argument(
+    "--newton_root",
+    type=str,
+    default=os.getenv("NEWTON_ROOT", ""),
+    help="Optional Newton repo root to add to PYTHONPATH when Newton is not installed in the environment.",
+)
 parser.add_argument("--asset_root", type=str, default=DEFAULT_ASSET_ROOT, help="WaterhoseDemo asset root.")
 parser.add_argument("--teleop_device", type=str, default=None, help="Teleop device. Use spacemouse.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Teleop sensitivity scale.")
@@ -129,8 +134,11 @@ if args_cli.teleop:
     args_cli.mode = "teleop"
 if args_cli.num_envs < 1:
     parser.error("--num_envs must be at least 1.")
-if args_cli.num_envs != 1 and "admm" in args_cli.task.lower():
-    parser.error("The experimental ADMM waterhose task is single-env only; use Isaac-Waterhose-Robot-Demo-v0.")
+if args_cli.num_envs != 1 and ("admm" in args_cli.task.lower() or "oneway-coupled" in args_cli.task.lower()):
+    parser.error(
+        "The coupled-manager waterhose tasks are single-env only until Newton's coupled ModelView supports "
+        "compact per-entry multi-world views. Use Isaac-Waterhose-Robot-Demo-v0 for multi-env runs today."
+    )
 if args_cli.mode == "teleop" and args_cli.teleop_device not in (None, "spacemouse"):
     parser.error("This demo currently supports --teleop_device spacemouse.")
 if args_cli.mode == "teleop" and args_cli.teleop_device is None:
@@ -143,6 +151,7 @@ def _configure_env_cfg(env_cfg) -> None:
     from isaaclab_newton.physics import NewtonCfg  # noqa: PLC0415
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.admm_manager import (  # noqa: PLC0415
         WaterhoseAdmmSolverCfg,
+        WaterhoseOneWaySolverCfg,
     )
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
         WaterhoseNewtonSolverCfg,
@@ -153,10 +162,10 @@ def _configure_env_cfg(env_cfg) -> None:
         env_cfg.max_demo_steps = int(args_cli.max_demo_steps)
     physics_cfg = env_cfg.sim.physics
     if not isinstance(physics_cfg, NewtonCfg) or not isinstance(
-        physics_cfg.solver_cfg, (WaterhoseNewtonSolverCfg, WaterhoseAdmmSolverCfg)
+        physics_cfg.solver_cfg, (WaterhoseNewtonSolverCfg, WaterhoseAdmmSolverCfg, WaterhoseOneWaySolverCfg)
     ):
         raise TypeError(
-            "Expected NewtonCfg(solver_cfg=WaterhoseNewtonSolverCfg|WaterhoseAdmmSolverCfg), "
+            "Expected NewtonCfg(solver_cfg=WaterhoseNewtonSolverCfg|WaterhoseAdmmSolverCfg|WaterhoseOneWaySolverCfg), "
             f"got {type(physics_cfg).__name__}."
         )
     solver_cfg = physics_cfg.solver_cfg
@@ -217,15 +226,16 @@ def _set_task_teleop_enabled(env_cfg, enabled: bool) -> None:
 
     solver_cfg = env_cfg.sim.physics.solver_cfg
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.admm_manager import (  # noqa: PLC0415
-        WaterhoseAdmmSolverCfg,
         NewtonWaterhoseAdmmManager,
+        WaterhoseAdmmSolverCfg,
+        WaterhoseOneWaySolverCfg,
     )
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
         WaterhoseNewtonSolverCfg,
         NewtonWaterhoseManager,
     )
 
-    if isinstance(solver_cfg, WaterhoseAdmmSolverCfg):
+    if isinstance(solver_cfg, (WaterhoseAdmmSolverCfg, WaterhoseOneWaySolverCfg)):
         NewtonWaterhoseAdmmManager.set_teleop_enabled(enabled)
     elif isinstance(solver_cfg, WaterhoseNewtonSolverCfg):
         NewtonWaterhoseManager.set_teleop_enabled(enabled)

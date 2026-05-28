@@ -23,6 +23,12 @@ from .cable_curve_import import CableCurveImportResult, add_cable_from_usd_curve
 
 VBD_KE = 1.0e3
 VBD_KD = 0.0
+GRIPPER_FINGER_BODY_NAMES = (
+    "right_gripper_leftfinger",
+    "right_gripper_rightfinger",
+    "left_gripper_leftfinger",
+    "left_gripper_rightfinger",
+)
 
 GRIPPER_DRIVER_DOFS = (13, 23)
 GRIPPER_FINGER_DOFS = (14, 15, 24, 25)
@@ -56,15 +62,23 @@ LEROBOT_INITIAL_STATE_22 = (
 class WaterhoseAdmmBuildInfo:
     """Bookkeeping from task-local model construction."""
 
+    num_envs: int = 1
+    env_body_count: int = 0
+    env_shape_count: int = 0
+    env_joint_q_count: int = 0
+    env_origins: np.ndarray | None = None
     robot_body_count: int = 0
     robot_shape_count: int = 0
     robot_joint_q_count: int = 0
     vbd_body_count: int = 0
     vbd_shape_count: int = 0
     vbd_initial_body_q: np.ndarray | None = None
+    vbd_initial_body_q_by_env: np.ndarray | None = None
     cable_body_labels: list[str] = field(default_factory=list)
     plug_body_labels: list[str] = field(default_factory=list)
     scene_shape_ids: list[int] = field(default_factory=list)
+    robot_proxy_body_labels: list[str] = field(default_factory=list)
+    vbd_proxy_body_labels: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -94,7 +108,13 @@ class WaterhoseAssetPaths:
                 raise FileNotFoundError(f"Waterhose asset not found: {path}")
 
 
-def build_waterhose_admm_builder(asset_root: str | Path) -> tuple[newton.ModelBuilder, WaterhoseAdmmBuildInfo]:
+def build_waterhose_admm_builder(
+    asset_root: str | Path,
+    *,
+    include_proxy_bodies: bool = False,
+    num_envs: int = 1,
+    env_spacing: float = 2.5,
+) -> tuple[newton.ModelBuilder, WaterhoseAdmmBuildInfo]:
     """Build a single Newton model containing the robot and VBD waterhose scene.
 
     The model is owned and stepped by the standard
@@ -107,6 +127,14 @@ def build_waterhose_admm_builder(asset_root: str | Path) -> tuple[newton.ModelBu
 
     robot_builder = _build_robot(paths.robot_urdf, shape_cfg)
     vbd_builder, cable_results, scene_shape_ids = _build_vbd_side(paths, fridge_xform)
+    robot_proxy_body_labels: list[str] = []
+    vbd_proxy_body_labels: list[str] = []
+    if include_proxy_bodies:
+        robot_proxy_body_labels, vbd_proxy_body_labels = _create_vbd_proxy_bodies(
+            robot_builder,
+            vbd_builder,
+            scene_shape_ids=scene_shape_ids,
+        )
 
     builder = NewtonManager.create_builder()
     newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
@@ -126,12 +154,18 @@ def build_waterhose_admm_builder(asset_root: str | Path) -> tuple[newton.ModelBu
     builder.color()
 
     info = WaterhoseAdmmBuildInfo(
+        num_envs=1,
+        env_body_count=int(builder.body_count),
+        env_shape_count=int(builder.shape_count),
+        env_joint_q_count=int(builder.joint_coord_count),
+        env_origins=np.zeros((1, 3), dtype=np.float32),
         robot_body_count=robot_body_count,
         robot_shape_count=robot_shape_count,
         robot_joint_q_count=int(robot_builder.joint_coord_count),
         vbd_body_count=int(vbd_builder.body_count),
         vbd_shape_count=int(vbd_builder.shape_count),
         vbd_initial_body_q=_builder_body_q_array(vbd_builder),
+        vbd_initial_body_q_by_env=_builder_body_q_array(vbd_builder).reshape(1, int(vbd_builder.body_count), 7),
         cable_body_labels=[
             _sanitize_label(f"vbd/{_body_label(vbd_builder, body_id)}")
             for result in cable_results
@@ -143,8 +177,92 @@ def build_waterhose_admm_builder(asset_root: str | Path) -> tuple[newton.ModelBu
             for body_id in result.head_body_ids
         ],
         scene_shape_ids=[robot_shape_count + int(shape_id) for shape_id in scene_shape_ids],
+        robot_proxy_body_labels=[_sanitize_label(f"mujoco/{label}") for label in robot_proxy_body_labels],
+        vbd_proxy_body_labels=[_sanitize_label(f"vbd/{label}") for label in vbd_proxy_body_labels],
     )
+    num_envs = max(1, int(num_envs))
+    if num_envs > 1:
+        builder, info = _replicate_waterhose_builder(builder, info, num_envs=num_envs, env_spacing=env_spacing)
     return builder, info
+
+
+def _replicate_waterhose_builder(
+    prototype: newton.ModelBuilder,
+    info: WaterhoseAdmmBuildInfo,
+    *,
+    num_envs: int,
+    env_spacing: float,
+) -> tuple[newton.ModelBuilder, WaterhoseAdmmBuildInfo]:
+    """Replicate the task prototype into one Newton multi-world builder."""
+
+    origins = _grid_origins(num_envs, env_spacing)
+    replicated = NewtonManager.create_builder()
+    newton.solvers.SolverMuJoCo.register_custom_attributes(replicated)
+    replicated.default_shape_cfg = prototype.default_shape_cfg
+
+    for env_id, origin in enumerate(origins):
+        replicated.begin_world(label=f"env_{env_id}")
+        replicated.add_builder(
+            prototype,
+            xform=wp.transform(
+                wp.vec3(float(origin[0]), float(origin[1]), float(origin[2])),
+                wp.quat_identity(),
+            ),
+            label_prefix=f"env_{env_id}",
+        )
+        replicated.end_world()
+
+    replicated.color()
+    vbd_initial_body_q = np.asarray(info.vbd_initial_body_q, dtype=np.float32)
+    vbd_initial_body_q_by_env = np.repeat(vbd_initial_body_q.reshape(1, *vbd_initial_body_q.shape), num_envs, axis=0)
+    vbd_initial_body_q_by_env[:, :, :3] += origins.reshape(num_envs, 1, 3)
+
+    env_body_count = int(info.env_body_count or prototype.body_count)
+    env_shape_count = int(info.env_shape_count or prototype.shape_count)
+    return replicated, WaterhoseAdmmBuildInfo(
+        num_envs=num_envs,
+        env_body_count=env_body_count,
+        env_shape_count=env_shape_count,
+        env_joint_q_count=int(info.env_joint_q_count or prototype.joint_coord_count),
+        env_origins=origins,
+        robot_body_count=int(info.robot_body_count),
+        robot_shape_count=int(info.robot_shape_count),
+        robot_joint_q_count=int(info.robot_joint_q_count),
+        vbd_body_count=int(info.vbd_body_count),
+        vbd_shape_count=int(info.vbd_shape_count),
+        vbd_initial_body_q=vbd_initial_body_q,
+        vbd_initial_body_q_by_env=vbd_initial_body_q_by_env,
+        cable_body_labels=_prefixed_env_labels(info.cable_body_labels, num_envs),
+        plug_body_labels=_prefixed_env_labels(info.plug_body_labels, num_envs),
+        scene_shape_ids=[
+            env_id * env_shape_count + int(shape_id)
+            for env_id in range(num_envs)
+            for shape_id in info.scene_shape_ids
+        ],
+        robot_proxy_body_labels=_prefixed_env_labels(info.robot_proxy_body_labels, num_envs),
+        vbd_proxy_body_labels=_prefixed_env_labels(info.vbd_proxy_body_labels, num_envs),
+    )
+
+
+def _grid_origins(num_envs: int, env_spacing: float) -> np.ndarray:
+    """Return IsaacLab-style grid origins without requiring a live scene."""
+
+    try:
+        from isaaclab.cloner.cloner_utils import grid_transforms  # noqa: PLC0415
+
+        origins, _ = grid_transforms(int(num_envs), float(env_spacing), device="cpu")
+        return origins.cpu().numpy().astype(np.float32, copy=False)
+    except Exception:
+        cols = int(np.ceil(np.sqrt(num_envs)))
+        origins = np.zeros((num_envs, 3), dtype=np.float32)
+        for env_id in range(num_envs):
+            origins[env_id, 0] = (env_id % cols) * float(env_spacing)
+            origins[env_id, 1] = (env_id // cols) * float(env_spacing)
+        return origins
+
+
+def _prefixed_env_labels(labels: list[str], num_envs: int) -> list[str]:
+    return [f"env_{env_id}/{label}" for env_id in range(num_envs) for label in labels]
 
 
 def build_waterhose_robot_model(asset_root: str | Path, device: str | wp.context.Device):
@@ -331,6 +449,140 @@ def _add_waterhose_cables(cable_usd_path: Path, builder: newton.ModelBuilder) ->
                 for neighbor_shape in builder.body_shapes.get(neighbor_body, []):
                     builder.add_shape_collision_filter_pair(head_shape, neighbor_shape)
     return results
+
+
+def _create_vbd_proxy_bodies(
+    robot_builder: newton.ModelBuilder,
+    vbd_builder: newton.ModelBuilder,
+    *,
+    scene_shape_ids: list[int],
+) -> tuple[list[str], list[str]]:
+    """Duplicate gripper finger bodies into the VBD scene as one-way proxies."""
+
+    proxy_shape_cfg = vbd_builder.default_shape_cfg.copy()
+    proxy_shape_cfg.ke = VBD_KE
+    proxy_shape_cfg.kd = VBD_KD
+    proxy_shape_cfg.mu = 1.0e6
+    proxy_shape_cfg.margin = 0.001
+
+    robot_labels: list[str] = []
+    proxy_labels: list[str] = []
+    proxy_shapes_by_name: dict[str, list[int]] = {}
+    for body_id, label in enumerate(robot_builder.body_label):
+        body_label = str(label)
+        body_name = body_label.rsplit("/", 1)[-1]
+        if body_name not in GRIPPER_FINGER_BODY_NAMES:
+            continue
+
+        mass = float(robot_builder.body_mass[body_id])
+        if mass <= 0.0:
+            continue
+        proxy_label = f"proxy_{body_name}"
+        proxy_body_id = vbd_builder.add_body(
+            xform=robot_builder.body_q[body_id],
+            mass=mass,
+            inertia=robot_builder.body_inertia[body_id],
+            lock_inertia=True,
+            label=proxy_label,
+        )
+        proxy_shape_ids = _copy_body_shapes(
+            src_builder=robot_builder,
+            dst_builder=vbd_builder,
+            src_body_id=body_id,
+            dst_body_id=proxy_body_id,
+            cfg=proxy_shape_cfg,
+        )
+        if not proxy_shape_ids:
+            proxy_shape_ids.append(
+                int(
+                    vbd_builder.add_shape_box(
+                        body=proxy_body_id,
+                        hx=0.02,
+                        hy=0.01,
+                        hz=0.04,
+                        cfg=proxy_shape_cfg,
+                    )
+                )
+            )
+
+        robot_labels.append(body_label)
+        proxy_labels.append(proxy_label)
+        proxy_shapes_by_name[body_name] = proxy_shape_ids
+
+    if not robot_labels:
+        raise RuntimeError("No RBY1 gripper finger bodies found for one-way VBD proxy coupling.")
+
+    for gripper_prefix in ("right_gripper", "left_gripper"):
+        left = proxy_shapes_by_name.get(f"{gripper_prefix}_leftfinger", [])
+        right = proxy_shapes_by_name.get(f"{gripper_prefix}_rightfinger", [])
+        for left_shape in left:
+            for right_shape in right:
+                vbd_builder.add_shape_collision_filter_pair(int(left_shape), int(right_shape))
+
+    for proxy_shape_ids in proxy_shapes_by_name.values():
+        for proxy_shape_id in proxy_shape_ids:
+            for scene_shape_id in scene_shape_ids:
+                vbd_builder.add_shape_collision_filter_pair(int(proxy_shape_id), int(scene_shape_id))
+
+    return robot_labels, proxy_labels
+
+
+def _copy_body_shapes(
+    *,
+    src_builder: newton.ModelBuilder,
+    dst_builder: newton.ModelBuilder,
+    src_body_id: int,
+    dst_body_id: int,
+    cfg: newton.ModelBuilder.ShapeConfig,
+) -> list[int]:
+    """Copy all shapes attached to one builder body to another builder body."""
+
+    shape_ids: list[int] = []
+    for shape_id in src_builder.body_shapes.get(src_body_id, []):
+        shape_type = int(src_builder.shape_type[shape_id])
+        scale = src_builder.shape_scale[shape_id]
+        xform = src_builder.shape_transform[shape_id]
+        pos = wp.transform_get_translation(xform)
+        rot = wp.transform_get_rotation(xform)
+
+        if shape_type == int(GeoType.SPHERE):
+            copied_id = dst_builder.add_shape_sphere(
+                body=dst_body_id,
+                radius=float(scale[0]),
+                pos=pos,
+                rot=rot,
+                cfg=cfg,
+            )
+        elif shape_type == int(GeoType.BOX):
+            copied_id = dst_builder.add_shape_box(
+                body=dst_body_id,
+                hx=float(scale[0]),
+                hy=float(scale[1]),
+                hz=float(scale[2]),
+                pos=pos,
+                rot=rot,
+                cfg=cfg,
+            )
+        elif shape_type == int(GeoType.CAPSULE):
+            copied_id = dst_builder.add_shape_capsule(
+                body=dst_body_id,
+                radius=float(scale[0]),
+                half_height=float(scale[1]),
+                pos=pos,
+                rot=rot,
+                cfg=cfg,
+            )
+        elif shape_type == int(GeoType.MESH):
+            copied_id = dst_builder.add_shape_mesh(
+                body=dst_body_id,
+                mesh=src_builder.shape_source[shape_id],
+                xform=xform,
+                cfg=cfg,
+            )
+        else:
+            continue
+        shape_ids.append(int(copied_id))
+    return shape_ids
 
 
 def _configure_mujoco_gravity_compensation(robot: newton.ModelBuilder) -> None:

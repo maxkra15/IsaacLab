@@ -141,6 +141,12 @@ class CoupledProxyCfg:
     proxy_bodies: list[int] | None = None
     """Destination proxy body ids. ``None`` mirrors :attr:`bodies`."""
 
+    proxy_body_label_patterns: list[str] = field(default_factory=list)
+    """Regexes matched against full Newton body labels for destination proxy bodies."""
+
+    proxy_body_name_patterns: list[str] = field(default_factory=list)
+    """Regexes matched against short Newton body names for destination proxy bodies."""
+
     particles: list[int] = field(default_factory=list)
     """Source particle ids mapped into the destination as proxy particles."""
 
@@ -152,6 +158,9 @@ class CoupledProxyCfg:
 
     proxy_particles: list[int] | None = None
     """Destination proxy particle ids. ``None`` mirrors :attr:`particles`."""
+
+    proxy_particle_range: tuple[int | None, int | None] | None = None
+    """Contiguous parent-model particle range ``[start, end)`` used as destination proxy particles."""
 
     mass_scale: float = 1.0
     """Scale factor for proxy mass/inertia in the destination view."""
@@ -179,6 +188,19 @@ class ProxyCouplingCfg:
 
     iterations: int = 1
     """Number of proxy relaxation passes per coupled step."""
+
+
+@configclass
+class OneWayCouplingCfg:
+    """One-way proxy coupling configuration.
+
+    The source solver drives proxy objects in the destination solver. The
+    destination solver can respond to those proxies, but harvested proxy forces
+    are discarded and never fed back into the source solver.
+    """
+
+    proxies: list[CoupledProxyCfg] = field(default_factory=list)
+    """Source-to-destination proxy mappings used by ``SolverOneWayCoupled``."""
 
 
 @configclass
@@ -254,12 +276,14 @@ class CoupledSolverCfg(NewtonSolverCfg):
     solver_type: str = "coupled"
     """Solver type metadata. Can be ``"coupled"``."""
 
-    coupling_type: Literal["base", "proxy", "admm"] = "proxy"
+    coupling_type: Literal["base", "proxy", "one_way", "admm"] = "proxy"
     """Coupling algorithm to construct.
 
     ``"base"`` constructs Newton's generic :class:`SolverCoupled` without
-    additional force or ADMM exchange. ``"proxy"`` and ``"admm"`` construct the
-    corresponding Newton coupling algorithms.
+    additional force or ADMM exchange. ``"proxy"`` constructs Newton's
+    bidirectional lagged-impulse proxy coupling. ``"one_way"`` uses the same
+    proxy state-transfer path but discards destination feedback, and
+    ``"admm"`` constructs Newton's ADMM coupling.
     """
 
     entries: list[CoupledSolverEntryCfg] = field(default_factory=list)
@@ -274,6 +298,9 @@ class CoupledSolverCfg(NewtonSolverCfg):
 
     proxy_coupling: ProxyCouplingCfg = field(default_factory=ProxyCouplingCfg)
     """Configuration for ``coupling_type="proxy"``."""
+
+    one_way_coupling: OneWayCouplingCfg = field(default_factory=OneWayCouplingCfg)
+    """Configuration for ``coupling_type="one_way"``."""
 
     admm_coupling: AdmmCouplingCfg = field(default_factory=AdmmCouplingCfg)
     """Configuration for ``coupling_type="admm"``."""

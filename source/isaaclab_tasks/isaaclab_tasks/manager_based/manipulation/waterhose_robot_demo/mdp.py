@@ -12,44 +12,70 @@ import torch
 from .manager import NewtonWaterhoseManager
 
 
-def _as_env_tensor(env, value, shape_tail: tuple[int, ...]) -> torch.Tensor:
-    tensor = torch.as_tensor(value, device=env.device, dtype=torch.float32)
-    return tensor.reshape(env.num_envs, *shape_tail)
+def _runtime_token() -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (id(runtime), int(getattr(runtime, "frame_count", -1))) for runtime in NewtonWaterhoseManager.get_runtimes()
+    )
+
+
+def _policy_state(env) -> dict[str, torch.Tensor]:
+    token = _runtime_token()
+    cached = getattr(env, "_waterhose_policy_state_cache", None)
+    if cached is None or cached[0] != token:
+        state = {
+            name: torch.as_tensor(value, device=env.device, dtype=torch.float32)
+            for name, value in NewtonWaterhoseManager.get_policy_state().items()
+        }
+        setattr(env, "_waterhose_policy_state_cache", (token, state))
+        return state
+    return cached[1]
+
+
+def _subtask_signals(env) -> dict[str, torch.Tensor]:
+    token = _runtime_token()
+    cached = getattr(env, "_waterhose_subtask_signal_cache", None)
+    if cached is None or cached[0] != token:
+        signals = {
+            name: torch.as_tensor(value, device=env.device, dtype=torch.bool)
+            for name, value in NewtonWaterhoseManager.get_subtask_term_signals().items()
+        }
+        setattr(env, "_waterhose_subtask_signal_cache", (token, signals))
+        return signals
+    return cached[1]
 
 
 def phase(env) -> torch.Tensor:
     """Current scripted state-machine phase index."""
-    return _as_env_tensor(env, NewtonWaterhoseManager.current_phases(), (1,))
+    return _policy_state(env)["phase"].reshape(env.num_envs, 1)
 
 
 def sim_time(env) -> torch.Tensor:
     """Local Newton simulation time [s]."""
-    return _as_env_tensor(env, NewtonWaterhoseManager.get_sim_times(), (1,))
+    return _policy_state(env)["sim_time"].reshape(env.num_envs, 1)
 
 
 def plug_pose(env) -> torch.Tensor:
     """Plug/head pose as xyz + xyzw."""
-    return _as_env_tensor(env, NewtonWaterhoseManager.get_plug_poses(), (7,))
+    return _policy_state(env)["plug_pose"].reshape(env.num_envs, 7)
 
 
 def tip_pose(env) -> torch.Tensor:
     """Cable tip capsule pose as xyz + xyzw."""
-    return _as_env_tensor(env, NewtonWaterhoseManager.get_tip_poses(), (7,))
+    return _policy_state(env)["tip_pose"].reshape(env.num_envs, 7)
 
 
 def right_ee_pose(env) -> torch.Tensor:
     """Right gripper end-effector pose as xyz + xyzw."""
-    return _as_env_tensor(env, NewtonWaterhoseManager.get_right_ee_poses(), (7,))
+    return _policy_state(env)["right_ee_pose"].reshape(env.num_envs, 7)
 
 
 def finite(env) -> torch.Tensor:
     """Whether all primary Newton state buffers are finite."""
-    return _as_env_tensor(env, NewtonWaterhoseManager.finite_mask(), (1,))
+    return _policy_state(env)["finite"].reshape(env.num_envs, 1)
 
 
 def _subtask_signal(env, name: str) -> torch.Tensor:
-    signals = NewtonWaterhoseManager.get_subtask_term_signals()
-    return torch.as_tensor(signals[name], device=env.device, dtype=torch.bool)
+    return _subtask_signals(env)[name]
 
 
 def approach_done(env) -> torch.Tensor:

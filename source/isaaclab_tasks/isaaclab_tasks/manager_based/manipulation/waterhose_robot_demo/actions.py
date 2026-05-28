@@ -74,10 +74,12 @@ class ScriptedDemoAction(ActionTerm):
         self._processed_actions[:, 6:] = self._raw_actions[:, 6:]
 
     def apply_actions(self) -> None:
+        if NewtonWaterhoseManager.teleop_enabled():
+            NewtonWaterhoseManager.apply_teleop_command(self._processed_actions)
+            return
         has_user_command = bool(torch.any(torch.abs(self._processed_actions) > float(self.cfg.input_deadzone)).item())
         if has_user_command:
             NewtonWaterhoseManager.set_teleop_enabled(True)
-        if NewtonWaterhoseManager.teleop_enabled():
             NewtonWaterhoseManager.apply_teleop_command(self._processed_actions)
 
     def reset(self, env_ids=None) -> None:
@@ -103,10 +105,12 @@ class AdmmScriptedDemoAction(ScriptedDemoAction):
         from .admm_manager import NewtonWaterhoseAdmmManager  # noqa: PLC0415
 
         command = self._processed_actions[0]
+        if NewtonWaterhoseAdmmManager.teleop_enabled():
+            NewtonWaterhoseAdmmManager.apply_teleop_command(command)
+            return
         has_user_command = bool(torch.any(torch.abs(command) > float(self.cfg.input_deadzone)).item())
         if has_user_command:
             NewtonWaterhoseAdmmManager.set_teleop_enabled(True)
-        if NewtonWaterhoseAdmmManager.teleop_enabled():
             NewtonWaterhoseAdmmManager.apply_teleop_command(command)
-        else:
-            NewtonWaterhoseAdmmManager.apply_scripted_control()
+            return
+        NewtonWaterhoseAdmmManager.apply_scripted_control()

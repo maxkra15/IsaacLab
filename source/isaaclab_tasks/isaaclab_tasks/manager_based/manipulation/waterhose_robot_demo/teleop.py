@@ -73,12 +73,11 @@ class WaterhoseSpaceMouse(DeviceBase):
         command[5] *= self._yaw_sign
         translation_norm = torch.linalg.vector_norm(command[:3])
         yaw_abs = torch.abs(command[5])
-        if translation_norm > self._deadzone:
-            command[5] = 0.0
-        elif yaw_abs > self._deadzone:
-            command[:3] = 0.0
-        if self._yaw_translation_lock and abs(float(command[5].detach().cpu())) > self._deadzone:
-            command[:3] = 0.0
+        translation_active = translation_norm > self._deadzone
+        yaw_active = yaw_abs > self._deadzone
+        command[5] = torch.where(translation_active, torch.zeros_like(command[5]), command[5])
+        zero_translation = yaw_active & (translation_active.logical_not() | bool(self._yaw_translation_lock))
+        command[:3] = torch.where(zero_translation, torch.zeros_like(command[:3]), command[:3])
         return command
 
 

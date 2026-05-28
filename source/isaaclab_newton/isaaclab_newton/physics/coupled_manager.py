@@ -30,6 +30,7 @@ from .coupled_manager_cfg import (
     CoupledProxyCfg,
     CoupledSolverCfg,
     CoupledSolverEntryCfg,
+    OneWayCouplingCfg,
 )
 from .mjwarp_manager import apply_mujoco_warp_model_overrides
 from .newton_manager import NewtonManager
@@ -41,6 +42,28 @@ from .solver_factory import (
 
 if TYPE_CHECKING:
     from isaaclab.scene import InteractiveSceneCfg
+
+
+class SolverOneWayCoupled(SolverProxyCoupled):
+    """Proxy-coupled solver that only transfers source motion to destination proxies.
+
+    This intentionally reuses Newton's proxy collision/contact preparation path
+    so the destination solver sees the same proxy bodies as bidirectional proxy
+    coupling. The difference is that proxy impulse buffers are cleared before
+    source stepping and again after destination stepping, so harvested
+    destination contact wrenches cannot feed back into the source solver.
+    """
+
+    def _step_coupled(self, state_in, state_out, control, contacts, dt) -> None:
+        del state_out
+        self._clear_proxy_feedback()
+        self._step_proxy(state_in, control, contacts, dt, iteration_restart=False)
+        self._clear_proxy_feedback()
+
+    def _clear_proxy_feedback(self) -> None:
+        for proxy in (*self._proxy_mappings, *self._proxy_particle_mappings):
+            if proxy.coupling_forces is not None:
+                proxy.coupling_forces.zero_()
 
 
 class _EntryCollisionPipelineSolver(CouplingInterface):
@@ -122,6 +145,15 @@ class NewtonCoupledManager(NewtonManager):
                     iterations=solver_cfg.proxy_coupling.iterations,
                 ),
             )
+        elif solver_cfg.coupling_type == "one_way":
+            NewtonManager._solver = SolverOneWayCoupled(
+                model=model,
+                entries=entries,
+                coupling=SolverProxyCoupled.Config(
+                    proxies=[cls._build_proxy(proxy_cfg) for proxy_cfg in solver_cfg.one_way_coupling.proxies],
+                    iterations=1,
+                ),
+            )
         elif solver_cfg.coupling_type == "admm":
             NewtonManager._solver = SolverAdmmCoupled(
                 model=model,
@@ -151,6 +183,11 @@ class NewtonCoupledManager(NewtonManager):
             cls._resolve_proxy_cfg(model, proxy_cfg, scene_cfg) for proxy_cfg in solver_cfg.proxy_coupling.proxies
         ]
         resolved_cfg.proxy_coupling = resolved_proxy_coupling
+        resolved_one_way_coupling = copy.copy(solver_cfg.one_way_coupling)
+        resolved_one_way_coupling.proxies = [
+            cls._resolve_proxy_cfg(model, proxy_cfg, scene_cfg) for proxy_cfg in solver_cfg.one_way_coupling.proxies
+        ]
+        resolved_cfg.one_way_coupling = resolved_one_way_coupling
         return resolved_cfg
 
     @staticmethod
@@ -209,6 +246,22 @@ class NewtonCoupledManager(NewtonManager):
             f"proxy {proxy_cfg.source!r}->{proxy_cfg.destination!r}",
         )
         resolved.bodies = cls._unique_ints([*proxy_cfg.bodies, *selected_bodies])
+        selected_proxy_bodies = [
+            *cls._resolve_body_label_patterns(
+                model,
+                proxy_cfg.proxy_body_label_patterns,
+                f"proxy {proxy_cfg.source!r}->{proxy_cfg.destination!r} destination",
+            ),
+            *cls._resolve_body_name_patterns(
+                model,
+                proxy_cfg.proxy_body_name_patterns,
+                f"proxy {proxy_cfg.source!r}->{proxy_cfg.destination!r} destination",
+            ),
+        ]
+        if selected_proxy_bodies:
+            resolved.proxy_bodies = cls._unique_ints(
+                [*(proxy_cfg.proxy_bodies or []), *selected_proxy_bodies]
+            )
         resolved.particles = cls._resolve_particles(
             model,
             explicit=proxy_cfg.particles,
@@ -216,6 +269,15 @@ class NewtonCoupledManager(NewtonManager):
             all_particles=proxy_cfg.all_particles,
             field=f"CoupledProxyCfg {proxy_cfg.source!r}->{proxy_cfg.destination!r}",
         )
+        selected_proxy_particles = cls._resolve_particles(
+            model,
+            explicit=[] if proxy_cfg.proxy_particles is None else proxy_cfg.proxy_particles,
+            particle_range=proxy_cfg.proxy_particle_range,
+            all_particles=False,
+            field=f"CoupledProxyCfg {proxy_cfg.source!r}->{proxy_cfg.destination!r} proxy",
+        )
+        if selected_proxy_particles:
+            resolved.proxy_particles = selected_proxy_particles
         return resolved
 
     @staticmethod
@@ -605,7 +667,7 @@ class NewtonCoupledManager(NewtonManager):
     @classmethod
     def _validate_solver_cfg(cls, solver_cfg: CoupledSolverCfg) -> None:
         """Validate coupled-solver config before constructing Newton objects."""
-        if solver_cfg.coupling_type not in ("base", "proxy", "admm"):
+        if solver_cfg.coupling_type not in ("base", "proxy", "one_way", "admm"):
             raise ValueError(f"Unsupported Newton coupling_type {solver_cfg.coupling_type!r}.")
         if len(solver_cfg.entries) < 2:
             raise ValueError("Newton coupled solver requires at least two solver entries.")
@@ -613,7 +675,9 @@ class NewtonCoupledManager(NewtonManager):
         if solver_cfg.coupling_type == "base":
             return
         if solver_cfg.coupling_type == "proxy":
-            cls._validate_proxy_coupling(solver_cfg)
+            cls._validate_proxy_coupling(solver_cfg.entries, solver_cfg.proxy_coupling)
+        elif solver_cfg.coupling_type == "one_way":
+            cls._validate_one_way_coupling(solver_cfg.entries, solver_cfg.one_way_coupling)
         else:
             cls._validate_admm_coupling(solver_cfg.admm_coupling)
 
@@ -648,15 +712,31 @@ class NewtonCoupledManager(NewtonManager):
                 owners[index] = entry.name
 
     @classmethod
-    def _validate_proxy_coupling(cls, solver_cfg: CoupledSolverCfg) -> None:
-        if len(solver_cfg.entries) > 2:
+    def _validate_proxy_coupling(cls, entries: list[CoupledSolverEntryCfg], proxy_coupling) -> None:
+        if len(entries) > 2:
             raise ValueError("Newton proxy coupling currently supports at most two solver entries.")
-        if not solver_cfg.proxy_coupling.proxies:
+        if not proxy_coupling.proxies:
             raise ValueError("Newton proxy coupling requires at least one proxy mapping.")
-        if solver_cfg.proxy_coupling.iterations < 1:
+        if proxy_coupling.iterations < 1:
             raise ValueError("ProxyCouplingCfg.iterations must be >= 1.")
-        entry_names = {entry.name for entry in solver_cfg.entries}
-        for proxy in solver_cfg.proxy_coupling.proxies:
+        cls._validate_proxy_mappings(entries, proxy_coupling.proxies)
+
+    @classmethod
+    def _validate_one_way_coupling(
+        cls, entries: list[CoupledSolverEntryCfg], one_way_coupling: OneWayCouplingCfg
+    ) -> None:
+        if len(entries) > 2:
+            raise ValueError("Newton one-way coupling currently supports at most two solver entries.")
+        if not one_way_coupling.proxies:
+            raise ValueError("Newton one-way coupling requires at least one proxy mapping.")
+        cls._validate_proxy_mappings(entries, one_way_coupling.proxies)
+
+    @classmethod
+    def _validate_proxy_mappings(
+        cls, entries: list[CoupledSolverEntryCfg], proxies: list[CoupledProxyCfg]
+    ) -> None:
+        entry_names = {entry.name for entry in entries}
+        for proxy in proxies:
             if proxy.source not in entry_names:
                 raise ValueError(f"CoupledProxyCfg source {proxy.source!r} does not match a coupled entry.")
             if proxy.destination not in entry_names:
