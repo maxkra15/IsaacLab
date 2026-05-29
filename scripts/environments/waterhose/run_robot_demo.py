@@ -91,6 +91,31 @@ def validate_visualizers(args_cli: argparse.Namespace, parser: argparse.Argument
     return selected
 
 
+def _local_isaacsim_kit_args() -> str:
+    """Return Kit extension-folder args for a source-built Isaac Sim checkout."""
+    isaacsim_root = Path(__file__).resolve().parents[3] / "_isaac_sim"
+    if not isaacsim_root.exists():
+        return ""
+
+    kit_args = []
+    for extension_dir in ("exts", "extsDeprecated", "extscache"):
+        extension_path = isaacsim_root / extension_dir
+        if extension_path.is_dir():
+            kit_args.append(f"--ext-folder={extension_path.resolve()}")
+    return " ".join(kit_args)
+
+
+def _ensure_local_isaacsim_kit_args(args_cli: argparse.Namespace, selected_visualizers: set[str]) -> None:
+    """Make direct runner launches see local Isaac Sim extensions."""
+    if "kit" not in selected_visualizers or getattr(args_cli, "kit_args", ""):
+        return
+
+    kit_args = _local_isaacsim_kit_args()
+    if kit_args:
+        args_cli.kit_args = kit_args
+        _debug_runner(f"kit_args={kit_args}")
+
+
 parser = argparse.ArgumentParser(description="Run the waterhose robot demo through IsaacLab.")
 parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--mode", choices=("scripted", "teleop"), default="scripted", help="Control mode.")
@@ -143,6 +168,7 @@ if args_cli.mode == "teleop" and args_cli.teleop_device is None:
     args_cli.teleop_device = "spacemouse"
 
 selected_visualizers = validate_visualizers(args_cli, parser)
+_ensure_local_isaacsim_kit_args(args_cli, selected_visualizers)
 
 
 def _configure_env_cfg(env_cfg) -> None:
