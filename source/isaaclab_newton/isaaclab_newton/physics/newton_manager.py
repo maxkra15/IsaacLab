@@ -935,9 +935,9 @@ class NewtonManager(PhysicsManager):
 
             SolverImplicitMPM.register_custom_attributes(builder)
         if getattr(solver_cfg, "coupling_type", None) == "admm":
-            from newton.solvers.coupled_experimental import SolverAdmmCoupled
+            from newton.solvers.experimental.coupled import SolverCoupledAdmm
 
-            SolverAdmmCoupled.register_custom_attributes(builder)
+            SolverCoupledAdmm.register_custom_attributes(builder)
 
     @classmethod
     def _set_fk_articulation_filter(cls, mask: np.ndarray | list[bool] | None) -> None:

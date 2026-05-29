@@ -14,11 +14,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from newton import CollisionPipeline, Model
-from newton.solvers.coupled_experimental import (
+from newton.solvers.experimental.coupled import (
     CouplingInterface,
-    SolverAdmmCoupled,
     SolverCoupled,
-    SolverProxyCoupled,
+    SolverCoupledAdmm,
+    SolverCoupledProxy,
 )
 
 from isaaclab.managers import SceneEntityCfg
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from isaaclab.scene import InteractiveSceneCfg
 
 
-class SolverOneWayCoupled(SolverProxyCoupled):
+class SolverOneWayCoupled(SolverCoupledProxy):
     """Proxy-coupled solver that only transfers source motion to destination proxies.
 
     This intentionally reuses Newton's proxy collision/contact preparation path
@@ -137,10 +137,10 @@ class NewtonCoupledManager(NewtonManager):
         if solver_cfg.coupling_type == "base":
             NewtonManager._solver = SolverCoupled(model=model, entries=entries)
         elif solver_cfg.coupling_type == "proxy":
-            NewtonManager._solver = SolverProxyCoupled(
+            NewtonManager._solver = SolverCoupledProxy(
                 model=model,
                 entries=entries,
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[cls._build_proxy(proxy_cfg) for proxy_cfg in solver_cfg.proxy_coupling.proxies],
                     iterations=solver_cfg.proxy_coupling.iterations,
                 ),
@@ -149,13 +149,13 @@ class NewtonCoupledManager(NewtonManager):
             NewtonManager._solver = SolverOneWayCoupled(
                 model=model,
                 entries=entries,
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[cls._build_proxy(proxy_cfg) for proxy_cfg in solver_cfg.one_way_coupling.proxies],
                     iterations=1,
                 ),
             )
         elif solver_cfg.coupling_type == "admm":
-            NewtonManager._solver = SolverAdmmCoupled(
+            NewtonManager._solver = SolverCoupledAdmm(
                 model=model,
                 entries=entries,
                 coupling=cls._build_admm(solver_cfg.admm_coupling, entries),
@@ -594,14 +594,14 @@ class NewtonCoupledManager(NewtonManager):
         )
 
     @classmethod
-    def _build_proxy(cls, proxy_cfg: CoupledProxyCfg) -> SolverProxyCoupled.Proxy:
+    def _build_proxy(cls, proxy_cfg: CoupledProxyCfg) -> SolverCoupledProxy.Proxy:
         """Build a Newton proxy mapping from an Isaac Lab proxy cfg."""
         if not proxy_cfg.source or not proxy_cfg.destination:
             raise ValueError("CoupledProxyCfg source and destination must be non-empty.")
         if not proxy_cfg.bodies and not proxy_cfg.particles:
             raise ValueError("CoupledProxyCfg must map at least one body or particle.")
 
-        return SolverProxyCoupled.Proxy(
+        return SolverCoupledProxy.Proxy(
             source=proxy_cfg.source,
             destination=proxy_cfg.destination,
             bodies=list(proxy_cfg.bodies),
@@ -628,21 +628,21 @@ class NewtonCoupledManager(NewtonManager):
     @classmethod
     def _build_admm(
         cls, admm_cfg: AdmmCouplingCfg, entries: list[SolverCoupled.Entry] | None = None
-    ) -> SolverAdmmCoupled.Config:
+    ) -> SolverCoupledAdmm.Config:
         """Build a Newton ADMM coupling config from an Isaac Lab cfg."""
         contact_pairs = [cls._build_admm_contact_pair(pair_cfg) for pair_cfg in admm_cfg.contact_pairs]
         if admm_cfg.auto_contact_pairs:
             if entries is None:
                 raise ValueError("AdmmCouplingCfg.auto_contact_pairs requires coupled solver entries.")
             contact_pairs.extend(
-                SolverAdmmCoupled.auto_detect_contact_pairs(
+                SolverCoupledAdmm.auto_detect_contact_pairs(
                     entries,
                     contact_distance=admm_cfg.auto_contact_distance,
                     detection_margin=admm_cfg.auto_detection_margin,
                 )
             )
 
-        return SolverAdmmCoupled.Config(
+        return SolverCoupledAdmm.Config(
             iterations=admm_cfg.iterations,
             rho=admm_cfg.rho,
             gamma=admm_cfg.gamma,
@@ -655,9 +655,9 @@ class NewtonCoupledManager(NewtonManager):
         )
 
     @staticmethod
-    def _build_admm_contact_pair(pair_cfg: AdmmContactPairCfg) -> SolverAdmmCoupled.ContactPair:
+    def _build_admm_contact_pair(pair_cfg: AdmmContactPairCfg) -> SolverCoupledAdmm.ContactPair:
         """Build a Newton ADMM contact-pair config from an Isaac Lab cfg."""
-        return SolverAdmmCoupled.ContactPair(
+        return SolverCoupledAdmm.ContactPair(
             source=pair_cfg.source,
             destination=pair_cfg.destination,
             contact_distance=pair_cfg.contact_distance,

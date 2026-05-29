@@ -57,11 +57,11 @@ from isaaclab_newton.physics import (
 )
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
 try:
-    from newton.solvers.coupled_experimental import SolverAdmmCoupled, SolverCoupled, SolverProxyCoupled
+    from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledAdmm, SolverCoupledProxy
 except ImportError:
-    SolverAdmmCoupled = None
+    SolverCoupledAdmm = None
     SolverCoupled = None
-    SolverProxyCoupled = None
+    SolverCoupledProxy = None
 
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
@@ -174,7 +174,7 @@ SOLVER_MATRIX = [
             use_collision_pipeline=True,
         ),
         NewtonCoupledManager,
-        SolverProxyCoupled,
+        SolverCoupledProxy,
         False,
         True,
         id="proxy_coupled_xpbd_body_particle",
@@ -232,7 +232,7 @@ SOLVER_MATRIX = [
             use_collision_pipeline=False,
         ),
         NewtonCoupledManager,
-        SolverAdmmCoupled,
+        SolverCoupledAdmm,
         False,
         False,
         id="admm_coupled_xpbd_body_particle",
@@ -596,8 +596,8 @@ def test_initialize_solver_populates_canonical_state(
                 radius_mean=0.02,
             )
         elif (
-            SolverProxyCoupled is not None
-            and issubclass(expected_solver_cls, SolverProxyCoupled)
+            SolverCoupledProxy is not None
+            and issubclass(expected_solver_cls, SolverCoupledProxy)
         ):
             body = builder.add_body(mass=1.0)
             builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
@@ -617,7 +617,7 @@ def test_initialize_solver_populates_canonical_state(
                 mass=0.1,
                 radius=0.02,
             )
-        elif SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
+        elif SolverCoupledAdmm is not None and expected_solver_cls is SolverCoupledAdmm:
             assert builder.has_custom_attribute("coupling:body_particle_attachment_body")
             body = builder.add_body(mass=1.0)
             particle = builder.add_particle(
@@ -626,7 +626,7 @@ def test_initialize_solver_populates_canonical_state(
                 mass=0.1,
                 radius=0.02,
             )
-            SolverAdmmCoupled.add_body_particle_attachment(builder, body, particle, stiffness=10.0)
+            SolverCoupledAdmm.add_body_particle_attachment(builder, body, particle, stiffness=10.0)
         else:
             # Pre-populate the builder with a minimal scene so MJCF conversion has
             # something to work with.
@@ -643,11 +643,11 @@ def test_initialize_solver_populates_canonical_state(
         if SolverCoupled is not None and expected_solver_cls is SolverCoupled:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
-        if SolverProxyCoupled is not None and issubclass(expected_solver_cls, SolverProxyCoupled):
+        if SolverCoupledProxy is not None and issubclass(expected_solver_cls, SolverCoupledProxy):
             rigid_solver = NewtonCoupledManager.get_entry_solver("rigid")
             assert rigid_solver is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
-        if SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
+        if SolverCoupledAdmm is not None and expected_solver_cls is SolverCoupledAdmm:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
         assert NewtonManager._use_single_state is expected_use_single_state
