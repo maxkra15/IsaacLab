@@ -47,6 +47,25 @@ run() {
     "$@"
 }
 
+source_without_nounset() {
+    local script_path="$1"
+    local had_nounset=0
+
+    case "$-" in
+        *u*)
+            had_nounset=1
+            set +u
+            ;;
+    esac
+
+    # shellcheck disable=SC1090
+    source "$script_path"
+
+    if [[ "$had_nounset" == "1" ]]; then
+        set -u
+    fi
+}
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -87,6 +106,7 @@ Setup options:
   --build-arg ARG            Add one argument to Isaac Sim build.sh.
   --all-configs              Build Isaac Sim default configs instead of release only.
   --resume-existing          Continue from an existing workspace instead of aborting.
+  --rebuild-isaacsim         Rebuild Isaac Sim when resuming an existing workspace.
   --skip-host-deps           Do not install apt packages.
   --skip-gcc-alternatives    Do not set gcc/g++ alternatives to version 11.
   --skip-lfs                 Do not run git lfs install/pull.
@@ -357,6 +377,13 @@ isaacsim_build_dir() {
     esac
 }
 
+isaacsim_build_ready() {
+    local isaacsim_dir="$1"
+    local build_dir
+    build_dir="$(isaacsim_build_dir "$isaacsim_dir")"
+    [[ -d "$build_dir" && -f "${build_dir}/python.sh" && -f "${build_dir}/setup_conda_env.sh" ]]
+}
+
 build_isaacsim() {
     local isaacsim_dir="$1"
     shift
@@ -378,6 +405,7 @@ link_isaacsim_build() {
     [[ -d "$build_dir" ]] || die "Expected Isaac Sim build directory does not exist: ${build_dir}"
     [[ -f "${build_dir}/python.sh" ]] || die "Isaac Sim python.sh not found in ${build_dir}"
     [[ -f "${build_dir}/setup_conda_env.sh" ]] || die "Isaac Sim setup_conda_env.sh not found in ${build_dir}"
+    [[ -f "${build_dir}/exts/isaacsim.robot.wheeled_robots/config/extension.toml" ]] || die "Isaac Sim build is missing isaacsim.robot.wheeled_robots. Rebuild Isaac Sim or use a compatible --isaacsim-ref."
 
     ln -sfn "$build_dir" "${repo_root}/_isaac_sim"
     log "Linked ${repo_root}/_isaac_sim -> ${build_dir}"
@@ -386,28 +414,37 @@ link_isaacsim_build() {
 setup_uv_env_and_install_isaaclab() {
     local repo_root="$1"
     local venv_name="$2"
+    local resume_existing="$3"
     local venv_dir
     venv_dir="$(venv_path "$repo_root" "$venv_name")"
 
     ensure_uv
     [[ -e "${repo_root}/_isaac_sim" ]] || die "_isaac_sim is missing in ${repo_root}"
     if [[ -e "$venv_dir" ]]; then
-        die "Virtual environment already exists: ${venv_dir}. Remove the workspace or use --resume-existing only for a known partial setup."
+        if [[ "$resume_existing" != "1" ]]; then
+            die "Virtual environment already exists: ${venv_dir}. Remove the workspace or use --resume-existing only for a known partial setup."
+        fi
+        log "Reusing existing virtual environment: ${venv_dir}"
+    else
+        run env -u VIRTUAL_ENV -u CONDA_PREFIX "${repo_root}/isaaclab.sh" --uv "$venv_name"
     fi
 
-    run "${repo_root}/isaaclab.sh" --uv "$venv_name"
-    # shellcheck disable=SC1091
-    source "${venv_dir}/bin/activate"
+    source_without_nounset "${venv_dir}/bin/activate"
     run "${repo_root}/isaaclab.sh" -i all
 }
 
 extract_assets() {
     local repo_root="$1"
     local assets_tar="$2"
+    local resume_existing="$3"
     local target_dir="${repo_root}/source/isaaclab_assets/data"
     local expected_dir="${target_dir}/WaterhoseDemo"
 
     if [[ -d "$expected_dir" ]]; then
+        if [[ "$resume_existing" == "1" ]]; then
+            log "Waterhose assets already present at ${expected_dir}"
+            return
+        fi
         die "Waterhose assets already exist at ${expected_dir}. Remove the workspace or use a clean setup."
     fi
     [[ -f "$assets_tar" ]] || die "Asset archive not found: ${assets_tar}. Copy waterhose_demo_assets.tar.gz next to this script or pass --assets-tar FILE."
@@ -435,11 +472,9 @@ activate_runtime_env() {
     venv_dir="$(venv_path "$repo_root" "$venv_name")"
     local activate="${venv_dir}/bin/activate"
     [[ -f "$activate" ]] || die "Virtual environment not found: ${venv_dir}. Run ./waterhose.sh setup first."
-    # shellcheck disable=SC1090
-    source "$activate"
+    source_without_nounset "$activate"
     if [[ -f "${repo_root}/_isaac_sim/setup_conda_env.sh" ]]; then
-        # shellcheck disable=SC1091
-        source "${repo_root}/_isaac_sim/setup_conda_env.sh" >/dev/null 2>&1 || true
+        source_without_nounset "${repo_root}/_isaac_sim/setup_conda_env.sh" >/dev/null 2>&1 || true
     fi
     export PYTHONPATH="${repo_root}/source/isaaclab:${PYTHONPATH:-}"
 }
@@ -450,6 +485,41 @@ run_isaaclab_python() {
     shift 2
     activate_runtime_env "$repo_root" "$venv_name"
     (cd "$repo_root" && exec "${repo_root}/isaaclab.sh" -p "$@")
+}
+
+isaacsim_kit_args() {
+    local repo_root="$1"
+    local isaacsim_root
+    isaacsim_root="$(readlink -f "${repo_root}/_isaac_sim")"
+
+    local kit_args=()
+    [[ -d "${isaacsim_root}/exts" ]] && kit_args+=("--ext-folder=${isaacsim_root}/exts")
+    [[ -d "${isaacsim_root}/extsDeprecated" ]] && kit_args+=("--ext-folder=${isaacsim_root}/extsDeprecated")
+    [[ -d "${isaacsim_root}/extscache" ]] && kit_args+=("--ext-folder=${isaacsim_root}/extscache")
+
+    printf '%s' "${kit_args[*]}"
+}
+
+run_clean_venv_python() {
+    local repo_root="$1"
+    local venv_name="$2"
+    shift 2
+    local venv_dir
+    venv_dir="$(venv_path "$repo_root" "$venv_name")"
+    local python_exe="${venv_dir}/bin/python"
+    [[ -x "$python_exe" ]] || die "Python executable not found: ${python_exe}"
+
+    # --vis none uses the standalone Newton/USD Python path. Do not source
+    # _isaac_sim/setup_conda_env.sh here: its Kit LD_LIBRARY_PATH entries can
+    # shadow pip usd-core's USD libraries and break pxr imports.
+    (
+        cd "$repo_root"
+        export VIRTUAL_ENV="$venv_dir"
+        export PATH="${venv_dir}/bin:${PATH}"
+        export PYTHONPATH="${repo_root}/source/isaaclab:${PYTHONPATH:-}"
+        unset LD_LIBRARY_PATH
+        exec "$python_exe" "$@"
+    )
 }
 
 cmd_setup() {
@@ -468,6 +538,7 @@ cmd_setup() {
     local skip_gcc_alternatives=0
     local skip_lfs=0
     local skip_smoke=0
+    local rebuild_isaacsim=0
     local release_only=1
     local build_args=()
 
@@ -501,6 +572,8 @@ cmd_setup() {
                 release_only=0; shift ;;
             --resume-existing)
                 resume_existing=1; shift ;;
+            --rebuild-isaacsim)
+                rebuild_isaacsim=1; shift ;;
             --skip-host-deps)
                 skip_host_deps=1; shift ;;
             --skip-gcc-alternatives)
@@ -547,11 +620,15 @@ cmd_setup() {
     if [[ "$release_only" == "1" ]]; then
         build_args=("-r" "${build_args[@]}")
     fi
-    build_isaacsim "$isaacsim_dir" "${build_args[@]}"
+    if [[ "$resume_existing" == "1" && "$rebuild_isaacsim" != "1" ]] && isaacsim_build_ready "$isaacsim_dir"; then
+        log "Reusing existing Isaac Sim build: $(isaacsim_build_dir "$isaacsim_dir")"
+    else
+        build_isaacsim "$isaacsim_dir" "${build_args[@]}"
+    fi
     link_isaacsim_build "$repo_root" "$isaacsim_dir"
 
-    setup_uv_env_and_install_isaaclab "$repo_root" "$venv_name"
-    extract_assets "$repo_root" "$assets_tar"
+    setup_uv_env_and_install_isaaclab "$repo_root" "$venv_name" "$resume_existing"
+    extract_assets "$repo_root" "$assets_tar" "$resume_existing"
 
     if [[ "$skip_smoke" != "1" ]]; then
         cmd_smoke --workspace "$workspace" --repo-dir-name "$repo_dir_name" --venv "$venv_name"
@@ -621,9 +698,21 @@ cmd_demo() {
     )
     [[ "$headless" == "1" ]] && args+=(--headless)
     [[ "$profile" == "1" ]] && args+=(--profile)
+
+    if [[ "$vis" != "none" ]]; then
+        local kit_args
+        kit_args="$(isaacsim_kit_args "$repo_root")"
+        if [[ -n "$kit_args" && " ${extra[*]} " != *" --kit_args "* ]]; then
+            args+=(--kit_args "$kit_args")
+        fi
+    fi
     args+=("${extra[@]}")
 
-    run_isaaclab_python "$repo_root" "$venv_name" "${args[@]}"
+    if [[ "$vis" == "none" ]]; then
+        run_clean_venv_python "$repo_root" "$venv_name" "${args[@]}"
+    else
+        run_isaaclab_python "$repo_root" "$venv_name" "${args[@]}"
+    fi
 }
 
 cmd_teleop() {
@@ -700,6 +789,12 @@ cmd_teleop() {
     [[ "$xr" == "1" ]] && args+=(--xr)
     [[ "$auto_launch_cloudxr" != "1" ]] && args+=(--no-auto_launch_cloudxr)
     [[ "$debug_teleop" == "1" ]] && args+=(--debug_teleop)
+
+    local kit_args
+    kit_args="$(isaacsim_kit_args "$repo_root")"
+    if [[ -n "$kit_args" && " ${extra[*]} " != *" --kit_args "* ]]; then
+        args+=(--kit_args "$kit_args")
+    fi
     args+=("${extra[@]}")
 
     run_isaaclab_python "$repo_root" "$venv_name" "${args[@]}"
@@ -739,7 +834,7 @@ cmd_smoke() {
         --repo-dir-name "$repo_dir_name" \
         --venv "$venv_name" \
         --task "$task" \
-        --vis none \
+        --vis kit \
         --headless \
         --profile \
         --num-envs "$num_envs" \
