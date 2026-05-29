@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -55,7 +56,7 @@ def visualizer_types(args_cli: argparse.Namespace) -> set[str]:
 
 def _debug_runner(message: str) -> None:
     if os.getenv("WATERHOSE_DEBUG_RUNNER", "").lower() in {"1", "true", "yes", "on"}:
-        print(f"[waterhose-runner] {message}", flush=True)
+        print(f"[waterhose-runner] {message}", file=sys.__stderr__, flush=True)
 
 
 def validate_visualizers(args_cli: argparse.Namespace, parser: argparse.ArgumentParser) -> set[str]:
@@ -304,6 +305,7 @@ def _run_env(env_cfg) -> None:
                 f"rollout_time={rollout_time:.3f}s wall_time={elapsed:.3f}s "
                 f"rtf={sim_time / rollout_time:.3f} steps_per_s={step / rollout_time:.1f} "
                 f"cuda_graph={graph_state}",
+                file=sys.__stderr__,
                 flush=True,
             )
         if env is not None:
