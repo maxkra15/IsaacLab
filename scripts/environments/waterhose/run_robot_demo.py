@@ -134,11 +134,8 @@ if args_cli.teleop:
     args_cli.mode = "teleop"
 if args_cli.num_envs < 1:
     parser.error("--num_envs must be at least 1.")
-if args_cli.num_envs != 1 and ("admm" in args_cli.task.lower() or "coupled" in args_cli.task.lower()):
-    parser.error(
-        "The coupled-manager waterhose tasks are single-env only: Newton's coupled ModelView does not yet "
-        "support multi-world MuJoCo views. Use Isaac-Waterhose-Robot-Demo-v0 for multi-env runs today."
-    )
+if args_cli.num_envs != 1 and "admm" in args_cli.task.lower():
+    parser.error("The experimental ADMM coupled task is single-env only.")
 if args_cli.mode == "teleop" and args_cli.teleop_device not in (None, "spacemouse"):
     parser.error("This demo currently supports --teleop_device spacemouse.")
 if args_cli.mode == "teleop" and args_cli.teleop_device is None:

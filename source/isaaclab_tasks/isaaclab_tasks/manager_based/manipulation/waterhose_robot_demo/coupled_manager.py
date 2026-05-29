@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import field
 from pathlib import Path
 from typing import ClassVar
@@ -38,6 +39,7 @@ from .coupled_builder import (
     WaterhoseCoupledBuildInfo,
     build_waterhose_coupled_builder,
     build_waterhose_robot_model,
+    waterhose_socket_pose,
 )
 
 
@@ -46,10 +48,41 @@ _DEFAULT_ASSET_ROOT = str(
 )
 
 
+@wp.kernel(enable_backward=False)
+def _write_free_joint_q_from_body_q(
+    free_joint_ids: wp.array(dtype=int),
+    joint_q_start: wp.array(dtype=int),
+    joint_child: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transformf),
+    joint_q: wp.array(dtype=float),
+):
+    """Copy each FREE joint's child ``body_q`` transform into its ``joint_q`` slot.
+
+    VBD integrates the cable root in ``body_q`` only, leaving ``joint_q`` stale.
+    Newton's ``ArticulationView`` reads root transforms from ``joint_q``, so this
+    writeback keeps observed cable/plug poses correct. FREE joints store the pose
+    as 7 floats matching ``wp.transformf``, so this is a straight component copy.
+    """
+    j = free_joint_ids[wp.tid()]
+    child = joint_child[j]
+    t = body_q[child]
+    p = wp.transform_get_translation(t)
+    r = wp.transform_get_rotation(t)
+    q0 = joint_q_start[j]
+    joint_q[q0 + 0] = p[0]
+    joint_q[q0 + 1] = p[1]
+    joint_q[q0 + 2] = p[2]
+    joint_q[q0 + 3] = r[0]
+    joint_q[q0 + 4] = r[1]
+    joint_q[q0 + 5] = r[2]
+    joint_q[q0 + 6] = r[3]
+
+
 class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     """Newton coupled-manager path for the waterhose robot demo."""
 
     _build_info: ClassVar[WaterhoseCoupledBuildInfo | None] = None
+    _free_joint_ids: ClassVar[wp.array | None] = None
     _plug_body_id: ClassVar[int | None] = None
     _tip_body_id: ClassVar[int | None] = None
     _right_ee_body_id: ClassVar[int | None] = None
@@ -63,6 +96,7 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     _script_phase: ClassVar[int] = 0
     _script_phase_elapsed: ClassVar[float] = 0.0
     _script_last_time: ClassVar[float | None] = None
+    _dbg_last_phase: ClassVar[int] = -1
     _phase_start_pose: ClassVar[np.ndarray | None] = None
     _last_target_pose: ClassVar[np.ndarray | None] = None
     _manual_target_pose: ClassVar[np.ndarray | None] = None
@@ -75,26 +109,60 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     _ik_pos_objs: ClassVar[list[object]] = []
     _ik_rot_objs: ClassVar[list[object]] = []
     _ik_fixed_tfs: ClassVar[list[wp.transform]] = []
+    _env0_offset: ClassVar[np.ndarray] = np.zeros(3, dtype=np.float64)
     _gripper_open_value: ClassVar[float] = 0.0
-    _gripper_closed_value: ClassVar[float] = 2.0 * 0.0036
+    # Per-finger closed target. One-way coupling means MuJoCo never feels the plug,
+    # so the fingers (and the kinematic VBD proxies synced to them) drive to this
+    # value regardless of the plug. Too small overshoots *inside* the plug, which
+    # makes the plug slowly creep into the gripper; tune so the fingers stop at the
+    # plug surface (raise = stop wider/less closed, lower = grip tighter).
+    _gripper_closed_value: ClassVar[float] = 2.0 * 0.004
     _plug_grasp_offset: ClassVar[np.ndarray] = np.array([0.0, -0.001, 0.01], dtype=np.float64)
     _approach_offset: ClassVar[np.ndarray] = np.array([0.0, 0.08, 0.0], dtype=np.float64)
     _engage_offset: ClassVar[np.ndarray] = np.array([0.01, 0.0, 0.0], dtype=np.float64)
     _retract_vector: ClassVar[np.ndarray] = np.array([0.0, 0.05, 0.0], dtype=np.float64)
+    _insert_offset: ClassVar[np.ndarray] = np.array([0.0, 0.0, 0.02], dtype=np.float64)
+    _withdraw_offset: ClassVar[np.ndarray] = np.array([-0.10, 0.0, 0.0], dtype=np.float64)
     _grasp_orientation_offset: ClassVar[np.ndarray] = np.array([0.5, 0.5, -0.5, 0.5], dtype=np.float64)
-    _SCRIPT_PHASES: ClassVar[tuple[str, ...]] = ("APPROACH", "ENGAGE", "GRASP", "HOLD_GRASP", "RETRACT", "DONE")
-    _SCRIPT_DURATIONS: ClassVar[tuple[float, ...]] = (3.0, 1.5, 0.5, 0.5, 1.5, 999.0)
+    # Socket approach pose (world frame, env 0); resolved from the fridge xform in _setup_controller.
+    _socket_pos: ClassVar[np.ndarray] = np.zeros(3, dtype=np.float64)
+    _socket_rot: ClassVar[np.ndarray] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    # Seconds for the gripper to close during GRASP -- the close "velocity" knob
+    # (larger = slower/gentler close).
+    _GRIPPER_CLOSE_SECONDS: ClassVar[float] = 1.0
+    _SCRIPT_PHASES: ClassVar[tuple[str, ...]] = (
+        "APPROACH",
+        "ENGAGE",
+        "GRASP",
+        "HOLD_GRASP",
+        "RETRACT",
+        "SETTLE",
+        "APPROACH_TARGET",
+        "ALIGN_AXES",
+        "INSERT",
+        "RELEASE",
+        "WITHDRAW",
+        "DONE",
+    )
+    _SCRIPT_DURATIONS: ClassVar[tuple[float, ...]] = (
+        3.0,  # APPROACH
+        1.5,  # ENGAGE
+        _GRIPPER_CLOSE_SECONDS,  # GRASP (gripper close)
+        0.5,  # HOLD_GRASP
+        1.5,  # RETRACT
+        0.3,  # SETTLE
+        5.0,  # APPROACH_TARGET (move plug to socket)
+        5.0,  # ALIGN_AXES (settle/align)
+        5.0,  # INSERT
+        1.0,  # RELEASE (gripper open)
+        2.0,  # WITHDRAW
+        999.0,  # DONE
+    )
 
     @classmethod
     def instantiate_builder_from_stage(cls) -> None:
         cfg = cls._waterhose_cfg()
         num_envs = max(1, int(getattr(cfg, "num_envs", 1)))
-        if num_envs != 1:
-            raise RuntimeError(
-                "The coupled-manager waterhose task is single-env: Newton's coupled ModelView does not yet "
-                "support multi-world views for the MuJoCo (MJWarp) entry. Use Isaac-Waterhose-Robot-Demo-v0 "
-                "for multi-env runs today."
-            )
         builder, build_info = build_waterhose_coupled_builder(
             getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT),
             include_proxy_bodies=bool(getattr(cfg, "include_proxy_bodies", False)),
@@ -109,14 +177,57 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     def _build_solver(cls, model, solver_cfg: CoupledSolverCfg) -> None:
         cls._build_scene_mesh_sdfs(model)
         super()._build_solver(model, solver_cfg)
+        cls._build_free_joint_ids(model)
         cls._configure_vbd_solver()
         cls._restore_vbd_initial_body_poses()
         cls._resolve_tracked_bodies(model)
         cls._initialize_robot_control_targets()
 
     @classmethod
+    def _build_free_joint_ids(cls, model) -> None:
+        """Cache FREE joint indices for the cable-root ``joint_q`` writeback.
+
+        Built once at solver-construction time (before CUDA-graph capture) so the
+        step path stays free of host-device transfers.
+        """
+        if model is None or getattr(model, "joint_type", None) is None or int(model.joint_count) == 0:
+            cls._free_joint_ids = None
+            return
+        joint_type_np = model.joint_type.numpy()
+        free_idx = np.where(joint_type_np == int(newton.JointType.FREE))[0]
+        cls._free_joint_ids = (
+            wp.array(free_idx.astype(np.int32), dtype=int, device=PhysicsManager._device) if free_idx.size else None
+        )
+
+    @classmethod
+    def _run_solver_substeps(cls, contacts) -> None:
+        """Run solver substeps, then sync cable-root FREE ``joint_q`` from ``body_q``.
+
+        VBD owns the cable-root pose in ``body_q``; this keeps ``joint_q`` (read by
+        ``ArticulationView`` for observations/mimic) consistent each step.
+        """
+        super()._run_solver_substeps(contacts)
+        if cls._free_joint_ids is None:
+            return
+        model = NewtonManager._model
+        state = NewtonManager._state_0
+        wp.launch(
+            _write_free_joint_q_from_body_q,
+            dim=int(cls._free_joint_ids.shape[0]),
+            inputs=[
+                cls._free_joint_ids,
+                model.joint_q_start,
+                model.joint_child,
+                state.body_q,
+                state.joint_q,
+            ],
+            device=PhysicsManager._device,
+        )
+
+    @classmethod
     def _solver_specific_clear(cls) -> None:
         cls._build_info = None
+        cls._free_joint_ids = None
         cls._plug_body_id = None
         cls._tip_body_id = None
         cls._right_ee_body_id = None
@@ -340,6 +451,19 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         cls._advance_script_phase_clock()
         target_pose, gripper_value = cls._scripted_target()
         cls._solve_ik_to_target(target_pose, gripper_value)
+        if os.environ.get("WATERHOSE_DEBUG_PHASE") and cls._script_phase != cls._dbg_last_phase:
+            cls._dbg_last_phase = cls._script_phase
+            phase = cls._SCRIPT_PHASES[min(cls._script_phase, len(cls._SCRIPT_PHASES) - 1)]
+            ee = np.asarray(cls.get_right_ee_pose()[:3], dtype=np.float64)
+            plug = np.asarray(cls.get_plug_pose()[:3], dtype=np.float64)
+            socket = np.asarray(cls._socket_pos, dtype=np.float64)
+            print(
+                f"[PHASE] t={cls.get_sim_time():.2f}s phase={phase} ee={ee.round(3).tolist()} "
+                f"plug={plug.round(3).tolist()} socket={socket.round(3).tolist()} "
+                f"ee_to_target={float(np.linalg.norm(ee - np.asarray(target_pose[:3]))):.3f} "
+                f"ee_to_socket={float(np.linalg.norm(ee - socket)):.3f}",
+                flush=True,
+            )
 
     @classmethod
     def apply_teleop_command(cls, command) -> None:
@@ -412,8 +536,28 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         cls._ik_pos_objs = [cls._ik_manager.position_objectives[f"ee_{index}"] for index in range(len(body_ids))]
         cls._ik_rot_objs = [cls._ik_manager.rotation_objectives[f"ee_{index}"] for index in range(len(body_ids))]
 
+        # The IK robot model lives at the world origin, but in multi-env the
+        # task model places env 0's robot at its grid origin. Express every IK
+        # target in env-0-relative coordinates by subtracting that origin
+        # (translation only; the grid applies no rotation). For single-env the
+        # offset is zero, so this is a no-op there.
+        env_origins = np.asarray(build_info.env_origins, dtype=np.float64)
+        cls._env0_offset = env_origins[0].copy() if env_origins.ndim == 2 and env_origins.shape[0] > 0 else np.zeros(3)
+        # Socket pose is built in the prototype frame; shift into env-0 world frame
+        # to match the plug/EE poses (the IK then re-subtracts the env-0 origin).
+        socket_pos_proto, cls._socket_rot = waterhose_socket_pose()
+        cls._socket_pos = socket_pos_proto + cls._env0_offset
         body_q = state.body_q.numpy()
-        cls._ik_fixed_tfs = [wp.transform(*body_q[int(body_ids[index])]) for index in (1, 2)]
+        cls._ik_fixed_tfs = []
+        for index in (1, 2):
+            bq = body_q[int(body_ids[index])]
+            pos = np.asarray(bq[:3], dtype=np.float64) - cls._env0_offset
+            cls._ik_fixed_tfs.append(
+                wp.transform(
+                    wp.vec3(float(pos[0]), float(pos[1]), float(pos[2])),
+                    wp.quat(float(bq[3]), float(bq[4]), float(bq[5]), float(bq[6])),
+                )
+            )
         robot_q_count = int(cls._ik_robot_model.joint_coord_count)
         cls._ik_joint_q = wp.array(
             state.joint_q.numpy()[:robot_q_count].reshape(1, -1),
@@ -456,6 +600,8 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         plug_pos = plug_pose[:3]
         plug_quat = plug_pose[3:]
         start_pose = cls._phase_start_pose if cls._phase_start_pose is not None else cls.get_right_ee_pose()
+        socket_pos = cls._socket_pos
+        socket_quat = cls._socket_rot
 
         target = start_pose.copy()
         gripper = cls._gripper_open_value
@@ -472,6 +618,23 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         elif phase_name == "RETRACT":
             target[:3] = start_pose[:3] + _quat_rotate(plug_quat, cls._retract_vector)
             gripper = cls._gripper_closed_value
+        elif phase_name == "SETTLE":
+            gripper = cls._gripper_closed_value
+        elif phase_name == "APPROACH_TARGET":
+            target[:3] = socket_pos
+            target[3:] = _normalize_quat(_quat_multiply(socket_quat, cls._grasp_orientation_offset))
+            gripper = cls._gripper_closed_value
+        elif phase_name == "ALIGN_AXES":
+            gripper = cls._gripper_closed_value
+        elif phase_name == "INSERT":
+            target[:3] = socket_pos + _quat_rotate(socket_quat, cls._insert_offset)
+            gripper = cls._gripper_closed_value
+        elif phase_name == "RELEASE":
+            gripper = cls._gripper_closed_value + (cls._gripper_open_value - cls._gripper_closed_value) * t
+        elif phase_name == "WITHDRAW":
+            target[:3] = start_pose[:3] + cls._withdraw_offset
+            gripper = cls._gripper_open_value
+        # DONE: hold the withdrawn pose with the gripper open (plug left inserted).
 
         pose = _interpolate_pose(start_pose, target, t)
         cls._last_target_pose = pose.copy()
@@ -483,7 +646,7 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
             return
 
         device = PhysicsManager._device
-        pos = target_pose[:3].astype(np.float32)
+        pos = (np.asarray(target_pose[:3], dtype=np.float64) - cls._env0_offset).astype(np.float32)
         quat = _normalize_quat(target_pose[3:]).astype(np.float32)
         wp.copy(
             cls._ik_target_pos,
@@ -660,16 +823,46 @@ def waterhose_vbd_proxy_collision_pipeline(model_view):
     return newton.CollisionPipeline(model_view, broad_phase="explicit", rigid_contact_max=30000)
 
 
-def waterhose_mujoco_single_model_view(model_view) -> None:
-    """Run MJWarp as one combined model when the parent Newton model has worlds.
+def waterhose_mujoco_cable_view(model_view) -> None:
+    """Overlay ``CABLE`` joints as ``D6`` on the MuJoCo entry view.
 
-    The coupled ModelView disables non-owned VBD bodies but keeps parent-model
-    indexing intact for state reconciliation. MJWarp's separate-world converter
-    expects a compact homogeneous robot-only model, so the one-way source entry
-    uses a single MJWarp model over the view instead.
+    MJWarp's converter has no ``CABLE`` codepath; a cable's
+    ``joint_dof_dim=(1, 1)`` re-interpreted as ``D6`` expands to one SLIDE + one
+    HINGE, allocating exactly 2 qpos / 2 qvel that match Newton's ``joint_q`` /
+    ``joint_qd`` 1:1, so no count overrides are needed. VBD owns the real cable
+    forces; the parent Newton model is untouched and MJWarp never solves these
+    joints. ``world_count`` is left alone so MJWarp uses native per-world
+    (``separate_worlds``) multi-env instead of collapsing all envs into one model.
+
+    Temporary view workaround until MJWarp skips cable joints natively.
     """
 
-    model_view.world_count = 1
+    parent = model_view.parent
+    if int(parent.joint_count) == 0:
+        return
+
+    # MuJoCo's compile rejects moving bodies with mass/inertia below mjMINVAL.
+    # VBD-owned cable/scene bodies are mass-0 by design and are disabled (never
+    # integrated) in this view, so give them a tiny mass/inertia here purely so
+    # the converter compiles. The parent model and the VBD view are untouched.
+    body_mass_np = parent.body_mass.numpy()
+    tiny = body_mass_np < 1.0e-9
+    if tiny.any():
+        body_mass_np = body_mass_np.copy()
+        body_mass_np[tiny] = 1.0e-6
+        model_view.body_mass = wp.array(body_mass_np, dtype=parent.body_mass.dtype, device=parent.device)
+        body_inertia_np = parent.body_inertia.numpy().copy()
+        body_inertia_np[tiny] = np.eye(3, dtype=body_inertia_np.dtype) * 1.0e-8
+        model_view.body_inertia = wp.array(body_inertia_np, dtype=parent.body_inertia.dtype, device=parent.device)
+
+    # Overlay CABLE joints as D6 (1:1 qpos/qvel) so MJWarp's converter ingests them.
+    joint_type_np = parent.joint_type.numpy()
+    cable_joint_ids = np.flatnonzero(joint_type_np == int(newton.JointType.CABLE))
+    if cable_joint_ids.size == 0:
+        return
+    new_joint_type = joint_type_np.copy()
+    new_joint_type[cable_joint_ids] = int(newton.JointType.D6)
+    model_view.joint_type = wp.array(new_joint_type, dtype=parent.joint_type.dtype, device=parent.device)
 
 
 @configclass
@@ -737,8 +930,7 @@ class WaterhoseOneWaySolverCfg(CoupledSolverCfg):
                 body_label_patterns=[r".*mujoco/.*"],
                 include_child_joints=True,
                 include_body_shapes=True,
-                configure_view=waterhose_mujoco_single_model_view,
-                solver_kwargs={"separate_worlds": False},
+                configure_view=waterhose_mujoco_cable_view,
             ),
             CoupledSolverEntryCfg(
                 name="vbd",
