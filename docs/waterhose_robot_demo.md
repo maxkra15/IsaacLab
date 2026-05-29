@@ -1,44 +1,64 @@
 # Waterhose Robot Demo
 
-Last verified: 2026-05-28.
+Last verified: 2026-05-29.
 
-This task is a client-facing Isaac Lab demo for inserting a flexible water hose into a socket with an RBY1DF robot. The stable default path is a one-way Newton setup wrapped as a manager-style Isaac Lab task. The experimental ADMM coupled-solver path remains available for solver development, but it is not the recommended demo path.
+This task is a client-facing Isaac Lab demo for inserting a flexible water hose into a socket with an RBY1DF robot.
 
-## Repositories
+The stable default is:
 
-Use the Isaac Lab fork branch that contains the task:
+- a manager-style Isaac Lab task;
+- self-contained under `waterhose_robot_demo`;
+- one-way Newton coupling between a MuJoCo robot runtime and a VBD hose runtime;
+- standard Isaac Lab launch, visualization, teleop, and Mimic surfaces.
+
+The coupled-manager tasks remain available for solver development, but they are not the default demo path.
+
+## Quick Setup
+
+For a fresh machine, put `waterhose.sh` and `waterhose_demo_assets.tar.gz` in a clean folder, then run:
 
 ```bash
-git clone git@github.com:maxkra15/IsaacLab.git IsaacLab-waterhose-demo
-cd IsaacLab-waterhose-demo
-git checkout waterhose-demo
+chmod +x ./waterhose.sh && ./waterhose.sh setup --accept-eula
 ```
 
-The Newton dependency is PR 2848. This branch was verified with:
+The script creates:
 
 ```text
-branch: pr-2848-coupled-solver-framework-latest
-tracks: origin/pr-2848-head
-ref: refs/pull/2848/head
+waterhose-demo/
+  IsaacLab-waterhose/    Isaac Lab fork checkout, task code, venv, assets
+  IsaacSim/              source-built Isaac Sim checkout and build
 ```
 
-For a separate Newton checkout:
+The Newton version is controlled by the Isaac Lab package metadata, not by `waterhose.sh`. The relevant pins are in:
+
+```text
+source/isaaclab_newton/setup.py
+source/isaaclab_physx/setup.py
+source/isaaclab_visualizers/setup.py
+```
+
+At the time of this document, those packages install:
+
+```text
+newton[sim] @ git+https://github.com/newton-physics/newton.git@refs/pull/2848/head
+```
+
+For an existing workspace after pulling dependency changes:
 
 ```bash
-git clone https://github.com/newton-physics/newton.git /path/to/newton
-cd /path/to/newton
-git fetch origin pull/2848/head:pr-2848-head
-git checkout pr-2848-head
+cd waterhose-demo/IsaacLab-waterhose
+git pull --ff-only
+source .venv/bin/activate
+./isaaclab.sh -i all
 ```
-
-The Isaac Lab packages in this fork pin `newton[sim]` to the verified PR commit above. The demo runner also accepts `--newton_root /path/to/newton` for workflows that use a separate Newton checkout.
 
 ## Assets
 
-The demo assets are distributed as `waterhose_demo_assets.tar.gz`. The archive contains a top-level `WaterhoseDemo/` directory with the RBY1DF URDF, robot meshes, fridge scene USD, cable curve USD, and plug meshes. Extract it into the Isaac Lab asset data directory:
+The demo assets are distributed as `waterhose_demo_assets.tar.gz`. The archive contains a top-level `WaterhoseDemo/` directory with the RBY1DF URDF, robot meshes, fridge scene USD, cable curve USD, and plug meshes.
+
+When using `waterhose.sh setup`, the archive is unpacked automatically. For manual setup, extract it into the Isaac Lab asset data directory:
 
 ```bash
-cd /path/to/IsaacLab-waterhose-demo
 tar -xzf /path/to/waterhose_demo_assets.tar.gz -C source/isaaclab_assets/data
 ```
 
@@ -50,50 +70,30 @@ source/isaaclab_assets/data/WaterhoseDemo/Waterhose/Cable008/Cable008_Body.usda
 source/isaaclab_assets/data/WaterhoseDemo/Waterhose/Cable008/curve/cable_SRA_curve03.usda
 ```
 
-## Install
-
-Install this fork with the normal Isaac Lab workflow:
-
-```bash
-cd /path/to/IsaacLab-waterhose-demo
-./isaaclab.sh --install
-```
-
-If a machine uses a separate Newton checkout during development, pass it explicitly when running:
-
-```bash
---newton_root /path/to/newton
-```
-
-If the assets are outside the default location, pass the extracted `WaterhoseDemo` directory:
-
-```bash
---asset_root /path/to/WaterhoseDemo
-```
-
-The task package sets `PXR_WORK_THREAD_LIMIT=1` by default before the USD-backed cable and fridge assets are imported. This avoids a USD/Warp threading failure seen during standalone Newton setup.
-
 ## Registered Tasks
 
-The task registrations live under:
+Task registrations live in:
 
 ```text
 source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/waterhose_robot_demo/config/rby1df/__init__.py
 ```
 
-Available task IDs:
+Current task IDs:
 
-```text
-Isaac-Waterhose-Robot-Demo-v0
-Isaac-Waterhose-Robot-Demo-Mimic-v0
-Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0
-```
+| Task ID | Purpose | Recommended use |
+| --- | --- | --- |
+| `Isaac-Waterhose-Robot-Demo-v0` | Stable default one-way split runtime | Client demos, scripted runs, teleop, data collection |
+| `Isaac-Waterhose-Robot-Demo-Mimic-v0` | Stable default runtime with Mimic APIs | Mimic/data-generation experiments |
+| `Isaac-Waterhose-Robot-Demo-Coupled-v0` | Coupled-manager one-way proxy coupling | Solver/API development |
+| `Isaac-Waterhose-Robot-Demo-OneWay-Coupled-v0` | Explicit alias for the coupled one-way task | Solver/API development |
+| `Isaac-Waterhose-Robot-Demo-TwoWay-Coupled-Experimental-v0` | Coupled-manager two-way proxy coupling | Experimental only |
+| `Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0` | Coupled-manager ADMM contact coupling | Experimental only |
 
-`Isaac-Waterhose-Robot-Demo-v0` is the stable default. `Isaac-Waterhose-Robot-Demo-Mimic-v0` exposes the same simulation through Isaac Lab Mimic APIs. `Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0` is retained for coupled-solver experiments only.
+Choosing a coupling method is done by selecting the task ID. There is no longer a `--backend reference|oneway|manager` runner switch.
 
-## Stable One-Way Architecture
+## Default Architecture
 
-The stable task is implemented as a normal Isaac Lab manager-style environment:
+`Isaac-Waterhose-Robot-Demo-v0` is implemented as a manager-style Isaac Lab environment:
 
 ```text
 env.py
@@ -107,9 +107,17 @@ teleop.py
 recorders.py
 ```
 
-`WaterhoseRobotDemoEnvCfg` uses `SimulationCfg(physics=NewtonCfg(...))` with `WaterhoseNewtonSolverCfg`. `WaterhoseRobotDemoEnv` synchronizes the Isaac Lab scene settings into the solver config before the manager is constructed. The action, observation, termination, event, recorder, and teleop surfaces are Isaac Lab managers.
+`WaterhoseRobotDemoEnvCfg` uses:
 
-Each simulated environment owns a split Newton runtime:
+```text
+SimulationCfg(
+  physics=NewtonCfg(
+    solver_cfg=WaterhoseNewtonSolverCfg(...)
+  )
+)
+```
+
+The runtime is intentionally split per environment:
 
 ```text
 MuJoCo robot runtime
@@ -127,27 +135,25 @@ MuJoCo robot state
   -> VBD cable/plug/fridge contact solve
 ```
 
-There is no force path from VBD back into MuJoCo. This is deliberate. The original Newton success demo used carefully filtered normal-force feedback, while generic coupled-manager feedback introduced tangential/friction forces that destabilized the robot. The default demo avoids that risk: the robot is authoritative, and the cable/plug respond to the robot through proxy gripper bodies.
-
-The proxy bodies duplicate the four gripper finger bodies and their attached shapes. They are high-friction VBD collision bodies and are driven kinematically from the MuJoCo finger states. The VBD solver then handles cable, plug, fridge, and gripper-proxy contacts.
+There is no force path from VBD back into MuJoCo. This is deliberate. The original Newton success demo used carefully filtered normal-force feedback, while generic full-force feedback introduced tangential/friction forces that destabilized the robot. The default demo avoids that risk: the robot is authoritative, and the cable/plug respond to the robot through proxy gripper bodies.
 
 ## Multi-Env Behavior
 
-`--num_envs` is supported for the stable one-way task. The current implementation creates N independent split Newton runtimes and arranges them on an Isaac Lab-style grid. It also builds a combined visualization model so Newton Viewer and Kit can show multiple environments.
+`--num-envs` / `--num_envs` is supported for the default task. The current implementation creates N independent split Newton runtimes and arranges them on an Isaac Lab-style grid. It also builds a combined visualization model so Newton Viewer and Kit can show multiple environments.
 
 This is not a true batched Newton model. The drawbacks are:
 
 - setup cost and memory scale roughly with the number of independent runtimes;
-- stepping is orchestrated by the task manager rather than by one vectorized Newton model;
+- stepping is orchestrated by the waterhose manager rather than by one vectorized Newton model;
 - Kit display is manually authored because the real physics is split between MuJoCo and VBD;
 - cable, plug, and socket state are not normal Isaac Lab `InteractiveScene` rigid objects;
-- Mimic object APIs must be provided by task-specific overrides.
+- Mimic object APIs are task-specific overrides.
 
-This is acceptable for demo, teleop, and initial data tooling. It is not the final high-throughput RL or imitation-learning architecture.
+This is acceptable for demo, teleop, and initial data tooling. It is not the final high-throughput RL architecture.
 
-## Kit And Newton Visualization
+## Visualization
 
-The demo uses the standard Isaac Lab launcher path. The runner supports a local `--vis` alias:
+The demo uses the standard Isaac Lab launcher path. The waterhose runner supports a local `--vis` alias:
 
 ```text
 --vis none
@@ -156,7 +162,7 @@ The demo uses the standard Isaac Lab launcher path. The runner supports a local 
 --vis kit,newton
 ```
 
-When Kit is selected, the dynamic robot/cable/plug display comes from the combined Newton visualization model. The static fridge scene is authored once per environment under a Kit display root because the real VBD static scene is internal to the Newton runtime.
+When Kit is selected, the runner automatically adds the local source-built Isaac Sim extension folders from `_isaac_sim`, so direct runner launches and `waterhose.sh` launches use the same Kit extension resolution.
 
 On machines where the display is on `:1`, prefix visual runs with:
 
@@ -166,63 +172,62 @@ DISPLAY=:1
 
 ## Run Commands
 
-Scripted demo without visualization:
+Using the standalone helper:
 
 ```bash
-./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis none --max_steps 2000
+./waterhose.sh demo --vis kit
+./waterhose.sh demo --vis newton
+./waterhose.sh demo --vis kit,newton
+./waterhose.sh demo --vis kit --headless --profile --max-steps 200
 ```
 
-Scripted demo in Newton Viewer:
+Multiple default environments:
 
 ```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis newton --max_steps 2000
+./waterhose.sh demo --vis kit --num-envs 2 --profile --max-steps 1000
+./waterhose.sh demo --vis newton --num-envs 2 --profile --max-steps 1000
 ```
 
-Scripted demo in Kit:
+Manual Isaac Lab runner examples:
 
 ```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis kit --max_steps 2000
+./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis kit --max_steps 2000
+./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis newton --max_steps 2000
+./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis kit,newton --max_steps 2000
 ```
 
-Scripted demo with both viewers:
+## Teleop
+
+The task supports two teleop entry points:
+
+- `waterhose.sh demo --teleop`, which uses the waterhose runner's built-in SpaceMouse loop;
+- `waterhose.sh teleop`, which uses Isaac Lab's standard `scripts/environments/teleoperation/teleop_se3_agent.py`.
+
+Recommended SpaceMouse teleop:
 
 ```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis kit,newton --max_steps 2000
+./waterhose.sh teleop --teleop-device spacemouse --vis kit
 ```
 
-Two environments without visualization:
+Built-in runner teleop:
 
 ```bash
-./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis none --num_envs 2 --max_steps 1000 --profile
+./waterhose.sh demo --teleop --vis kit
 ```
 
-Two environments in Newton Viewer:
+XR / Apple Vision Pro path through Isaac Teleop:
 
 ```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis newton --num_envs 2 --max_steps 1000 --profile
+./waterhose.sh teleop --xr --cloudxr-env avp --vis kit
 ```
 
-Two environments in Kit:
+Teleop uses the waterhose-specific SpaceMouse mapping from the old simple demo: XYZ translation plus gripper yaw/spin. Roll and pitch are suppressed. Translation and yaw can be separated with:
 
 ```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --vis kit --num_envs 2 --max_steps 1000 --profile
+--spacemouse_simple_yaw_translation_lock
 ```
 
-Teleop with SpaceMouse in Kit:
-
-```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --mode teleop --teleop_device spacemouse --vis kit
-```
-
-Teleop with SpaceMouse in Newton Viewer:
-
-```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --mode teleop --teleop_device spacemouse --vis newton
-```
-
-Teleop uses the waterhose-specific SpaceMouse mapping from the old simple demo: XYZ translation plus gripper yaw/spin. Roll and pitch are suppressed, and translation/yaw can be locked apart with `--spacemouse_simple_yaw_translation_lock`. The left/right gripper action comes through the standard Isaac Lab `Se3SpaceMouse` gripper term.
-
-Useful teleop tuning flags:
+Useful tuning flags for the built-in runner teleop path:
 
 ```bash
 --sensitivity 0.75
@@ -235,88 +240,15 @@ Useful teleop tuning flags:
 --debug_teleop
 ```
 
-Mimic task smoke run:
+## Mimic
 
-```bash
-./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --task Isaac-Waterhose-Robot-Demo-Mimic-v0 --vis none --num_envs 2 --max_steps 1 --profile
-```
-
-Coupled task (stable one-way proxy coupling, recommended):
-
-```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --task Isaac-Waterhose-Robot-Demo-Coupled-v0 --vis newton --num_envs 1 --max_steps 1000
-```
-
-Experimental two-way coupled task (robot feels the cable):
-
-```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --task Isaac-Waterhose-Robot-Demo-TwoWay-Coupled-Experimental-v0 --vis newton --num_envs 1 --max_steps 1000
-```
-
-Experimental ADMM task:
-
-```bash
-DISPLAY=:1 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py --task Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0 --vis newton --num_envs 1 --max_steps 1000
-```
-
-The coupled tasks (one-way, two-way, ADMM) are single-env only in this runner.
-
-## Coupled Architecture
-
-The coupled waterhose path shares one task-local model builder and Newton
-coupled-manager, with thin per-coupling env configs on top:
-
-```text
-coupled_builder.py   # task-local combined Newton model (robot + VBD cable/scene + gripper proxies)
-coupled_manager.py   # NewtonWaterhoseCoupledManager + VBD/OneWay/TwoWay/ADMM solver configs
-coupled_mdp.py       # observation / termination helpers
-coupled_env_cfg.py   # shared scene + MDP terms + WaterhoseRobotDemoCoupledEnvCfg base
-one_way_env_cfg.py   # canonical, stable one-way proxy coupling (recommended default)
-two_way_env_cfg.py   # experimental two-way proxy coupling (robot feels the cable)
-admm_env_cfg.py      # experimental ADMM cross-solver coupling
-```
-
-All variants build the same task-local combined Newton model through
-`NewtonCoupledManager`: the MuJoCo robot, the VBD cable/fridge/plug scene, and
-(for the proxy couplings) duplicated gripper-finger proxy bodies embedded in the
-VBD world. The coupling is chosen purely by the solver config —
-`WaterhoseOneWaySolverCfg` (canonical), `WaterhoseTwoWaySolverCfg`, or
-`WaterhoseAdmmSolverCfg`.
-
-The recommended, stable path is the one-way proxy coupling: the robot drives the
-gripper proxies, cable/gripper contact is resolved entirely inside the VBD
-solver, and harvested proxy feedback is discarded so the cable cannot push the
-robot. This mirrors the proven reference demo's contact architecture.
-
-### Experimental ADMM coupling
-
-The ADMM path steps the robot (MuJoCo) and cable (VBD) as separate solvers and
-reconciles their gripper/cable contact with linearized ADMM each step. It uses
-`WaterhoseAdmmSolverCfg`, `CoupledSolverEntryCfg`, `AdmmCouplingCfg`, and a VBD
-sub-solver config.
-
-This approach is architecturally attractive because it is closer to a single coupled Newton simulation. In the long term, that is the likely direction for a proper coupled, batched, Isaac Lab-native task.
-
-It was not pursued as the primary demo path because the observed behavior was less stable than the one-way runtime:
-
-- contact transfer could push forces back into the robot and disturb the scripted motion;
-- the cable became jumpy under stiff contact/coupling settings;
-- friction and tangential forces were much harder to control than the reference one-way proxy behavior;
-- ADMM iterations and contact sets made the simulation slower;
-- matching the original success demo required careful filtering of contact pairs and solver parameters;
-- the path was not validated for multi-env or client demo use.
-
-For now, the ADMM path is retained as a research and solver-development target. It should not be used as the default waterhose demo.
-
-## Mimic Integration
-
-The Mimic variant is:
+The Mimic task is:
 
 ```text
 Isaac-Waterhose-Robot-Demo-Mimic-v0
 ```
 
-It uses `WaterhoseRobotDemoMimicEnv`, which adapts the stable one-way task to `ManagerBasedRLMimicEnv`. The object poses are supplied directly from the Newton manager:
+It uses `WaterhoseRobotDemoMimicEnv`, which adapts the stable default task to `ManagerBasedRLMimicEnv`. The object poses are supplied directly from the Newton manager:
 
 ```text
 hose_plug
@@ -339,13 +271,74 @@ align
 insert
 ```
 
-This is task-specific because the cable, plug, and socket are not regular Isaac Lab scene assets. The overrides provide the object pose and subtask signal surface that Mimic expects, while keeping the stable one-way Newton runtime.
+Mimic smoke run:
+
+```bash
+./waterhose.sh mimic-smoke --num-envs 2
+```
+
+Manual Mimic smoke run:
+
+```bash
+./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
+  --task Isaac-Waterhose-Robot-Demo-Mimic-v0 \
+  --vis kit --headless --num_envs 2 --max_steps 1 --profile
+```
+
+## Coupled-Manager Variants
+
+The coupled-manager path is separate from the default demo. It uses:
+
+```text
+coupled_builder.py   combined Newton model: robot + VBD cable/scene + optional gripper proxies
+coupled_manager.py   NewtonWaterhoseCoupledManager and solver configs
+coupled_mdp.py       observation and termination helpers
+coupled_env_cfg.py   shared manager-style coupled env config
+one_way_env_cfg.py   coupled-manager one-way proxy coupling
+two_way_env_cfg.py   coupled-manager two-way proxy coupling
+admm_env_cfg.py      ADMM cross-solver coupling
+```
+
+The one-way coupled task:
+
+```bash
+./waterhose.sh demo \
+  --task Isaac-Waterhose-Robot-Demo-Coupled-v0 \
+  --vis newton --num-envs 1 --max-steps 1000
+```
+
+The explicit one-way alias:
+
+```bash
+./waterhose.sh demo \
+  --task Isaac-Waterhose-Robot-Demo-OneWay-Coupled-v0 \
+  --vis newton --num-envs 1 --max-steps 1000
+```
+
+The experimental two-way task:
+
+```bash
+./waterhose.sh demo \
+  --task Isaac-Waterhose-Robot-Demo-TwoWay-Coupled-Experimental-v0 \
+  --vis newton --num-envs 1 --max-steps 1000
+```
+
+The experimental ADMM task:
+
+```bash
+./waterhose.sh demo \
+  --task Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0 \
+  --vis newton --num-envs 1 --max-steps 1000
+```
+
+The ADMM path steps the robot and cable as separate solvers and reconciles contact with linearized ADMM each step. It is architecturally interesting, but it is not the recommended demo path because it has been slower and less stable around stiff gripper/cable contact.
 
 ## Current Caveats
 
-- The stable task is one-way. The cable does not apply forces back to the robot.
-- Multi-env is N independent Newton runtimes, not one true vectorized Newton model.
-- Kit display is manually authored for this task because the real simulation is split between MuJoCo and VBD.
+- The default task is one-way. The cable does not apply forces back to the robot.
+- Default multi-env is N independent Newton runtimes, not one true vectorized Newton model.
+- Kit display is task-authored because the real simulation is split between MuJoCo and VBD.
 - The Mimic task has task-local object pose overrides rather than default scene object APIs.
-- The ADMM task is experimental and single-env.
-- XR/Apple Vision Pro support should be layered through the standard Isaac Lab teleop/XR stack, but it has not been validated in this task yet.
+- The coupled-manager tasks are for solver development and are less validated than the default task.
+- The ADMM task is experimental and should be run single-env.
+- XR/Apple Vision Pro support is wired through Isaac Teleop but has not had the same validation as scripted and SpaceMouse runs.
