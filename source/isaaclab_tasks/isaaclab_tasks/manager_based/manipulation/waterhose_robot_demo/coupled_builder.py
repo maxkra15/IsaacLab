@@ -593,15 +593,12 @@ def _copy_body_shapes(
         shape_type = int(src_builder.shape_type[shape_id])
         scale = src_builder.shape_scale[shape_id]
         xform = src_builder.shape_transform[shape_id]
-        pos = wp.transform_get_translation(xform)
-        rot = wp.transform_get_rotation(xform)
 
         if shape_type == int(GeoType.SPHERE):
             copied_id = dst_builder.add_shape_sphere(
                 body=dst_body_id,
                 radius=float(scale[0]),
-                pos=pos,
-                rot=rot,
+                xform=xform,
                 cfg=cfg,
             )
         elif shape_type == int(GeoType.BOX):
@@ -610,8 +607,7 @@ def _copy_body_shapes(
                 hx=float(scale[0]),
                 hy=float(scale[1]),
                 hz=float(scale[2]),
-                pos=pos,
-                rot=rot,
+                xform=xform,
                 cfg=cfg,
             )
         elif shape_type == int(GeoType.CAPSULE):
@@ -619,8 +615,7 @@ def _copy_body_shapes(
                 body=dst_body_id,
                 radius=float(scale[0]),
                 half_height=float(scale[1]),
-                pos=pos,
-                rot=rot,
+                xform=xform,
                 cfg=cfg,
             )
         elif shape_type == int(GeoType.MESH):

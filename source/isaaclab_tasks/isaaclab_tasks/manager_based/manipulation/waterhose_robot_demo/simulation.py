@@ -1232,13 +1232,13 @@ class WaterhoseRobotDemoSimulation:
                 shape_xform_data = shape_transform_np[shape_idx]
                 pos = wp.vec3(shape_xform_data[0], shape_xform_data[1], shape_xform_data[2])
                 rot = wp.quat(shape_xform_data[3], shape_xform_data[4], shape_xform_data[5], shape_xform_data[6])
+                shape_xform = wp.transform(p=pos, q=rot)
 
                 if shape_type == GeoType.SPHERE:
                     sid = vbd_builder.add_shape_sphere(
                         body=proxy_body_id,
                         radius=float(shape_scale[0]),
-                        pos=pos,
-                        rot=rot,
+                        xform=shape_xform,
                         cfg=proxy_shape_cfg,
                     )
                     shape_ids.append(int(sid))
@@ -1248,8 +1248,7 @@ class WaterhoseRobotDemoSimulation:
                         hx=float(shape_scale[0]),
                         hy=float(shape_scale[1]),
                         hz=float(shape_scale[2]),
-                        pos=pos,
-                        rot=rot,
+                        xform=shape_xform,
                         cfg=proxy_shape_cfg,
                     )
                     shape_ids.append(int(sid))
@@ -1258,14 +1257,12 @@ class WaterhoseRobotDemoSimulation:
                         body=proxy_body_id,
                         radius=float(shape_scale[0]),
                         half_height=float(shape_scale[1]),
-                        pos=pos,
-                        rot=rot,
+                        xform=shape_xform,
                         cfg=proxy_shape_cfg,
                     )
                     shape_ids.append(int(sid))
                 elif shape_type == GeoType.MESH:
                     shape_source = self.mujoco_model.shape_source[shape_idx]
-                    shape_xform = wp.transform(p=pos, q=rot)
                     sid = vbd_builder.add_shape_mesh(
                         body=proxy_body_id,
                         mesh=shape_source,
