@@ -686,10 +686,6 @@ cmd_demo() {
         esac
     done
 
-    if [[ "$headless" == "1" && "$vis" != "none" ]]; then
-        die "--headless cannot be combined with --vis ${vis}. Use --vis none for a headless rollout, or omit --headless to use Kit."
-    fi
-
     local repo_root
     repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
     local args=(
