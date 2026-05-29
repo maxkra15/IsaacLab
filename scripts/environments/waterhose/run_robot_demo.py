@@ -147,10 +147,6 @@ selected_visualizers = validate_visualizers(args_cli, parser)
 
 def _configure_env_cfg(env_cfg) -> None:
     from isaaclab_newton.physics import NewtonCfg  # noqa: PLC0415
-    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_manager import (  # noqa: PLC0415
-        WaterhoseAdmmSolverCfg,
-        WaterhoseOneWaySolverCfg,
-    )
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
         WaterhoseNewtonSolverCfg,
     )
@@ -159,14 +155,31 @@ def _configure_env_cfg(env_cfg) -> None:
     if hasattr(env_cfg, "max_demo_steps"):
         env_cfg.max_demo_steps = int(args_cli.max_demo_steps)
     physics_cfg = env_cfg.sim.physics
-    if not isinstance(physics_cfg, NewtonCfg) or not isinstance(
-        physics_cfg.solver_cfg, (WaterhoseNewtonSolverCfg, WaterhoseAdmmSolverCfg, WaterhoseOneWaySolverCfg)
-    ):
+    if not isinstance(physics_cfg, NewtonCfg):
         raise TypeError(
-            "Expected NewtonCfg(solver_cfg=WaterhoseNewtonSolverCfg|WaterhoseAdmmSolverCfg|WaterhoseOneWaySolverCfg), "
+            "Expected NewtonCfg(solver_cfg=WaterhoseNewtonSolverCfg), "
             f"got {type(physics_cfg).__name__}."
         )
+
     solver_cfg = physics_cfg.solver_cfg
+    if not isinstance(solver_cfg, WaterhoseNewtonSolverCfg):
+        try:
+            from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_manager import (  # noqa: PLC0415
+                WaterhoseAdmmSolverCfg,
+                WaterhoseOneWaySolverCfg,
+            )
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "This task uses the experimental coupled waterhose manager, but the installed Newton package "
+                "does not provide the coupled solver API. Use the default Isaac-Waterhose-Robot-Demo-v0 task "
+                "or install the Newton coupled-solver PR."
+            ) from exc
+        if not isinstance(solver_cfg, (WaterhoseAdmmSolverCfg, WaterhoseOneWaySolverCfg)):
+            raise TypeError(
+                "Expected NewtonCfg(solver_cfg=WaterhoseNewtonSolverCfg|WaterhoseAdmmSolverCfg|WaterhoseOneWaySolverCfg), "
+                f"got {type(solver_cfg).__name__}."
+            )
+
     solver_cfg.num_envs = int(env_cfg.scene.num_envs)
     solver_cfg.env_spacing = float(env_cfg.scene.env_spacing)
     if hasattr(solver_cfg, "newton_root"):
@@ -223,20 +236,28 @@ def _set_task_teleop_enabled(env_cfg, enabled: bool) -> None:
     """Enable teleop on the selected waterhose Newton manager."""
 
     solver_cfg = env_cfg.sim.physics.solver_cfg
-    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_manager import (  # noqa: PLC0415
-        NewtonWaterhoseCoupledManager,
-        WaterhoseAdmmSolverCfg,
-        WaterhoseOneWaySolverCfg,
-    )
     from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.manager import (  # noqa: PLC0415
         WaterhoseNewtonSolverCfg,
         NewtonWaterhoseManager,
     )
 
+    if isinstance(solver_cfg, WaterhoseNewtonSolverCfg):
+        NewtonWaterhoseManager.set_teleop_enabled(enabled)
+        return
+
+    try:
+        from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_manager import (  # noqa: PLC0415
+            NewtonWaterhoseCoupledManager,
+            WaterhoseAdmmSolverCfg,
+            WaterhoseOneWaySolverCfg,
+        )
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Teleop for the experimental coupled waterhose task requires the Newton coupled-solver API."
+        ) from exc
+
     if isinstance(solver_cfg, (WaterhoseAdmmSolverCfg, WaterhoseOneWaySolverCfg)):
         NewtonWaterhoseCoupledManager.set_teleop_enabled(enabled)
-    elif isinstance(solver_cfg, WaterhoseNewtonSolverCfg):
-        NewtonWaterhoseManager.set_teleop_enabled(enabled)
 
 
 def _run_env(env_cfg) -> None:
