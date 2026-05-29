@@ -23,6 +23,12 @@ from .cable_curve_import import CableCurveImportResult, add_cable_from_usd_curve
 
 VBD_KE = 1.0e3
 VBD_KD = 0.0
+# Mass [kg] for the kinematic gripper proxy bodies in the VBD world. They are
+# re-synced to the robot pose every step, so for contact they must read as a
+# near-immovable surface relative to the gram-scale cable/plug. The finger's true
+# local mass (~grams) is far too light: VBD contact resolution then pushes the
+# light proxy aside instead of ejecting the mass-0 plug, so the plug penetrates.
+PROXY_BODY_MASS = 1.0
 GRIPPER_FINGER_BODY_NAMES = (
     "right_gripper_leftfinger",
     "right_gripper_rightfinger",
@@ -301,6 +307,30 @@ def _compute_fridge_xform() -> wp.transform:
     return wp.transform(wp.vec3(0.95, fridge_y_offset, fridge_z_offset), fridge_rot)
 
 
+def _compute_socket_approach_xform(fridge_xform: wp.transform) -> wp.transform:
+    """Socket approach pose as a fixed offset from the fridge (matches the demo)."""
+    socket_offset = wp.vec3(-0.259404, 0.362961, -0.262711)
+    pos = wp.transform_point(fridge_xform, socket_offset)
+    fridge_rot = wp.transform_get_rotation(fridge_xform)
+    socket_local = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 20.0 * wp.pi / 180.0)
+    return wp.transform(pos, fridge_rot * socket_local)
+
+
+def waterhose_socket_pose() -> tuple[np.ndarray, np.ndarray]:
+    """Return the prototype-frame socket approach pose as ``(pos[3], quat[4])``.
+
+    Prototype frame = the single-env builder before grid replication; callers in
+    multi-env add their env origin to place it in world coordinates.
+    """
+    xform = _compute_socket_approach_xform(_compute_fridge_xform())
+    p = wp.transform_get_translation(xform)
+    q = wp.transform_get_rotation(xform)
+    return (
+        np.array([float(p[0]), float(p[1]), float(p[2])], dtype=np.float64),
+        np.array([float(q[0]), float(q[1]), float(q[2]), float(q[3])], dtype=np.float64),
+    )
+
+
 def _build_robot(robot_urdf_path: Path, shape_cfg: newton.ModelBuilder.ShapeConfig) -> newton.ModelBuilder:
     robot = newton.ModelBuilder()
     newton.solvers.SolverMuJoCo.register_custom_attributes(robot)
@@ -363,6 +393,18 @@ def _build_vbd_side(
     ]
     if cable_joint_ids:
         builder.add_articulation(cable_joint_ids, label="water_hose_cable_articulation")
+
+    # Anchor each cable's chain root with a FREE joint in its own articulation.
+    # ``add_rod_graph`` leaves the spanning-tree root parent-less, so MuJoCo's
+    # converter orphans it during its topological body walk (KeyError on
+    # ``body_mapping[parent]``) when the coupled model carries multiple worlds. A
+    # FREE root keeps the cable a clean floating tree the converter can ingest; VBD
+    # still owns the pose and the coupled manager syncs the root joint_q from body_q.
+    for index, result in enumerate(cable_results):
+        if not result.cable_body_ids:
+            continue
+        root_joint_id = builder.add_joint_free(child=int(result.cable_body_ids[0]))
+        builder.add_articulation([int(root_joint_id)], label=f"water_hose_cable_{index}_root_articulation")
 
     _transform_builder_bodies(
         builder,
@@ -477,11 +519,20 @@ def _create_vbd_proxy_bodies(
         mass = float(robot_builder.body_mass[body_id])
         if mass <= 0.0:
             continue
+        # Override the finger-local mass with a heavy proxy mass and scale the
+        # inertia by the same ratio so the proxy resists like an immovable grip.
+        ratio = PROXY_BODY_MASS / mass
+        li = robot_builder.body_inertia[body_id]
+        proxy_inertia = wp.mat33(
+            float(li[0, 0]) * ratio, float(li[0, 1]) * ratio, float(li[0, 2]) * ratio,
+            float(li[1, 0]) * ratio, float(li[1, 1]) * ratio, float(li[1, 2]) * ratio,
+            float(li[2, 0]) * ratio, float(li[2, 1]) * ratio, float(li[2, 2]) * ratio,
+        )
         proxy_label = f"proxy_{body_name}"
         proxy_body_id = vbd_builder.add_body(
             xform=robot_builder.body_q[body_id],
-            mass=mass,
-            inertia=robot_builder.body_inertia[body_id],
+            mass=PROXY_BODY_MASS,
+            inertia=proxy_inertia,
             lock_inertia=True,
             label=proxy_label,
         )
