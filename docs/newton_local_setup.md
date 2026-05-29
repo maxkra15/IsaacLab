@@ -1,6 +1,6 @@
 # Isaac Lab Newton Dependency Setup
 
-Last verified: 2026-05-28.
+Last verified: 2026-05-29.
 
 The waterhose demo depends on Newton PR 2848 until the coupled-solver APIs land in a released Newton version.
 
@@ -21,7 +21,7 @@ allow `warp-lang>=1.14.0.dev20260514`.
 
 ## Runtime Wiring
 
-The waterhose demo uses Newton PR 2848 directly. Isaac Lab imports coupled solver classes from `newton.solvers.coupled_experimental`, and the local Newton package dependencies pin `newton[sim]` to the verified PR commit above.
+The waterhose demo uses Newton PR 2848 directly. Isaac Lab imports coupled solver classes from `newton.solvers.experimental.coupled`, and the local Newton package dependencies pin `newton[sim]` to the verified PR head above.
 
 There is no vendored coupled solver fallback in this worktree. If PR 2848 changes, update the Newton pins and any separate Newton checkout together.
 
