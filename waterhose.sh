@@ -9,9 +9,8 @@
 #   cd /path/to/safe/folder
 #   ./waterhose.sh setup --accept-eula
 #
-# The setup command creates /path/to/safe/folder/waterhose-demo/ and keeps the
-# IsaacLab checkout, Isaac Sim source checkout, build, venv, symlink, and assets
-# inside that workspace.
+# Version pins (Newton, Kit extensions) live in the waterhose-demo branch itself.
+# This script only clones branches, builds Isaac Sim, installs Isaac Lab, and unpacks assets.
 
 set -euo pipefail
 
@@ -23,6 +22,7 @@ DEFAULT_REPO_URL="${WATERHOSE_REPO_URL:-https://github.com/maxkra15/IsaacLab.git
 DEFAULT_REPO_REF="${WATERHOSE_REPO_REF:-waterhose-demo}"
 DEFAULT_ISAACSIM_DIR_NAME="IsaacSim"
 DEFAULT_ISAACSIM_URL="${ISAACSIM_REPO_URL:-https://github.com/isaac-sim/IsaacSim.git}"
+# Public GitHub branch. Internal omni_isaac_sim SHAs are not on this remote.
 DEFAULT_ISAACSIM_REF="${ISAACSIM_REPO_REF:-develop}"
 DEFAULT_VENV=".venv"
 DEFAULT_ASSETS_TAR="${SCRIPT_DIR}/waterhose_demo_assets.tar.gz"
@@ -70,6 +70,7 @@ usage() {
     cat <<'EOF'
 Usage:
   ./waterhose.sh setup [options]
+  ./waterhose.sh assets [options]
   ./waterhose.sh demo [options] [-- extra demo args]
   ./waterhose.sh teleop [options] [-- extra teleop args]
   ./waterhose.sh smoke [options]
@@ -97,7 +98,7 @@ Setup options:
   --repo-ref REF             IsaacLab waterhose branch/tag. Default: waterhose-demo
   --repo-dir-name NAME       Checkout dir inside workspace. Default: IsaacLab-waterhose
   --isaacsim-url URL         Isaac Sim repo URL.
-  --isaacsim-ref REF         Isaac Sim branch/tag. Default: develop
+  --isaacsim-ref REF         Isaac Sim branch on ISAACSIM_REPO_URL. Default: develop
   --isaacsim-dir-name NAME   Isaac Sim dir inside workspace. Default: IsaacSim
   --venv DIR                 venv directory inside IsaacLab checkout. Default: .venv
   --assets-tar FILE          waterhose_demo_assets.tar.gz path.
@@ -111,6 +112,13 @@ Setup options:
   --skip-gcc-alternatives    Do not set gcc/g++ alternatives to version 11.
   --skip-lfs                 Do not run git lfs install/pull.
   --skip-smoke               Do not run the post-install headless smoke check.
+
+Assets options:
+  Unpack waterhose_demo_assets.tar.gz into an existing workspace (no full setup).
+
+  --workspace DIR            Workspace created by setup. Default: ./waterhose-demo
+  --repo-dir-name NAME       Checkout dir inside workspace. Default: IsaacLab-waterhose
+  --assets-tar FILE          waterhose_demo_assets.tar.gz path.
 
 Demo options:
   --workspace DIR            Workspace created by setup. Default: ./waterhose-demo
@@ -157,6 +165,44 @@ abs_path() {
     else
         printf '%s/%s\n' "$PWD" "$path"
     fi
+}
+
+resolve_assets_tar() {
+    local explicit_path="${1:-}"
+    local tried=() candidate search_dir
+
+    if [[ -n "$explicit_path" ]]; then
+        candidate="$(abs_path "$explicit_path")"
+        tried+=("$candidate")
+        [[ -f "$candidate" ]] && {
+            printf '%s\n' "$candidate"
+            return 0
+        }
+    fi
+
+    for search_dir in "$SCRIPT_DIR" "$PWD"; do
+        candidate="${search_dir}/waterhose_demo_assets.tar.gz"
+        tried+=("$candidate")
+        [[ -f "$candidate" ]] && {
+            printf '%s\n' "$(abs_path "$candidate")"
+            return 0
+        }
+
+        shopt -s nullglob
+        for candidate in "${search_dir}"/waterhose*assets*.tar.gz "${search_dir}"/WaterhoseDemo*.tar.gz; do
+            tried+=("$candidate")
+            printf '%s\n' "$(abs_path "$candidate")"
+            shopt -u nullglob
+            return 0
+        done
+        shopt -u nullglob
+    done
+
+    printf '[waterhose:error] Asset archive not found.\n' >&2
+    printf 'Checked:\n' >&2
+    printf '  %s\n' "${tried[@]}" >&2
+    printf 'Pass --assets-tar FILE or place waterhose_demo_assets.tar.gz next to waterhose.sh or in the current directory.\n' >&2
+    exit 1
 }
 
 repo_dir_for_workspace() {
@@ -288,18 +334,20 @@ ensure_clean_git_checkout() {
     fi
 }
 
-clone_or_resume_repo() {
+git_sync_checkout() {
     local repo_dir="$1"
     local repo_url="$2"
     local repo_ref="$3"
     local resume_existing="$4"
+    shift 4
+    local clone_env=("$@")
 
     if [[ -e "$repo_dir" && ! -d "${repo_dir}/.git" ]]; then
-        die "Repo path exists but is not a git checkout: ${repo_dir}"
+        die "Path exists but is not a git checkout: ${repo_dir}"
     fi
 
     if [[ -d "${repo_dir}/.git" ]]; then
-        [[ "$resume_existing" == "1" ]] || die "Repo checkout already exists: ${repo_dir}"
+        [[ "$resume_existing" == "1" ]] || die "Checkout already exists: ${repo_dir}"
         ensure_clean_git_checkout "$repo_dir"
         run git -C "$repo_dir" fetch origin --tags --prune
         if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/${repo_ref}"; then
@@ -307,10 +355,24 @@ clone_or_resume_repo() {
         else
             run git -C "$repo_dir" checkout "$repo_ref"
         fi
-        return
+    else
+        run env "${clone_env[@]}" git clone --branch "$repo_ref" --single-branch "$repo_url" "$repo_dir"
     fi
 
-    run git clone --branch "$repo_ref" "$repo_url" "$repo_dir"
+    log "$(basename "$repo_dir") at $(git -C "$repo_dir" rev-parse --short HEAD) (${repo_ref})"
+}
+
+require_waterhose_assets() {
+    local repo_root="$1"
+    local expected_dir="${repo_root}/source/isaaclab_assets/data/WaterhoseDemo"
+
+    [[ -d "$expected_dir" ]] || die \
+        "Waterhose assets are missing at ${expected_dir}. " \
+        "Run: ./waterhose.sh assets --assets-tar ./waterhose_demo_assets.tar.gz"
+}
+
+clone_or_resume_repo() {
+    git_sync_checkout "$1" "$2" "$3" "$4"
 }
 
 clone_or_resume_isaacsim() {
@@ -320,22 +382,7 @@ clone_or_resume_isaacsim() {
     local resume_existing="$4"
     local skip_lfs="$5"
 
-    if [[ -e "$isaacsim_dir" && ! -d "${isaacsim_dir}/.git" ]]; then
-        die "Isaac Sim path exists but is not a git checkout: ${isaacsim_dir}"
-    fi
-
-    if [[ -d "${isaacsim_dir}/.git" ]]; then
-        [[ "$resume_existing" == "1" ]] || die "Isaac Sim checkout already exists: ${isaacsim_dir}"
-        ensure_clean_git_checkout "$isaacsim_dir"
-        run git -C "$isaacsim_dir" fetch origin --tags --prune
-        if git -C "$isaacsim_dir" show-ref --verify --quiet "refs/remotes/origin/${isaacsim_ref}"; then
-            run git -C "$isaacsim_dir" checkout -B "$isaacsim_ref" "origin/${isaacsim_ref}"
-        else
-            run git -C "$isaacsim_dir" checkout "$isaacsim_ref"
-        fi
-    else
-        run env GIT_LFS_SKIP_SMUDGE=1 git clone --branch "$isaacsim_ref" "$isaacsim_url" "$isaacsim_dir"
-    fi
+    git_sync_checkout "$isaacsim_dir" "$isaacsim_url" "$isaacsim_ref" "$resume_existing" GIT_LFS_SKIP_SMUDGE=1
 
     if [[ "$skip_lfs" != "1" ]]; then
         run git -C "$isaacsim_dir" lfs install
@@ -531,7 +578,7 @@ cmd_setup() {
     local isaacsim_ref="$DEFAULT_ISAACSIM_REF"
     local isaacsim_dir_name="$DEFAULT_ISAACSIM_DIR_NAME"
     local venv_name="$DEFAULT_VENV"
-    local assets_tar="$DEFAULT_ASSETS_TAR"
+    local assets_tar=""
     local accept_eula=0
     local resume_existing=0
     local skip_host_deps=0
@@ -628,6 +675,8 @@ cmd_setup() {
     link_isaacsim_build "$repo_root" "$isaacsim_dir"
 
     setup_uv_env_and_install_isaaclab "$repo_root" "$venv_name" "$resume_existing"
+    assets_tar="$(resolve_assets_tar "$assets_tar")"
+    log "Using asset archive: ${assets_tar}"
     extract_assets "$repo_root" "$assets_tar" "$resume_existing"
 
     if [[ "$skip_smoke" != "1" ]]; then
@@ -636,6 +685,35 @@ cmd_setup() {
 
     log "Setup complete."
     log "Workspace: ${workspace}"
+}
+
+cmd_assets() {
+    local workspace="$DEFAULT_WORKSPACE"
+    local repo_dir_name="$DEFAULT_REPO_DIR_NAME"
+    local assets_tar=""
+
+    while (($#)); do
+        case "$1" in
+            --workspace)
+                workspace="$(abs_path "$2")"; shift 2 ;;
+            --repo-dir-name)
+                repo_dir_name="$2"; shift 2 ;;
+            --assets-tar)
+                assets_tar="$(abs_path "$2")"; shift 2 ;;
+            --help|-h)
+                usage; exit 0 ;;
+            *)
+                die "Unknown assets option: $1" ;;
+        esac
+    done
+
+    require_command tar
+    local repo_root
+    repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
+    assets_tar="$(resolve_assets_tar "$assets_tar")"
+    log "Using asset archive: ${assets_tar}"
+    extract_assets "$repo_root" "$assets_tar" 1
+    log "Assets ready at ${repo_root}/source/isaaclab_assets/data/WaterhoseDemo"
 }
 
 cmd_demo() {
@@ -688,6 +766,7 @@ cmd_demo() {
 
     local repo_root
     repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
+    require_waterhose_assets "$repo_root"
     local args=(
         scripts/environments/waterhose/run_robot_demo.py
         --task "$task"
@@ -774,6 +853,7 @@ cmd_teleop() {
 
     local repo_root
     repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
+    require_waterhose_assets "$repo_root"
     local args=(
         scripts/environments/teleoperation/teleop_se3_agent.py
         --task "$task"
@@ -910,6 +990,8 @@ main() {
     case "$command" in
         setup)
             cmd_setup "$@" ;;
+        assets)
+            cmd_assets "$@" ;;
         demo)
             cmd_demo "$@" ;;
         teleop)
