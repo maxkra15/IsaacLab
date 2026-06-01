@@ -14,15 +14,14 @@ import torch
 import isaaclab.utils.math as PoseUtils
 from isaaclab.envs import ManagerBasedRLMimicEnv
 
-from .env import WaterhoseRobotDemoEnv
-from .manager import NewtonWaterhoseManager
+from .coupled_manager import NewtonWaterhoseCoupledManager
 
 
-class WaterhoseRobotDemoMimicEnv(WaterhoseRobotDemoEnv, ManagerBasedRLMimicEnv):
+class WaterhoseRobotDemoMimicEnv(ManagerBasedRLMimicEnv):
     """Mimic API adapter for the stable one-way waterhose demo task."""
 
     def get_robot_eef_pose(self, eef_name: str, env_ids: Sequence[int] | None = None) -> torch.Tensor:
-        poses = self._poses_to_tensor(NewtonWaterhoseManager.get_right_ee_poses(), env_ids)
+        poses = self._poses_to_tensor(NewtonWaterhoseCoupledManager.get_right_ee_poses(), env_ids)
         return self._pose_tensor_to_matrix(poses)
 
     def target_eef_pose_to_action(
@@ -44,7 +43,7 @@ class WaterhoseRobotDemoMimicEnv(WaterhoseRobotDemoEnv, ManagerBasedRLMimicEnv):
         current_pos, current_rot = PoseUtils.unmake_pose(current_pose)
 
         delta_pos = target_pos - current_pos
-        delta_rot_mat = current_rot.transpose(-1, -2).matmul(target_rot)
+        delta_rot_mat = target_rot.matmul(current_rot.transpose(-1, -2))
         delta_rot = PoseUtils.axis_angle_from_quat(PoseUtils.quat_from_matrix(delta_rot_mat))
 
         cfg = self._demo_action_cfg()
@@ -69,7 +68,7 @@ class WaterhoseRobotDemoMimicEnv(WaterhoseRobotDemoEnv, ManagerBasedRLMimicEnv):
         current_pos, current_rot = PoseUtils.unmake_pose(current_pose)
         delta_pos, delta_rot = self._action_to_pose_delta(action)
         target_pos = current_pos + delta_pos
-        target_rot = current_rot.matmul(self._axis_angle_to_matrix(delta_rot))
+        target_rot = self._axis_angle_to_matrix(delta_rot).matmul(current_rot)
         return {eef_name: PoseUtils.make_pose(target_pos, target_rot).clone()}
 
     def actions_to_gripper_actions(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -79,13 +78,13 @@ class WaterhoseRobotDemoMimicEnv(WaterhoseRobotDemoEnv, ManagerBasedRLMimicEnv):
     def get_object_poses(self, env_ids: Sequence[int] | None = None) -> dict[str, torch.Tensor]:
         return {
             name: self._pose_tensor_to_matrix(self._poses_to_tensor(poses, env_ids))
-            for name, poses in NewtonWaterhoseManager.get_object_poses().items()
+            for name, poses in NewtonWaterhoseCoupledManager.get_object_poses().items()
         }
 
     def get_subtask_term_signals(self, env_ids: Sequence[int] | None = None) -> dict[str, torch.Tensor]:
         return {
             name: self._slice_env_ids(torch.as_tensor(value, device=self.device, dtype=torch.bool), env_ids)
-            for name, value in NewtonWaterhoseManager.get_subtask_term_signals().items()
+            for name, value in NewtonWaterhoseCoupledManager.get_subtask_term_signals().items()
         }
 
     def _demo_action_cfg(self):

@@ -20,6 +20,11 @@ The script automatically detects which stack to use based on the environment con
 
 import argparse
 from collections.abc import Callable
+import inspect
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 from isaaclab.app import AppLauncher
 
@@ -38,6 +43,7 @@ parser.add_argument(
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
+parser.add_argument("--max_steps", type=int, default=0, help="Optional teleop loop bound. Set to 0 to run until closed.")
 parser.add_argument(
     "--debug_teleop",
     action="store_true",
@@ -62,6 +68,47 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+
+
+def _default_waterhose_asset_root() -> str:
+    return str(Path(__file__).resolve().parents[3] / "source" / "isaaclab_assets" / "data" / "WaterhoseDemo")
+
+
+def _prewarm_waterhose_static_scene_cache() -> None:
+    """Prepare the task-local Newton static-scene cache before Kit starts."""
+
+    task = args_cli.task or ""
+    if "Waterhose-Robot-Demo" not in task:
+        return
+    asset_root = os.getenv("WATERHOSE_ASSETS_DIR", _default_waterhose_asset_root())
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_builder "
+            "import ensure_static_scene_cache; "
+            "ensure_static_scene_cache(sys.argv[1])"
+        ),
+        asset_root,
+    ]
+    result = subprocess.run(command, env=os.environ.copy(), check=False)
+    if result.returncode != 0:
+        raise RuntimeError("Failed to prepare the waterhose static-scene collision cache.")
+
+
+def _prefer_cuda_for_waterhose_xr() -> None:
+    """Keep the Newton waterhose runtime on CUDA for XR unless the user chose another device."""
+
+    task = args_cli.task or ""
+    if "Waterhose-Robot-Demo" not in task:
+        return
+    if not bool(getattr(args_cli, "xr", False)):
+        return
+    if bool(getattr(args_cli, "device_explicit", False)):
+        return
+    args_cli.device = "cuda:0"
+    args_cli.device_explicit = True
 
 
 def _get_visualizer_types(launcher_args: argparse.Namespace) -> set[str]:
@@ -92,6 +139,8 @@ def _prepare_native_teleop_visualizers() -> None:
 
 
 _prepare_native_teleop_visualizers()
+_prefer_cuda_for_waterhose_xr()
+_prewarm_waterhose_static_scene_cache()
 app_launcher_args = vars(args_cli)
 
 # launch omniverse app
@@ -156,6 +205,48 @@ def _create_builtin_device(device_name: str, sensitivity: float) -> object | Non
     return None
 
 
+def _resolve_class_type(class_type: object) -> type:
+    return class_type._resolve() if hasattr(class_type, "_resolve") else class_type
+
+
+def _create_configured_device(device_name: str, devices_cfg: dict, callbacks: dict[str, Callable[[], None]]) -> object:
+    """Instantiate a configured native teleop device without the deprecated factory shim."""
+
+    from isaaclab.devices import DeviceBase
+    from isaaclab.devices.retargeter_base import RetargeterBase
+
+    device_cfg = devices_cfg[device_name]
+    device_constructor = getattr(device_cfg, "class_type", None)
+    if device_constructor is None:
+        raise ValueError(f"Device configuration '{device_name}' does not declare class_type.")
+    device_cls = _resolve_class_type(device_constructor)
+    if not issubclass(device_cls, DeviceBase):
+        raise TypeError(f"class_type for '{device_name}' must be a DeviceBase subclass; got {device_constructor}")
+
+    retargeters = []
+    for retargeter_cfg in getattr(device_cfg, "retargeters", None) or []:
+        retargeter_constructor = getattr(retargeter_cfg, "retargeter_type", None)
+        if retargeter_constructor is None:
+            raise ValueError(f"Retargeter configuration {type(retargeter_cfg).__name__} does not declare retargeter_type.")
+        retargeter_cls = _resolve_class_type(retargeter_constructor)
+        if not issubclass(retargeter_cls, RetargeterBase):
+            raise TypeError(
+                f"retargeter_type for {type(retargeter_cfg).__name__} must be a RetargeterBase subclass; "
+                f"got {retargeter_constructor}"
+            )
+        retargeters.append(retargeter_cls(retargeter_cfg))
+
+    constructor_params = inspect.signature(device_cls).parameters
+    params: dict = {"cfg": device_cfg}
+    if "retargeters" in constructor_params:
+        params["retargeters"] = retargeters
+    device = device_cls(**params)
+
+    for key, callback in callbacks.items():
+        device.add_callback(key, callback)
+    return device
+
+
 def _close_simulation_app() -> None:
     if simulation_app is not None:
         simulation_app.close()
@@ -190,9 +281,7 @@ def _create_teleop_interface(
     if teleop_device_explicitly_set:
         device_name = args_cli.teleop_device
         if hasattr(env_cfg, "teleop_devices") and device_name in env_cfg.teleop_devices.devices:
-            from isaaclab.devices.teleop_device_factory import create_teleop_device
-
-            return create_teleop_device(device_name, env_cfg.teleop_devices.devices, teleoperation_callbacks), None
+            return _create_configured_device(device_name, env_cfg.teleop_devices.devices, teleoperation_callbacks), None
         teleop_interface = _create_builtin_device(device_name, args_cli.sensitivity)
         if teleop_interface is None:
             raise ValueError(
@@ -380,6 +469,8 @@ def main() -> None:
             try:
                 # run everything in inference mode
                 with torch.inference_mode():
+                    if args_cli.max_steps > 0 and step_count >= args_cli.max_steps:
+                        break
                     # get device command
                     action = teleop_interface.advance()
                     step_count += 1

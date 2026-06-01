@@ -8,7 +8,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import os
 from pathlib import Path
+import pickle
+import tempfile
 
 import numpy as np
 import warp as wp
@@ -29,6 +33,7 @@ VBD_KD = 0.0
 # local mass (~grams) is far too light: VBD contact resolution then pushes the
 # light proxy aside instead of ejecting the mass-0 plug, so the plug penetrates.
 PROXY_BODY_MASS = 1.0
+STATIC_SCENE_CACHE_VERSION = 1
 GRIPPER_FINGER_BODY_NAMES = (
     "right_gripper_leftfinger",
     "right_gripper_rightfinger",
@@ -36,8 +41,10 @@ GRIPPER_FINGER_BODY_NAMES = (
     "left_gripper_rightfinger",
 )
 
-GRIPPER_DRIVER_DOFS = (13, 23)
-GRIPPER_FINGER_DOFS = (14, 15, 24, 25)
+# Newton's USD importer preserves the joint order authored in rby1df.usda:
+# torso(6), head(2), left arm(7), left gripper(3), right arm(7), right gripper(3).
+GRIPPER_DRIVER_DOFS = (25, 15)
+GRIPPER_FINGER_DOFS = (26, 27, 16, 17)
 LEROBOT_INITIAL_STATE_22 = (
     0.0,
     0.872664213180542,
@@ -75,11 +82,22 @@ class WaterhoseCoupledBuildInfo:
     env_origins: np.ndarray | None = None
     robot_body_count: int = 0
     robot_shape_count: int = 0
+    robot_joint_count: int = 0
     robot_joint_q_count: int = 0
+    robot_body_ids: list[int] = field(default_factory=list)
+    robot_shape_ids: list[int] = field(default_factory=list)
+    robot_joint_ids: list[int] = field(default_factory=list)
     vbd_body_count: int = 0
     vbd_shape_count: int = 0
+    vbd_joint_count: int = 0
+    vbd_body_ids: list[int] = field(default_factory=list)
+    vbd_shape_ids: list[int] = field(default_factory=list)
+    vbd_joint_ids: list[int] = field(default_factory=list)
     vbd_initial_body_q: np.ndarray | None = None
     vbd_initial_body_q_by_env: np.ndarray | None = None
+    cable_body_ids_by_curve: list[list[int]] = field(default_factory=list)
+    cable_segment_lengths_by_curve: list[list[float]] = field(default_factory=list)
+    cable_head_body_ids_by_curve: list[list[int]] = field(default_factory=list)
     cable_body_labels: list[str] = field(default_factory=list)
     plug_body_labels: list[str] = field(default_factory=list)
     scene_shape_ids: list[int] = field(default_factory=list)
@@ -92,24 +110,26 @@ class WaterhoseAssetPaths:
     """Resolved asset paths used by the waterhose Newton builder."""
 
     root: Path
-    robot_urdf: Path
+    robot_usd: Path
     scene_usd: Path
     cable_usd: Path
+    fridge_usd: Path
 
     @classmethod
     def from_root(cls, asset_root: str | Path) -> "WaterhoseAssetPaths":
         root = Path(asset_root).expanduser().resolve()
         paths = cls(
             root=root,
-            robot_urdf=root / "RBY1DF" / "urdf" / "robot_edited.urdf",
+            robot_usd=root / "rby1df" / "rby1df.usda",
             scene_usd=root / "Waterhose" / "Cable008" / "Cable008_Body.usda",
             cable_usd=root / "Waterhose" / "Cable008" / "curve" / "cable_SRA_curve03.usda",
+            fridge_usd=root / "fridge" / "fridge.usda",
         )
         paths.validate()
         return paths
 
     def validate(self) -> None:
-        for path in (self.robot_urdf, self.scene_usd, self.cable_usd):
+        for path in (self.robot_usd, self.scene_usd, self.cable_usd, self.fridge_usd):
             if not path.is_file():
                 raise FileNotFoundError(f"Waterhose asset not found: {path}")
 
@@ -131,24 +151,38 @@ def build_waterhose_coupled_builder(
     shape_cfg = _create_collision_shape_config()
     fridge_xform = _compute_fridge_xform()
 
-    robot_builder = _build_robot(paths.robot_urdf, shape_cfg)
+    _debug_builder("robot:start")
+    robot_builder = _build_robot(paths.robot_usd, shape_cfg)
+    _debug_builder(
+        f"robot:done bodies={robot_builder.body_count} shapes={robot_builder.shape_count} joints={robot_builder.joint_count}"
+    )
+    _debug_builder("vbd:start")
     vbd_builder, cable_results, scene_shape_ids = _build_vbd_side(paths, fridge_xform)
+    _debug_builder(
+        f"vbd:done bodies={vbd_builder.body_count} shapes={vbd_builder.shape_count} joints={vbd_builder.joint_count}"
+    )
     robot_proxy_body_labels: list[str] = []
     vbd_proxy_body_labels: list[str] = []
     if include_proxy_bodies:
+        _debug_builder("proxy:start")
         robot_proxy_body_labels, vbd_proxy_body_labels = _create_vbd_proxy_bodies(
             robot_builder,
             vbd_builder,
             scene_shape_ids=scene_shape_ids,
         )
+        _debug_builder("proxy:done")
 
+    _debug_builder("combine:start")
     builder = NewtonManager.create_builder()
     newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
     builder.default_shape_cfg = shape_cfg
     builder.add_builder(robot_builder, label_prefix="mujoco")
     robot_body_count = int(robot_builder.body_count)
     robot_shape_count = int(robot_builder.shape_count)
+    robot_joint_count = int(robot_builder.joint_count)
     builder.add_builder(vbd_builder, label_prefix="vbd")
+    _debug_builder(f"combine:done bodies={builder.body_count} shapes={builder.shape_count}")
+    _debug_builder("filter:start")
     _filter_robot_vbd_cross_contacts(
         builder=builder,
         robot_builder=robot_builder,
@@ -156,8 +190,10 @@ def build_waterhose_coupled_builder(
         robot_shape_count=robot_shape_count,
         cable_results=cable_results,
     )
+    _debug_builder("filter:done")
     _sanitize_builder_labels(builder)
     builder.color()
+    _debug_builder("color:done")
 
     info = WaterhoseCoupledBuildInfo(
         num_envs=1,
@@ -167,11 +203,26 @@ def build_waterhose_coupled_builder(
         env_origins=np.zeros((1, 3), dtype=np.float32),
         robot_body_count=robot_body_count,
         robot_shape_count=robot_shape_count,
+        robot_joint_count=robot_joint_count,
         robot_joint_q_count=int(robot_builder.joint_coord_count),
+        robot_body_ids=list(range(robot_body_count)),
+        robot_shape_ids=list(range(robot_shape_count)),
+        robot_joint_ids=list(range(robot_joint_count)),
         vbd_body_count=int(vbd_builder.body_count),
         vbd_shape_count=int(vbd_builder.shape_count),
+        vbd_joint_count=int(vbd_builder.joint_count),
+        vbd_body_ids=list(range(robot_body_count, robot_body_count + int(vbd_builder.body_count))),
+        vbd_shape_ids=list(range(robot_shape_count, robot_shape_count + int(vbd_builder.shape_count))),
+        vbd_joint_ids=list(range(robot_joint_count, robot_joint_count + int(vbd_builder.joint_count))),
         vbd_initial_body_q=_builder_body_q_array(vbd_builder),
         vbd_initial_body_q_by_env=_builder_body_q_array(vbd_builder).reshape(1, int(vbd_builder.body_count), 7),
+        cable_body_ids_by_curve=[
+            [robot_body_count + int(body_id) for body_id in result.cable_body_ids] for result in cable_results
+        ],
+        cable_segment_lengths_by_curve=[list(result.segment_lengths) for result in cable_results],
+        cable_head_body_ids_by_curve=[
+            [robot_body_count + int(body_id) for body_id in result.head_body_ids] for result in cable_results
+        ],
         cable_body_labels=[
             _sanitize_label(f"vbd/{_body_label(vbd_builder, body_id)}")
             for result in cable_results
@@ -225,6 +276,9 @@ def _replicate_waterhose_builder(
 
     env_body_count = int(info.env_body_count or prototype.body_count)
     env_shape_count = int(info.env_shape_count or prototype.shape_count)
+    env_joint_count = int(getattr(info, "robot_joint_count", 0)) + int(getattr(info, "vbd_joint_count", 0))
+    if env_joint_count <= 0:
+        env_joint_count = int(prototype.joint_count)
     return replicated, WaterhoseCoupledBuildInfo(
         num_envs=num_envs,
         env_body_count=env_body_count,
@@ -233,11 +287,26 @@ def _replicate_waterhose_builder(
         env_origins=origins,
         robot_body_count=int(info.robot_body_count),
         robot_shape_count=int(info.robot_shape_count),
+        robot_joint_count=int(info.robot_joint_count),
         robot_joint_q_count=int(info.robot_joint_q_count),
+        robot_body_ids=_replicate_ids(info.robot_body_ids, env_body_count, num_envs),
+        robot_shape_ids=_replicate_ids(info.robot_shape_ids, env_shape_count, num_envs),
+        robot_joint_ids=_replicate_ids(info.robot_joint_ids, env_joint_count, num_envs),
         vbd_body_count=int(info.vbd_body_count),
         vbd_shape_count=int(info.vbd_shape_count),
+        vbd_joint_count=int(info.vbd_joint_count),
+        vbd_body_ids=_replicate_ids(info.vbd_body_ids, env_body_count, num_envs),
+        vbd_shape_ids=_replicate_ids(info.vbd_shape_ids, env_shape_count, num_envs),
+        vbd_joint_ids=_replicate_ids(info.vbd_joint_ids, env_joint_count, num_envs),
         vbd_initial_body_q=vbd_initial_body_q,
         vbd_initial_body_q_by_env=vbd_initial_body_q_by_env,
+        cable_body_ids_by_curve=_replicate_curve_ids(info.cable_body_ids_by_curve, env_body_count, num_envs),
+        cable_segment_lengths_by_curve=[
+            list(lengths)
+            for _env_id in range(num_envs)
+            for lengths in info.cable_segment_lengths_by_curve
+        ],
+        cable_head_body_ids_by_curve=_replicate_curve_ids(info.cable_head_body_ids_by_curve, env_body_count, num_envs),
         cable_body_labels=_prefixed_env_labels(info.cable_body_labels, num_envs),
         plug_body_labels=_prefixed_env_labels(info.plug_body_labels, num_envs),
         scene_shape_ids=[
@@ -271,6 +340,18 @@ def _prefixed_env_labels(labels: list[str], num_envs: int) -> list[str]:
     return [f"env_{env_id}/{label}" for env_id in range(num_envs) for label in labels]
 
 
+def _replicate_ids(ids: list[int], stride: int, num_envs: int) -> list[int]:
+    return [env_id * int(stride) + int(item) for env_id in range(num_envs) for item in ids]
+
+
+def _replicate_curve_ids(curves: list[list[int]], stride: int, num_envs: int) -> list[list[int]]:
+    return [
+        [env_id * int(stride) + int(item) for item in curve]
+        for env_id in range(num_envs)
+        for curve in curves
+    ]
+
+
 def build_waterhose_robot_model(asset_root: str | Path, device: str | wp.context.Device):
     """Build the robot-only model used by Newton IK.
 
@@ -280,7 +361,7 @@ def build_waterhose_robot_model(asset_root: str | Path, device: str | wp.context
     """
 
     paths = WaterhoseAssetPaths.from_root(asset_root)
-    robot_builder = _build_robot(paths.robot_urdf, _create_collision_shape_config())
+    robot_builder = _build_robot(paths.robot_usd, _create_collision_shape_config())
     return robot_builder.finalize(device=wp.get_device(str(device)))
 
 
@@ -331,17 +412,21 @@ def waterhose_socket_pose() -> tuple[np.ndarray, np.ndarray]:
     )
 
 
-def _build_robot(robot_urdf_path: Path, shape_cfg: newton.ModelBuilder.ShapeConfig) -> newton.ModelBuilder:
+def _build_robot(robot_usd_path: Path, shape_cfg: newton.ModelBuilder.ShapeConfig) -> newton.ModelBuilder:
     robot = newton.ModelBuilder()
     newton.solvers.SolverMuJoCo.register_custom_attributes(robot)
     robot.default_shape_cfg = shape_cfg
 
-    robot.add_urdf(
-        str(robot_urdf_path),
+    robot.add_usd(
+        str(robot_usd_path),
         floating=False,
         enable_self_collisions=False,
-        parse_visuals_as_colliders=False,
-        ignore_inertial_definitions=True,
+        load_visual_shapes=True,
+        hide_collision_shapes=True,
+        only_load_enabled_joints=True,
+        only_load_enabled_rigid_bodies=False,
+        parse_mujoco_options=True,
+        root_path="/",
     )
 
     for body_id, label in enumerate(robot.body_label):
@@ -380,11 +465,17 @@ def _build_vbd_side(
     paths: WaterhoseAssetPaths, fridge_xform: wp.transform
 ) -> tuple[newton.ModelBuilder, list[CableCurveImportResult], list[int]]:
     builder = _create_vbd_builder()
+    _debug_builder("vbd:static_scene:start")
     scene_shape_ids = _load_static_scene(builder, paths.scene_usd, fridge_xform)
+    _debug_builder(f"vbd:static_scene:done shapes={len(scene_shape_ids)} bodies={builder.body_count}")
 
+    _debug_builder("vbd:cables:start")
     cable_results = _add_waterhose_cables(paths.cable_usd, builder)
+    _debug_builder(f"vbd:cables:done curves={len(cable_results)} bodies={builder.body_count}")
+    _debug_builder("vbd:filters:start")
     _filter_cable_self_collisions(builder, cable_results)
     _zero_fixed_cable_bodies(builder, cable_results)
+    _debug_builder("vbd:filters:done")
 
     cable_joint_ids = [
         joint_id
@@ -406,12 +497,14 @@ def _build_vbd_side(
         root_joint_id = builder.add_joint_free(child=int(result.cable_body_ids[0]))
         builder.add_articulation([int(root_joint_id)], label=f"water_hose_cable_{index}_root_articulation")
 
+    _debug_builder("vbd:transform:start")
     _transform_builder_bodies(
         builder,
         [body_id for result in cable_results for body_id in [*result.cable_body_ids, *result.head_body_ids]],
         fridge_xform,
     )
     _scale_plug_mesh_shapes(builder, cable_results, xy_scale=0.95, mu=10.0)
+    _debug_builder("vbd:transform:done")
     return builder, cable_results, scene_shape_ids
 
 
@@ -427,12 +520,41 @@ def _create_vbd_builder() -> newton.ModelBuilder:
 
 
 def _load_static_scene(builder: newton.ModelBuilder, scene_usd_path: Path, fridge_xform: wp.transform) -> list[int]:
+    cache_path = _static_scene_cache_path(scene_usd_path)
+    if _static_scene_cache_is_valid(cache_path, scene_usd_path):
+        try:
+            return _load_static_scene_from_cache(builder, cache_path)
+        except Exception as exc:
+            print(f"[waterhose-builder] Ignoring invalid static-scene cache {cache_path}: {exc}", flush=True)
+
+    scene_shape_ids = _import_static_scene_from_usd(builder, scene_usd_path, fridge_xform)
+    _write_static_scene_cache(builder, scene_shape_ids, scene_usd_path, cache_path)
+    return scene_shape_ids
+
+
+def ensure_static_scene_cache(asset_root: str | Path) -> Path:
+    """Build the static collision cache in a Kit-free process when needed."""
+
+    paths = WaterhoseAssetPaths.from_root(asset_root)
+    cache_path = _static_scene_cache_path(paths.scene_usd)
+    if _static_scene_cache_is_valid(cache_path, paths.scene_usd):
+        return cache_path
+
+    builder = _create_vbd_builder()
+    scene_shape_ids = _import_static_scene_from_usd(builder, paths.scene_usd, _compute_fridge_xform())
+    _write_static_scene_cache(builder, scene_shape_ids, paths.scene_usd, cache_path)
+    return cache_path
+
+
+def _import_static_scene_from_usd(
+    builder: newton.ModelBuilder, scene_usd_path: Path, fridge_xform: wp.transform
+) -> list[int]:
     scene_result = builder.add_usd(
         str(scene_usd_path),
         xform=fridge_xform,
         root_path="/root",
         load_sites=False,
-        load_visual_shapes=True,
+        load_visual_shapes=False,
         hide_collision_shapes=False,
         parse_mujoco_options=False,
         only_load_enabled_joints=True,
@@ -447,6 +569,150 @@ def _load_static_scene(builder: newton.ModelBuilder, scene_usd_path: Path, fridg
         builder.body_inv_inertia[body_id] = wp.mat33()
 
     scene_shape_ids = sorted(int(shape_id) for shape_id in scene_result["path_shape_map"].values())
+    for left_index, left_shape in enumerate(scene_shape_ids):
+        for right_shape in scene_shape_ids[left_index + 1 :]:
+            builder.add_shape_collision_filter_pair(left_shape, right_shape)
+
+    return scene_shape_ids
+
+
+def _static_scene_cache_path(scene_usd_path: Path) -> Path:
+    scene_path = Path(scene_usd_path).expanduser().resolve()
+    stat = scene_path.stat()
+    key = hashlib.sha1(
+        f"{scene_path}|{stat.st_size}|{stat.st_mtime_ns}|{STATIC_SCENE_CACHE_VERSION}".encode("utf-8")
+    ).hexdigest()[:16]
+    cache_root = Path(os.getenv("WATERHOSE_CACHE_DIR", Path.home() / ".cache" / "isaaclab_waterhose"))
+    return cache_root / f"{scene_path.stem}_static_collision_{key}.pkl"
+
+
+def _static_scene_cache_is_valid(cache_path: Path, scene_usd_path: Path) -> bool:
+    if not cache_path.is_file():
+        return False
+    try:
+        with cache_path.open("rb") as f:
+            metadata = pickle.load(f)["metadata"]
+    except Exception:
+        return False
+    stat = Path(scene_usd_path).expanduser().resolve().stat()
+    return (
+        metadata.get("version") == STATIC_SCENE_CACHE_VERSION
+        and metadata.get("source_size") == stat.st_size
+        and metadata.get("source_mtime_ns") == stat.st_mtime_ns
+    )
+
+
+def _write_static_scene_cache(
+    builder: newton.ModelBuilder, scene_shape_ids: list[int], scene_usd_path: Path, cache_path: Path
+) -> None:
+    scene_body_ids = sorted({int(builder.shape_body[shape_id]) for shape_id in scene_shape_ids})
+    body_index = {body_id: index for index, body_id in enumerate(scene_body_ids)}
+    stat = Path(scene_usd_path).expanduser().resolve().stat()
+    payload = {
+        "metadata": {
+            "version": STATIC_SCENE_CACHE_VERSION,
+            "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns,
+        },
+        "bodies": [
+            {
+                "label": builder.body_label[body_id],
+                "q": tuple(float(v) for v in builder.body_q[body_id]),
+            }
+            for body_id in scene_body_ids
+        ],
+        "shapes": [
+            {
+                "body": body_index[int(builder.shape_body[shape_id])],
+                "label": builder.shape_label[shape_id],
+                "xform": tuple(float(v) for v in builder.shape_transform[shape_id]),
+                "scale": tuple(float(v) for v in builder.shape_scale[shape_id]),
+                "flags": int(builder.shape_flags[shape_id]),
+                "density": 0.0,
+                "ke": float(builder.shape_material_ke[shape_id]),
+                "kd": float(builder.shape_material_kd[shape_id]),
+                "kf": float(builder.shape_material_kf[shape_id]),
+                "ka": float(builder.shape_material_ka[shape_id]),
+                "mu": float(builder.shape_material_mu[shape_id]),
+                "restitution": float(builder.shape_material_restitution[shape_id]),
+                "mu_torsional": float(builder.shape_material_mu_torsional[shape_id]),
+                "mu_rolling": float(builder.shape_material_mu_rolling[shape_id]),
+                "kh": float(builder.shape_material_kh[shape_id]),
+                "margin": float(builder.shape_margin[shape_id]),
+                "gap": float(builder.shape_gap[shape_id]),
+                "is_solid": bool(builder.shape_is_solid[shape_id]),
+                "collision_group": int(builder.shape_collision_group[shape_id]),
+                "color": tuple(float(v) for v in builder.shape_color[shape_id]),
+                "vertices": np.asarray(builder.shape_source[shape_id].vertices, dtype=np.float32),
+                "indices": np.asarray(builder.shape_source[shape_id].indices, dtype=np.int32),
+            }
+            for shape_id in scene_shape_ids
+        ],
+    }
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", dir=cache_path.parent, delete=False) as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        temp_path = Path(f.name)
+    temp_path.replace(cache_path)
+
+
+def _load_static_scene_from_cache(builder: newton.ModelBuilder, cache_path: Path) -> list[int]:
+    with cache_path.open("rb") as f:
+        payload = pickle.load(f)
+
+    body_ids = []
+    for body in payload["bodies"]:
+        body_id = builder.add_link(
+            xform=wp.transform(*body["q"]),
+            mass=0.0,
+            inertia=wp.mat33(),
+            label=body["label"],
+        )
+        body_ids.append(int(body_id))
+
+    scene_shape_ids = []
+    for shape in payload["shapes"]:
+        cfg = builder.default_shape_cfg.copy()
+        cfg.flags = int(shape["flags"])
+        cfg.density = float(shape["density"])
+        cfg.ke = float(shape["ke"])
+        cfg.kd = float(shape["kd"])
+        cfg.kf = float(shape["kf"])
+        cfg.ka = float(shape["ka"])
+        cfg.mu = float(shape["mu"])
+        cfg.restitution = float(shape["restitution"])
+        cfg.mu_torsional = float(shape["mu_torsional"])
+        cfg.mu_rolling = float(shape["mu_rolling"])
+        cfg.kh = float(shape["kh"])
+        cfg.margin = float(shape["margin"])
+        cfg.gap = float(shape["gap"])
+        cfg.is_solid = bool(shape["is_solid"])
+        cfg.collision_group = int(shape["collision_group"])
+        mesh = newton.Mesh(
+            np.asarray(shape["vertices"], dtype=np.float32),
+            np.asarray(shape["indices"], dtype=np.int32),
+            compute_inertia=False,
+            is_solid=bool(shape["is_solid"]),
+            color=shape["color"],
+        )
+        shape_id = builder.add_shape_mesh(
+            body_ids[int(shape["body"])],
+            xform=wp.transform(*shape["xform"]),
+            mesh=mesh,
+            scale=wp.vec3(*shape["scale"]),
+            cfg=cfg,
+            color=shape["color"],
+            label=shape["label"],
+        )
+        scene_shape_ids.append(int(shape_id))
+
+    for body_id in body_ids:
+        builder.body_mass[body_id] = 0.0
+        builder.body_inv_mass[body_id] = 0.0
+        builder.body_inertia[body_id] = wp.mat33()
+        builder.body_inv_inertia[body_id] = wp.mat33()
+
     for left_index, left_shape in enumerate(scene_shape_ids):
         for right_shape in scene_shape_ids[left_index + 1 :]:
             builder.add_shape_collision_filter_pair(left_shape, right_shape)
@@ -650,16 +916,18 @@ def _initial_robot_joint_positions() -> list[float]:
     lr = LEROBOT_INITIAL_STATE_22
     q = [0.0] * 28
     q[0:6] = lr[0:6]
-    q[6:13] = lr[6:13]
-    q[12] += np.pi / 2.0
-    q[13] = lr[20]
-    q[14] = -lr[20] / 2.0
-    q[15] = lr[20] / 2.0
-    q[16:23] = lr[13:20]
-    q[22] -= np.pi / 2.0
-    q[23] = lr[21]
-    q[24] = -lr[21] / 2.0
-    q[25] = lr[21] / 2.0
+    q[6] = 0.0
+    q[7] = 0.0
+    q[8:15] = lr[13:20]
+    q[14] -= np.pi / 2.0
+    q[15] = lr[21]
+    q[16] = -lr[21] / 2.0
+    q[17] = lr[21] / 2.0
+    q[18:25] = lr[6:13]
+    q[24] += np.pi / 2.0
+    q[25] = lr[20]
+    q[26] = -lr[20] / 2.0
+    q[27] = lr[20] / 2.0
     return q
 
 
@@ -803,3 +1071,8 @@ def _sanitize_label(label: str) -> str:
     while "//" in cleaned:
         cleaned = cleaned.replace("//", "/")
     return cleaned.strip("/")
+
+
+def _debug_builder(message: str) -> None:
+    if os.getenv("WATERHOSE_DEBUG_BUILDER", "").lower() in {"1", "true", "yes", "on"}:
+        print(f"[waterhose-builder] {message}", flush=True)

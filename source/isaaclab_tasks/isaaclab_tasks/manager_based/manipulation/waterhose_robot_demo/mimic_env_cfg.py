@@ -10,10 +10,11 @@ from __future__ import annotations
 from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.configclass import configclass
 
-from . import mdp
-from .env_cfg import ObservationsCfg, WaterhoseRobotDemoEnvCfg
+from . import coupled_mdp as mdp
+from .coupled_env_cfg import ObservationsCfg, TerminationsCfg, WaterhoseRobotDemoEnvCfg
 
 
 @configclass
@@ -35,10 +36,18 @@ class WaterhoseMimicObservationsCfg(ObservationsCfg):
 
 
 @configclass
+class WaterhoseMimicTerminationsCfg(TerminationsCfg):
+    """Termination terms used by demo recording and Mimic data generation."""
+
+    success = DoneTerm(func=mdp.insert_done)
+
+
+@configclass
 class WaterhoseRobotDemoMimicEnvCfg(WaterhoseRobotDemoEnvCfg, MimicEnvCfg):
     """Mimic variant of the stable one-way waterhose demo."""
 
     observations: WaterhoseMimicObservationsCfg = WaterhoseMimicObservationsCfg()
+    terminations: WaterhoseMimicTerminationsCfg = WaterhoseMimicTerminationsCfg()
 
     def __post_init__(self):
         super().__post_init__()

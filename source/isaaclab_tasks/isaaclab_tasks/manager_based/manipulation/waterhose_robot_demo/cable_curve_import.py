@@ -35,6 +35,7 @@ class CableCurveImportResult:
     head_body_ids: list[int]
     head_fixed_joint_ids: list[int]
     fixed_body_ids: list[int]
+    segment_lengths: list[float]
 
 
 @dataclass
@@ -597,6 +598,7 @@ def add_cable_from_usd_curve(
         head_body_ids=head_body_ids,
         head_fixed_joint_ids=head_fixed_joint_ids,
         fixed_body_ids=fixed_body_ids,
+        segment_lengths=edge_lengths,
     )
 
 

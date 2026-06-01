@@ -46,6 +46,8 @@ from .coupled_builder import (
 _DEFAULT_ASSET_ROOT = str(
     Path(__file__).resolve().parents[5] / "isaaclab_assets" / "data" / "WaterhoseDemo"
 )
+_RIGHT_EE_FROM_BASE_POS = np.array([0.0, 0.0, -0.1335], dtype=np.float64)
+_RIGHT_EE_FROM_BASE_QUAT = np.array([0.70710677, 0.70710677, 0.0, 0.0], dtype=np.float64)
 
 
 @wp.kernel(enable_backward=False)
@@ -160,28 +162,104 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     )
 
     @classmethod
+    def start_simulation(cls) -> None:
+        """Start from the task-local Newton builder, not stage-authored visuals."""
+
+        # The IsaacLab scene authors USD assets for rendering and cloning, while
+        # this manager owns the real split MuJoCo/VBD Newton model. In Kitless
+        # Newton runs those visual USDs can still populate NewtonManager._builder
+        # during scene creation. Clear that stage-derived builder so the normal
+        # Newton lifecycle calls instantiate_builder_from_stage() below.
+        NewtonManager._builder = None
+        super().start_simulation()
+
+    @classmethod
     def instantiate_builder_from_stage(cls) -> None:
         cfg = cls._waterhose_cfg()
         num_envs = max(1, int(getattr(cfg, "num_envs", 1)))
+        _debug_manager(f"instantiate:start num_envs={num_envs}")
         builder, build_info = build_waterhose_coupled_builder(
             getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT),
             include_proxy_bodies=bool(getattr(cfg, "include_proxy_bodies", False)),
             num_envs=num_envs,
             env_spacing=float(getattr(cfg, "env_spacing", 2.5)),
         )
+        _debug_manager(
+            "instantiate:built "
+            f"bodies={builder.body_count} shapes={builder.shape_count} joints={builder.joint_count}"
+        )
+        cls._configure_entry_ownership(cfg, build_info)
+        cls._prepare_kit_scene(builder, build_info, getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT))
         NewtonManager.set_builder(builder)
         NewtonManager._num_envs = num_envs
         cls._build_info = build_info
+        _debug_manager("instantiate:done")
+
+    @classmethod
+    def _configure_entry_ownership(cls, cfg, build_info: WaterhoseCoupledBuildInfo) -> None:
+        """Bind coupled solver entries to generated body/joint/shape ids.
+
+        The task-local builder is generated before the standard coupled manager
+        resolves entry selectors. Using explicit ownership lets us relabel
+        bodies to their real Kit USD prims without depending on label prefixes
+        such as ``mujoco/`` or ``vbd/``.
+        """
+
+        for entry in getattr(cfg, "entries", ()):
+            if entry.name == "mujoco":
+                entry.bodies = list(build_info.robot_body_ids)
+                entry.joints = list(build_info.robot_joint_ids)
+                entry.shapes = list(build_info.robot_shape_ids)
+            elif entry.name == "vbd":
+                entry.bodies = list(build_info.vbd_body_ids)
+                entry.joints = list(build_info.vbd_joint_ids)
+                entry.shapes = list(build_info.vbd_shape_ids)
+            else:
+                continue
+            entry.body_entities = []
+            entry.body_label_patterns = []
+            entry.body_name_patterns = []
+            entry.include_child_joints = False
+            entry.include_body_shapes = False
+            entry.include_static_shapes = False
+
+    @classmethod
+    def _prepare_kit_scene(cls, builder, build_info: WaterhoseCoupledBuildInfo, asset_root: str) -> None:
+        sim = PhysicsManager._sim
+        if sim is None:
+            return
+        try:
+            visualizer_types = set(sim.resolve_visualizer_types())
+        except Exception:
+            visualizer_types = set()
+        if "kit" not in visualizer_types:
+            return
+        from .kit_display import prepare_usd_scene_for_newton_sync  # noqa: PLC0415
+
+        prepare_usd_scene_for_newton_sync(
+            sim=sim,
+            builder=builder,
+            build_info=build_info,
+            asset_root=asset_root,
+        )
 
     @classmethod
     def _build_solver(cls, model, solver_cfg: CoupledSolverCfg) -> None:
+        _debug_manager(
+            "solver:start "
+            f"bodies={getattr(model, 'body_count', '?')} shapes={getattr(model, 'shape_count', '?')} "
+            f"joints={getattr(model, 'joint_count', '?')}"
+        )
         cls._build_scene_mesh_sdfs(model)
+        _debug_manager("solver:sdfs_done")
         super()._build_solver(model, solver_cfg)
+        _debug_manager("solver:coupled_done")
         cls._build_free_joint_ids(model)
         cls._configure_vbd_solver()
         cls._restore_vbd_initial_body_poses()
         cls._resolve_tracked_bodies(model)
         cls._initialize_robot_control_targets()
+        _debug_manager("solver:done")
 
     @classmethod
     def _build_free_joint_ids(cls, model) -> None:
@@ -348,15 +426,19 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         build_info = cls._build_info
         num_envs = max(1, int(getattr(build_info, "num_envs", 1)))
         cls._right_ee_body_ids = [
-            _find_body_for_env(labels, "right_gripper_end_effector", env_id) for env_id in range(num_envs)
+            _find_body_for_env(labels, "right_gripper_base", env_id) for env_id in range(num_envs)
         ]
-        cls._plug_body_ids = [_find_body_for_env(labels, "authored_head_0", env_id) for env_id in range(num_envs)]
-        cls._tip_body_ids = [
-            _find_body_for_env(labels, "water_hose_cable_0_edge_body_0", env_id) for env_id in range(num_envs)
-        ]
-        cls._cable0_last_body_ids = [
-            _find_body_for_env(labels, "water_hose_cable_0_edge_body_42", env_id) for env_id in range(num_envs)
-        ]
+        curves_per_env = max(1, len(getattr(build_info, "cable_body_ids_by_curve", [])) // num_envs)
+        cls._plug_body_ids = []
+        cls._tip_body_ids = []
+        cls._cable0_last_body_ids = []
+        for env_id in range(num_envs):
+            curve_index = env_id * curves_per_env
+            head_ids = build_info.cable_head_body_ids_by_curve[curve_index]
+            body_ids = build_info.cable_body_ids_by_curve[curve_index]
+            cls._plug_body_ids.append(int(head_ids[0]) if head_ids else None)
+            cls._tip_body_ids.append(int(body_ids[0]) if body_ids else None)
+            cls._cable0_last_body_ids.append(int(body_ids[-1]) if body_ids else None)
         cls._right_ee_body_id = cls._right_ee_body_ids[0]
         cls._plug_body_id = cls._plug_body_ids[0]
         cls._tip_body_id = cls._tip_body_ids[0]
@@ -395,12 +477,25 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         return int(cls._script_phase)
 
     @classmethod
+    def current_phases(cls) -> np.ndarray:
+        num_envs = max(1, int(getattr(cls._build_info, "num_envs", 1)))
+        return np.full((num_envs, 1), float(cls.current_phase()), dtype=np.float32)
+
+    @classmethod
     def get_right_ee_pose(cls) -> np.ndarray:
-        return cls._body_pose(cls._right_ee_body_id, "right_gripper_end_effector")
+        return _compose_pose(
+            cls._body_pose(cls._right_ee_body_id, "right_gripper_base"),
+            _RIGHT_EE_FROM_BASE_POS,
+            _RIGHT_EE_FROM_BASE_QUAT,
+        )
 
     @classmethod
     def get_right_ee_poses(cls) -> np.ndarray:
-        return cls._body_poses(cls._right_ee_body_ids, "right_gripper_end_effector")
+        base_poses = cls._body_poses(cls._right_ee_body_ids, "right_gripper_base")
+        return np.stack(
+            [_compose_pose(pose, _RIGHT_EE_FROM_BASE_POS, _RIGHT_EE_FROM_BASE_QUAT) for pose in base_poses],
+            axis=0,
+        ).astype(np.float32, copy=False)
 
     @classmethod
     def get_plug_pose(cls) -> np.ndarray:
@@ -419,11 +514,35 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         return cls._body_poses(cls._tip_body_ids, "cable tip")
 
     @classmethod
+    def get_socket_poses(cls) -> np.ndarray:
+        num_envs = max(1, int(getattr(cls._build_info, "num_envs", 1)))
+        origins = getattr(cls._build_info, "env_origins", None)
+        if origins is None:
+            origins = np.zeros((num_envs, 3), dtype=np.float32)
+        origins = np.asarray(origins, dtype=np.float32).reshape(num_envs, 3)
+        base_socket = np.asarray(cls._socket_pos - cls._env0_offset, dtype=np.float32)
+        quat = np.asarray(cls._socket_rot, dtype=np.float32)
+        return np.concatenate((base_socket.reshape(1, 3) + origins, np.repeat(quat.reshape(1, 4), num_envs, axis=0)), axis=1)
+
+    @classmethod
+    def get_object_poses(cls) -> dict[str, np.ndarray]:
+        return {
+            "hose_plug": cls.get_plug_poses(),
+            "hose_tip": cls.get_tip_poses(),
+            "socket": cls.get_socket_poses(),
+        }
+
+    @classmethod
     def is_finite(cls) -> bool:
         state = NewtonManager._state_0
         if state is None:
             return False
         return bool(np.isfinite(state.body_q.numpy()).all() and np.isfinite(state.body_qd.numpy()).all())
+
+    @classmethod
+    def finite_mask(cls) -> np.ndarray:
+        num_envs = max(1, int(getattr(cls._build_info, "num_envs", 1)))
+        return np.full((num_envs, 1), float(cls.is_finite()), dtype=np.float32)
 
     @classmethod
     def is_done(cls, max_demo_steps: int = 0) -> bool:
@@ -433,6 +552,18 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
     @classmethod
     def is_success(cls) -> bool:
         return False
+
+    @classmethod
+    def get_subtask_term_signals(cls) -> dict[str, np.ndarray]:
+        """Return coarse Mimic subtask completion flags for each environment."""
+
+        phases = cls.current_phases().reshape(-1).astype(np.int32)
+        return {
+            "approach": (phases >= 1),
+            "grasp": (phases >= 3),
+            "align": (phases >= 7),
+            "insert": (phases >= 9),
+        }
 
     @classmethod
     def set_teleop_enabled(cls, enabled: bool) -> None:
@@ -477,9 +608,8 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         pose[3:] = _normalize_quat(_quat_multiply(_quat_from_rotvec(command_np[3:6]), pose[3:]))
         gripper = cls._gripper_open_value
         if command_np.shape[0] > 6:
-            gripper = float(
-                np.clip(cls._gripper_open_value - command_np[6] * cls._gripper_open_value, 0.0, cls._gripper_open_value)
-            )
+            close_alpha = float(np.clip((1.0 - command_np[6]) * 0.5, 0.0, 1.0))
+            gripper = float(cls._gripper_open_value + (cls._gripper_closed_value - cls._gripper_open_value) * close_alpha)
         cls._manual_target_pose = pose
         cls._solve_ik_to_target(pose, gripper)
 
@@ -501,8 +631,8 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
         cls._ik_robot_model = build_waterhose_robot_model(getattr(cfg, "asset_root", _DEFAULT_ASSET_ROOT), device)
         labels = [str(label) for label in cls._ik_robot_model.body_label]
         objective_specs = [
-            ("right_gripper_end_effector", 1.0),
-            ("left_gripper_end_effector", 1.0),
+            ("right_gripper_base", 1.0),
+            ("left_gripper_base", 1.0),
             ("torso_hip_yaw", 50.0),
         ]
         body_ids = [_find_body(labels, token) for token, _weight in objective_specs]
@@ -646,8 +776,9 @@ class NewtonWaterhoseCoupledManager(NewtonCoupledManager):
             return
 
         device = PhysicsManager._device
-        pos = (np.asarray(target_pose[:3], dtype=np.float64) - cls._env0_offset).astype(np.float32)
-        quat = _normalize_quat(target_pose[3:]).astype(np.float32)
+        base_target = _target_pose_to_base_pose(np.asarray(target_pose, dtype=np.float64))
+        pos = (np.asarray(base_target[:3], dtype=np.float64) - cls._env0_offset).astype(np.float32)
+        quat = _normalize_quat(base_target[3:]).astype(np.float32)
         wp.copy(
             cls._ik_target_pos,
             wp.array([wp.vec3(float(pos[0]), float(pos[1]), float(pos[2]))], dtype=wp.vec3, device=device),
@@ -767,7 +898,7 @@ class WaterhoseVBDSolverCfg(NewtonSolverCfg):
 
 
 @configclass
-class WaterhoseAdmmSolverCfg(CoupledSolverCfg):
+class WaterhoseCoupledSolverCfg(CoupledSolverCfg):
     """ADMM coupled solver config for the waterhose robot demo."""
 
     class_type: type[NewtonManager] | str = NewtonWaterhoseCoupledManager
@@ -944,8 +1075,8 @@ class WaterhoseOneWaySolverCfg(CoupledSolverCfg):
 
 
 @configclass
-class WaterhoseTwoWaySolverCfg(WaterhoseOneWaySolverCfg):
-    """Experimental two-way proxy coupling for the waterhose robot demo.
+class WaterhoseProxyCoupledSolverCfg(WaterhoseOneWaySolverCfg):
+    """Two-way proxy coupling for the waterhose robot demo.
 
     Uses the same embedded gripper proxies as the one-way config, but harvested
     proxy contact wrenches are fed back to the MuJoCo robot
@@ -954,7 +1085,7 @@ class WaterhoseTwoWaySolverCfg(WaterhoseOneWaySolverCfg):
     default. Treat as experimental.
     """
 
-    solver_type: str = "waterhose_two_way"
+    solver_type: str = "waterhose_proxy_coupled"
     coupling_type: str = "proxy"
     proxy_coupling: ProxyCouplingCfg = ProxyCouplingCfg()
 
@@ -972,10 +1103,17 @@ def _find_body(labels: list[str], suffix_or_token: str) -> int | None:
     return None
 
 
+def _debug_manager(message: str) -> None:
+    if os.environ.get("WATERHOSE_DEBUG_MANAGER", "").lower() in {"1", "true", "yes", "on"}:
+        print(f"[waterhose-manager] {message}", flush=True)
+
+
 def _find_body_for_env(labels: list[str], suffix_or_token: str, env_id: int) -> int | None:
-    env_prefix = f"env_{env_id}/"
+    env_token = f"env_{env_id}"
     for body_id, label in enumerate(labels):
-        if not label.startswith(env_prefix):
+        if env_id > 0 and env_token not in label:
+            continue
+        if env_id == 0 and env_token in label and f"{env_token}/" not in label and f"{env_token}" not in label:
             continue
         if label.endswith(suffix_or_token) or suffix_or_token in label:
             return body_id
@@ -1002,6 +1140,23 @@ def _quat_multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
         ],
         dtype=np.float64,
     )
+
+
+def _compose_pose(base_pose: np.ndarray, local_pos: np.ndarray, local_quat: np.ndarray) -> np.ndarray:
+    base = np.asarray(base_pose, dtype=np.float64)
+    base_pos = base[:3]
+    base_quat = _normalize_quat(base[3:7])
+    pos = base_pos + _quat_rotate(base_quat, np.asarray(local_pos, dtype=np.float64))
+    quat = _normalize_quat(_quat_multiply(base_quat, np.asarray(local_quat, dtype=np.float64)))
+    return np.concatenate((pos, quat), axis=0)
+
+
+def _target_pose_to_base_pose(ee_pose: np.ndarray) -> np.ndarray:
+    ee = np.asarray(ee_pose, dtype=np.float64)
+    ee_quat = _normalize_quat(ee[3:7])
+    base_quat = _normalize_quat(_quat_multiply(ee_quat, _quat_inverse(_RIGHT_EE_FROM_BASE_QUAT)))
+    base_pos = ee[:3] - _quat_rotate(base_quat, _RIGHT_EE_FROM_BASE_POS)
+    return np.concatenate((base_pos, base_quat), axis=0)
 
 
 def _quat_inverse(quat: np.ndarray) -> np.ndarray:

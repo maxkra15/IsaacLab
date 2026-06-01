@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.devices.device_base import DeviceBase, DeviceCfg
+from isaaclab.devices.keyboard import Se3Keyboard, Se3KeyboardCfg
 from isaaclab.devices.spacemouse import Se3SpaceMouse, Se3SpaceMouseCfg
 from isaaclab.utils.configclass import configclass
 
@@ -124,3 +125,15 @@ def create_waterhose_spacemouse_device(args_cli: argparse.Namespace, sensitivity
         yaw_translation_lock=bool(args_cli.spacemouse_simple_yaw_translation_lock),
     )
     return WaterhoseSpaceMouse(cfg)
+
+
+def create_waterhose_keyboard_device(args_cli: argparse.Namespace, sensitivity: float) -> Se3Keyboard:
+    """Create a standard Isaac Lab keyboard device for the demo runner."""
+
+    return Se3Keyboard(
+        Se3KeyboardCfg(
+            pos_sensitivity=0.02 * sensitivity,
+            rot_sensitivity=0.05 * sensitivity,
+            sim_device="cpu",
+        )
+    )

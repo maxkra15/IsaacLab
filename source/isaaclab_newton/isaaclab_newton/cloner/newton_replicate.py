@@ -64,23 +64,28 @@ def _build_newton_builder_from_mapping(
     # add_builder xforms are deltas from env_0 so positions don't get double-counted.
     env0_pos = positions[0]
 
-    # Deformable prim paths are handled by per_world_builder_hooks, not add_usd.
-    # Resolve the regex prim_path patterns to concrete env_0 paths so add_usd
-    # can skip them via ignore_paths.
+    # Deformable and cable prim paths are handled by per-world builder hooks,
+    # not by the regular USD import. Resolve their regex prim_path patterns to
+    # concrete env_0 paths so add_usd skips them when building prototypes.
     import re
 
-    _deformable_ignore_paths: list[str] = []
+    hook_managed_ignore_paths: list[str] = []
+    registry_entries = []
     if hasattr(NewtonManager, "_deformable_registry"):
-        for entry in NewtonManager._deformable_registry:
-            pat = re.compile(entry.prim_path.replace(".*", "[^/]*") + "$")
-            for src_path in sources:
-                # Check if any prim under this source matches the deformable pattern
-                prim = stage.GetPrimAtPath(src_path)
-                if prim.IsValid():
-                    for child in Usd.PrimRange(prim):
-                        child_path = str(child.GetPath())
-                        if pat.match(child_path):
-                            _deformable_ignore_paths.append(child_path)
+        registry_entries.extend(NewtonManager._deformable_registry)
+    if hasattr(NewtonManager, "_cable_registry"):
+        registry_entries.extend(NewtonManager._cable_registry)
+
+    for entry in registry_entries:
+        pattern = re.compile(entry.prim_path.replace(".*", "[^/]*") + "$")
+        for src_path in sources:
+            prim = stage.GetPrimAtPath(src_path)
+            if not prim.IsValid():
+                continue
+            for child in Usd.PrimRange(prim):
+                child_path = str(child.GetPath())
+                if pattern.match(child_path):
+                    hook_managed_ignore_paths.append(child_path)
 
     protos: dict[str, ModelBuilder] = {}
     for src_path in sources:
@@ -92,7 +97,7 @@ def _build_newton_builder_from_mapping(
             load_visual_shapes=True,
             skip_mesh_approximation=True,
             schema_resolvers=schema_resolvers,
-            ignore_paths=_deformable_ignore_paths if _deformable_ignore_paths else None,
+            ignore_paths=hook_managed_ignore_paths if hook_managed_ignore_paths else None,
         )
         if simplify_meshes:
             p.approximate_meshes("convex_hull", keep_visual_shapes=True)
@@ -135,7 +140,8 @@ def _build_newton_builder_from_mapping(
                 for proto_shape_idx in proto_shape_indices:
                     local_site_map[label][col].append(offset + proto_shape_idx)
 
-        # Run per-world builder hooks (e.g. deformable body registration).
+        # Run per-world builder hooks for objects that are represented by a
+        # custom Newton build path, such as cables and deformables.
         if hasattr(NewtonManager, "_per_world_builder_hooks"):
             for hook in NewtonManager._per_world_builder_hooks:
                 hook(builder, col, positions[col].tolist(), quaternions[col].tolist())
@@ -147,6 +153,10 @@ def _build_newton_builder_from_mapping(
     if hasattr(NewtonManager, "_post_replicate_hooks"):
         for hook in NewtonManager._post_replicate_hooks:
             hook(builder)
+
+    solver_cfg = getattr(NewtonManager._cfg, "solver_cfg", None)
+    if getattr(solver_cfg, "requires_graph_coloring", False):
+        builder.color()
 
     site_index_map = {
         **global_site_map,

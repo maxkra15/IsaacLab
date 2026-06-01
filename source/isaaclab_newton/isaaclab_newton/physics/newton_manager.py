@@ -1528,6 +1528,14 @@ class NewtonManager(PhysicsManager):
         """
         cls._solver.step(state_0, state_1, control, contacts, substep_dt)
 
+    @staticmethod
+    def _filter_solver_kwargs(solver_class, solver_cfg) -> dict:
+        """Return constructor kwargs supported by a Newton solver class."""
+
+        from .solver_factory import resolve_newton_solver_kwargs
+
+        return resolve_newton_solver_kwargs(solver_cfg, solver_class)
+
     @classmethod
     def _solver_specific_clear(cls) -> None:
         """Solver-specific cleanup hook called from :meth:`clear`.

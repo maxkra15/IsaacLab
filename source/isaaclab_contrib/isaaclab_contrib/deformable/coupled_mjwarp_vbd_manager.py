@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 from typing import TYPE_CHECKING
 
@@ -21,7 +20,6 @@ from isaaclab.sim.utils.stage import get_current_stage
 
 from .deformable_object import (
     add_deformable_entry_to_builder,
-    clear_deformable_builder_hooks,
     install_deformable_builder_hooks,
 )
 from .kernels import _kernel_body_particle_reaction
@@ -83,9 +81,11 @@ class NewtonCoupledMJWarpVBDManager(NewtonManager):
         super().step()
 
     @classmethod
-    def _solver_specific_clear(cls):
-        """Clear VBD-specific state."""
-        clear_deformable_builder_hooks()
+    def _solver_specific_clear(cls) -> None:
+        """Reset shared builder hooks and registries owned by the base manager."""
+        NewtonManager._cable_registry = []
+        NewtonManager._deformable_registry = []
+        NewtonManager._per_world_builder_hooks = []
 
     @classmethod
     def _get_deformable_ignore_paths(cls) -> list[str]:
@@ -243,7 +243,7 @@ class NewtonCoupledMJWarpVBDManager(NewtonManager):
             )
 
             # Inject registered sites into the proto before replication
-            global_sites, proto_sites, world_sites = cls._cl_inject_sites(builder, {proto_path: proto})
+            global_sites, proto_sites = cls._cl_inject_sites(builder, {proto_path: proto})
             global_site_map: dict[str, tuple[int, None]] = {label: (idx, None) for label, idx in global_sites.items()}
             num_worlds = len(env_paths)
             local_site_map: dict[str, list[list[int]]] = {}
@@ -264,13 +264,7 @@ class NewtonCoupledMJWarpVBDManager(NewtonManager):
                     rotation.GetImaginary()[2],
                     rotation.GetReal(),
                 )
-                env_xform = wp.transform(pos, quat)
-                builder.add_builder(proto, xform=env_xform)
-                for label, xform in world_sites.items():
-                    if label not in local_site_map:
-                        local_site_map[label] = [[] for _ in range(num_worlds)]
-                    site_idx = builder.add_site(body=-1, xform=wp.transform_multiply(env_xform, xform), label=label)
-                    local_site_map[label][col].append(site_idx)
+                builder.add_builder(proto, xform=wp.transform(pos, quat))
                 for label, proto_shape_indices in site_entries.items():
                     if label not in local_site_map:
                         local_site_map[label] = [[] for _ in range(num_worlds)]
@@ -305,13 +299,8 @@ class NewtonCoupledMJWarpVBDManager(NewtonManager):
         """
         cls._coupling_mode = solver_cfg.coupling_mode
 
-        valid = set(inspect.signature(SolverMuJoCo.__init__).parameters) - {"self", "model"}
-        kwargs = {k: v for k, v in solver_cfg.rigid_solver_cfg.to_dict().items() if k in valid}
-        cls._rigid_solver = SolverMuJoCo(model, **kwargs)
-
-        valid = set(inspect.signature(SolverVBD.__init__).parameters) - {"self", "model"}
-        kwargs = {k: v for k, v in solver_cfg.soft_solver_cfg.to_dict().items() if k in valid}
-        cls._soft_solver = SolverVBD(model, **kwargs)
+        cls._rigid_solver = SolverMuJoCo(model, **cls._filter_solver_kwargs(SolverMuJoCo, solver_cfg.rigid_solver_cfg))
+        cls._soft_solver = SolverVBD(model, **cls._filter_solver_kwargs(SolverVBD, solver_cfg.soft_solver_cfg))
 
         # Dummy solver for the newtonmanager
         NewtonManager._solver = SolverBase(model)
@@ -334,8 +323,10 @@ class NewtonCoupledMJWarpVBDManager(NewtonManager):
         """
         if cls._coupling_mode == "one_way":
             cls._step_one_way(state_in, state_out, control, substep_dt)
-        else:
+        elif cls._coupling_mode == "two_way":
             cls._step_two_way(state_in, state_out, control, substep_dt)
+        else:
+            raise ValueError(f"Unknown coupling_mode={cls._coupling_mode!r}; expected one of {{'one_way', 'two_way'}}.")
 
     @classmethod
     def _simulate_physics_only(cls) -> None:

@@ -34,6 +34,11 @@ optional arguments:
 # Standard library imports
 import argparse
 import contextlib
+import inspect
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 # Isaac Lab AppLauncher
 from isaaclab.app import AppLauncher
@@ -64,6 +69,7 @@ parser.add_argument(
     default=10,
     help="Number of continuous steps with task success for concluding a demo as successful. Default is 10.",
 )
+parser.add_argument("--max_steps", type=int, default=0, help="Optional recording loop bound. Set to 0 to run until closed.")
 parser.add_argument(
     "--cloudxr_env",
     type=str,
@@ -101,6 +107,72 @@ args_cli = parser.parse_args()
 if args_cli.task is None:
     parser.error("--task is required")
 
+
+def _default_waterhose_asset_root() -> str:
+    return str(Path(__file__).resolve().parents[2] / "source" / "isaaclab_assets" / "data" / "WaterhoseDemo")
+
+
+def _prewarm_waterhose_static_scene_cache() -> None:
+    """Prepare the task-local Newton static-scene cache before Kit starts."""
+
+    if "Waterhose-Robot-Demo" not in args_cli.task:
+        return
+    asset_root = os.getenv("WATERHOSE_ASSETS_DIR", _default_waterhose_asset_root())
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_builder "
+            "import ensure_static_scene_cache; "
+            "ensure_static_scene_cache(sys.argv[1])"
+        ),
+        asset_root,
+    ]
+    result = subprocess.run(command, env=os.environ.copy(), check=False)
+    if result.returncode != 0:
+        raise RuntimeError("Failed to prepare the waterhose static-scene collision cache.")
+
+
+def _prefer_cuda_for_waterhose_xr() -> None:
+    """Keep the Newton waterhose runtime on CUDA for XR unless the user chose another device."""
+
+    task = args_cli.task or ""
+    if "Waterhose-Robot-Demo" not in task:
+        return
+    if not bool(getattr(args_cli, "xr", False)):
+        return
+    if bool(getattr(args_cli, "device_explicit", False)):
+        return
+    args_cli.device = "cuda:0"
+    args_cli.device_explicit = True
+
+
+def _get_visualizer_types(launcher_args: argparse.Namespace) -> set[str]:
+    visualizers = getattr(launcher_args, "visualizer", None)
+    if not visualizers:
+        return set()
+    if isinstance(visualizers, str):
+        visualizers = [token.strip() for token in visualizers.split(",")]
+    return {str(visualizer).strip().lower() for visualizer in visualizers if str(visualizer).strip()}
+
+
+def _prepare_interactive_recording_visualizer() -> None:
+    """Demo recording is an interactive Kit workflow, even when using SpaceMouse."""
+
+    visualizer_types = _get_visualizer_types(args_cli)
+    if getattr(args_cli, "headless_explicit", False) and args_cli.headless:
+        parser.error("Demo recording requires a Kit app window; remove --headless or use a non-interactive tool.")
+    if "none" in visualizer_types:
+        parser.error("Demo recording requires a Kit app window; use --visualizer kit.")
+    if "kit" not in visualizer_types:
+        args_cli.visualizer = ["kit", *visualizer_types]
+        args_cli.visualizer_explicit = True
+
+
+_prepare_interactive_recording_visualizer()
+_prefer_cuda_for_waterhose_xr()
+_prewarm_waterhose_static_scene_cache()
 app_launcher_args = vars(args_cli)
 
 # launch the simulator
@@ -112,7 +184,6 @@ simulation_app = app_launcher.app
 
 # Third-party imports
 import logging
-import os
 import time
 from collections.abc import Callable
 
@@ -123,7 +194,6 @@ import omni.ui as ui
 
 from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
 from isaaclab.devices.openxr import remove_camera_configs
-from isaaclab.devices.teleop_device_factory import create_teleop_device
 from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
 from isaaclab.envs.ui import EmptyWindow
@@ -310,6 +380,48 @@ def _create_builtin_device(device_name: str) -> object | None:
     return None
 
 
+def _resolve_class_type(class_type: object) -> type:
+    return class_type._resolve() if hasattr(class_type, "_resolve") else class_type
+
+
+def _create_configured_device(device_name: str, devices_cfg: dict, callbacks: dict[str, Callable]) -> object:
+    """Instantiate a configured native teleop device without the deprecated factory shim."""
+
+    from isaaclab.devices import DeviceBase
+    from isaaclab.devices.retargeter_base import RetargeterBase
+
+    device_cfg = devices_cfg[device_name]
+    device_constructor = getattr(device_cfg, "class_type", None)
+    if device_constructor is None:
+        raise ValueError(f"Device configuration '{device_name}' does not declare class_type.")
+    device_cls = _resolve_class_type(device_constructor)
+    if not issubclass(device_cls, DeviceBase):
+        raise TypeError(f"class_type for '{device_name}' must be a DeviceBase subclass; got {device_constructor}")
+
+    retargeters = []
+    for retargeter_cfg in getattr(device_cfg, "retargeters", None) or []:
+        retargeter_constructor = getattr(retargeter_cfg, "retargeter_type", None)
+        if retargeter_constructor is None:
+            raise ValueError(f"Retargeter configuration {type(retargeter_cfg).__name__} does not declare retargeter_type.")
+        retargeter_cls = _resolve_class_type(retargeter_constructor)
+        if not issubclass(retargeter_cls, RetargeterBase):
+            raise TypeError(
+                f"retargeter_type for {type(retargeter_cfg).__name__} must be a RetargeterBase subclass; "
+                f"got {retargeter_constructor}"
+            )
+        retargeters.append(retargeter_cls(retargeter_cfg))
+
+    constructor_params = inspect.signature(device_cls).parameters
+    params: dict = {"cfg": device_cfg}
+    if "retargeters" in constructor_params:
+        params["retargeters"] = retargeters
+    device = device_cls(**params)
+
+    for key, callback in callbacks.items():
+        device.add_callback(key, callback)
+    return device
+
+
 def setup_teleop_device(callbacks: dict[str, Callable], use_isaac_teleop: bool = False) -> object:
     """Set up the teleoperation device based on configuration.
 
@@ -347,7 +459,7 @@ def setup_teleop_device(callbacks: dict[str, Callable], use_isaac_teleop: bool =
         elif teleop_device_explicitly_set:
             device_name = args_cli.teleop_device
             if hasattr(env_cfg, "teleop_devices") and device_name in env_cfg.teleop_devices.devices:
-                teleop_interface = create_teleop_device(device_name, env_cfg.teleop_devices.devices, callbacks)
+                teleop_interface = _create_configured_device(device_name, env_cfg.teleop_devices.devices, callbacks)
             else:
                 teleop_interface = _create_builtin_device(device_name)
                 if teleop_interface is None:
@@ -436,6 +548,14 @@ def process_success_condition(env: gym.Env, success_term: object | None, success
     return success_step_count, False
 
 
+def _reset_sim_for_recording(env: gym.Env) -> None:
+    """Reset the simulator when the backend supports it without rebuilding task-local Newton solver state."""
+
+    if "Waterhose-Robot-Demo" in args_cli.task:
+        return
+    env.sim.reset()
+
+
 def handle_reset(
     env: gym.Env,
     success_step_count: int,
@@ -460,7 +580,7 @@ def handle_reset(
         Reset success step count (0).
     """
     print("Resetting environment...")
-    env.sim.reset()
+    _reset_sim_for_recording(env)
     env.recorder_manager.reset()
     env.reset()
     if teleop_interface is not None and hasattr(teleop_interface, "reset"):
@@ -536,21 +656,25 @@ def run_simulation_loop(
         nonlocal running_recording_instance, label_text
 
         # Reset before starting
-        env.sim.reset()
+        _reset_sim_for_recording(env)
         env.reset()
         teleop_interface.reset()
 
         subtasks = {}
         stack_name = "IsaacTeleop" if use_isaac_teleop else "native"
         print(f"{stack_name} recording started.")
+        step_count = 0
 
         if use_isaac_teleop:
             from isaaclab_teleop import poll_control_events
 
         with contextlib.suppress(KeyboardInterrupt), torch.inference_mode():
             while simulation_app.is_running():
+                if args_cli.max_steps > 0 and step_count >= args_cli.max_steps:
+                    break
                 # Get teleop command (may be None while waiting for session start)
                 action = teleop_interface.advance()
+                step_count += 1
 
                 if use_isaac_teleop:
                     ctrl = poll_control_events(teleop_interface)

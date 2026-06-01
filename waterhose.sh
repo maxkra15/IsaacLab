@@ -26,7 +26,7 @@ DEFAULT_ISAACSIM_URL="${ISAACSIM_REPO_URL:-https://github.com/isaac-sim/IsaacSim
 DEFAULT_ISAACSIM_REF="${ISAACSIM_REPO_REF:-develop}"
 DEFAULT_VENV=".venv"
 DEFAULT_ASSETS_TAR="${SCRIPT_DIR}/waterhose_demo_assets.tar.gz"
-DEFAULT_TASK="Isaac-Waterhose-Robot-Demo-v0"
+DEFAULT_TASK="Isaac-Waterhose-RBY1-IK-Abs-v0"
 DEFAULT_MIMIC_TASK="Isaac-Waterhose-Robot-Demo-Mimic-v0"
 
 log() {
@@ -118,7 +118,7 @@ Demo options:
   --vis VALUE                kit, newton, kit,newton, or none. Default: kit
   --num-envs N               Number of environments. Default: 1
   --max-steps N              Demo step limit. Default: 2000
-  --headless                 Pass --headless to IsaacLab.
+  --headless                 Legacy IsaacLab headless flag. Prefer --vis none for headless runs.
   --profile                  Print timing from the runner.
   --teleop                   Use the demo runner's built-in SpaceMouse teleop mode.
   --venv DIR                 venv directory inside IsaacLab checkout. Default: .venv
@@ -142,7 +142,7 @@ Teleop options:
 Examples:
   ./waterhose.sh setup --accept-eula
   ./waterhose.sh demo --vis kit,newton --num-envs 2
-  ./waterhose.sh demo --vis none --headless --profile --max-steps 500
+  ./waterhose.sh demo --vis none --profile --max-steps 500
   ./waterhose.sh teleop --teleop-device spacemouse --vis kit
   ./waterhose.sh teleop --xr --cloudxr-env avp --vis kit
 EOF
@@ -834,15 +834,14 @@ cmd_smoke() {
         --repo-dir-name "$repo_dir_name" \
         --venv "$venv_name" \
         --task "$task" \
-        --vis kit \
-        --headless \
+        --vis none \
         --profile \
         --num-envs "$num_envs" \
         --max-steps "$max_steps"
 }
 
 cmd_profile() {
-    cmd_demo --vis none --headless --profile "$@"
+    cmd_demo --vis none --profile "$@"
 }
 
 cmd_mimic_smoke() {

@@ -5,14 +5,21 @@
 
 import gymnasium as gym
 
+from . import agents
+
 
 _PKG = "isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo"
+_WATERHOSE_PKG = "isaaclab_tasks.manager_based.manipulation.waterhose"
+_WATERHOSE_AGENTS = f"{_WATERHOSE_PKG}.agents"
 
 
 gym.register(
     id="Isaac-Waterhose-Robot-Demo-v0",
-    entry_point=f"{_PKG}.env:WaterhoseRobotDemoEnv",
-    kwargs={"env_cfg_entry_point": f"{_PKG}.env_cfg:WaterhoseRobotDemoEnvCfg"},
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{_PKG}.coupled_env_cfg:WaterhoseRobotDemoEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:WaterhoseRobotDemoPPORunnerCfg",
+    },
     disable_env_checker=True,
 )
 
@@ -23,33 +30,25 @@ gym.register(
     disable_env_checker=True,
 )
 
-# Canonical coupled task: stable one-way proxy coupling (robot drives the cable).
+# ADMM-coupled task: use the same scene-config based setup as the canonical
+# Isaac-Waterhose-v0 task. The stable client demo remains
+# Isaac-Waterhose-Robot-Demo-v0.
 gym.register(
     id="Isaac-Waterhose-Robot-Demo-Coupled-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={"env_cfg_entry_point": f"{_PKG}.one_way_env_cfg:WaterhoseRobotDemoOneWayEnvCfg"},
+    kwargs={
+        "env_cfg_entry_point": f"{_WATERHOSE_PKG}.waterhose_env_cfg:WaterhoseEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{_WATERHOSE_AGENTS}.rsl_rl_ppo_cfg:WaterhosePPORunnerCfg",
+    },
     disable_env_checker=True,
 )
 
 gym.register(
-    id="Isaac-Waterhose-Robot-Demo-OneWay-Coupled-v0",
+    id="Isaac-Waterhose-Robot-Demo-Proxy-Coupled-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={"env_cfg_entry_point": f"{_PKG}.one_way_env_cfg:WaterhoseRobotDemoOneWayEnvCfg"},
-    disable_env_checker=True,
-)
-
-# Experimental couplings: two-way feeds cable reaction back to the robot; ADMM
-# resolves gripper/cable contact across solvers and can be unstable on contact.
-gym.register(
-    id="Isaac-Waterhose-Robot-Demo-TwoWay-Coupled-Experimental-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={"env_cfg_entry_point": f"{_PKG}.two_way_env_cfg:WaterhoseRobotDemoTwoWayEnvCfg"},
-    disable_env_checker=True,
-)
-
-gym.register(
-    id="Isaac-Waterhose-Robot-Demo-Admm-Experimental-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={"env_cfg_entry_point": f"{_PKG}.admm_env_cfg:WaterhoseRobotDemoAdmmEnvCfg"},
+    kwargs={
+        "env_cfg_entry_point": f"{_WATERHOSE_PKG}.waterhose_env_cfg:WaterhoseProxyEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{_WATERHOSE_AGENTS}.rsl_rl_ppo_cfg:WaterhosePPORunnerCfg",
+    },
     disable_env_checker=True,
 )

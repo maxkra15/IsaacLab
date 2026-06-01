@@ -17,9 +17,6 @@ from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.managers.manager_base import ManagerTermBase
 from isaaclab.utils.configclass import configclass
 
-from .manager import NewtonWaterhoseManager
-
-
 @configclass
 class ScriptedDemoActionCfg(ActionTermCfg):
     """SE(3) command action for the demo task."""
@@ -74,13 +71,18 @@ class ScriptedDemoAction(ActionTerm):
         self._processed_actions[:, 6:] = self._raw_actions[:, 6:]
 
     def apply_actions(self) -> None:
-        if NewtonWaterhoseManager.teleop_enabled():
-            NewtonWaterhoseManager.apply_teleop_command(self._processed_actions)
+        from .coupled_manager import NewtonWaterhoseCoupledManager  # noqa: PLC0415
+
+        command = self._processed_actions[0]
+        if NewtonWaterhoseCoupledManager.teleop_enabled():
+            NewtonWaterhoseCoupledManager.apply_teleop_command(command)
             return
-        has_user_command = bool(torch.any(torch.abs(self._processed_actions) > float(self.cfg.input_deadzone)).item())
+        has_user_command = bool(torch.any(torch.abs(command) > float(self.cfg.input_deadzone)).item())
         if has_user_command:
-            NewtonWaterhoseManager.set_teleop_enabled(True)
-            NewtonWaterhoseManager.apply_teleop_command(self._processed_actions)
+            NewtonWaterhoseCoupledManager.set_teleop_enabled(True)
+            NewtonWaterhoseCoupledManager.apply_teleop_command(command)
+            return
+        NewtonWaterhoseCoupledManager.apply_scripted_control()
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:
@@ -100,17 +102,3 @@ class CoupledScriptedDemoAction(ScriptedDemoAction):
     """Runs the coupled scripted controller, or routes non-zero commands to teleop."""
 
     cfg: CoupledScriptedDemoActionCfg
-
-    def apply_actions(self) -> None:
-        from .coupled_manager import NewtonWaterhoseCoupledManager  # noqa: PLC0415
-
-        command = self._processed_actions[0]
-        if NewtonWaterhoseCoupledManager.teleop_enabled():
-            NewtonWaterhoseCoupledManager.apply_teleop_command(command)
-            return
-        has_user_command = bool(torch.any(torch.abs(command) > float(self.cfg.input_deadzone)).item())
-        if has_user_command:
-            NewtonWaterhoseCoupledManager.set_teleop_enabled(True)
-            NewtonWaterhoseCoupledManager.apply_teleop_command(command)
-            return
-        NewtonWaterhoseCoupledManager.apply_scripted_control()

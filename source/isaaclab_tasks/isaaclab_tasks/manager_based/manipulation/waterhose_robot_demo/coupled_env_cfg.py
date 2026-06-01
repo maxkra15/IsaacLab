@@ -3,11 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Shared config and base env for the coupled waterhose robot demo.
-
-Variant configs (one-way, two-way, ADMM) subclass
-:class:`WaterhoseRobotDemoCoupledEnvCfg` and only swap the Newton coupling.
-"""
+"""Manager-based configs for the waterhose robot demo tasks."""
 
 from __future__ import annotations
 
@@ -26,12 +22,12 @@ from isaaclab.devices.keyboard import Se3KeyboardCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils.configclass import configclass
-from isaaclab_newton.physics import NewtonCfg
+from isaaclab_newton.physics import NewtonCfg, NewtonCollisionPipelineCfg
 from isaaclab_teleop.xr_cfg import XrCfg
 
 from . import coupled_mdp
 from .actions import CoupledScriptedDemoAction, CoupledScriptedDemoActionCfg
-from .coupled_manager import WaterhoseOneWaySolverCfg
+from .coupled_manager import WaterhoseCoupledSolverCfg, WaterhoseOneWaySolverCfg, WaterhoseProxyCoupledSolverCfg
 from .isaac_teleop import make_waterhose_isaac_teleop_cfg
 from .teleop import WaterhoseSpaceMouseCfg
 
@@ -39,6 +35,11 @@ from .teleop import WaterhoseSpaceMouseCfg
 _DEFAULT_ASSET_ROOT = str(
     Path(__file__).resolve().parents[5] / "isaaclab_assets" / "data" / "WaterhoseDemo"
 )
+_ROBOT_USD = str(Path(_DEFAULT_ASSET_ROOT) / "rby1df" / "rby1df.usda")
+_FRIDGE_USD = str(Path(_DEFAULT_ASSET_ROOT) / "fridge" / "fridge.usda")
+_CABLE_VISUAL_USD = str(Path(_DEFAULT_ASSET_ROOT) / "Waterhose" / "Cable008" / "curve" / "cable_SRA_curve03.usda")
+_FRIDGE_POS = (0.95, (0.293 - 0.395) / 2.0, 0.902 + 2.0 * (0.5 * (0.6 - 0.215)))
+_FRIDGE_ROT = (0.0, 0.0, 0.7071067811865475, 0.7071067811865476)
 
 
 @configclass
@@ -70,7 +71,7 @@ class ObservationsCfg:
 
         def __post_init__(self):
             self.enable_corruption = False
-            self.concatenate_terms = False
+            self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
 
@@ -92,7 +93,23 @@ class TerminationsCfg:
 
 @configclass
 class WaterhoseCoupledSceneCfg(InteractiveSceneCfg):
-    """Scene shell for the task-local Newton coupled model."""
+    """Scene shell for authored USD visuals driven by the task-local Newton model."""
+
+    robot_visual = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Robot",
+        spawn=sim_utils.UsdFileCfg(usd_path=_ROBOT_USD),
+    )
+
+    fridge_visual = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Fridge",
+        spawn=sim_utils.UsdFileCfg(usd_path=_FRIDGE_USD),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=_FRIDGE_POS, rot=_FRIDGE_ROT),
+    )
+
+    cable_visual = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/WaterhoseCableCurves",
+        spawn=sim_utils.UsdFileCfg(usd_path=_CABLE_VISUAL_USD),
+    )
 
     light = AssetBaseCfg(
         prim_path="/World/Light",
@@ -101,12 +118,12 @@ class WaterhoseCoupledSceneCfg(InteractiveSceneCfg):
 
 
 @configclass
-class WaterhoseRobotDemoCoupledEnvCfg(ManagerBasedRLEnvCfg):
-    """Base manager-based waterhose task on the Newton coupled manager.
+class WaterhoseRobotDemoEnvCfg(ManagerBasedRLEnvCfg):
+    """Stable manager-based waterhose demo task.
 
-    Defaults to the stable one-way proxy coupling. Variants override
-    ``sim.physics.solver_cfg`` (and the scene where needed) to select a
-    different Newton coupling.
+    The MuJoCo robot is authoritative. Its gripper states drive VBD proxy
+    colliders, so the hose and plug feel the robot while the robot does not
+    receive VBD feedback.
     """
 
     scene: WaterhoseCoupledSceneCfg = WaterhoseCoupledSceneCfg(num_envs=1, env_spacing=2.5, replicate_physics=True)
@@ -151,3 +168,39 @@ class WaterhoseRobotDemoCoupledEnvCfg(ManagerBasedRLEnvCfg):
             }
         )
         self.isaac_teleop = make_waterhose_isaac_teleop_cfg(self.sim.device, self.xr)
+
+
+@configclass
+class WaterhoseRobotDemoCoupledEnvCfg(WaterhoseRobotDemoEnvCfg):
+    """ADMM-coupled variant of the waterhose demo task."""
+
+    sim: SimulationCfg = SimulationCfg(
+        dt=1.0 / 60.0,
+        render_interval=1,
+        physics=NewtonCfg(
+            solver_cfg=WaterhoseCoupledSolverCfg(asset_root=_DEFAULT_ASSET_ROOT),
+            num_substeps=8,
+            use_cuda_graph=True,
+            collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
+        ),
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.sim.dt = 1.0 / 60.0
+        self.sim.physics.num_substeps = 8
+
+
+@configclass
+class WaterhoseRobotDemoProxyCoupledEnvCfg(WaterhoseRobotDemoEnvCfg):
+    """Two-way proxy-coupled variant of the waterhose demo task."""
+
+    sim: SimulationCfg = SimulationCfg(
+        dt=1.0 / 100.0,
+        render_interval=1,
+        physics=NewtonCfg(
+            solver_cfg=WaterhoseProxyCoupledSolverCfg(asset_root=_DEFAULT_ASSET_ROOT),
+            num_substeps=10,
+            use_cuda_graph=True,
+        ),
+    )
