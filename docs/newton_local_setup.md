@@ -1,6 +1,6 @@
 # Isaac Lab Newton Local Setup
 
-Last verified: 2026-05-20.
+Last verified: 2026-06-01.
 
 This workspace uses sibling checkouts under `/home/maximiliank/Work`.
 
@@ -9,12 +9,12 @@ This workspace uses sibling checkouts under `/home/maximiliank/Work`.
 - Isaac Lab feature reference: `/home/maximiliank/Work/IsaacLab` on `feat/newton-implicit-mpm`.
 - Isaac Lab MPM base: `/home/maximiliank/Work/IsaacLab-mpm` on `max/newton-mpm-manager`.
 - Isaac Lab coupling worktree: `/home/maximiliank/Work/IsaacLab-coupling` on `max/newton-coupling-manager`.
-- Newton PR 2848 reference: `/home/maximiliank/Work/newton` on `pr-2848-coupled-solver-framework-fresh`.
+- Newton PR 2848 reference: `/home/maximiliank/Work/newton` on `pr-2848-head-latest`.
 
 The verified Newton PR 2848 commit is:
 
 ```text
-e9851d3e11ad35e879e818c789570eb4fa5b0264
+8be890dd7ff7fc4e2e1e67b1a9b4552adab1e6de
 ```
 
 `origin/pr-2848-head` was refreshed directly from `refs/pull/2848/head` and points at that same commit.
@@ -29,13 +29,13 @@ Install the local Newton checkout editable into the Isaac Lab Python environment
 
 The coupling manager expects Newton PR 2848 APIs, especially:
 
-- `newton.solvers.coupled_experimental.SolverCoupled`
-- `newton.solvers.coupled_experimental.SolverProxyCoupled`
-- `newton.solvers.coupled_experimental.SolverAdmmCoupled`
+- `newton.solvers.experimental.coupled.SolverCoupled`
+- `newton.solvers.experimental.coupled.SolverCoupledProxy`
+- `newton.solvers.experimental.coupled.SolverCoupledAdmm`
 - `SolverCoupled.Entry(..., configure_view=..., substeps=..., in_place=...)`
-- `SolverProxyCoupled.Proxy(..., bodies=..., particles=..., collision_pipeline=..., collide_interval=...)`
-- `SolverAdmmCoupled.ContactPair(...)`
-- `SolverAdmmCoupled.add_body_particle_attachment(...)`
+- `SolverCoupledProxy.Proxy(..., bodies=..., particles=..., collision_pipeline=..., collide_interval=...)`
+- `SolverCoupledAdmm.ContactPair(...)`
+- `SolverCoupledAdmm.add_body_particle_attachment(...)`
 
 ## Worktree Rule
 
