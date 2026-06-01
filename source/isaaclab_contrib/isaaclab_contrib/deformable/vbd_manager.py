@@ -31,6 +31,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _rotate_vector_by_quat_np(quat_xyzw: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    """Rotate a 3D vector by an ``xyzw`` quaternion."""
+
+    quat = np.asarray(quat_xyzw, dtype=np.float64)
+    norm = float(np.linalg.norm(quat))
+    if not np.isfinite(norm) or norm <= 1.0e-12:
+        return vec
+    quat = quat / norm
+    q_vec = quat[:3]
+    q_w = quat[3]
+    t = 2.0 * np.cross(q_vec, vec)
+    return vec + q_w * t + np.cross(q_vec, t)
+
+
 @wp.kernel(enable_backward=False)
 def _write_free_joint_q_from_body_q(
     free_joint_ids: wp.array(dtype=int),
@@ -269,11 +283,6 @@ class NewtonVBDManager(NewtonManager):
         if not cls._clone_physics_only and cls._cable_registry:
             import re
 
-            import usdrt
-
-            if NewtonManager._usdrt_stage is None:
-                NewtonManager._usdrt_stage = get_current_stage(fabric=True)
-
             stage = get_current_stage()
             curves_registered = False
             for entry in cls._cable_registry:
@@ -295,27 +304,6 @@ class NewtonVBDManager(NewtonManager):
                             expected_points,
                         )
                         continue
-                    fab_prim = NewtonManager._usdrt_stage.GetPrimAtPath(curve_prim.GetPath().pathString)
-                    xformable_prim = usdrt.Rt.Xformable(fab_prim)
-                    if not xformable_prim.HasWorldXform():
-                        xformable_prim.SetWorldXformFromUsd()
-                    # Pre-seed Fabric ``points``: without this Hydra reads an empty array on frame 0.
-                    fab_points_attr = fab_prim.GetAttribute("points")
-                    if not fab_points_attr.IsValid():
-                        fab_points_attr = fab_prim.CreateAttribute(
-                            "points", usdrt.Sdf.ValueTypeNames.Point3fArray, True
-                        )
-                    fab_points_attr.Set(
-                        usdrt.Vt.Vec3fArray([usdrt.Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in usd_points])
-                    )
-                    fab_prim.CreateAttribute(cls._newton_cable_body_offset_attr, usdrt.Sdf.ValueTypeNames.UInt, True)
-                    fab_prim.GetAttribute(cls._newton_cable_body_offset_attr).Set(int(body_offset))
-                    fab_prim.CreateAttribute(cls._newton_cable_body_count_attr, usdrt.Sdf.ValueTypeNames.UInt, True)
-                    fab_prim.GetAttribute(cls._newton_cable_body_count_attr).Set(len(entry.edges))
-                    fab_prim.CreateAttribute(
-                        cls._newton_cable_last_edge_length_attr, usdrt.Sdf.ValueTypeNames.Float, True
-                    )
-                    fab_prim.GetAttribute(cls._newton_cable_last_edge_length_attr).Set(float(entry.last_edge_length))
                     curves_registered = True
             if curves_registered:
                 cls._mark_curves_dirty()
@@ -413,46 +401,72 @@ class NewtonVBDManager(NewtonManager):
     def sync_curves_to_usd(cls) -> None:
         """Update cable ``UsdGeomBasisCurves.points`` from Newton ``body_q``.
 
-        Runs on the CPU Fabric device because Kit/Hydra reads that bucket for
-        runtime-spawned ``UsdGeomBasisCurves``.
+        Kit renders the authored USD ``BasisCurves`` asset for the waterhose.
+        Write those curve points through pxr USD instead of Fabric array
+        attributes: Kit 110 rejects Python-side Fabric data sources for
+        ``Point3fArray`` in this path, which leaves the viewport in a bad state.
         """
-        if cls._usdrt_stage is None or cls._state_0 is None or cls._state_0.body_q is None:
+        if cls._clone_physics_only or cls._state_0 is None or cls._state_0.body_q is None:
             return
         if not getattr(cls, "_cable_registry", None) or not cls._curves_dirty:
             return
-        import usdrt
-
-        selection = cls._usdrt_stage.SelectPrims(
-            require_attrs=[
-                (usdrt.Sdf.ValueTypeNames.Point3fArray, "points", usdrt.Usd.Access.ReadWrite),
-                (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_cable_body_offset_attr, usdrt.Usd.Access.Read),
-                (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_cable_body_count_attr, usdrt.Usd.Access.Read),
-                (usdrt.Sdf.ValueTypeNames.Float, cls._newton_cable_last_edge_length_attr, usdrt.Usd.Access.Read),
-                (usdrt.Sdf.ValueTypeNames.Matrix4d, "omni:fabric:worldMatrix", usdrt.Usd.Access.Read),
-            ],
-            device="cpu",
-        )
-        if selection.GetCount() == 0:
+        stage = get_current_stage()
+        if stage is None:
             return
 
-        # wp.launch requires inputs on the same device as the launch.
-        if cls._cable_body_q_cpu is None or cls._cable_body_q_cpu.shape != cls._state_0.body_q.shape:
-            cls._cable_body_q_cpu = wp.empty_like(cls._state_0.body_q, device="cpu")
-        wp.copy(cls._cable_body_q_cpu, cls._state_0.body_q)
+        try:
+            from pxr import Gf, UsdGeom, Vt  # noqa: PLC0415
+        except Exception:
+            return
 
-        wp.launch(
-            _sync_cable_curve_points,
-            dim=selection.GetCount(),
-            inputs=[
-                wp.fabricarrayarray(data=selection, attrib="points", dtype=wp.vec3f),
-                wp.fabricarray(data=selection, attrib="omni:fabric:worldMatrix"),
-                wp.fabricarray(data=selection, attrib=cls._newton_cable_body_offset_attr),
-                wp.fabricarray(data=selection, attrib=cls._newton_cable_body_count_attr),
-                wp.fabricarray(data=selection, attrib=cls._newton_cable_last_edge_length_attr),
-                cls._cable_body_q_cpu,
-            ],
-            device="cpu",
-        )
+        try:
+            body_q = cls._state_0.body_q.numpy()
+        except Exception:
+            return
+
+        import re
+
+        xform_cache = UsdGeom.XformCache()
+        for entry in cls._cable_registry:
+            curve_template_path = entry.curve_prim_path or f"{entry.prim_path}/geometry/mesh"
+            point_count = len(entry.edges) + 1
+            if point_count < 2:
+                continue
+            for inst_idx, body_offset in enumerate(entry.body_offsets):
+                if int(body_offset) + len(entry.edges) > body_q.shape[0]:
+                    continue
+                resolved = re.sub(r"(?<=[Ee]nv_)\.\*", str(inst_idx), curve_template_path)
+                resolved = re.sub(r"\.\*", str(inst_idx), resolved)
+                curve_prim = stage.GetPrimAtPath(resolved)
+                if not curve_prim or not curve_prim.IsValid():
+                    continue
+
+                world_to_local = xform_cache.GetLocalToWorldTransform(curve_prim).GetInverse()
+                local_points = []
+                for point_idx in range(len(entry.edges)):
+                    pose = body_q[int(body_offset) + point_idx]
+                    point_world = Gf.Vec3d(float(pose[0]), float(pose[1]), float(pose[2]))
+                    local_points.append(world_to_local.Transform(point_world))
+
+                tail_pose = body_q[int(body_offset) + len(entry.edges) - 1]
+                tail_offset = _rotate_vector_by_quat_np(
+                    np.asarray(tail_pose[3:7], dtype=np.float64),
+                    np.asarray((0.0, 0.0, float(entry.last_edge_length)), dtype=np.float64),
+                )
+                tail_world_np = np.asarray(tail_pose[:3], dtype=np.float64) + tail_offset
+                tail_world = Gf.Vec3d(float(tail_world_np[0]), float(tail_world_np[1]), float(tail_world_np[2]))
+                local_points.append(world_to_local.Transform(tail_world))
+
+                curve = UsdGeom.BasisCurves(curve_prim)
+                curve.GetPointsAttr().Set(
+                    Vt.Vec3fArray(
+                        [Gf.Vec3f(float(point[0]), float(point[1]), float(point[2])) for point in local_points]
+                    )
+                )
+                vertex_counts_attr = curve.GetCurveVertexCountsAttr()
+                vertex_counts = vertex_counts_attr.Get() if vertex_counts_attr else None
+                if vertex_counts is None or sum(int(count) for count in vertex_counts) != point_count:
+                    vertex_counts_attr.Set(Vt.IntArray([point_count]))
         cls._curves_dirty = False
 
     @classmethod

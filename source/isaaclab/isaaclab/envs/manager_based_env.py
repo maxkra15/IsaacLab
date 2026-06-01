@@ -181,8 +181,8 @@ class ManagerBasedEnv:
         # non-rendering modes.
         # Initialize when a Kit viewport exists. ViewportCameraController uses omni.kit (renderer camera);
         # skip in kitless Newton-only runs (e.g. --viz rerun) where no Kit app is running.
-        has_visualizers = self.sim.has_active_visualizers()
-        if (self.sim.has_gui or has_visualizers) and has_kit():
+        has_kit_visualizer = "kit" in set(self.sim.resolve_visualizer_types())
+        if (self.sim.has_gui or has_kit_visualizer) and has_kit():
             self.viewport_camera_controller = ViewportCameraController(self, self.cfg.viewer)
         else:
             self.viewport_camera_controller = None

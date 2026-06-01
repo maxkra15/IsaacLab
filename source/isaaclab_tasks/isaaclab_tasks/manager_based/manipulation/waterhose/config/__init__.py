@@ -3,4 +3,4 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Waterhose manipulation tasks."""
+"""Robot-specific waterhose task configurations."""

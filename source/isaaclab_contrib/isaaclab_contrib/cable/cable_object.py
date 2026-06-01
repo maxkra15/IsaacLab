@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import newton
+import numpy as np
 import warp as wp
 from isaaclab_newton.assets.articulation.articulation import Articulation
 from isaaclab_newton.physics import NewtonManager as SimulationManager
@@ -20,6 +22,22 @@ import isaaclab.sim as sim_utils
 
 if TYPE_CHECKING:
     from .cable_object_cfg import CableObjectCfg
+
+logger = logging.getLogger(__name__)
+
+
+def _rotate_vector_by_quat_np(quat_xyzw: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    """Rotate a 3D vector by an ``xyzw`` quaternion."""
+
+    quat = np.asarray(quat_xyzw, dtype=np.float64)
+    norm = float(np.linalg.norm(quat))
+    if not np.isfinite(norm) or norm <= 1.0e-12:
+        return vec
+    quat = quat / norm
+    q_vec = quat[:3]
+    q_w = quat[3]
+    t = 2.0 * np.cross(q_vec, vec)
+    return vec + q_w * t + np.cross(q_vec, t)
 
 
 @dataclass
@@ -172,7 +190,7 @@ def apply_cable_attachments_to_builder(
     world_idx: int,
     env_position: list[float],
     env_rotation: list[float] | tuple[float, float, float, float],
-) -> None:
+) -> list[int]:
     """Per-world hook that realizes pending cable attachments as Newton fixed joints.
 
     Args:
@@ -183,8 +201,10 @@ def apply_cable_attachments_to_builder(
     """
     pending = getattr(SimulationManager, "_pending_cable_attachments", None)
     if not pending:
-        return
+        return []
 
+    joint_ids: list[int] = []
+    joint_ids_by_cable: dict[int, list[int]] = {}
     for cable_idx, attachment in pending:
         entry = SimulationManager._cable_registry[cable_idx]
         segments_in_world = entry.segment_body_indices[world_idx]
@@ -247,7 +267,7 @@ def apply_cable_attachments_to_builder(
         # Keep the articulated cable segment as the loop-joint child. Targets may be
         # static scene bodies (or world, -1) with no articulation, while the cable
         # segment is already reachable through the cable root articulation.
-        builder.add_joint_fixed(
+        joint_id = builder.add_joint_fixed(
             parent=target_body_idx,
             child=cable_body_idx,
             parent_xform=target_xform,
@@ -255,6 +275,18 @@ def apply_cable_attachments_to_builder(
             label=f"{entry.prim_path}/attachment_seg{anchor_idx}_w{world_idx}",
             collision_filter_parent=True,
         )
+        joint_id = int(joint_id)
+        joint_ids.append(joint_id)
+        joint_ids_by_cable.setdefault(int(cable_idx), []).append(joint_id)
+
+    for cable_idx, cable_joint_ids in joint_ids_by_cable.items():
+        if not cable_joint_ids:
+            continue
+        entry = SimulationManager._cable_registry[cable_idx]
+        expanded_prim_path = entry.prim_path.replace("env_.*", f"env_{world_idx}")
+        builder.add_articulation(cable_joint_ids, label=f"{expanded_prim_path}/attachment_articulation")
+
+    return joint_ids
 
 
 def install_cable_builder_hooks() -> None:
@@ -263,10 +295,112 @@ def install_cable_builder_hooks() -> None:
     SimulationManager._pending_cable_attachments = []
     if not hasattr(SimulationManager, "_per_world_builder_hooks"):
         SimulationManager._per_world_builder_hooks = []
-    if add_registered_cables_to_builder not in SimulationManager._per_world_builder_hooks:
-        SimulationManager._per_world_builder_hooks.append(add_registered_cables_to_builder)
-    if apply_cable_attachments_to_builder not in SimulationManager._per_world_builder_hooks:
-        SimulationManager._per_world_builder_hooks.append(apply_cable_attachments_to_builder)
+    SimulationManager._per_world_builder_hooks = [
+        hook
+        for hook in SimulationManager._per_world_builder_hooks
+        if hook
+        not in (
+            add_registered_cables_to_builder,
+            apply_cable_attachments_to_builder,
+        )
+    ]
+    SimulationManager._per_world_builder_hooks.append(add_registered_cables_to_builder)
+    SimulationManager._per_world_builder_hooks.append(apply_cable_attachments_to_builder)
+    SimulationManager.register_pre_render_callback("cable_curve_sync", sync_registered_cable_curves_to_usd)
+
+
+def sync_registered_cable_curves_to_usd() -> None:
+    """Update registered cable ``UsdGeomBasisCurves.points`` from Newton body poses.
+
+    Cable segment bodies are created by builder hooks and intentionally do not
+    have authored USD prims. Kit renders the authored cable curve USD, so the
+    curve control points must be updated explicitly from the live Newton rod
+    segment body transforms before each render.
+    """
+    if getattr(SimulationManager, "_clone_physics_only", False):
+        return
+    state = SimulationManager._state_0
+    if state is None or state.body_q is None:
+        return
+    registry = getattr(SimulationManager, "_cable_registry", None)
+    if not registry:
+        return
+
+    from isaaclab.sim.utils.stage import get_current_stage
+
+    stage = get_current_stage()
+    if stage is None:
+        return
+
+    try:
+        from pxr import Gf, UsdGeom, Vt  # noqa: PLC0415
+    except Exception:
+        return
+
+    try:
+        body_q = state.body_q.numpy()
+    except Exception:
+        return
+
+    xform_cache = UsdGeom.XformCache()
+    for entry in registry:
+        curve_template_path = entry.curve_prim_path or f"{entry.prim_path}/geometry/mesh"
+        point_count = len(entry.edges) + 1
+        if point_count < 2:
+            continue
+        for inst_idx, body_offset in enumerate(entry.body_offsets):
+            if int(body_offset) + len(entry.edges) > body_q.shape[0]:
+                continue
+            resolved = re.sub(r"(?<=[Ee]nv_)\.\*", str(inst_idx), curve_template_path)
+            resolved = re.sub(r"\.\*", str(inst_idx), resolved)
+            curve_prim = stage.GetPrimAtPath(resolved)
+            if not curve_prim or not curve_prim.IsValid():
+                logger.debug("[cable_curve_sync] curve prim not found at %s", resolved)
+                continue
+
+            world_to_local = xform_cache.GetLocalToWorldTransform(curve_prim).GetInverse()
+            local_points = []
+            for point_idx in range(len(entry.edges)):
+                pose = body_q[int(body_offset) + point_idx]
+                point_world = Gf.Vec3d(float(pose[0]), float(pose[1]), float(pose[2]))
+                local_points.append(world_to_local.Transform(point_world))
+
+            tail_pose = body_q[int(body_offset) + len(entry.edges) - 1]
+            tail_offset = _rotate_vector_by_quat_np(
+                np.asarray(tail_pose[3:7], dtype=np.float64),
+                np.asarray((0.0, 0.0, float(entry.last_edge_length)), dtype=np.float64),
+            )
+            tail_world_np = np.asarray(tail_pose[:3], dtype=np.float64) + tail_offset
+            tail_world = Gf.Vec3d(float(tail_world_np[0]), float(tail_world_np[1]), float(tail_world_np[2]))
+            local_points.append(world_to_local.Transform(tail_world))
+
+            curve = UsdGeom.BasisCurves(curve_prim)
+            curve.GetPointsAttr().Set(
+                Vt.Vec3fArray([Gf.Vec3f(float(point[0]), float(point[1]), float(point[2])) for point in local_points])
+            )
+            vertex_counts_attr = curve.GetCurveVertexCountsAttr()
+            vertex_counts = vertex_counts_attr.Get() if vertex_counts_attr else None
+            if vertex_counts is None or sum(int(count) for count in vertex_counts) != point_count:
+                vertex_counts_attr.Set(Vt.IntArray([point_count]))
+
+
+def _active_solver_cfg_supports_cables() -> bool:
+    """Return whether the active Newton solver cfg contains a VBD cable-owning solver."""
+    from isaaclab.physics import PhysicsManager
+    from isaaclab_newton.physics import CoupledSolverCfg
+    from isaaclab_contrib.deformable.newton_manager_cfg import (
+        CoupledFeatherstoneVBDSolverCfg,
+        CoupledMJWarpVBDSolverCfg,
+        VBDSolverCfg,
+    )
+
+    physics_cfg = PhysicsManager._cfg
+    solver_cfg = getattr(physics_cfg, "solver_cfg", None)
+    if isinstance(solver_cfg, (VBDSolverCfg, CoupledMJWarpVBDSolverCfg, CoupledFeatherstoneVBDSolverCfg)):
+        return True
+    if isinstance(solver_cfg, CoupledSolverCfg):
+        return any(isinstance(getattr(entry_cfg, "solver_cfg", None), VBDSolverCfg) for entry_cfg in solver_cfg.entries)
+    return False
 
 
 class CableObject(Articulation):
@@ -316,10 +450,14 @@ class CableObject(Articulation):
         # env-cfg module before Kit starts without polluting ``pxr`` caches.
         from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdShade
 
+        if not hasattr(SimulationManager, "_cable_registry") and _active_solver_cfg_supports_cables():
+            install_cable_builder_hooks()
+
         if not hasattr(SimulationManager, "_cable_registry"):
             raise RuntimeError(
                 "CableObject can only be simulated under the Newton VBD solver"
-                " (`VBDSolverCfg` or one of its coupled variants:"
+                " (`VBDSolverCfg`, a generic `CoupledSolverCfg` with a `VBDSolverCfg` entry,"
+                " or one of the legacy coupled variants:"
                 " `CoupledMJWarpVBDSolverCfg`, `CoupledFeatherstoneVBDSolverCfg`)."
                 " The cable registry is installed by the VBD manager's `initialize()`"
                 " hook via `install_cable_builder_hooks()`, and `JointType.CABLE`"

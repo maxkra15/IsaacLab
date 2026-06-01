@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import os
 import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -24,17 +23,20 @@ os.environ.setdefault("ISAACLAB_REPLACE_NEWTON_SHAPE_COLORS", "0")
 from isaaclab.app import AppLauncher
 
 
-DEFAULT_TASK = "Isaac-Waterhose-Robot-Demo-v0"
-DEFAULT_ASSET_ROOT = str(
-    Path(__file__).resolve().parents[3] / "source" / "isaaclab_assets" / "data" / "WaterhoseDemo"
-)
+DEFAULT_TASK = "Isaac-Waterhose-Coupled-v0"
+DEFAULT_MAX_STEPS = 3200
 SUPPORTED_VISUALIZERS = {"kit", "newton", "none"}
+# KitVisualizer uses eye/lookat; this lookat is one meter along camera-local -Z
+# from the authored Kit transform translate=(-0.9, 0.6, 0.3), rotateXYZ=(73.32259, 0, -112.30437).
+KIT_CAMERA_EYE = (-0.9, 0.6, 0.3)
+KIT_CAMERA_LOOKAT = (-0.013736291, 0.236437794, 0.013017143)
+NEWTON_CAMERA_EYE = (-2.55, -7.1, 2.3)
+NEWTON_CAMERA_LOOKAT = (0.55, -0.42, 0.9)
 SCENE_CONFIG_COUPLED_TASKS = {
-    "Isaac-Waterhose-v0",
-    "Isaac-Waterhose-Proxy-v0",
-    "Isaac-Waterhose-RBY1-IK-Abs-v0",
-    "Isaac-Waterhose-Robot-Demo-Coupled-v0",
-    "Isaac-Waterhose-Robot-Demo-Proxy-Coupled-v0",
+    "Isaac-Waterhose-Coupled-v0",
+}
+SCENE_CONFIG_SCRIPTED_TASKS = {
+    "Isaac-Waterhose-Coupled-v0",
 }
 
 
@@ -162,25 +164,19 @@ def _ensure_local_isaacsim_kit_args(args_cli: argparse.Namespace, selected_visua
         _debug_runner(f"kit_args={kit_args}")
 
 
-def _prewarm_static_scene_cache(asset_root: str) -> None:
-    """Generate the Newton static-scene collision cache before Kit starts."""
+def _ensure_display_for_visible_visualizer(selected_visualizers: set[str]) -> None:
+    """Use a local X display for visible visualizers when the shell did not export DISPLAY."""
 
-    command = [
-        sys.executable,
-        "-c",
-        (
-            "import sys; "
-            "from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_builder "
-            "import ensure_static_scene_cache; "
-            "ensure_static_scene_cache(sys.argv[1])"
-        ),
-        asset_root,
-    ]
-    result = subprocess.run(command, env=os.environ.copy(), check=False)
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Failed to prepare the waterhose static-scene collision cache required for Kit visualization."
-        )
+    if not ({"kit", "newton"} & selected_visualizers):
+        return
+    if os.environ.get("DISPLAY"):
+        return
+    x11_root = Path("/tmp/.X11-unix")
+    for display in ("1", "0"):
+        if (x11_root / f"X{display}").exists():
+            os.environ["DISPLAY"] = f":{display}"
+            _debug_runner(f"DISPLAY was unset; using DISPLAY=:{display}")
+            return
 
 
 def _uses_scene_config_coupled_task() -> bool:
@@ -189,42 +185,21 @@ def _uses_scene_config_coupled_task() -> bool:
     return args_cli.task.split(":")[-1] in SCENE_CONFIG_COUPLED_TASKS
 
 
-parser = argparse.ArgumentParser(description="Run the waterhose robot demo through IsaacLab.")
+parser = argparse.ArgumentParser(description="Run the scripted waterhose robot demo through IsaacLab.")
 parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
-parser.add_argument("--mode", choices=("scripted", "teleop"), default="scripted", help="Control mode.")
-parser.add_argument("--teleop", action="store_true", help="Alias for --mode teleop.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
-parser.add_argument("--max_steps", type=int, default=2000, help="Maximum manager steps to run.")
+parser.add_argument("--max_steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum manager steps to run.")
 parser.add_argument("--max_demo_steps", type=int, default=0, help="Optional env-level termination bound; 0 disables it.")
-parser.add_argument(
-    "--newton_root",
-    type=str,
-    default=os.getenv("NEWTON_ROOT", ""),
-    help="Optional Newton repo root to add to PYTHONPATH when Newton is not installed in the environment.",
-)
+parser.add_argument("--settle_time", type=float, default=4.0, help="Initial settle time for scene-config scripted IK demos.")
+parser.add_argument("--debug_script", action="store_true", help="Print phase transitions for scene-config scripted IK demos.")
 parser.add_argument(
     "--asset_root",
     type=str,
     default=os.getenv("WATERHOSE_ASSETS_DIR", ""),
     help="Optional WaterhoseDemo asset root. The packaged task assets are used when omitted.",
 )
-parser.add_argument("--teleop_device", type=str, default=None, help="Teleop device. Use spacemouse.")
-parser.add_argument("--sensitivity", type=float, default=1.0, help="Teleop sensitivity scale.")
 parser.add_argument("--profile", action="store_true", help="Print rollout timing after the run.")
-parser.add_argument("--debug_teleop", action="store_true", help="Print periodic teleop commands.")
 AppLauncher.add_app_launcher_args(parser)
-parser.add_argument("--spacemouse_pos_sensitivity", type=float, default=None)
-parser.add_argument("--spacemouse_rot_sensitivity", type=float, default=None)
-parser.add_argument("--spacemouse_simple_x_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
-parser.add_argument("--spacemouse_simple_y_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
-parser.add_argument("--spacemouse_simple_z_sign", type=float, choices=(-1.0, 1.0), default=1.0)
-parser.add_argument("--spacemouse_simple_yaw_sign", type=float, choices=(-1.0, 1.0), default=-1.0)
-parser.add_argument("--spacemouse_simple_deadzone", type=float, default=1.0e-3)
-parser.add_argument(
-    "--spacemouse_simple_yaw_translation_lock",
-    action=argparse.BooleanOptionalAction,
-    default=False,
-)
 parser.add_argument(
     "--vis",
     dest="visualizer",
@@ -235,21 +210,14 @@ parser.add_argument(
 args_cli = parser.parse_args()
 _install_faulthandler()
 
-if args_cli.teleop:
-    args_cli.mode = "teleop"
 if args_cli.num_envs < 1:
     parser.error("--num_envs must be at least 1.")
-if args_cli.mode == "teleop" and args_cli.teleop_device not in (None, "keyboard", "spacemouse"):
-    parser.error("This demo currently supports --teleop_device keyboard or spacemouse.")
-if args_cli.mode == "teleop" and args_cli.teleop_device is None:
-    args_cli.teleop_device = "spacemouse"
 
 selected_visualizers = validate_visualizers(args_cli, parser)
-if args_cli.mode == "teleop" and args_cli.teleop_device == "keyboard" and "kit" not in selected_visualizers:
-    parser.error("Keyboard teleop requires a Kit window. Use --vis kit.")
 _prefer_cuda_for_waterhose_xr(args_cli)
 if args_cli.asset_root:
     os.environ["WATERHOSE_ASSETS_DIR"] = args_cli.asset_root
+_ensure_display_for_visible_visualizer(selected_visualizers)
 _ensure_local_isaacsim_kit_args(args_cli, selected_visualizers)
 
 
@@ -261,59 +229,7 @@ def _configure_env_cfg(env_cfg) -> None:
         env_cfg.max_demo_steps = int(args_cli.max_demo_steps)
     physics_cfg = env_cfg.sim.physics
     if not isinstance(physics_cfg, NewtonCfg):
-        raise TypeError(
-            "Expected NewtonCfg(solver_cfg=WaterhoseOneWaySolverCfg|WaterhoseCoupledSolverCfg|"
-            "WaterhoseProxyCoupledSolverCfg), "
-            f"got {type(physics_cfg).__name__}."
-        )
-
-    solver_cfg = physics_cfg.solver_cfg
-    try:
-        from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_manager import (  # noqa: PLC0415
-            WaterhoseCoupledSolverCfg,
-            WaterhoseOneWaySolverCfg,
-            WaterhoseProxyCoupledSolverCfg,
-        )
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "The waterhose robot demo requires the Newton coupled-manager API in isaaclab_newton."
-        ) from exc
-
-    solver_types = (WaterhoseCoupledSolverCfg, WaterhoseOneWaySolverCfg, WaterhoseProxyCoupledSolverCfg)
-    if not isinstance(solver_cfg, solver_types):
-        return
-    if isinstance(solver_cfg, WaterhoseOneWaySolverCfg) and int(env_cfg.scene.num_envs) != 1:
-        raise ValueError(
-            "Isaac-Waterhose-Robot-Demo-v0 is the stable task-local one-way demo and currently supports "
-            "one environment when using upstream Newton PR 2848. Use "
-            "Isaac-Waterhose-Robot-Demo-Proxy-Coupled-v0 or Isaac-Waterhose-Robot-Demo-Coupled-v0 for "
-            "standard scene-config multi-env coupling."
-        )
-
-    solver_cfg.num_envs = int(env_cfg.scene.num_envs)
-    solver_cfg.env_spacing = float(env_cfg.scene.env_spacing)
-    if hasattr(solver_cfg, "newton_root"):
-        solver_cfg.newton_root = args_cli.newton_root
-    solver_cfg.asset_root = args_cli.asset_root or getattr(solver_cfg, "asset_root", DEFAULT_ASSET_ROOT)
-    _configure_scene_visual_assets(env_cfg.scene, solver_cfg.asset_root)
-    if hasattr(solver_cfg, "max_demo_steps"):
-        solver_cfg.max_demo_steps = int(args_cli.max_demo_steps)
-
-
-def _configure_scene_visual_assets(scene_cfg, asset_root: str) -> None:
-    """Keep IsaacLab scene visuals in sync with the Newton builder asset root."""
-
-    root = Path(asset_root).expanduser().resolve()
-    usd_paths = {
-        "robot_visual": root / "rby1df" / "rby1df.usda",
-        "fridge_visual": root / "fridge" / "fridge.usda",
-        "cable_visual": root / "Waterhose" / "Cable008" / "curve" / "cable_SRA_curve03.usda",
-    }
-    for attr_name, usd_path in usd_paths.items():
-        asset_cfg = getattr(scene_cfg, attr_name, None)
-        spawn_cfg = getattr(asset_cfg, "spawn", None)
-        if spawn_cfg is not None and hasattr(spawn_cfg, "usd_path"):
-            spawn_cfg.usd_path = str(usd_path)
+        raise TypeError(f"Expected a Newton-backed task config, got {type(physics_cfg).__name__}.")
 
 
 def _configure_visualizers(env_cfg) -> None:
@@ -323,8 +239,8 @@ def _configure_visualizers(env_cfg) -> None:
 
         visualizer_cfgs.append(
             KitVisualizerCfg(
-                eye=(-2.55, -7.1, 2.3),
-                lookat=(0.55, -0.42, 0.9),
+                eye=KIT_CAMERA_EYE,
+                lookat=KIT_CAMERA_LOOKAT,
             )
         )
     if "newton" in selected_visualizers:
@@ -332,8 +248,8 @@ def _configure_visualizers(env_cfg) -> None:
 
         visualizer_cfgs.append(
             NewtonVisualizerCfg(
-                eye=(-2.55, -7.1, 2.3),
-                lookat=(0.55, -0.42, 0.9),
+                eye=NEWTON_CAMERA_EYE,
+                lookat=NEWTON_CAMERA_LOOKAT,
                 show_static=True,
             )
         )
@@ -359,40 +275,15 @@ def _simulation_is_running(env) -> bool:
     return True
 
 
-def _set_task_teleop_enabled(env_cfg, enabled: bool) -> None:
-    """Enable teleop on the selected waterhose Newton manager."""
-
-    solver_cfg = env_cfg.sim.physics.solver_cfg
-
-    try:
-        from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_manager import (  # noqa: PLC0415
-            NewtonWaterhoseCoupledManager,
-            WaterhoseCoupledSolverCfg,
-            WaterhoseOneWaySolverCfg,
-            WaterhoseProxyCoupledSolverCfg,
-        )
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "Teleop for the waterhose robot demo requires the Newton coupled-manager API."
-        ) from exc
-
-    if isinstance(solver_cfg, (WaterhoseCoupledSolverCfg, WaterhoseOneWaySolverCfg, WaterhoseProxyCoupledSolverCfg)):
-        NewtonWaterhoseCoupledManager.set_teleop_enabled(enabled)
-
-
 def _run_env(env_cfg) -> None:
     import gymnasium as gym  # noqa: PLC0415
     import torch  # noqa: PLC0415
-    from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.teleop import (  # noqa: PLC0415
-        create_waterhose_keyboard_device,
-        create_waterhose_spacemouse_device,
-    )
 
     env = None
     step = 0
     start = time.perf_counter()
     rollout_start = start
-    teleop_interface = None
+    scripted_state = None
     try:
         _debug_runner("gym_make:start")
         env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
@@ -401,31 +292,25 @@ def _run_env(env_cfg) -> None:
         env.reset()
         _debug_runner("reset:done")
         actions = torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device)
-        if args_cli.mode == "teleop":
-            if args_cli.teleop_device == "keyboard":
-                teleop_interface = create_waterhose_keyboard_device(args_cli, args_cli.sensitivity)
-            else:
-                teleop_interface = create_waterhose_spacemouse_device(args_cli, args_cli.sensitivity)
-            teleop_interface.reset()
-            _set_task_teleop_enabled(env_cfg, True)
-            print(f"[INFO] Teleop device: {teleop_interface}", flush=True)
+        task_name = args_cli.task.split(":")[-1]
+        if task_name in SCENE_CONFIG_SCRIPTED_TASKS:
+            from isaaclab_tasks.manager_based.manipulation.waterhose.scripted_state_machine import (  # noqa: PLC0415
+                create_scripted_policy,
+            )
+
+            scripted_state = create_scripted_policy(
+                env,
+                settle_time=args_cli.settle_time,
+                debug=args_cli.debug_script,
+            )
 
         rollout_start = time.perf_counter()
         _debug_runner(f"loop:start running={_simulation_is_running(env)} max_steps={args_cli.max_steps}")
         while _simulation_is_running(env) and step < args_cli.max_steps:
-            if teleop_interface is not None:
-                command = teleop_interface.advance()
+            if scripted_state is not None:
+                actions = scripted_state.compute(env)
+            else:
                 actions.zero_()
-                command = command.to(device=env.device, dtype=actions.dtype).reshape(-1)
-                width = min(actions.shape[1], command.numel())
-                actions[:, :width] = command[:width].reshape(1, width).repeat(env.num_envs, 1)
-                if args_cli.debug_teleop and step % 15 == 0:
-                    command_cpu = command.detach().cpu()
-                    print(
-                        "teleop command:",
-                        " ".join(f"{float(value):+.3f}" for value in command_cpu.tolist()),
-                        flush=True,
-                    )
             obs, rew, terminated, truncated, extras = env.step(actions)
             del obs, rew, extras
             if bool(torch.any(terminated | truncated).item()):
@@ -463,11 +348,7 @@ def main() -> None:
     if "kit" in selected_visualizers or _uses_scene_config_coupled_task():
         # The scene-config coupled tasks import Newton/USD builders while resolving
         # the task. SimulationApp must own the USD Python bindings first; otherwise
-        # Kit extensions can see preloaded pxr modules from the venv and fail during
-        # startup. The stable task-local one-way demo still needs its static-scene
-        # cache prewarmed for Kit display.
-        if "kit" in selected_visualizers and not _uses_scene_config_coupled_task():
-            _prewarm_static_scene_cache(args_cli.asset_root or DEFAULT_ASSET_ROOT)
+        # Kit extensions can see preloaded pxr modules from the venv and fail at startup.
         app_launcher = AppLauncher(args_cli)
         try:
             env_cfg = _parse_configured_env_cfg()

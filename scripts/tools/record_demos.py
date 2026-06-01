@@ -36,8 +36,6 @@ import argparse
 import contextlib
 import inspect
 import os
-from pathlib import Path
-import subprocess
 import sys
 
 # Isaac Lab AppLauncher
@@ -108,37 +106,11 @@ if args_cli.task is None:
     parser.error("--task is required")
 
 
-def _default_waterhose_asset_root() -> str:
-    return str(Path(__file__).resolve().parents[2] / "source" / "isaaclab_assets" / "data" / "WaterhoseDemo")
-
-
-def _prewarm_waterhose_static_scene_cache() -> None:
-    """Prepare the task-local Newton static-scene cache before Kit starts."""
-
-    if "Waterhose-Robot-Demo" not in args_cli.task:
-        return
-    asset_root = os.getenv("WATERHOSE_ASSETS_DIR", _default_waterhose_asset_root())
-    command = [
-        sys.executable,
-        "-c",
-        (
-            "import sys; "
-            "from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_builder "
-            "import ensure_static_scene_cache; "
-            "ensure_static_scene_cache(sys.argv[1])"
-        ),
-        asset_root,
-    ]
-    result = subprocess.run(command, env=os.environ.copy(), check=False)
-    if result.returncode != 0:
-        raise RuntimeError("Failed to prepare the waterhose static-scene collision cache.")
-
-
 def _prefer_cuda_for_waterhose_xr() -> None:
     """Keep the Newton waterhose runtime on CUDA for XR unless the user chose another device."""
 
     task = args_cli.task or ""
-    if "Waterhose-Robot-Demo" not in task:
+    if "Waterhose" not in task:
         return
     if not bool(getattr(args_cli, "xr", False)):
         return
@@ -172,7 +144,6 @@ def _prepare_interactive_recording_visualizer() -> None:
 
 _prepare_interactive_recording_visualizer()
 _prefer_cuda_for_waterhose_xr()
-_prewarm_waterhose_static_scene_cache()
 app_launcher_args = vars(args_cli)
 
 # launch the simulator
@@ -549,10 +520,8 @@ def process_success_condition(env: gym.Env, success_term: object | None, success
 
 
 def _reset_sim_for_recording(env: gym.Env) -> None:
-    """Reset the simulator when the backend supports it without rebuilding task-local Newton solver state."""
+    """Reset the simulator between recording episodes."""
 
-    if "Waterhose-Robot-Demo" in args_cli.task:
-        return
     env.sim.reset()
 
 

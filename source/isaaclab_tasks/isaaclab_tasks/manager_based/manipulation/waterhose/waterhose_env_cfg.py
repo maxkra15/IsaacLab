@@ -12,10 +12,20 @@ MDP config groups are copied from the Franka cable-plug task
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCollisionPipelineCfg
+from isaaclab_newton.physics import (
+    CoupledProxyCfg,
+    CoupledSolverCfg,
+    CoupledSolverEntryCfg,
+    MJWarpSolverCfg,
+    NewtonCollisionPipelineCfg,
+    ProxyCouplingCfg,
+)
+from isaaclab_newton.envs.mdp.actions.newton_ik_actions_cfg import NewtonInverseKinematicsActionCfg
+from isaaclab_newton.ik.newton_ik_manager_cfg import NewtonIKManagerCfg
 from isaaclab_newton.sim.spawners.materials.physics_materials_cfg import NewtonCableMaterialCfg
 from isaaclab_visualizers.kit.kit_visualizer_cfg import KitVisualizerCfg
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
@@ -25,8 +35,10 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.assets.rigid_object.rigid_object_cfg import RigidObjectCfg
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
+from isaaclab.devices.device_base import DevicesCfg
+from isaaclab.devices.keyboard import Se3KeyboardCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg, DifferentialInverseKinematicsActionCfg
+from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -39,14 +51,23 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 
 from isaaclab_contrib.cable.cable_object_cfg import CableAttachmentCfg, CableObjectCfg
-from isaaclab_contrib.coupling.coupled_manager_cfg import CoupledAdmmSolverCfg, CoupledProxySolverCfg
 from isaaclab_contrib.deformable.newton_manager_cfg import (
     CoupledNewtonCfg,
     NewtonModelCfg,
     VBDSolverCfg,
 )
 
-import isaaclab.envs.mdp as mdp
+import isaaclab_tasks.manager_based.manipulation.waterhose.mdp as mdp
+from isaaclab_tasks.manager_based.manipulation.waterhose.teleop import WaterhoseSpaceMouseCfg
+
+try:
+    import isaacteleop  # noqa: F401 -- IsaacTeleop pipeline builders need this at runtime.
+    from isaaclab_teleop import IsaacTeleopCfg, XrCfg
+
+    _TELEOP_AVAILABLE = True
+except ImportError:
+    _TELEOP_AVAILABLE = False
+    logging.getLogger(__name__).warning("isaaclab_teleop is not installed. XR teleoperation is disabled.")
 
 WATERHOSE_ASSETS_DIR = os.environ.get(
     "WATERHOSE_ASSETS_DIR",
@@ -56,6 +77,9 @@ WATERHOSE_ASSETS_DIR = os.environ.get(
 # rby1df robot: URDF converted to USD (scripts/tools/convert_urdf.py) then flattened
 # into a single self-contained asset.
 _RBY1_USD = os.path.join(WATERHOSE_ASSETS_DIR, "rby1df", "rby1df.usda")
+_RIGHT_GRIPPER_EE_FRAME_POS = (0.0, 0.0, -0.075)
+# USD stores xformOp:orient as (w, x, y, z); IsaacLab action offsets use (x, y, z, w).
+_RIGHT_GRIPPER_EE_FRAME_ROT = (0.70710677, 0.70710677, 0.0, 0.0)
 
 # add_rod_graph places each segment's body frame at the edge's start node u (edge
 # (u, v), +Z from u->v), so cable_local_pos=(0, 0, 0) welds at u. The anchor sits
@@ -75,6 +99,84 @@ _CABLE2_ANCHOR_NODE = _CABLE2_HEAD_NODE_1
 # solve (robot joints go NaN at step 0).
 _ANCHOR_POS = tuple(p + n for p, n in zip(_FRIDGE_POS, _CABLE1_ANCHOR_NODE))
 _ANCHOR2_POS = tuple(p + n for p, n in zip(_FRIDGE_POS, _CABLE2_ANCHOR_NODE))
+_KIT_CAMERA_EYE = (-0.9, 0.6, 0.3)
+_KIT_CAMERA_LOOKAT = (-0.013736291, 0.236437794, 0.013017143)
+_NEWTON_CAMERA_EYE = (-2.0, 1.5, 0.8)
+_NEWTON_CAMERA_LOOKAT = (0.0, 0.35, 0.2)
+_ROBOT_BASE_PRIM_PATH_ENV0 = "/World/envs/env_0/Robot/origin"
+
+
+def _build_waterhose_teleop_pipeline():
+    """Build the IsaacTeleop pipeline for the absolute Waterhose IK action space."""
+
+    from isaacteleop.retargeters import (
+        GripperRetargeter,
+        GripperRetargeterConfig,
+        Se3AbsRetargeter,
+        Se3RetargeterConfig,
+        TensorReorderer,
+    )
+    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource, HandsSource
+    from isaacteleop.retargeting_engine.interface import OutputCombiner, ValueInput
+    from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
+
+    controllers = ControllersSource(name="controllers")
+    hands = HandsSource(name="hands")
+    transform_input = ValueInput("world_T_anchor", TransformMatrix())
+    transformed_controllers = controllers.transformed(transform_input.output(ValueInput.VALUE))
+
+    se3_cfg = Se3RetargeterConfig(
+        input_device=ControllersSource.RIGHT,
+        zero_out_xy_rotation=False,
+        use_wrist_rotation=False,
+        use_wrist_position=False,
+        target_offset_roll=90.0,
+        target_offset_pitch=0.0,
+        target_offset_yaw=0.0,
+    )
+    se3 = Se3AbsRetargeter(se3_cfg, name="ee_pose")
+    connected_se3 = se3.connect(
+        {
+            ControllersSource.RIGHT: transformed_controllers.output(ControllersSource.RIGHT),
+        }
+    )
+
+    gripper_cfg = GripperRetargeterConfig(hand_side="right")
+    gripper = GripperRetargeter(gripper_cfg, name="gripper")
+    connected_gripper = gripper.connect(
+        {
+            ControllersSource.RIGHT: transformed_controllers.output(ControllersSource.RIGHT),
+            HandsSource.RIGHT: hands.output(HandsSource.RIGHT),
+        }
+    )
+
+    ee_pose_elements = ["pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w"]
+    gripper_elements = ["gripper_value"]
+    reorderer = TensorReorderer(
+        input_config={
+            "ee_pose": ee_pose_elements,
+            "gripper_command": gripper_elements,
+        },
+        output_order=ee_pose_elements + gripper_elements,
+        name="action_reorderer",
+        input_types={"ee_pose": "array", "gripper_command": "scalar"},
+    )
+    connected_reorderer = reorderer.connect(
+        {
+            "ee_pose": connected_se3.output("ee_pose"),
+            "gripper_command": connected_gripper.output("gripper_command"),
+        }
+    )
+
+    return OutputCombiner({"action": connected_reorderer.output("output")})
+
+
+def _make_proxy_collision_pipeline(model):
+    """Build the destination-view collision pipeline used by Newton proxy coupling."""
+    from newton import CollisionPipeline
+
+    return CollisionPipeline(model, broad_phase="explicit", rigid_contact_max=30000)
+
 
 _RBY1_IK_INITIAL_JOINT_POS = {
     "torso_joint_1": 0.0,
@@ -150,6 +252,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(usd_path=_RBY1_USD),
+        articulation_root_prim_path="/Geometry/origin",
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 1.0, -1.0),
             rot=(0.0, 0.0, -0.70710678, 0.70710678),  # 90 deg about +Z (x, y, z, w)
@@ -195,7 +298,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "cable001.usda"),
             physics_material=NewtonCableMaterialCfg(
                 stretch_stiffness=1e6,
-                bend_stiffness=2e1,
+                bend_stiffness=1e1,
                 stretch_damping=1e-5,
                 bend_damping=1e0,
                 density=1000.0,
@@ -294,7 +397,7 @@ class ActionsCfg:
     gripper_action = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*_gripper_finger_joint_1"],
-        scale=1.0,
+        scale=80.0,
         use_default_offset=True,
     )
 
@@ -323,7 +426,21 @@ class EventCfg:
     reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_scale,
         mode="reset",
-        params={"position_range": (0.9, 1.1), "velocity_range": (0.0, 0.0)},
+        params={"position_range": (1.0, 1.0), "velocity_range": (0.0, 0.0)},
+    )
+    gripper_finger_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["right_gripper_leftfinger", "right_gripper_rightfinger"],
+            ),
+            "static_friction_range": (1.0e6, 1.0e6),
+            "dynamic_friction_range": (1.0e6, 1.0e6),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 1,
+        },
     )
 
 
@@ -365,12 +482,23 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         self.episode_length_s = 1.0
 
         # simulation settings
-        self.sim.dt = 1 / 60.0
+        self.sim.dt = 1 / 100.0
         self.sim.render_interval = self.decimation
         self.sim.gravity = (0.0, 0.0, -9.81)
 
-        view = dict(eye=(-2.0, 1.5, 0.8), lookat=(0.0, 0.35, 0.2), window_width=1600, window_height=1600)
-        self.sim.visualizer_cfgs = [KitVisualizerCfg(**view), NewtonVisualizerCfg(**view)]
+        kit_view = dict(
+            eye=_KIT_CAMERA_EYE,
+            lookat=_KIT_CAMERA_LOOKAT,
+            window_width=1600,
+            window_height=1600,
+        )
+        newton_view = dict(
+            eye=_NEWTON_CAMERA_EYE,
+            lookat=_NEWTON_CAMERA_LOOKAT,
+            window_width=1600,
+            window_height=1600,
+        )
+        self.sim.visualizer_cfgs = [KitVisualizerCfg(**kit_view), NewtonVisualizerCfg(**newton_view)]
 
         # Resolution of `--video` recordings (independent of the on-screen visualizer windows above).
         self.video_recorder.window_width = 1600
@@ -379,108 +507,105 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         # Coupled MJWarp (articulated rby1df robot) + VBD (cables/plugs).
         self.sim.physics = CoupledNewtonCfg(
             scene_cfg=self.scene,
-            use_cuda_graph=False,
-            solver_cfg=CoupledAdmmSolverCfg(
-                src_solver_cfg=MJWarpSolverCfg(
-                    cone="elliptic",
-                    ls_parallel=True,
-                    ls_iterations=20,
-                    integrator="implicitfast",
-                ),
-                dst_solver_cfg=VBDSolverCfg(
-                    iterations=20,
-                    rigid_avbd_beta=1e2,
-                    rigid_contact_k_start=1e1,
-                    rigid_body_contact_buffer_size=1024,
-                ),
-                src_bodies=[SceneEntityCfg("robot")],
-                dst_bodies=[
-                    SceneEntityCfg("cable1"),
-                    SceneEntityCfg("cable2"),
-                    SceneEntityCfg("plug1"),
-                    SceneEntityCfg("plug2"),
-                    SceneEntityCfg("anchor1"),
-                    SceneEntityCfg("anchor2"),
+            use_cuda_graph=True,
+            solver_cfg=CoupledSolverCfg(
+                coupling_type="proxy",
+                scene_cfg=self.scene,
+                entries=[
+                    CoupledSolverEntryCfg(
+                        name="mjc",
+                        solver_cfg=MJWarpSolverCfg(
+                            cone="elliptic",
+                            ls_parallel=True,
+                            ls_iterations=20,
+                            integrator="implicitfast",
+                            use_mujoco_contacts=False,
+                        ),
+                        body_entities=[SceneEntityCfg("robot")],
+                    ),
+                    CoupledSolverEntryCfg(
+                        name="vbd",
+                        solver_cfg=VBDSolverCfg(
+                            iterations=20,
+                            friction_epsilon=1.0e-2,
+                            rigid_contact_hard=True,
+                            rigid_body_contact_buffer_size=1024,
+                            rigid_body_particle_contact_buffer_size=1,
+                            rigid_joint_linear_ke=1.0e6,
+                            rigid_joint_angular_ke=1.0e6,
+                        ),
+                        solver_class="newton.solvers:SolverVBD",
+                        body_entities=[
+                            SceneEntityCfg("cable1"),
+                            SceneEntityCfg("cable2"),
+                            SceneEntityCfg("plug1"),
+                            SceneEntityCfg("plug2"),
+                            SceneEntityCfg("anchor1"),
+                            SceneEntityCfg("anchor2"),
+                        ],
+                        all_particles=True,
+                        include_static_shapes=True,
+                    ),
                 ],
-                iterations=5,
-                rho=30.0,
-                gamma=0.1,
-                baumgarte=0.005,
-                contact_distance=0.003,
+                proxy_coupling=ProxyCouplingCfg(
+                    proxies=[
+                        CoupledProxyCfg(
+                            source="mjc",
+                            destination="vbd",
+                            body_entities=[
+                                SceneEntityCfg(
+                                    "robot",
+                                    body_names=[
+                                        "right_gripper_leftfinger",
+                                        "right_gripper_rightfinger",
+                                        "left_gripper_leftfinger",
+                                        "left_gripper_rightfinger",
+                                    ],
+                                )
+                            ],
+                            mode="lagged",
+                            # The RBY1 finger links are ~33 g. Match the stable
+                            # waterhose demo's 1 kg VBD proxy fingers through the
+                            # generic IsaacLab/Newton proxy-coupling config.
+                            mass_scale=30.0,
+                            collision_pipeline_factory=_make_proxy_collision_pipeline,
+                            collide_interval=1,
+                        )
+                    ],
+                    iterations=1,
+                ),
             ),
             num_substeps=8,
             collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
             model_cfg=NewtonModelCfg(
                 shape_material_ke=1.0e3,
                 shape_material_kd=1.0e0,
+                soft_contact_mu=0.5,
                 shape_material_mu=1.0,
             ),
         )
 
 
 @configclass
-class WaterhoseProxyEnvCfg(WaterhoseEnvCfg):
-    """Waterhose variant using Newton's standard proxy-coupled solver."""
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
-        self.sim.physics.solver_cfg = CoupledProxySolverCfg(
-            src_solver_cfg=MJWarpSolverCfg(
-                cone="elliptic",
-                ls_parallel=True,
-                ls_iterations=20,
-                integrator="implicitfast",
-            ),
-            dst_solver_cfg=VBDSolverCfg(
-                iterations=20,
-                rigid_avbd_beta=1e2,
-                rigid_contact_k_start=1e1,
-                rigid_body_contact_buffer_size=1024,
-            ),
-            src_bodies=[SceneEntityCfg("robot")],
-            dst_bodies=[
-                SceneEntityCfg("cable1"),
-                SceneEntityCfg("cable2"),
-                SceneEntityCfg("plug1"),
-                SceneEntityCfg("plug2"),
-                SceneEntityCfg("anchor1"),
-                SceneEntityCfg("anchor2"),
-            ],
-            proxy_bodies=[
-                SceneEntityCfg(
-                    "robot",
-                    body_names=[
-                        "right_gripper_leftfinger",
-                        "right_gripper_rightfinger",
-                        "left_gripper_leftfinger",
-                        "left_gripper_rightfinger",
-                    ],
-                )
-            ],
-            proxy_mode="lagged",
-            proxy_iterations=1,
-            proxy_collide_interval=1,
-            proxy_mass_scale=1.0,
-        )
-
-
-@configclass
 class WaterhoseIkActionsCfg:
-    """Absolute right end-effector pose plus binary gripper action for scripted demos."""
+    """Absolute right end-effector pose plus normalized right-gripper action for scripted demos."""
 
     arm_action = DifferentialInverseKinematicsActionCfg(
         asset_name="robot",
         joint_names=["right_arm_joint_.*"],
-        body_name="right_gripper_dummy",
+        body_name="right_gripper_base",
         controller=DifferentialIKControllerCfg(
             command_type="pose",
             use_relative_mode=False,
             ik_method="dls",
             ik_params={"lambda_val": 0.05},
         ),
+        body_offset=DifferentialInverseKinematicsActionCfg.OffsetCfg(
+            pos=_RIGHT_GRIPPER_EE_FRAME_POS,
+            rot=_RIGHT_GRIPPER_EE_FRAME_ROT,
+        ),
     )
-    gripper_action = BinaryJointPositionActionCfg(
+    gripper_action = mdp.WaterhoseGripperPositionActionCfg(
         asset_name="robot",
         joint_names=[
             "right_gripper_finger_joint_1",
@@ -493,9 +618,9 @@ class WaterhoseIkActionsCfg:
             "right_gripper_right_finger_joint": 0.045,
         },
         close_command_expr={
-            "right_gripper_finger_joint_1": 0.008,
-            "right_gripper_left_finger_joint": -0.004,
-            "right_gripper_right_finger_joint": 0.004,
+            "right_gripper_finger_joint_1": 0.0072,
+            "right_gripper_left_finger_joint": -0.0036,
+            "right_gripper_right_finger_joint": 0.0036,
         },
     )
 
@@ -509,6 +634,106 @@ class WaterhoseIkEnvCfg(WaterhoseEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.episode_length_s = 30.0
-        self.scene.num_envs = 1
         self.scene.robot.init_state.joint_pos = _RBY1_IK_INITIAL_JOINT_POS
-        self.events.reset_robot_joints = None
+
+
+@configclass
+class WaterhoseNewtonIkActionsCfg(WaterhoseIkActionsCfg):
+    """Newton-native absolute right end-effector pose plus normalized right-gripper action."""
+
+    arm_action = NewtonInverseKinematicsActionCfg(
+        asset_name="robot",
+        joint_names=["torso_joint_.*", "right_arm_joint_.*"],
+        body_name="right_gripper_base",
+        controller=NewtonIKManagerCfg(
+            command_type="pose",
+            use_relative_mode=False,
+            iterations=24,
+            lambda_initial=0.1,
+            jacobian_mode="analytic",
+            joint_limit_weight=10.0,
+            use_persistent_seed=True,
+        ),
+        ik_model_source="asset_usd",
+        fixed_body_names=["left_gripper_base", "torso_hip_yaw"],
+        fixed_body_weights=[1.0, 50.0],
+        body_offset=NewtonInverseKinematicsActionCfg.OffsetCfg(
+            pos=_RIGHT_GRIPPER_EE_FRAME_POS,
+            rot=_RIGHT_GRIPPER_EE_FRAME_ROT,
+        ),
+    )
+
+
+@configclass
+class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
+    """Newton-native relative end-effector delta pose plus normalized right-gripper action."""
+
+    arm_action = NewtonInverseKinematicsActionCfg(
+        asset_name="robot",
+        joint_names=["torso_joint_.*", "right_arm_joint_.*"],
+        body_name="right_gripper_base",
+        controller=NewtonIKManagerCfg(
+            command_type="pose",
+            use_relative_mode=True,
+            iterations=24,
+            lambda_initial=0.1,
+            jacobian_mode="analytic",
+            joint_limit_weight=10.0,
+            use_persistent_seed=True,
+        ),
+        ik_model_source="asset_usd",
+        fixed_body_names=["left_gripper_base", "torso_hip_yaw"],
+        fixed_body_weights=[1.0, 50.0],
+        body_offset=NewtonInverseKinematicsActionCfg.OffsetCfg(
+            pos=_RIGHT_GRIPPER_EE_FRAME_POS,
+            rot=_RIGHT_GRIPPER_EE_FRAME_ROT,
+        ),
+    )
+
+
+@configclass
+class WaterhoseProxyIkEnvCfg(WaterhoseEnvCfg):
+    """Waterhose task with Newton proxy coupling and the scripted IK action space."""
+
+    actions: WaterhoseNewtonIkActionsCfg = WaterhoseNewtonIkActionsCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.episode_length_s = 30.0
+        self.scene.robot.init_state.joint_pos = _RBY1_IK_INITIAL_JOINT_POS
+        if _TELEOP_AVAILABLE:
+            self.xr = XrCfg(
+                anchor_pos=(0.0, 0.0, 0.0),
+                anchor_rot=(0.0, 0.0, 0.0, 1.0),
+            )
+            self.isaac_teleop = IsaacTeleopCfg(
+                pipeline_builder=_build_waterhose_teleop_pipeline,
+                sim_device=self.sim.device,
+                xr_cfg=self.xr,
+                target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
+            )
+
+
+@configclass
+class WaterhoseProxyTeleopEnvCfg(WaterhoseProxyIkEnvCfg):
+    """Waterhose task variant for native IsaacLab keyboard and SpaceMouse teleoperation."""
+
+    actions: WaterhoseNewtonRelativeIkActionsCfg = WaterhoseNewtonRelativeIkActionsCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.isaac_teleop = None
+        self.teleop_devices = DevicesCfg(
+            devices={
+                "keyboard": Se3KeyboardCfg(
+                    pos_sensitivity=0.02,
+                    rot_sensitivity=0.05,
+                    sim_device=self.sim.device,
+                ),
+                "spacemouse": WaterhoseSpaceMouseCfg(
+                    pos_sensitivity=0.05,
+                    rot_sensitivity=0.15,
+                    sim_device=self.sim.device,
+                ),
+            }
+        )

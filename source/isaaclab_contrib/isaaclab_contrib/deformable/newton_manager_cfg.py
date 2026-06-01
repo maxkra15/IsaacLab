@@ -37,6 +37,9 @@ class VBDSolverCfg(NewtonSolverCfg):
     iterations: int = 10
     """Number of VBD iterations per substep."""
 
+    friction_epsilon: float = 0.01
+    """Regularization epsilon for Coulomb friction in VBD rigid contacts."""
+
     integrate_with_external_rigid_solver: bool = False
     """Whether rigid bodies are integrated by an external solver (one-way coupling).
 
@@ -82,6 +85,9 @@ class VBDSolverCfg(NewtonSolverCfg):
     rigid_contact_k_start: float = 1.0e2
     """Initial stiffness seed for all rigid body contacts [N/m]."""
 
+    rigid_contact_hard: bool = True
+    """Whether VBD treats rigid contacts as hard constraints."""
+
     rigid_body_contact_buffer_size: int = 64
     """Per-body body-body contact list capacity.
 
@@ -100,6 +106,15 @@ class VBDSolverCfg(NewtonSolverCfg):
     enforcing the constraint by the end of the step. Set to ``0`` to disable ramping and pin ``k`` at
     the ceiling for the entire step.
     """
+
+    rigid_body_particle_contact_buffer_size: int = 256
+    """Per-body rigid body/particle contact list capacity."""
+
+    rigid_joint_linear_ke: float = 1.0e5
+    """Maximum linear penalty stiffness for VBD rigid joints [N/m]."""
+
+    rigid_joint_angular_ke: float = 1.0e5
+    """Maximum angular penalty stiffness for VBD rigid joints [N m/rad]."""
 
 
 @configclass

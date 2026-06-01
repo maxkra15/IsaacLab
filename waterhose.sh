@@ -26,8 +26,8 @@ DEFAULT_ISAACSIM_URL="${ISAACSIM_REPO_URL:-https://github.com/isaac-sim/IsaacSim
 DEFAULT_ISAACSIM_REF="${ISAACSIM_REPO_REF:-develop}"
 DEFAULT_VENV=".venv"
 DEFAULT_ASSETS_TAR="${SCRIPT_DIR}/waterhose_demo_assets.tar.gz"
-DEFAULT_TASK="Isaac-Waterhose-RBY1-IK-Abs-v0"
-DEFAULT_MIMIC_TASK="Isaac-Waterhose-Robot-Demo-Mimic-v0"
+DEFAULT_TASK="Isaac-Waterhose-Coupled-v0"
+DEFAULT_TELEOP_TASK="Isaac-Waterhose-Coupled-Teleop-v0"
 
 log() {
     printf '[waterhose] %s\n' "$*"
@@ -74,7 +74,6 @@ Usage:
   ./waterhose.sh teleop [options] [-- extra teleop args]
   ./waterhose.sh smoke [options]
   ./waterhose.sh profile [options]
-  ./waterhose.sh mimic-smoke [options]
   ./waterhose.sh python [--workspace DIR] <script.py> [args...]
   ./waterhose.sh shell [--workspace DIR]
 
@@ -114,34 +113,33 @@ Setup options:
 
 Demo options:
   --workspace DIR            Workspace created by setup. Default: ./waterhose-demo
-  --task TASK                Task name. Default: Isaac-Waterhose-Robot-Demo-v0
-  --vis VALUE                kit, newton, kit,newton, or none. Default: kit
+  --task TASK                Task name. Default: Isaac-Waterhose-Coupled-v0
+  --vis VALUE                kit, newton, or none. Default: kit
   --num-envs N               Number of environments. Default: 1
-  --max-steps N              Demo step limit. Default: 2000
+  --max-steps N              Demo step limit. Default: 3200
   --headless                 Legacy IsaacLab headless flag. Prefer --vis none for headless runs.
   --profile                  Print timing from the runner.
-  --teleop                   Use the demo runner's built-in SpaceMouse teleop mode.
   --venv DIR                 venv directory inside IsaacLab checkout. Default: .venv
 
 Teleop options:
-  Uses scripts/environments/teleoperation/teleop_se3_agent.py.
+  Uses scripts/environments/teleoperation/teleop_se3_agent.py. Desktop
+  teleop uses env_cfg.teleop_devices on Isaac-Waterhose-Coupled-Teleop-v0.
+  XR uses env_cfg.isaac_teleop on Isaac-Waterhose-Coupled-v0.
 
   --workspace DIR            Workspace created by setup. Default: ./waterhose-demo
-  --teleop-device NAME       keyboard, spacemouse, or gamepad. Default: spacemouse
-  --isaac-teleop             Use env_cfg.isaac_teleop instead of legacy teleop_device.
-  --xr                       Use IsaacTeleop/OpenXR mode. Implies --isaac-teleop.
-  --cloudxr-env VALUE        cloudxrjs, avp, none, or a .env path. Default: cloudxrjs
+  --teleop-device DEVICE     keyboard, spacemouse, or gamepad. Default: spacemouse
+  --xr / --no-xr             Use IsaacTeleop/OpenXR mode. Default: --no-xr.
+  --cloudxr-env VALUE        cloudxrjs, avp, none, or a .env path. Default: none
   --no-auto-launch-cloudxr   Do not auto-launch CloudXR.
-  --task TASK                Task name. Default: Isaac-Waterhose-Robot-Demo-v0
-  --vis VALUE                kit or kit,newton. Default: kit
+  --task TASK                Task name. Default: Isaac-Waterhose-Coupled-Teleop-v0
+  --vis VALUE                kit. Default: kit
   --num-envs N               Number of environments. Default: 1
-  --sensitivity VALUE        Teleop sensitivity. Default: 1.0
   --debug-teleop             Print periodic teleop diagnostics.
   --venv DIR                 venv directory inside IsaacLab checkout. Default: .venv
 
 Examples:
   ./waterhose.sh setup --accept-eula
-  ./waterhose.sh demo --vis kit,newton --num-envs 2
+  ./waterhose.sh demo --vis kit --num-envs 1
   ./waterhose.sh demo --vis none --profile --max-steps 500
   ./waterhose.sh teleop --teleop-device spacemouse --vis kit
   ./waterhose.sh teleop --xr --cloudxr-env avp --vis kit
@@ -644,8 +642,7 @@ cmd_demo() {
     local task="$DEFAULT_TASK"
     local vis="kit"
     local num_envs=1
-    local max_steps=2000
-    local mode="scripted"
+    local max_steps=3200
     local venv_name="$DEFAULT_VENV"
     local headless=0
     local profile=0
@@ -665,10 +662,6 @@ cmd_demo() {
                 num_envs="$2"; shift 2 ;;
             --max-steps|--max_steps)
                 max_steps="$2"; shift 2 ;;
-            --mode)
-                mode="$2"; shift 2 ;;
-            --teleop)
-                mode="teleop"; shift ;;
             --headless)
                 headless=1; shift ;;
             --profile)
@@ -691,7 +684,6 @@ cmd_demo() {
     local args=(
         scripts/environments/waterhose/run_robot_demo.py
         --task "$task"
-        --mode "$mode"
         --num_envs "$num_envs"
         --max_steps "$max_steps"
         --vis "$vis"
@@ -718,15 +710,15 @@ cmd_demo() {
 cmd_teleop() {
     local workspace="$DEFAULT_WORKSPACE"
     local repo_dir_name="$DEFAULT_REPO_DIR_NAME"
-    local task="$DEFAULT_TASK"
+    local task="$DEFAULT_TELEOP_TASK"
+    local task_explicit=0
     local vis="kit"
     local num_envs=1
-    local sensitivity=1.0
-    local teleop_device="spacemouse"
-    local use_isaac_teleop=0
     local xr=0
-    local cloudxr_env="cloudxrjs"
-    local auto_launch_cloudxr=1
+    local teleop_device="spacemouse"
+    local cloudxr_env="none"
+    local cloudxr_explicit=0
+    local auto_launch_cloudxr=0
     local debug_teleop=0
     local venv_name="$DEFAULT_VENV"
     local extra=()
@@ -738,23 +730,19 @@ cmd_teleop() {
             --repo-dir-name)
                 repo_dir_name="$2"; shift 2 ;;
             --task)
-                task="$2"; shift 2 ;;
+                task="$2"; task_explicit=1; shift 2 ;;
+            --teleop-device|--teleop_device)
+                teleop_device="$2"; shift 2 ;;
             --vis|--visualizer)
                 vis="$2"; shift 2 ;;
             --num-envs|--num_envs)
                 num_envs="$2"; shift 2 ;;
-            --sensitivity)
-                sensitivity="$2"; shift 2 ;;
-            --teleop-device|--teleop_device)
-                teleop_device="$2"; shift 2 ;;
-            --isaac-teleop)
-                use_isaac_teleop=1; shift ;;
             --xr)
-                xr=1
-                use_isaac_teleop=1
-                shift ;;
+                xr=1; shift ;;
+            --no-xr)
+                xr=0; shift ;;
             --cloudxr-env|--cloudxr_env)
-                cloudxr_env="$2"; shift 2 ;;
+                cloudxr_env="$2"; cloudxr_explicit=1; shift 2 ;;
             --no-auto-launch-cloudxr|--no-auto_launch_cloudxr)
                 auto_launch_cloudxr=0; shift ;;
             --debug-teleop|--debug_teleop)
@@ -772,6 +760,12 @@ cmd_teleop() {
         esac
     done
 
+    if [[ "$xr" == "1" ]]; then
+        [[ "$task_explicit" == "0" ]] && task="$DEFAULT_TASK"
+        [[ "$cloudxr_explicit" == "0" ]] && cloudxr_env="cloudxrjs"
+        [[ "$cloudxr_env" != "none" ]] && auto_launch_cloudxr=1
+    fi
+
     local repo_root
     repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
     local args=(
@@ -779,14 +773,14 @@ cmd_teleop() {
         --task "$task"
         --num_envs "$num_envs"
         --visualizer "$vis"
-        --sensitivity "$sensitivity"
         --cloudxr_env "$cloudxr_env"
     )
 
-    if [[ "$use_isaac_teleop" != "1" ]]; then
+    if [[ "$xr" == "1" ]]; then
+        args+=(--xr)
+    else
         args+=(--teleop_device "$teleop_device")
     fi
-    [[ "$xr" == "1" ]] && args+=(--xr)
     [[ "$auto_launch_cloudxr" != "1" ]] && args+=(--no-auto_launch_cloudxr)
     [[ "$debug_teleop" == "1" ]] && args+=(--debug_teleop)
 
@@ -842,10 +836,6 @@ cmd_smoke() {
 
 cmd_profile() {
     cmd_demo --vis none --profile "$@"
-}
-
-cmd_mimic_smoke() {
-    cmd_smoke --task "$DEFAULT_MIMIC_TASK" "$@"
 }
 
 cmd_python() {
@@ -917,8 +907,6 @@ main() {
             cmd_smoke "$@" ;;
         profile)
             cmd_profile "$@" ;;
-        mimic-smoke)
-            cmd_mimic_smoke "$@" ;;
         python)
             cmd_python "$@" ;;
         shell)

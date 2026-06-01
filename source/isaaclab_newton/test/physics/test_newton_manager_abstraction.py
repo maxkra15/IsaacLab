@@ -50,9 +50,7 @@ from isaaclab_newton.physics import (
     NewtonMPMManager,
     NewtonSolverCfg,
     NewtonXPBDManager,
-    OneWayCouplingCfg,
     ProxyCouplingCfg,
-    SolverOneWayCoupled,
     XPBDSolverCfg,
 )
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
@@ -178,39 +176,6 @@ SOLVER_MATRIX = [
         False,
         True,
         id="proxy_coupled_xpbd_body_particle",
-    ),
-    pytest.param(
-        lambda: CoupledSolverCfg(
-            coupling_type="one_way",
-            entries=[
-                CoupledSolverEntryCfg(
-                    name="rigid",
-                    solver_cfg=XPBDSolverCfg(iterations=1),
-                    bodies=[0],
-                ),
-                CoupledSolverEntryCfg(
-                    name="particle",
-                    solver_cfg=XPBDSolverCfg(iterations=1),
-                    particles=[0],
-                    in_place=True,
-                ),
-            ],
-            one_way_coupling=OneWayCouplingCfg(
-                proxies=[
-                    CoupledProxyCfg(
-                        source="rigid",
-                        destination="particle",
-                        bodies=[0],
-                    )
-                ],
-            ),
-            use_collision_pipeline=True,
-        ),
-        NewtonCoupledManager,
-        SolverOneWayCoupled,
-        False,
-        True,
-        id="one_way_coupled_xpbd_body_particle",
     ),
     pytest.param(
         lambda: CoupledSolverCfg(
@@ -492,17 +457,6 @@ def test_coupled_scene_entity_selectors_require_scene_cfg():
                 ),
             ),
             "Unsupported CoupledProxyCfg mode",
-        ),
-        (
-            CoupledSolverCfg(
-                coupling_type="one_way",
-                entries=[
-                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
-                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
-                ],
-                one_way_coupling=OneWayCouplingCfg(),
-            ),
-            "one-way coupling requires",
         ),
         (
             CoupledSolverCfg(

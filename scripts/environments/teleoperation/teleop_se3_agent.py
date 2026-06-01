@@ -22,8 +22,6 @@ import argparse
 from collections.abc import Callable
 import inspect
 import os
-from pathlib import Path
-import subprocess
 import sys
 
 from isaaclab.app import AppLauncher
@@ -70,38 +68,11 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 
-def _default_waterhose_asset_root() -> str:
-    return str(Path(__file__).resolve().parents[3] / "source" / "isaaclab_assets" / "data" / "WaterhoseDemo")
-
-
-def _prewarm_waterhose_static_scene_cache() -> None:
-    """Prepare the task-local Newton static-scene cache before Kit starts."""
-
-    task = args_cli.task or ""
-    if "Waterhose-Robot-Demo" not in task:
-        return
-    asset_root = os.getenv("WATERHOSE_ASSETS_DIR", _default_waterhose_asset_root())
-    command = [
-        sys.executable,
-        "-c",
-        (
-            "import sys; "
-            "from isaaclab_tasks.manager_based.manipulation.waterhose_robot_demo.coupled_builder "
-            "import ensure_static_scene_cache; "
-            "ensure_static_scene_cache(sys.argv[1])"
-        ),
-        asset_root,
-    ]
-    result = subprocess.run(command, env=os.environ.copy(), check=False)
-    if result.returncode != 0:
-        raise RuntimeError("Failed to prepare the waterhose static-scene collision cache.")
-
-
 def _prefer_cuda_for_waterhose_xr() -> None:
     """Keep the Newton waterhose runtime on CUDA for XR unless the user chose another device."""
 
     task = args_cli.task or ""
-    if "Waterhose-Robot-Demo" not in task:
+    if "Waterhose" not in task:
         return
     if not bool(getattr(args_cli, "xr", False)):
         return
@@ -140,7 +111,6 @@ def _prepare_native_teleop_visualizers() -> None:
 
 _prepare_native_teleop_visualizers()
 _prefer_cuda_for_waterhose_xr()
-_prewarm_waterhose_static_scene_cache()
 app_launcher_args = vars(args_cli)
 
 # launch omniverse app

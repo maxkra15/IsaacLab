@@ -191,8 +191,8 @@ class LeappDeploymentEnv:
         self.has_rtx_sensors = bool(self.sim.get_setting("/isaaclab/render/rtx_sensors"))
 
         # Match the standard env initialization path for viewport camera setup.
-        has_visualizers = bool(self.sim.get_setting("/isaaclab/visualizer"))
-        if self.sim.has_gui or has_visualizers:
+        visualizer_types = set(self.sim.resolve_visualizer_types()) if hasattr(self.sim, "resolve_visualizer_types") else set()
+        if self.sim.has_gui or "kit" in visualizer_types:
             self.viewport_camera_controller = ViewportCameraController(cast(Any, self), self.cfg.viewer)
         else:
             self.viewport_camera_controller = None

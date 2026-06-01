@@ -17,6 +17,18 @@ from pxr import Usd
 from isaaclab_newton.physics import NewtonManager
 
 
+def _solver_cfg_requires_graph_coloring(solver_cfg) -> bool:
+    """Return whether a solver cfg or any coupled sub-solver needs VBD graph coloring."""
+    if solver_cfg is None:
+        return False
+    if getattr(solver_cfg, "requires_graph_coloring", False):
+        return True
+    return any(
+        _solver_cfg_requires_graph_coloring(getattr(entry_cfg, "solver_cfg", None))
+        for entry_cfg in getattr(solver_cfg, "entries", ())
+    )
+
+
 def _build_newton_builder_from_mapping(
     stage: Usd.Stage,
     sources: Sequence[str],
@@ -155,7 +167,7 @@ def _build_newton_builder_from_mapping(
             hook(builder)
 
     solver_cfg = getattr(NewtonManager._cfg, "solver_cfg", None)
-    if getattr(solver_cfg, "requires_graph_coloring", False):
+    if _solver_cfg_requires_graph_coloring(solver_cfg):
         builder.color()
 
     site_index_map = {

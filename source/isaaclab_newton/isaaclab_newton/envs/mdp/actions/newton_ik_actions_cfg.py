@@ -44,6 +44,32 @@ class NewtonInverseKinematicsActionCfg(ActionTermCfg):
     body_offset: OffsetCfg | None = None
     """Offset of the target frame w.r.t. the body frame."""
 
+    fixed_body_names: list[str] = []
+    """Body names that should stay fixed during IK.
+
+    These bodies are added as extra pose objectives at their reset pose. This is useful for whole-arm
+    manipulators where the IK model contains additional joints that should not drift while solving the
+    commanded end-effector pose.
+    """
+
+    fixed_body_weights: list[float] | None = None
+    """Optional per-body objective weights for :attr:`fixed_body_names`.
+
+    If omitted, each fixed body uses the controller's default position and rotation weights.
+    """
+
+    ik_model_source: str = "prototype"
+    """Source for the Newton IK model.
+
+    Supported values:
+
+    * ``"prototype"``: use the replicated Newton prototype model registered by the physics manager.
+    * ``"asset_usd"``: build a robot-only Newton IK model from the articulation asset's USD file.
+
+    The latter is useful for coupled scenes where the replicated prototype also contains deformables or
+    additional rigid objects that should not be part of the IK optimization problem.
+    """
+
     scale: float | tuple[float, ...] = 1.0
     """Scale factor applied to the raw action.
 
