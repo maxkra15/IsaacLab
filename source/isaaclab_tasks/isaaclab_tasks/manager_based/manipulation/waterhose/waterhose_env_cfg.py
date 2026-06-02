@@ -50,7 +50,7 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_contrib.cable.cable_object_cfg import CableAttachmentCfg, CableObjectCfg, CableSdfCaptureCfg
+from isaaclab_contrib.cable.cable_object_cfg import CableAttachmentCfg, CableObjectCfg
 from isaaclab_contrib.deformable.newton_manager_cfg import (
     CoupledNewtonCfg,
     NewtonModelCfg,
@@ -77,14 +77,22 @@ WATERHOSE_ASSETS_DIR = os.environ.get(
 # rby1df robot: URDF converted to USD (scripts/tools/convert_urdf.py) then flattened
 # into a single self-contained asset.
 _RBY1_USD = os.path.join(WATERHOSE_ASSETS_DIR, "rby1df", "rby1df.usda")
-_RIGHT_GRIPPER_EE_FRAME_POS = (0.0, 0.0, -0.075)
+_RIGHT_GRIPPER_EE_FRAME_POS = (0.0, 0.0, -0.1055)
 # USD stores xformOp:orient as (w, x, y, z); IsaacLab action offsets use (x, y, z, w).
 _RIGHT_GRIPPER_EE_FRAME_ROT = (0.70710677, 0.70710677, 0.0, 0.0)
 
 # add_rod_graph places each segment's body frame at the edge's start node u
-# (edge (u, v), +Z from u->v), so the head plug weld's local offset is authored
-# against segment 0's start frame.
+# (edge (u, v), +Z from u->v), so cable_local_pos=(0, 0, 0) welds at u and the head
+# plug weld's local offset is authored against segment 0's start frame. cable001's
+# last segment is edge (42, 43) -> u=42, so the tail weld pins node 42.
 _FRIDGE_POS = (0.0, 0.0, 0.5)
+_CABLE1_TAIL_NODE_42 = (-0.18810473382472992, 0.3453156650066376, -0.25986239314079285)
+_CABLE1_ANCHOR_NODE = _CABLE1_TAIL_NODE_42
+# World position of the cable tail node = the per-env kinematic anchor body. The cable
+# welds to this per-env body rather than the shared static world body (-1): a fixed joint
+# to the global world body corrupts the multi-env coupled MJWarp+VBD solve (robot joints
+# go NaN at step 0).
+_ANCHOR_POS = tuple(p + n for p, n in zip(_FRIDGE_POS, _CABLE1_ANCHOR_NODE))
 _KIT_CAMERA_EYE = (-0.9, 0.6, 0.3)
 _KIT_CAMERA_LOOKAT = (-0.013736291, 0.236437794, 0.013017143)
 _NEWTON_CAMERA_EYE = (-2.0, 1.5, 0.8)
@@ -253,7 +261,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         },
     )
 
-    ### Cable 1 (graspable plug welded to the head, tail retained by static SDF contact)
+    ### Cable 1 (graspable plug welded to the head; tail welded to a kinematic anchor sphere)
     plug1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Plug1",
         spawn=sim_utils.UsdFileCfg(usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda")),
@@ -263,6 +271,57 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         ),
     )
 
+    # Cable tail anchor.
+    #
+    # The cable tail is pinned to the world so it does not fall under gravity while the robot
+    # grasps and inserts the head. Two mechanisms can do this; we use the *weld* (option A):
+    #
+    #   Option A -- fixed-joint weld (used here).
+    #     A 1 mm kinematic sphere (`Anchor1`) is placed exactly at the tail node's world pose
+    #     and the cable tail node is welded to it with a Newton `add_joint_fixed` constraint
+    #     (see the `CableAttachmentCfg` on `cable1`). Pros: exact, drift-free, cheap (two
+    #     constraint rows, no collision geometry). With the softened VBD joints used here
+    #     (`rigid_joint_hard=False` + `k_start` ramps) the weld is compliant rather than
+    #     infinitely stiff, so it no longer pumps energy on contact the way a hard weld did.
+    #     A per-env body is used rather than the global world body (-1): a fixed joint to the
+    #     shared world body corrupts the multi-env coupled MJWarp+VBD solve (robot joints go
+    #     NaN at step 0).
+    #
+    #   Option B -- static SDF capture (alternative; see `CableSdfCaptureCfg`).
+    #     Instead of a joint, generate a static collision fixture (a "retaining cup" at the tail
+    #     tip plus several "through-sleeves" around the last segments) as signed-distance-field
+    #     meshes built once and reused across envs. The cable is mechanically trapped inside the
+    #     fixture by contact rather than constrained by a joint. To switch to it, drop the tail
+    #     `CableAttachmentCfg` below and instead pass e.g.::
+    #
+    #         sdf_captures=[
+    #             CableSdfCaptureCfg(cable_anchor=-1, label_suffix="tail_sdf_capture", ...),
+    #             *(CableSdfCaptureCfg(cable_anchor=i, through_sleeve=True, ...) for i in range(-2, -8, -1)),
+    #         ]
+    #
+    #     and add the generated shapes to the VBD entry's `shape_label_patterns`
+    #     (e.g. r"/World/envs/env_\\d+/Cable1/tail_sdf_.*"). Pros: contact can slip/settle via
+    #     friction and only constrains the cable where it actually touches, so it yields more
+    #     gracefully than a stiff weld. Cons: 8 collision shapes per cable cost more contact work
+    #     at runtime than the two-row weld, and the tail is held only as firmly as friction allows.
+    anchor1 = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Anchor1",
+        spawn=sim_utils.SphereCfg(
+            radius=0.001,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.1)),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=_ANCHOR_POS),
+    )
+
+    # The deformable cable, simulated as a Cosserat rod by the VBD solver. Material values are
+    # tuned for stability under proxy coupling with the gripper (see the VBD solver entry below):
+    #   stretch_stiffness -- axial EA; 1e8 resists stretching without exploding (1e12 blew up).
+    #   bend_stiffness    -- resistance to bending; keeps the hose from kinking unnaturally.
+    #   stretch/bend_damping -- velocity damping; small values quell jitter without over-damping.
+    #   density           -- mass per unit volume; balanced against the gripper proxy mass_scale
+    #                        so contact does not pump energy into the rod.
     cable1 = CableObjectCfg(
         prim_path="/World/envs/env_.*/Cable1",
         spawn=sim_utils.UsdFileCfg(
@@ -278,61 +337,23 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         init_state=CableObjectCfg.InitialStateCfg(
             pos=_FRIDGE_POS,
         ),
-        resample_segment_length=None,  # authored geometry keeps the plug weld's 22mm head offset valid
+        # Keep the authored node spacing: the head plug weld's 22 mm offset is authored against
+        # the original segment-0 frame, so resampling would invalidate it. None = no resampling.
+        resample_segment_length=None,
         attachments=[
+            # Head weld: cable segment-0 head node -> graspable Plug1 rigid body.
             CableAttachmentCfg(
                 target_prim_path="/World/envs/env_.*/Plug1",
                 cable_anchor=0,
                 cable_local_pos=(0.0, 0.0, 0.022),  # the head node is 22mm along +Z from the head body center
             ),
-        ],
-        sdf_captures=[
-            CableSdfCaptureCfg(
-                cable_anchor=-1,
-                label_suffix="tail_sdf_capture",
-                outer_radius=0.012,
-                bore_clearance=0.0001,
-                retainer_offset=0.0045,
-                retainer_thickness=0.0015,
-                tail_clearance=0.006,
-                radial_segments=32,
-                sdf_max_resolution=64,
-                margin=0.0,
-                gap=0.0002,
-                mu=1.0,
-            ),
-            *[
-                CableSdfCaptureCfg(
-                    cable_anchor=anchor_idx,
-                    label_suffix=f"tail_sdf_sleeve_{abs(anchor_idx)}",
-                    outer_radius=0.012,
-                    bore_clearance=0.0008,
-                    retainer_offset=0.0015,
-                    tail_clearance=0.0015,
-                    through_sleeve=True,
-                    radial_segments=32,
-                    sdf_max_resolution=64,
-                    margin=0.0,
-                    gap=0.0002,
-                    mu=1.0,
-                )
-                for anchor_idx in (-2, -3, -4, -5, -6, -7)
-            ],
-            CableSdfCaptureCfg(
-                cable_anchor=-8,
-                label_suffix="tail_sdf_sleeve_8",
-                outer_radius=0.012,
-                bore_clearance=0.0012,
-                retainer_offset=0.0015,
-                tail_clearance=0.0015,
-                through_sleeve=True,
-                radial_segments=32,
-                sdf_max_resolution=64,
-                margin=0.0,
-                gap=0.0002,
-                mu=1.0,
+            # Tail weld: cable last-segment start node (42) -> kinematic Anchor1 sphere.
+            CableAttachmentCfg(
+                target_prim_path="/World/envs/env_.*/Anchor1",
+                cable_anchor=42,  # last segment start node; Anchor1 sits exactly there
             ),
         ],
+        sdf_captures=[],
     )
 
     sky_light = AssetBaseCfg(
@@ -481,7 +502,11 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         self.video_recorder.window_width = 1600
         self.video_recorder.window_height = 1600
 
-        # Coupled MJWarp (articulated rby1df robot) + VBD (cables/plugs).
+        # Coupled physics: MuJoCo-Warp solves the articulated rby1df robot, VBD solves the
+        # deformable cable (and its welded plug/anchor bodies). The two are joined by one-way
+        # "proxy" coupling: the gripper bodies are mirrored as immovable proxy shapes in the VBD
+        # solver so the cable collides against them, but the cable cannot push the robot back.
+        # This avoids two-way energy pumping while still letting the gripper grasp the cable.
         self.sim.physics = CoupledNewtonCfg(
             scene_cfg=self.scene,
             use_cuda_graph=True,
@@ -502,6 +527,11 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                     ),
                     CoupledSolverEntryCfg(
                         name="vbd",
+                        # The cable weld joints (head->Plug1, tail->Anchor1) are intentionally
+                        # *soft*: rigid_joint_hard=False with linear/angular k_start ramps lets the
+                        # augmented-Lagrangian stiffness grow gradually instead of clamping hard.
+                        # A hard weld plus hard contacts accumulated AL impulses and exploded the
+                        # cable on first gripper contact; the soft ramp keeps it stable.
                         solver_cfg=VBDSolverCfg(
                             iterations=10,
                             friction_epsilon=0.1,
@@ -519,9 +549,11 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         solver_class="newton.solvers:SolverVBD",
                         body_entities=[
                             SceneEntityCfg("cable1"),
+                            # Weld targets must live in the VBD model so the cable fixed joints
+                            # (head -> Plug1, tail -> Anchor1) can be created against them.
                             SceneEntityCfg("plug1"),
+                            SceneEntityCfg("anchor1"),
                         ],
-                        shape_label_patterns=[r"/World/envs/env_\d+/Cable1/tail_sdf_.*"],
                         all_particles=True,
                         include_static_shapes=False,
                     ),
@@ -546,12 +578,14 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             ],
                             mode="lagged",
                             # Make the finger proxies effectively immovable in the VBD view so the
-                            # cable contact cannot push them back (no two-way energy pumping), and
-                            # refresh contacts every substep so a moving gripper never penetrates
-                            # the cable before the stiff penalty fires.
-                            mass_scale=1.0e2,
+                            # cable contact cannot push them back (no two-way energy pumping).
+                            # Refresh proxy contacts every 5th substep to match the Newton
+                            # cable_robot reference (vbd_collide_substeps=5); this cuts collision
+                            # cost ~5x. mass_scale keeps the fingers immovable so the lagged
+                            # contacts stay valid between refreshes.
+                            mass_scale=1.0e0,
                             collision_pipeline_factory=_make_proxy_collision_pipeline,
-                            collide_interval=1,
+                            collide_interval=5,
                             shape_material_ke=2.0e5,
                             shape_material_mu=3.0e6,
                             shape_margin=0.001,

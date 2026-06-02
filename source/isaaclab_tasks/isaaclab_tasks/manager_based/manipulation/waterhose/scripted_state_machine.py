@@ -20,23 +20,25 @@ from isaaclab.utils.math import (
     subtract_frame_transforms,
 )
 
-# Midpoint between the right finger link frames in right_gripper_base local frame.
-_RIGHT_EE_FROM_BASE_POS = (0.0, 0.0, -0.075)
+# Center of the grasp contact region in right_gripper_base local frame.
+_RIGHT_EE_FROM_BASE_POS = (0.0, 0.0, -0.1055)
 # USD stores xformOp:orient as (w, x, y, z); IsaacLab frame math uses (x, y, z, w).
 _RIGHT_EE_FROM_BASE_QUAT = (0.70710677, 0.70710677, 0.0, 0.0)
+_RIGHT_FINGER_PAD_LOCAL_POS = (0.0015, 0.0, -0.0305)
 _PLUG_TIP_OFFSET = (0.0, 0.0, -0.014106234)
-_PLUG_GRASP_OFFSET = (0.0, 0.0, 0.006)
+_CABLE_RADIUS = 0.003
+_GRASP_SHIFT = 0.01
+_PLUG_GRASP_OFFSET = (0.0, -_CABLE_RADIUS + 0.002, _GRASP_SHIFT)
 _CABLE1_PLUG_SEGMENT_ID = 0
 _CABLE1_PLUG_LOCAL_POS = (0.0, 0.0, 0.022)
 _GRIPPER_INITIAL_GRASP_COMMAND = -0.72
 _GRIPPER_PREGRASP_COMMAND = -0.80
-_GRIPPER_FALLBACK_GRASP_COMMAND = -0.93
-_GRIPPER_MAX_FORCE_CLOSE_COMMAND = -0.93
-_GRIPPER_FORCE_TARGET_N = 45.0
-_GRIPPER_LOCK_FORCE_N = 35.0
+_GRIPPER_FALLBACK_GRASP_COMMAND = -1.0
+_GRIPPER_MAX_FORCE_CLOSE_COMMAND = -1.0
+_GRIPPER_FORCE_TARGET_N = 80.0
+_GRIPPER_LOCK_FORCE_N = 80.0
 _GRIPPER_TIGHTEN_RATE = 0.30
 _GRIPPER_CENTERING_K = 0.4
-_GRIPPER_AXIS_CENTERING_K = 0.8
 _GRIPPER_CENTERING_MAX_STEP = 0.002
 
 
@@ -78,8 +80,8 @@ class WaterhoseDemoState:
     HOLD_GRASP = 4
     RETRACT = 5
     SETTLE = 6
-    APPROACH_TARGET = 7
-    ALIGN_AXES = 8
+    ALIGN_AXES = 7
+    APPROACH_TARGET = 8
     VERIFY_ALIGN = 9
     INSERT = 10
     RELEASE = 11
@@ -94,15 +96,15 @@ class WaterhoseDemoState:
         "HOLD_GRASP",
         "RETRACT",
         "SETTLE",
-        "APPROACH_TARGET",
         "ALIGN_AXES",
+        "APPROACH_TARGET",
         "VERIFY_ALIGN",
         "INSERT",
         "RELEASE",
         "WITHDRAW",
         "DONE",
     )
-    DURATIONS = (0.25, 1.0, 1.5, 0.6, 0.8, 2.0, 0.6, 5.0, 1.0, 1.0, 5.0, 1.0, 2.0, 1.0e6)
+    DURATIONS = (0.25, 3.0, 1.5, 0.5, 0.5, 1.5, 0.3, 5.0, 5.0, 2.0, 5.0, 1.0, 2.0, 1.0e6)
 
     def __init__(self, num_envs: int, step_dt: float, device: torch.device | str, settle_time: float, debug: bool):
         self.num_envs = int(num_envs)
@@ -145,7 +147,7 @@ class WaterhoseDemoState:
             self.num_envs, 1
         )
         self.engage_offset = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
-        self.retract_vector = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=device).repeat(
+        self.retract_vector = torch.tensor([0.0, 0.05, 0.0], dtype=torch.float32, device=device).repeat(
             self.num_envs, 1
         )
         self.withdraw_offset = torch.tensor([-0.10, 0.0, 0.0], dtype=torch.float32, device=device).repeat(
@@ -162,11 +164,27 @@ class WaterhoseDemoState:
         self.insert_duration = 4.0
         self.turn_orientation_gain = 0.7
         self.align_orientation_gain = 0.12
-        self.insert_orientation_gain = 0.05
+        self.insert_orientation_gain = 0.2
         self.verify_lateral_gain = 1.0
+        self.insert_axial_gain = 0.8
         self.insert_lateral_gain = 0.5
         self.insert_lateral_integral_gain = 5.0
+        self.verify_lateral_correction_limit = 0.010
+        self.insert_axial_correction_limit = 0.015
+        self.insert_lateral_correction_limit = 0.012
+        self.insert_lateral_integral_limit = 0.002
         self.insert_lateral_integral = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
+        self.insert_ee_start_pos_w = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
+        self.insert_ee_quat_w = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=device)
+        self.insert_ee_quat_w[:, 3] = 1.0
+        self.insert_t_paused = torch.zeros((self.num_envs,), dtype=torch.float32, device=device)
+        self.insert_depth_paused = torch.zeros((self.num_envs,), dtype=torch.bool, device=device)
+        self.insert_cos_pause_threshold = -0.95
+        self.insert_cos_resume_threshold = -0.97
+        # One-shot turn target that aligns the plug tip with the socket axis on ALIGN_AXES entry.
+        self.align_target_quat_w = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=device)
+        self.align_target_quat_w[:, 3] = 1.0
+        self.align_ee_pos_w = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
         self.plug_grasp_fallback_offset = torch.tensor(_PLUG_GRASP_OFFSET, dtype=torch.float32, device=device).repeat(
             self.num_envs, 1
         )
@@ -194,9 +212,19 @@ class WaterhoseDemoState:
         self.ee_offset_quat = torch.tensor(_RIGHT_EE_FROM_BASE_QUAT, dtype=torch.float32, device=device).repeat(
             self.num_envs, 1
         )
+        self.finger_pad_local_pos = torch.tensor(
+            _RIGHT_FINGER_PAD_LOCAL_POS,
+            dtype=torch.float32,
+            device=device,
+        ).repeat(self.num_envs, 1)
         self._plug_segment_body_ids = None
+        self._tail_segment_body_ids = None
         self._plug_body_ids = None
+        self._plug_body_ids_done = False
         self._right_proxy_body_ids = None
+        self._ee_body_id = None
+        self._left_finger_body_id = None
+        self._right_finger_body_id = None
         self.grip_command = torch.full(
             (self.num_envs, 1), _GRIPPER_INITIAL_GRASP_COMMAND, dtype=torch.float32, device=device
         )
@@ -221,6 +249,15 @@ class WaterhoseDemoState:
         self.phase_grasp_pos_w[env_ids] = 0.0
         self.phase_grasp_quat_w[env_ids] = 0.0
         self.phase_grasp_quat_w[env_ids, 3] = 1.0
+        self.insert_lateral_integral[env_ids] = 0.0
+        self.insert_ee_start_pos_w[env_ids] = 0.0
+        self.insert_ee_quat_w[env_ids] = 0.0
+        self.insert_ee_quat_w[env_ids, 3] = 1.0
+        self.insert_t_paused[env_ids] = 0.0
+        self.insert_depth_paused[env_ids] = False
+        self.align_target_quat_w[env_ids] = 0.0
+        self.align_target_quat_w[env_ids, 3] = 1.0
+        self.align_ee_pos_w[env_ids] = 0.0
 
     def compute(self, env) -> torch.Tensor:
         robot = env.scene["robot"]
@@ -228,7 +265,11 @@ class WaterhoseDemoState:
             plug = env.scene["plug1"]
         except KeyError:
             plug = None  # cable-only debug: no plug spawned; fall back to the live cable frame
-        ee_body_id = robot.find_bodies("right_gripper_base")[0][0]
+        if self._ee_body_id is None:
+            self._ee_body_id = robot.find_bodies("right_gripper_base")[0][0]
+            self._left_finger_body_id = robot.find_bodies("right_gripper_leftfinger")[0][0]
+            self._right_finger_body_id = robot.find_bodies("right_gripper_rightfinger")[0][0]
+        ee_body_id = self._ee_body_id
 
         root_pose_w = robot.data.root_link_pose_w.torch
         root_pos_w = root_pose_w[:, :3]
@@ -248,6 +289,8 @@ class WaterhoseDemoState:
             rigid_plug_pose_w[..., 6] = 1.0
         rigid_plug_pos_w = rigid_plug_pose_w[:, :3]
         plug_pos_w, plug_quat_w = self._get_live_plug_frame(env, rigid_plug_pose_w)
+        first_step = self.elapsed == 0.0
+        self._update_plug_grasp_offset(env, plug_pos_w, plug_quat_w, first_step & (self.phase <= self.ENGAGE))
         plug_grasp_offset = self.plug_grasp_offset
         grasp_pos_w = plug_pos_w + quat_apply(plug_quat_w, plug_grasp_offset)
         grasp_quat_w = plug_quat_w
@@ -264,21 +307,22 @@ class WaterhoseDemoState:
             self.num_envs, 1
         )
         insertion_dir_w = _normalize_vector(quat_apply(self.socket_quat_w, socket_z_axis))
-        plug_tip_pos_w = plug_pos_w + quat_apply(plug_quat_w, self.plug_tip_offset)
-        plug_tip_z_w = _normalize_vector(quat_apply(plug_quat_w, socket_z_axis))
+        plug_tip_pos_w, plug_tip_quat_w = self._get_live_tip_frame(env, plug_pos_w, plug_quat_w)
+        plug_tip_z_w = _normalize_vector(quat_apply(plug_tip_quat_w, socket_z_axis))
         plug_tip_target_w = socket_pos_w + self.insertion_start_depth * insertion_dir_w
         plug_tip_error_w = plug_tip_pos_w - plug_tip_target_w
         plug_tip_axial_error = torch.sum(plug_tip_error_w * insertion_dir_w, dim=-1, keepdim=True) * insertion_dir_w
         plug_tip_lateral_error = plug_tip_error_w - plug_tip_axial_error
         plug_tip_lateral_norm = torch.linalg.vector_norm(plug_tip_lateral_error, dim=-1)
         plug_axis_cosine = torch.sum(plug_tip_z_w * insertion_dir_w, dim=-1)
+        desired_plug_z_w = -insertion_dir_w
 
         current_pose = torch.cat((ee_pos_b, ee_quat_b), dim=-1)
         current_pose_w = torch.cat((ee_pos_w, ee_quat_w), dim=-1)
-        first_step = self.elapsed == 0.0
-        if torch.any(first_step):
-            self.phase_start_pose[first_step] = current_pose[first_step]
-            self.phase_start_pose_w[first_step] = current_pose_w[first_step]
+        # Branch-free: masked writes are no-ops when ``first_step`` is empty, so we avoid the
+        # ``torch.any(...)`` host sync that would otherwise stall the step on the GPU.
+        self.phase_start_pose[first_step] = current_pose[first_step]
+        self.phase_start_pose_w[first_step] = current_pose_w[first_step]
 
         target_pose = self.phase_start_pose.clone()
         gripper = torch.ones((self.num_envs, 1), device=self.device)
@@ -288,18 +332,20 @@ class WaterhoseDemoState:
             target_pose[mask, :3] = pos_b[mask]
             target_pose[mask, 3:] = quat_b[mask]
 
-        def set_grasp_target(mask: torch.Tensor, desired_grasp_pos_w: torch.Tensor, quat_w: torch.Tensor) -> None:
-            target_ee_pos_w = ee_pos_w + (desired_grasp_pos_w - grasp_pos_w)
-            set_world_target(mask, target_ee_pos_w, quat_w)
-
         plug_grasp_quat_w = normalize(quat_mul(grasp_quat_w, self.grasp_orientation_offset))
-        socket_grasp_quat_w = normalize(quat_mul(self.socket_quat_w, self.grasp_orientation_offset))
-        if torch.any(first_step):
-            self.phase_plug_pos_w[first_step] = plug_pos_w[first_step]
-            self.phase_plug_quat_w[first_step] = grasp_quat_w[first_step]
-            self.phase_grasp_pos_w[first_step] = grasp_pos_w[first_step]
-            self.phase_grasp_quat_w[first_step] = plug_grasp_quat_w[first_step]
-        phase_plug_tip_z_w = _normalize_vector(quat_apply(self.phase_plug_quat_w, socket_z_axis))
+        # Branch-free phase-entry bookkeeping (masked writes; no host sync).
+        self.phase_plug_pos_w[first_step] = plug_pos_w[first_step]
+        self.phase_plug_quat_w[first_step] = grasp_quat_w[first_step]
+        self.phase_grasp_pos_w[first_step] = grasp_pos_w[first_step]
+        self.phase_grasp_quat_w[first_step] = plug_grasp_quat_w[first_step]
+        entered_align = first_step & (self.phase == self.ALIGN_AXES)
+        self._init_align_axes_state(entered_align, ee_pos_w, ee_quat_w, plug_tip_z_w, desired_plug_z_w)
+        entered_insert = first_step & (self.phase == self.INSERT)
+        self.insert_ee_start_pos_w[entered_insert] = ee_pos_w[entered_insert]
+        self.insert_ee_quat_w[entered_insert] = ee_quat_w[entered_insert]
+        self.insert_lateral_integral[entered_insert] = 0.0
+        self.insert_t_paused[entered_insert] = 0.0
+        self.insert_depth_paused[entered_insert] = False
         grip_command = self._update_grip_command()
 
         approach = self.phase == self.APPROACH
@@ -310,11 +356,7 @@ class WaterhoseDemoState:
         set_world_target(approach, approach_pos_w, self.phase_grasp_quat_w)
 
         engage = self.phase == self.ENGAGE
-        engage_duration = torch.clamp(self.durations[self.ENGAGE], min=1.0e-6)
-        engage_alpha = torch.clamp((self.elapsed / engage_duration).unsqueeze(-1), 0.0, 1.0)
-        engage_alpha = engage_alpha * engage_alpha * (3.0 - 2.0 * engage_alpha)
-        pregrasp = torch.full_like(gripper, _GRIPPER_PREGRASP_COMMAND)
-        gripper[engage] = 1.0 + (pregrasp[engage] - 1.0) * engage_alpha[engage]
+        gripper[engage] = 1.0
         set_world_target(engage, self.phase_grasp_pos_w + self.engage_offset, self.phase_grasp_quat_w)
 
         grasp = self.phase == self.GRASP
@@ -327,15 +369,8 @@ class WaterhoseDemoState:
         gripper[hold_grasp] = grip_command[hold_grasp]
 
         retract = self.phase == self.RETRACT
-        desired_plug_z_w = insertion_dir_w
-        turn_correction_w = _correction_quat_between_vectors(
-            phase_plug_tip_z_w,
-            desired_plug_z_w,
-            self.turn_orientation_gain,
-        )
-        turn_quat_w = normalize(quat_mul(turn_correction_w, self.phase_start_pose_w[:, 3:]))
-        retract_pos_w = self.phase_start_pose_w[:, :3] + self.retract_vector
-        set_world_target(retract, retract_pos_w, turn_quat_w)
+        retract_pos_w = self.phase_start_pose_w[:, :3] + quat_apply(self.phase_plug_quat_w, self.retract_vector)
+        set_world_target(retract, retract_pos_w, self.phase_start_pose_w[:, 3:])
         gripper[retract] = grip_command[retract]
 
         settle = self.phase == self.SETTLE
@@ -344,52 +379,72 @@ class WaterhoseDemoState:
 
         approach_target = self.phase == self.APPROACH_TARGET
         socket_start_pos_w = socket_pos_w + self.insertion_start_depth * insertion_dir_w
-        phase_plug_tip_pos_w = self.phase_plug_pos_w + quat_apply(self.phase_plug_quat_w, self.plug_tip_offset)
-        phase_grasp_tip_offset_w = self.phase_grasp_pos_w - phase_plug_tip_pos_w
-        desired_grasp_start_w = socket_start_pos_w + phase_grasp_tip_offset_w
-        transfer_ee_pos_w = self.phase_start_pose_w[:, :3] + (desired_grasp_start_w - self.phase_grasp_pos_w)
-        set_world_target(approach_target, transfer_ee_pos_w, self.phase_start_pose_w[:, 3:])
+        # The plug is aligned while still clear of the socket, then translated in with that
+        # measured aligned orientation preserved. Driving a twisted plug into the socket proxy
+        # first tends to knock it out of the fingers.
+        set_world_target(approach_target, socket_start_pos_w, self.phase_start_pose_w[:, 3:])
         gripper[approach_target] = grip_command[approach_target]
 
-        lost_grip = self.grip_feedback_available & (self.phase >= self.ALIGN_AXES) & (self.phase <= self.INSERT) & (
+        lost_grip = self.grip_feedback_available & (self.phase >= self.APPROACH_TARGET) & (self.phase <= self.INSERT) & (
             self.grip_force <= 5.0
         )
 
         align_axes = (self.phase == self.ALIGN_AXES) & lost_grip.logical_not()
-        align_correction_w = _correction_quat_between_vectors(
-            plug_tip_z_w,
-            desired_plug_z_w,
-            self.align_orientation_gain,
-        )
-        align_quat_w = normalize(quat_mul(align_correction_w, ee_quat_w))
-        set_world_target(align_axes, ee_pos_w, align_quat_w)
+        set_world_target(align_axes, self.align_ee_pos_w, self.align_target_quat_w)
         gripper[align_axes] = grip_command[align_axes]
 
         verify_align = (self.phase == self.VERIFY_ALIGN) & lost_grip.logical_not()
-        verify_pos_w = ee_pos_w - self.verify_lateral_gain * plug_tip_lateral_error
+        verify_lateral_correction = _clamp_vector_norm(
+            self.verify_lateral_gain * plug_tip_lateral_error,
+            self.verify_lateral_correction_limit,
+        )
+        verify_pos_w = ee_pos_w - verify_lateral_correction
         set_world_target(verify_align, verify_pos_w, self.phase_start_pose_w[:, 3:])
         gripper[verify_align] = grip_command[verify_align]
 
         insert = (self.phase == self.INSERT) & lost_grip.logical_not()
-        insert_elapsed = torch.clamp(self.elapsed, min=0.0, max=self.insert_duration)
-        insert_alpha = torch.clamp((insert_elapsed / self.insert_duration).unsqueeze(-1), 0.0, 1.0)
-        insert_alpha = insert_alpha * insert_alpha * (3.0 - 2.0 * insert_alpha)
-        insert_depth = self.insertion_start_depth + insert_alpha * (self.insert_final_depth - self.insertion_start_depth)
-        insert_depth_travel = insert_depth - self.insertion_start_depth
-        self.insert_lateral_integral[insert] += plug_tip_lateral_error[insert] * self.step_dt
         insert_correction_w = _correction_quat_between_vectors(
             plug_tip_z_w,
             desired_plug_z_w,
             self.insert_orientation_gain,
         )
-        insert_quat_w = normalize(quat_mul(insert_correction_w, self.phase_start_pose_w[:, 3:]))
-        insert_pos_w = (
-            self.phase_start_pose_w[:, :3]
-            + insert_depth_travel * insertion_dir_w
-            - self.insert_lateral_gain * plug_tip_lateral_error
-            - self.insert_lateral_integral_gain * self.insert_lateral_integral
+        self.insert_ee_quat_w[insert] = normalize(quat_mul(insert_correction_w, self.insert_ee_quat_w))[insert]
+        pause_now = insert & (plug_axis_cosine > self.insert_cos_pause_threshold)
+        resume_now = insert & self.insert_depth_paused & (plug_axis_cosine < self.insert_cos_resume_threshold)
+        self.insert_depth_paused[pause_now] = True
+        self.insert_depth_paused[resume_now] = False
+        self.insert_t_paused[insert & self.insert_depth_paused] += self.step_dt
+        insert_elapsed = torch.clamp(self.elapsed - self.insert_t_paused, min=0.0, max=self.insert_duration)
+        insert_alpha = torch.clamp((insert_elapsed / self.insert_duration).unsqueeze(-1), 0.0, 1.0)
+        insert_alpha = insert_alpha * insert_alpha * (3.0 - 2.0 * insert_alpha)
+        insert_depth = self.insertion_start_depth + insert_alpha * (self.insert_final_depth - self.insertion_start_depth)
+        insert_depth_travel = insert_depth - self.insertion_start_depth
+        insert_tip_target_w = socket_pos_w + insert_depth * insertion_dir_w
+        insert_tip_error_w = plug_tip_pos_w - insert_tip_target_w
+        insert_tip_axial_error = (
+            torch.sum(insert_tip_error_w * insertion_dir_w, dim=-1, keepdim=True) * insertion_dir_w
         )
-        set_world_target(insert, insert_pos_w, insert_quat_w)
+        insert_axial_correction = _clamp_vector_norm(
+            self.insert_axial_gain * insert_tip_axial_error,
+            self.insert_axial_correction_limit,
+        )
+        self.insert_lateral_integral[insert] += plug_tip_lateral_error[insert] * self.step_dt
+        self.insert_lateral_integral[insert] = _clamp_vector_norm(
+            self.insert_lateral_integral,
+            self.insert_lateral_integral_limit,
+        )[insert]
+        insert_lateral_correction = _clamp_vector_norm(
+            self.insert_lateral_gain * plug_tip_lateral_error
+            + self.insert_lateral_integral_gain * self.insert_lateral_integral,
+            self.insert_lateral_correction_limit,
+        )
+        insert_pos_w = (
+            self.insert_ee_start_pos_w
+            + insert_depth_travel * insertion_dir_w
+            - insert_axial_correction
+            - insert_lateral_correction
+        )
+        set_world_target(insert, insert_pos_w, self.insert_ee_quat_w)
         gripper[insert] = grip_command[insert]
 
         target_pose[lost_grip] = current_pose[lost_grip]
@@ -417,30 +472,27 @@ class WaterhoseDemoState:
         target_quat = target_pose[:, 3:]
         target_quat = torch.where(torch.sum(start_quat * target_quat, dim=-1, keepdim=True) < 0.0, -target_quat, target_quat)
         self.command_pose[:, 3:] = normalize(start_quat * (1.0 - blend) + target_quat * blend)
+        direct_control = verify_align | insert
+        self.command_pose[direct_control] = target_pose[direct_control]
 
-        centering_active = self.phase == self.ENGAGE
-        if torch.any(centering_active):
-            left_finger_id = robot.find_bodies("right_gripper_leftfinger")[0][0]
-            right_finger_id = robot.find_bodies("right_gripper_rightfinger")[0][0]
-            left_finger_pos_w = robot.data.body_pos_w.torch[:, left_finger_id]
-            right_finger_pos_w = robot.data.body_pos_w.torch[:, right_finger_id]
-            finger_axis_w = _normalize_vector(right_finger_pos_w - left_finger_pos_w)
-            finger_mid_pos_w = 0.5 * (left_finger_pos_w + right_finger_pos_w)
-            grasp_error_w = grasp_pos_w - finger_mid_pos_w
-            plug_axis_w = plug_tip_z_w
+        # Finger-pad frames (cached body ids, GPU-only reads). Computed once per step and reused
+        # by both the centering nudge and the optional debug block.
+        left_finger_pos_w = robot.data.body_pos_w.torch[:, self._left_finger_body_id]
+        right_finger_pos_w = robot.data.body_pos_w.torch[:, self._right_finger_body_id]
+        left_finger_quat_w = robot.data.body_quat_w.torch[:, self._left_finger_body_id]
+        right_finger_quat_w = robot.data.body_quat_w.torch[:, self._right_finger_body_id]
+        left_pad_pos_w = left_finger_pos_w + quat_apply(left_finger_quat_w, self.finger_pad_local_pos)
+        right_pad_pos_w = right_finger_pos_w + quat_apply(right_finger_quat_w, self.finger_pad_local_pos)
+        finger_mid_pos_w = 0.5 * (left_pad_pos_w + right_pad_pos_w)
 
-            delta_center_w = _GRIPPER_CENTERING_K * torch.sum(grasp_error_w * finger_axis_w, dim=-1, keepdim=True) * finger_axis_w
-            grasp_error_radial_w = grasp_error_w - torch.sum(grasp_error_w * plug_axis_w, dim=-1, keepdim=True) * plug_axis_w
-            delta_axis_w = _GRIPPER_AXIS_CENTERING_K * grasp_error_radial_w
-            centering_delta_w = delta_center_w + delta_axis_w
-            centering_delta_w = centering_delta_w - torch.sum(
-                centering_delta_w * plug_axis_w,
-                dim=-1,
-                keepdim=True,
-            ) * plug_axis_w
-            centering_delta_w = _clamp_vector_norm(centering_delta_w, _GRIPPER_CENTERING_MAX_STEP)
-            centering_delta_b = quat_apply(quat_inv(root_quat_w), centering_delta_w)
-            self.command_pose[centering_active, :3] += centering_delta_b[centering_active]
+        # Branch-free centering: nudge the EE so the finger midpoint tracks the grasp point.
+        # The masked write affects only ENGAGE..ALIGN_AXES envs, so no host sync is needed.
+        centering_active = (self.phase >= self.ENGAGE) & (self.phase <= self.ALIGN_AXES) & lost_grip.logical_not()
+        centering_delta_b = quat_apply(
+            quat_inv(root_quat_w),
+            _clamp_vector_norm(_GRIPPER_CENTERING_K * (grasp_pos_w - finger_mid_pos_w), _GRIPPER_CENTERING_MAX_STEP),
+        )
+        self.command_pose[centering_active, :3] += centering_delta_b[centering_active]
 
         actions = torch.cat((self.command_pose, gripper), dim=-1)
 
@@ -448,12 +500,7 @@ class WaterhoseDemoState:
         rotation_error = quat_error_magnitude(target_pose[:, 3:], current_pose[:, 3:])
 
         if self.debug:
-            left_finger_id = robot.find_bodies("right_gripper_leftfinger")[0][0]
-            right_finger_id = robot.find_bodies("right_gripper_rightfinger")[0][0]
-            left_finger_pos_w = robot.data.body_pos_w.torch[:, left_finger_id]
-            right_finger_pos_w = robot.data.body_pos_w.torch[:, right_finger_id]
-            finger_mid_pos_w = 0.5 * (left_finger_pos_w + right_finger_pos_w)
-            finger_gap = torch.linalg.vector_norm(left_finger_pos_w - right_finger_pos_w, dim=-1)
+            finger_gap = torch.linalg.vector_norm(left_pad_pos_w - right_pad_pos_w, dim=-1)
             finger_mid_error = torch.linalg.vector_norm(finger_mid_pos_w - grasp_pos_w, dim=-1)
             self._update_debug_markers(env, plug_pos_w, rigid_plug_pos_w, grasp_pos_w, finger_mid_pos_w)
 
@@ -504,11 +551,11 @@ class WaterhoseDemoState:
             | (self.phase == self.INSERT)
         )
         should_advance &= custom_advance.logical_not()
-        align_converged = (self.elapsed >= 0.5) & (plug_axis_cosine > 0.90)
+        align_converged = (self.elapsed >= 0.5) & (plug_axis_cosine < -0.90)
         verify_converged = (
             (self.elapsed >= 0.5)
             & (plug_tip_lateral_norm < 0.010)
-            & (plug_axis_cosine > 0.90)
+            & (plug_axis_cosine < -0.90)
         )
         should_advance |= retract & timed_out
         should_advance |= approach_target & timed_out
@@ -518,24 +565,25 @@ class WaterhoseDemoState:
         should_advance |= insert & (self.elapsed >= self.insert_duration)
         should_advance &= lost_grip.logical_not()
         should_advance &= self.phase < self.DONE
-        if torch.any(should_advance):
-            self.phase[should_advance] += 1
-            self.elapsed[should_advance] = 0.0
-            self.phase_start_pose[should_advance] = current_pose[should_advance]
-            self.phase_start_pose_w[should_advance] = current_pose_w[should_advance]
-            entered_insert = should_advance & (self.phase == self.INSERT)
-            if torch.any(entered_insert):
-                self.insert_lateral_integral[entered_insert] = 0.0
+        # Branch-free phase advance (masked writes; no host sync).
+        self.phase[should_advance] += 1
+        self.elapsed[should_advance] = 0.0
+        self.phase_start_pose[should_advance] = current_pose[should_advance]
+        self.phase_start_pose_w[should_advance] = current_pose_w[should_advance]
+        entered_insert = should_advance & (self.phase == self.INSERT)
+        self.insert_lateral_integral[entered_insert] = 0.0
 
         return actions
 
     def _update_grip_command(self) -> torch.Tensor:
-        """Tighten only during capture, then hold the locked command through insertion."""
+        """Tighten only during capture, then hold the locked command through insertion.
 
-        hold_active = (self.phase >= self.GRASP) & (self.phase <= self.INSERT)
+        Branch-free over envs: the proxy grip force is read every step (a cheap GPU-only
+        gather) and every command update is masked, so there is no per-step host sync. Updates
+        still only affect the GRASP/HOLD_GRASP/INSERT envs via the masks below.
+        """
+
         tighten_active = ((self.phase == self.GRASP) | (self.phase == self.HOLD_GRASP)) & self.grip_locked.logical_not()
-        if not torch.any(hold_active):
-            return self.grip_command
 
         proxy_force = self._get_right_proxy_grip_force()
         if proxy_force is None:
@@ -546,19 +594,15 @@ class WaterhoseDemoState:
 
         self.grip_feedback_available = True
         self.grip_force[:] = proxy_force
-        lock_now = hold_active & (
-            (proxy_force >= _GRIPPER_LOCK_FORCE_N)
-            | (self.grip_command.squeeze(-1) <= _GRIPPER_MAX_FORCE_CLOSE_COMMAND + 1.0e-5)
+        hold_active = (self.phase >= self.GRASP) & (self.phase <= self.INSERT)
+        at_close_limit = self.grip_command.squeeze(-1) <= _GRIPPER_MAX_FORCE_CLOSE_COMMAND + 1.0e-5
+        self.grip_locked[hold_active & ((proxy_force >= _GRIPPER_LOCK_FORCE_N) | at_close_limit)] = True
+        tighten = tighten_active & self.grip_locked.logical_not() & (proxy_force < _GRIPPER_FORCE_TARGET_N)
+        next_command = torch.clamp(
+            self.grip_command - _GRIPPER_TIGHTEN_RATE * self.step_dt, min=_GRIPPER_MAX_FORCE_CLOSE_COMMAND
         )
-        self.grip_locked[lock_now] = True
-        tighten = tighten_active & lock_now.logical_not() & (proxy_force < _GRIPPER_FORCE_TARGET_N)
-        if torch.any(tighten):
-            next_command = self.grip_command[tighten] - _GRIPPER_TIGHTEN_RATE * self.step_dt
-            self.grip_command[tighten] = torch.clamp(next_command, min=_GRIPPER_MAX_FORCE_CLOSE_COMMAND)
-            command_limited = tighten & (
-                self.grip_command.squeeze(-1) <= _GRIPPER_MAX_FORCE_CLOSE_COMMAND + 1.0e-5
-            )
-            self.grip_locked[command_limited] = True
+        self.grip_command[tighten] = next_command[tighten]
+        self.grip_locked[tighten & (self.grip_command.squeeze(-1) <= _GRIPPER_MAX_FORCE_CLOSE_COMMAND + 1.0e-5)] = True
         return self.grip_command
 
     def _get_right_proxy_grip_force(self) -> torch.Tensor | None:
@@ -577,12 +621,9 @@ class WaterhoseDemoState:
             wrench_tensor = wp.to_torch(wrenches).to(device=self.device)
             if wrench_tensor.ndim != 2 or wrench_tensor.shape[-1] < 3:
                 return None
-            if int(torch.max(body_ids).item()) >= wrench_tensor.shape[0]:
-                return None
-            finger_wrenches = wrench_tensor[body_ids]
-            finger_forces = finger_wrenches[..., :3]
+            finger_forces = wrench_tensor[body_ids][..., :3]
             return torch.linalg.vector_norm(finger_forces, dim=-1).sum(dim=-1)
-        except (AttributeError, ImportError, RuntimeError):
+        except (AttributeError, ImportError, IndexError, RuntimeError):
             return None
 
     def _get_live_plug_frame(self, env, rigid_plug_pose_w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -620,6 +661,74 @@ class WaterhoseDemoState:
 
         return rigid_plug_pose_w[:, :3], normalize(rigid_plug_pose_w[:, 3:])
 
+    def _get_live_tip_frame(
+        self,
+        env,
+        plug_pos_w: torch.Tensor,
+        plug_quat_w: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the live plug insertion tip.
+
+        Cable segment 0's Newton body origin is not the connector tip in this
+        rig: the Plug1 weld uses cable_local_pos=(0, 0, 0.022).  Use the actual
+        plug frame plus the plug mesh's local -Z tip offset for insertion
+        lateral/depth checks.
+        """
+
+        return plug_pos_w + quat_apply(plug_quat_w, self.plug_tip_offset), plug_quat_w
+
+    def _update_plug_grasp_offset(
+        self,
+        env,
+        plug_pos_w: torch.Tensor,
+        plug_quat_w: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        """Match the stable demo: grasp from the side and shift 1 cm toward the cable body.
+
+        Branch-free: the offset write is masked, so this can run every step without a host
+        sync; only ``first_step`` envs in the early phases actually update.
+        """
+
+        try:
+            cable = env.scene["cable1"]
+        except KeyError:
+            return
+
+        tail_ids = self._resolve_tail_segment_body_ids(cable)
+        tail_pos_w = None
+        if tail_ids is not None:
+            tail_pose_w = self._newton_body_poses(tail_ids)
+            if tail_pose_w is not None:
+                tail_pos_w = tail_pose_w[:, :3]
+
+        if tail_pos_w is None:
+            try:
+                tail_pos_w = cable.data.body_link_pose_w.torch[:, -1, :3]
+            except (AttributeError, IndexError, RuntimeError):
+                return
+
+        toward_cable_w = _normalize_vector(tail_pos_w - plug_pos_w)
+        toward_cable_local = quat_apply(quat_inv(plug_quat_w), toward_cable_w)
+        offset = toward_cable_local * _GRASP_SHIFT
+        offset[:, 1] += -_CABLE_RADIUS + 0.002
+        self.plug_grasp_offset[mask] = offset[mask]
+
+    def _init_align_axes_state(
+        self,
+        mask: torch.Tensor,
+        ee_pos_w: torch.Tensor,
+        ee_quat_w: torch.Tensor,
+        plug_tip_z_w: torch.Tensor,
+        desired_plug_z_w: torch.Tensor,
+    ) -> None:
+        """Capture the one-shot turn target that aligns the plug tip with the socket axis."""
+
+        turn_correction_w = _correction_quat_between_vectors(plug_tip_z_w, desired_plug_z_w, 1.0)
+        turn_target_quat_w = normalize(quat_mul(turn_correction_w, ee_quat_w))
+        self.align_ee_pos_w[mask] = ee_pos_w[mask]
+        self.align_target_quat_w[mask] = turn_target_quat_w[mask]
+
     def _newton_body_poses(self, body_ids: torch.Tensor | None) -> torch.Tensor | None:
         """Read global Newton body poses for a vector of body ids."""
 
@@ -633,16 +742,18 @@ class WaterhoseDemoState:
             if state is None or state.body_q is None:
                 return None
             body_q = wp.to_torch(state.body_q).to(device=self.device)
-            if int(torch.max(body_ids).item()) >= body_q.shape[0]:
-                return None
             return body_q[body_ids]
-        except (AttributeError, ImportError, RuntimeError):
+        except (AttributeError, ImportError, IndexError, RuntimeError):
             return None
 
     def _resolve_plug_body_ids(self) -> torch.Tensor | None:
-        """Resolve global Newton body ids for the simulated Plug1 rigid body."""
+        """Resolve global Newton body ids for the simulated Plug1 rigid body.
 
-        if self._plug_body_ids is not None:
+        Caches the result once the model is queryable -- including a negative result when Plug1
+        is absent (cable-only scenes) -- so the body-label scan does not repeat every step.
+        """
+
+        if self._plug_body_ids_done:
             return self._plug_body_ids
 
         try:
@@ -651,6 +762,8 @@ class WaterhoseDemoState:
             model = NewtonManager.get_model()
             body_labels = [str(label) for label in getattr(model, "body_label", [])]
         except (AttributeError, ImportError, RuntimeError):
+            return None
+        if not body_labels:
             return None
 
         body_ids = []
@@ -662,9 +775,12 @@ class WaterhoseDemoState:
                 if label == target or label.startswith(f"{target}/")
             ]
             if not matches:
+                self._plug_body_ids = None
+                self._plug_body_ids_done = True
                 return None
             body_ids.append(matches[0])
         self._plug_body_ids = torch.tensor(body_ids, dtype=torch.long, device=self.device)
+        self._plug_body_ids_done = True
         return self._plug_body_ids
 
     def _resolve_right_proxy_body_ids(self) -> torch.Tensor | None:
@@ -722,6 +838,26 @@ class WaterhoseDemoState:
             body_ids.append(int(segments[_CABLE1_PLUG_SEGMENT_ID]))
         self._plug_segment_body_ids = torch.tensor(body_ids, dtype=torch.long, device=self.device)
         return self._plug_segment_body_ids
+
+    def _resolve_tail_segment_body_ids(self, cable) -> torch.Tensor | None:
+        """Resolve global Newton body ids for Cable1's tail segment."""
+
+        if self._tail_segment_body_ids is not None:
+            return self._tail_segment_body_ids
+
+        entry = getattr(cable, "_registry_entry", None)
+        segment_body_indices = getattr(entry, "segment_body_indices", None)
+        if not segment_body_indices or len(segment_body_indices) < self.num_envs:
+            return None
+
+        body_ids = []
+        for env_idx in range(self.num_envs):
+            segments = segment_body_indices[env_idx]
+            if not segments:
+                return None
+            body_ids.append(int(segments[-1]))
+        self._tail_segment_body_ids = torch.tensor(body_ids, dtype=torch.long, device=self.device)
+        return self._tail_segment_body_ids
 
     def _update_debug_markers(
         self,
