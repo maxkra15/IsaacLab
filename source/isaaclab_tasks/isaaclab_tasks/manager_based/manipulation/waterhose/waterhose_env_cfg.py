@@ -50,7 +50,7 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_contrib.cable.cable_object_cfg import CableAttachmentCfg, CableObjectCfg
+from isaaclab_contrib.cable.cable_object_cfg import CableAttachmentCfg, CableObjectCfg, CableSdfCaptureCfg
 from isaaclab_contrib.deformable.newton_manager_cfg import (
     CoupledNewtonCfg,
     NewtonModelCfg,
@@ -81,24 +81,10 @@ _RIGHT_GRIPPER_EE_FRAME_POS = (0.0, 0.0, -0.075)
 # USD stores xformOp:orient as (w, x, y, z); IsaacLab action offsets use (x, y, z, w).
 _RIGHT_GRIPPER_EE_FRAME_ROT = (0.70710677, 0.70710677, 0.0, 0.0)
 
-# add_rod_graph places each segment's body frame at the edge's start node u (edge
-# (u, v), +Z from u->v), so cable_local_pos=(0, 0, 0) welds at u. The anchor sits
-# at that start node: cable001's last segment is edge (42, 43) -> u=42; cable002's
-# first segment is edge (0, 1) -> u=0.
+# add_rod_graph places each segment's body frame at the edge's start node u
+# (edge (u, v), +Z from u->v), so the head plug weld's local offset is authored
+# against segment 0's start frame.
 _FRIDGE_POS = (0.0, 0.0, 0.5)
-_CABLE1_TAIL_NODE_42 = (-0.18810473382472992, 0.3453156650066376, -0.25986239314079285)
-_CABLE1_TAIL_NODE_43 = (-0.18807558715343475, 0.3453156650066376, -0.2473306804895401)
-_CABLE2_HEAD_NODE_0 = (-0.18045400083065033, 0.3453156650066376, -0.24754305183887482)
-_CABLE2_HEAD_NODE_1 = (-0.18038532137870789, 0.3453156650066376, -0.25747784972190857)
-_CABLE1_ANCHOR_NODE = _CABLE1_TAIL_NODE_42
-_CABLE2_ANCHOR_NODE = _CABLE2_HEAD_NODE_1
-
-# World positions of the cable fixed-end nodes = per-env kinematic anchor bodies. The
-# cable welds to these (a per-env body) rather than the shared static world body: a
-# fixed joint to the global world body (-1) corrupts the multi-env coupled MJWarp+VBD
-# solve (robot joints go NaN at step 0).
-_ANCHOR_POS = tuple(p + n for p, n in zip(_FRIDGE_POS, _CABLE1_ANCHOR_NODE))
-_ANCHOR2_POS = tuple(p + n for p, n in zip(_FRIDGE_POS, _CABLE2_ANCHOR_NODE))
 _KIT_CAMERA_EYE = (-0.9, 0.6, 0.3)
 _KIT_CAMERA_LOOKAT = (-0.013736291, 0.236437794, 0.013017143)
 _NEWTON_CAMERA_EYE = (-2.0, 1.5, 0.8)
@@ -175,7 +161,14 @@ def _make_proxy_collision_pipeline(model):
     """Build the destination-view collision pipeline used by Newton proxy coupling."""
     from newton import CollisionPipeline
 
-    return CollisionPipeline(model, broad_phase="explicit", rigid_contact_max=30000)
+    return CollisionPipeline(
+        model,
+        broad_phase="explicit",
+        rigid_contact_max=30000,
+        contact_matching="sticky",
+        contact_matching_pos_threshold=0.005,
+        contact_matching_normal_dot_threshold=0.95,
+    )
 
 
 _RBY1_IK_INITIAL_JOINT_POS = {
@@ -215,7 +208,7 @@ _RBY1_IK_INITIAL_JOINT_POS = {
 
 @configclass
 class WaterhoseSceneCfg(InteractiveSceneCfg):
-    """Cable + plug with the cable tail pinned to static anchors; sky light and ground."""
+    """Cable + plug with the cable tail captured by SDF contact; sky light and ground."""
 
     ### Static fridge body
     fridge = AssetBaseCfg(
@@ -224,28 +217,6 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "fridge.usda"),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=_FRIDGE_POS),
-    )
-
-    ### Per-env kinematic anchors the cable fixed ends weld to (see _ANCHOR_POS note).
-    anchor1 = RigidObjectCfg(
-        prim_path="/World/envs/env_.*/Anchor1",
-        spawn=sim_utils.SphereCfg(
-            radius=0.001,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.1)),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=_ANCHOR_POS),
-    )
-    anchor2 = RigidObjectCfg(
-        prim_path="/World/envs/env_.*/Anchor2",
-        spawn=sim_utils.SphereCfg(
-            radius=0.001,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.1)),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=_ANCHOR2_POS),
     )
 
     ### rby1df robot (28-DOF, fixed base). Drive gains match the reference example.
@@ -282,7 +253,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         },
     )
 
-    ### Cable 1
+    ### Cable 1 (graspable plug welded to the head, tail retained by static SDF contact)
     plug1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Plug1",
         spawn=sim_utils.UsdFileCfg(usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda")),
@@ -297,9 +268,9 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "cable001.usda"),
             physics_material=NewtonCableMaterialCfg(
-                stretch_stiffness=1e6,
-                bend_stiffness=1e1,
-                stretch_damping=1e-5,
+                stretch_stiffness=1e8,
+                bend_stiffness=30.0,
+                stretch_damping=1e-3,
                 bend_damping=1e0,
                 density=1000.0,
             ),
@@ -307,53 +278,59 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         init_state=CableObjectCfg.InitialStateCfg(
             pos=_FRIDGE_POS,
         ),
+        resample_segment_length=None,  # authored geometry keeps the plug weld's 22mm head offset valid
         attachments=[
             CableAttachmentCfg(
                 target_prim_path="/World/envs/env_.*/Plug1",
                 cable_anchor=0,
                 cable_local_pos=(0.0, 0.0, 0.022),  # the head node is 22mm along +Z from the head body center
             ),
-            CableAttachmentCfg(
-                target_prim_path="/World/envs/env_.*/Anchor1",
-                cable_anchor=42,  # last segment start node; Anchor1 sits exactly there
-            ),
         ],
-    )
-
-    ### Cable 2
-    plug2 = RigidObjectCfg(
-        prim_path="/World/envs/env_.*/Plug2",
-        spawn=sim_utils.UsdFileCfg(usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda")),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.00921878, 0.34529759, 0.5 - 0.37485825),
-            rot=(0.0, 0.52994014, 0.0, 0.84803505),
-        ),
-    )
-
-    cable2 = CableObjectCfg(
-        prim_path="/World/envs/env_.*/Cable2",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "cable002.usda"),
-            physics_material=NewtonCableMaterialCfg(
-                stretch_stiffness=1e6,
-                bend_stiffness=2e1,
-                stretch_damping=1e-5,
-                bend_damping=1e0,
-                density=1000.0,
-            ),
-        ),
-        init_state=CableObjectCfg.InitialStateCfg(
-            pos=_FRIDGE_POS,
-        ),
-        attachments=[
-            CableAttachmentCfg(
-                target_prim_path="/World/envs/env_.*/Plug2",
+        sdf_captures=[
+            CableSdfCaptureCfg(
                 cable_anchor=-1,
-                cable_local_pos=(0.0, 0.0, 0.022),  # the head node is 22mm along +Z from the head body center
+                label_suffix="tail_sdf_capture",
+                outer_radius=0.012,
+                bore_clearance=0.0001,
+                retainer_offset=0.0045,
+                retainer_thickness=0.0015,
+                tail_clearance=0.006,
+                radial_segments=32,
+                sdf_max_resolution=64,
+                margin=0.0,
+                gap=0.0002,
+                mu=1.0,
             ),
-            CableAttachmentCfg(
-                target_prim_path="/World/envs/env_.*/Anchor2",
-                cable_anchor=1,  # head segment start node; Anchor2 sits exactly there
+            *[
+                CableSdfCaptureCfg(
+                    cable_anchor=anchor_idx,
+                    label_suffix=f"tail_sdf_sleeve_{abs(anchor_idx)}",
+                    outer_radius=0.012,
+                    bore_clearance=0.0008,
+                    retainer_offset=0.0015,
+                    tail_clearance=0.0015,
+                    through_sleeve=True,
+                    radial_segments=32,
+                    sdf_max_resolution=64,
+                    margin=0.0,
+                    gap=0.0002,
+                    mu=1.0,
+                )
+                for anchor_idx in (-2, -3, -4, -5, -6, -7)
+            ],
+            CableSdfCaptureCfg(
+                cable_anchor=-8,
+                label_suffix="tail_sdf_sleeve_8",
+                outer_radius=0.012,
+                bore_clearance=0.0012,
+                retainer_offset=0.0015,
+                tail_clearance=0.0015,
+                through_sleeve=True,
+                radial_segments=32,
+                sdf_max_resolution=64,
+                margin=0.0,
+                gap=0.0002,
+                mu=1.0,
             ),
         ],
     )
@@ -526,25 +503,27 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                     CoupledSolverEntryCfg(
                         name="vbd",
                         solver_cfg=VBDSolverCfg(
-                            iterations=20,
-                            friction_epsilon=1.0e-2,
-                            rigid_contact_hard=True,
-                            rigid_body_contact_buffer_size=1024,
-                            rigid_body_particle_contact_buffer_size=1,
-                            rigid_joint_linear_ke=1.0e6,
-                            rigid_joint_angular_ke=1.0e6,
+                            iterations=10,
+                            friction_epsilon=0.1,
+                            rigid_contact_hard=False,
+                            rigid_joint_hard=False,
+                            rigid_avbd_beta=1.0e5,
+                            rigid_contact_history=False,
+                            rigid_contact_k_start=1.0e2,
+                            rigid_body_contact_buffer_size=512,
+                            rigid_joint_linear_ke=1.0e5,
+                            rigid_joint_angular_ke=1.0e5,
+                            rigid_joint_linear_k_start=1.0e4,
+                            rigid_joint_angular_k_start=1.0e1,
                         ),
                         solver_class="newton.solvers:SolverVBD",
                         body_entities=[
                             SceneEntityCfg("cable1"),
-                            SceneEntityCfg("cable2"),
                             SceneEntityCfg("plug1"),
-                            SceneEntityCfg("plug2"),
-                            SceneEntityCfg("anchor1"),
-                            SceneEntityCfg("anchor2"),
                         ],
+                        shape_label_patterns=[r"/World/envs/env_\d+/Cable1/tail_sdf_.*"],
                         all_particles=True,
-                        include_static_shapes=True,
+                        include_static_shapes=False,
                     ),
                 ],
                 proxy_coupling=ProxyCouplingCfg(
@@ -556,31 +535,37 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                                 SceneEntityCfg(
                                     "robot",
                                     body_names=[
+                                        "right_gripper_base",
                                         "right_gripper_leftfinger",
                                         "right_gripper_rightfinger",
+                                        "left_gripper_base",
                                         "left_gripper_leftfinger",
                                         "left_gripper_rightfinger",
                                     ],
                                 )
                             ],
                             mode="lagged",
-                            # The RBY1 finger links are ~33 g. Match the stable
-                            # waterhose demo's 1 kg VBD proxy fingers through the
-                            # generic IsaacLab/Newton proxy-coupling config.
-                            mass_scale=30.0,
+                            # Make the finger proxies effectively immovable in the VBD view so the
+                            # cable contact cannot push them back (no two-way energy pumping), and
+                            # refresh contacts every substep so a moving gripper never penetrates
+                            # the cable before the stiff penalty fires.
+                            mass_scale=1.0e2,
                             collision_pipeline_factory=_make_proxy_collision_pipeline,
                             collide_interval=1,
+                            shape_material_ke=2.0e5,
+                            shape_material_mu=3.0e6,
+                            shape_margin=0.001,
                         )
                     ],
                     iterations=1,
                 ),
             ),
-            num_substeps=8,
+            num_substeps=10,
             collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
             model_cfg=NewtonModelCfg(
-                shape_material_ke=1.0e3,
-                shape_material_kd=1.0e0,
-                soft_contact_mu=0.5,
+                shape_material_ke=1.0e5,
+                shape_material_kd=1.0e-1,
+                soft_contact_mu=1.0,
                 shape_material_mu=1.0,
             ),
         )

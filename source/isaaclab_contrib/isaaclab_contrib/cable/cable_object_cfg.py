@@ -55,6 +55,58 @@ class CableAttachmentCfg:
 
 
 @configclass
+class CableSdfCaptureCfg:
+    """Static SDF contact geometry that mechanically captures a cable segment.
+
+    The capture is added directly to the Newton builder as a static mesh shape.
+    It does not create a body or a joint; coupled-solver entries should select
+    it with ``shape_label_patterns``.
+    """
+
+    cable_anchor: int = -1
+    """Rod-segment body index to surround, Python-style."""
+
+    label_suffix: str = "sdf_capture"
+    """Suffix appended under the cable prim path for the Newton shape label."""
+
+    outer_radius: float = 0.012
+    """Outer radius of the generated connector shell [m]."""
+
+    bore_clearance: float = 0.0015
+    """Clearance added to the cable radius for the main bore [m]."""
+
+    retainer_hole_radius: float | None = None
+    """Radius of the retaining lip hole [m]. ``None`` uses 75% of cable radius."""
+
+    retainer_offset: float = 0.0045
+    """Distance behind the segment start where the retaining lip begins [m]."""
+
+    retainer_thickness: float = 0.0015
+    """Axial thickness of the retaining lip [m]."""
+
+    tail_clearance: float = 0.006
+    """Extra closed-end clearance beyond the segment end [m]."""
+
+    through_sleeve: bool = False
+    """When true, build an open through-sleeve instead of a closed retaining cup."""
+
+    radial_segments: int = 32
+    """Number of radial tessellation segments in the generated mesh."""
+
+    sdf_max_resolution: int = 64
+    """Maximum SDF grid resolution for the generated connector mesh."""
+
+    margin: float = 0.0
+    """Newton contact margin for the connector shape [m]."""
+
+    gap: float = 0.001
+    """Newton contact gap for the connector shape [m]."""
+
+    mu: float = 1.0
+    """Newton friction coefficient for the connector shape."""
+
+
+@configclass
 class CableObjectCfg(ArticulationCfg):
     """Configuration for a cable / 1D-rod asset (Newton backend).
 
@@ -82,4 +134,15 @@ class CableObjectCfg(ArticulationCfg):
     empty dict instead of crashing on ``MISSING``; a harmless
     ``logger.warning("Not all actuators are configured!")`` is expected."""
 
+    resample_segment_length: float | None = None
+    """Optional arc-length resample target [m]. When set, the cable's authored control
+    points are resampled to approximately uniform segments of this length (endpoints
+    preserved) before the rod is built; ``None`` keeps the authored points as-is. Use it
+    to remove non-uniform segments (e.g. a long lead-in) that destabilize the rod solve.
+    Note: segment indices change, so prefer endpoint-relative ``cable_anchor`` values
+    (``0`` / ``-1``) on attachments when this is enabled."""
+
     attachments: list[CableAttachmentCfg] = []
+
+    sdf_captures: list[CableSdfCaptureCfg] = []
+    """Static SDF contact captures associated with this cable."""

@@ -91,6 +91,9 @@ class CoupledSolverEntryCfg:
     body shapes visible automatically.
     """
 
+    shape_label_patterns: list[str] = field(default_factory=list)
+    """Regexes matched against full Newton shape labels."""
+
     solver_kwargs: dict[str, Any] = field(default_factory=dict)
     """Extra keyword arguments bound into the sub-solver factory.
 
@@ -177,6 +180,21 @@ class CoupledProxyCfg:
 
     collide_interval: int | None = None
     """Proxy-local collision refresh interval when a factory is supplied."""
+
+    shape_material_ke: float | None = None
+    """Optional contact stiffness override for shapes attached to proxy source bodies."""
+
+    shape_material_kd: float | None = None
+    """Optional contact damping override for shapes attached to proxy source bodies."""
+
+    shape_material_mu: float | None = None
+    """Optional friction override for shapes attached to proxy source bodies."""
+
+    shape_margin: float | None = None
+    """Optional contact margin override for shapes attached to proxy source bodies."""
+
+    shape_gap: float | None = None
+    """Optional contact gap override for shapes attached to proxy source bodies."""
 
 
 @configclass

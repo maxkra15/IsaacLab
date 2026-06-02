@@ -74,6 +74,41 @@ def _debug_runner(message: str) -> None:
         print(f"[waterhose-runner] {message}", file=sys.__stderr__, flush=True)
 
 
+def _debug_cable_positions(tag: str) -> None:
+    """TEMP debug: print a summary of the Newton cable body positions.
+
+    Shows position bounds, the first segment, and whether any value is non-finite
+    so cable blow-up can be localized to a specific step.
+    """
+    try:
+        import warp as wp  # noqa: PLC0415
+        import torch as _torch  # noqa: PLC0415
+
+        from isaaclab_newton.physics import NewtonManager  # noqa: PLC0415
+
+        state = NewtonManager.get_state_0()
+        model = NewtonManager.get_model()
+        if state is None or getattr(state, "body_q", None) is None or model is None:
+            print(f"[cable-debug] {tag}: no Newton state/model yet", flush=True)
+            return
+        body_q = wp.to_torch(state.body_q)
+        labels = [str(label) for label in getattr(model, "body_label", [])]
+        cable_ids = [i for i, label in enumerate(labels) if "cable" in label.lower()]
+        if not cable_ids:
+            print(f"[cable-debug] {tag}: no cable bodies found (n_bodies={len(labels)})", flush=True)
+            return
+        pos = body_q[_torch.tensor(cable_ids, device=body_q.device), :3]
+        finite = bool(_torch.isfinite(pos).all().item())
+        rnd = lambda values: [round(float(v), 4) for v in values]  # noqa: E731
+        print(
+            f"[cable-debug] {tag}: n={len(cable_ids)} finite={finite} "
+            f"min={rnd(pos.amin(dim=0))} max={rnd(pos.amax(dim=0))} first={rnd(pos[0])}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - debug helper, never fatal
+        print(f"[cable-debug] {tag}: error {exc!r}", flush=True)
+
+
 def _install_faulthandler() -> None:
     if os.getenv("WATERHOSE_FAULTHANDLER", "").lower() not in {"1", "true", "yes", "on"}:
         return
@@ -306,6 +341,7 @@ def _run_env(env_cfg) -> None:
 
         rollout_start = time.perf_counter()
         _debug_runner(f"loop:start running={_simulation_is_running(env)} max_steps={args_cli.max_steps}")
+        _debug_cable_positions("init (post-reset, pre-step)")
         while _simulation_is_running(env) and step < args_cli.max_steps:
             if scripted_state is not None:
                 actions = scripted_state.compute(env)
@@ -313,6 +349,8 @@ def _run_env(env_cfg) -> None:
                 actions.zero_()
             obs, rew, terminated, truncated, extras = env.step(actions)
             del obs, rew, extras
+            if step < 5 or step % 20 == 0:
+                _debug_cable_positions(f"step={step}")
             if bool(torch.any(terminated | truncated).item()):
                 break
             step += 1

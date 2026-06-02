@@ -88,6 +88,11 @@ class VBDSolverCfg(NewtonSolverCfg):
     rigid_contact_hard: bool = True
     """Whether VBD treats rigid contacts as hard constraints."""
 
+    rigid_contact_history: bool = False
+    """Whether to warm-start body-body rigid contacts across steps from the collision pipeline's
+    contact matching (restores penalty ``k``; for hard contacts also lambda and sticky anchors).
+    Requires a collision pipeline built with ``contact_matching`` enabled (e.g. ``"latest"``/``"sticky"``)."""
+
     rigid_body_contact_buffer_size: int = 64
     """Per-body body-body contact list capacity.
 
@@ -115,6 +120,22 @@ class VBDSolverCfg(NewtonSolverCfg):
 
     rigid_joint_angular_ke: float = 1.0e5
     """Maximum angular penalty stiffness for VBD rigid joints [N m/rad]."""
+
+    rigid_joint_linear_k_start: float = 1.0e2
+    """Initial linear penalty seed for VBD rigid joints [N/m]; ramps toward
+    :attr:`rigid_joint_linear_ke` when ``rigid_avbd_beta > 0``."""
+
+    rigid_joint_angular_k_start: float = 1.0e1
+    """Initial angular penalty seed for VBD rigid joints [N m/rad]; ramps toward
+    :attr:`rigid_joint_angular_ke` when ``rigid_avbd_beta > 0``."""
+
+    rigid_joint_hard: bool = True
+    """Whether VBD treats non-cable structural joints (e.g. cross-solver welds) as hard
+    (augmented-Lagrangian) or soft (penalty-only). ``False`` softens every joint to
+    penalty-only after construction (via ``SolverVBD.set_joint_constraint_mode``), which
+    avoids AL ``lambda`` accumulation against cable bend torques that can blow the solve
+    up (the Newton waterhose reference's anti-blow-up measure). Cable stretch/bend slots
+    are already soft by default."""
 
 
 @configclass

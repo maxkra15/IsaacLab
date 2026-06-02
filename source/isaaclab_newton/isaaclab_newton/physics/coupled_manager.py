@@ -131,7 +131,10 @@ class NewtonCoupledManager(NewtonManager):
         else:
             raise ValueError(f"Unsupported Newton coupling_type {solver_cfg.coupling_type!r}.")
 
+        cls._apply_coupled_model_cfg(model)
+        cls._apply_proxy_shape_overrides(model, solver_cfg.proxy_coupling.proxies)
         cls._apply_entry_solver_overrides(solver_cfg.entries)
+        cls._apply_vbd_joint_constraint_modes(solver_cfg.entries)
         cls._configure_fk_articulation_filter(model, solver_cfg.entries)
         if hasattr(NewtonManager._solver, "prepare_graph_capture"):
             NewtonManager._solver.prepare_graph_capture()
@@ -171,6 +174,13 @@ class NewtonCoupledManager(NewtonManager):
         bodies = cls._unique_ints([*entry_cfg.bodies, *selected_bodies])
         joints = list(entry_cfg.joints)
         shapes = list(entry_cfg.shapes)
+        shapes.extend(
+            cls._resolve_shape_label_patterns(
+                model,
+                entry_cfg.shape_label_patterns,
+                f"entry {entry_cfg.name!r}",
+            )
+        )
         if body_selector_used:
             if entry_cfg.include_child_joints:
                 joints.extend(cls._child_joints_for_bodies(model, bodies))
@@ -376,6 +386,21 @@ class NewtonCoupledManager(NewtonManager):
         return cls._resolve_body_patterns(labels, patterns, field, "body_label_patterns")
 
     @classmethod
+    def _resolve_shape_label_patterns(cls, model: Model, patterns: list[str], field: str) -> list[int]:
+        """Resolve full-shape-label regexes to shape ids."""
+        if not patterns:
+            return []
+        labels = getattr(model, "shape_label", None)
+        if labels is None:
+            raise ValueError("Newton model does not expose shape_label; shape selectors cannot be resolved.")
+        return cls._resolve_body_patterns(
+            [str(label) for label in labels],
+            patterns,
+            field,
+            "shape_label_patterns",
+        )
+
+    @classmethod
     def _resolve_body_name_patterns(cls, model: Model, patterns: list[str], field: str) -> list[int]:
         """Resolve short-body-name regexes to body ids."""
         labels = cls._body_labels(model)
@@ -477,6 +502,29 @@ class NewtonCoupledManager(NewtonManager):
             apply_mujoco_warp_model_overrides(NewtonManager._solver.solver(entry_cfg.name), entry_cfg.solver_cfg)
 
     @classmethod
+    def _apply_vbd_joint_constraint_modes(cls, entries: list[CoupledSolverEntryCfg]) -> None:
+        """Soften VBD structural joints to penalty-only when ``rigid_joint_hard=False``.
+
+        Mirrors the Newton waterhose reference, which sets every VBD joint to
+        penalty-only (no augmented-Lagrangian dual) to avoid lambda accumulation
+        against cable bend torques that otherwise blows up the solve.
+        """
+        for entry_cfg in entries:
+            if getattr(entry_cfg.solver_cfg, "rigid_joint_hard", True):
+                continue
+            solver_class, _ = resolve_newton_solver_class_and_kwargs(
+                entry_cfg.solver_cfg,
+                entry_cfg.solver_class,
+                entry_cfg.solver_kwargs,
+            )
+            if getattr(solver_class, "__name__", "") != "SolverVBD":
+                continue
+            sub_solver = NewtonManager._solver.solver(entry_cfg.name)
+            joint_count = int(getattr(getattr(sub_solver, "model", None), "joint_count", 0))
+            for joint_index in range(joint_count):
+                sub_solver.set_joint_constraint_mode(joint_index, hard=False)
+
+    @classmethod
     def _configure_fk_articulation_filter(cls, model: Model, entries: list[CoupledSolverEntryCfg]) -> None:
         """Exclude solver-owned VBD articulations from NewtonManager's generic FK path."""
         if model.articulation_count <= 0 or getattr(model, "joint_articulation", None) is None:
@@ -576,6 +624,56 @@ class NewtonCoupledManager(NewtonManager):
             collision_pipeline=proxy_cfg.collision_pipeline_factory,
             collide_interval=proxy_cfg.collide_interval,
         )
+
+    @staticmethod
+    def _set_model_array_indices(model: Model, attr_name: str, indices: list[int], value: float | None) -> None:
+        """Set selected entries in a Newton model array when the attribute exists."""
+
+        if value is None or not indices:
+            return
+        data = getattr(model, attr_name, None)
+        if data is None:
+            return
+        values = data.numpy()
+        values[np.asarray(indices, dtype=np.int32)] = float(value)
+
+    @classmethod
+    def _apply_coupled_model_cfg(cls, model: Model) -> None:
+        """Apply global NewtonModelCfg overrides for coupled-solver models."""
+
+        from isaaclab.physics import PhysicsManager
+
+        cfg = PhysicsManager._cfg
+        model_cfg = getattr(cfg, "model_cfg", None) if cfg is not None else None
+        if model_cfg is None:
+            return
+
+        model.soft_contact_ke = float(model_cfg.soft_contact_ke)
+        model.soft_contact_kd = float(model_cfg.soft_contact_kd)
+        model.soft_contact_mu = float(model_cfg.soft_contact_mu)
+        if model_cfg.shape_material_ke is not None:
+            model.shape_material_ke.fill_(float(model_cfg.shape_material_ke))
+        if model_cfg.shape_material_kd is not None:
+            model.shape_material_kd.fill_(float(model_cfg.shape_material_kd))
+        if model_cfg.shape_material_mu is not None:
+            model.shape_material_mu.fill_(float(model_cfg.shape_material_mu))
+
+    @classmethod
+    def _apply_proxy_shape_overrides(cls, model: Model, proxies: list[CoupledProxyCfg]) -> None:
+        """Apply per-proxy contact material overrides to source body shapes."""
+
+        for proxy_cfg in proxies:
+            shape_ids = cls._shapes_for_bodies(
+                model,
+                list(proxy_cfg.bodies),
+                include_body_shapes=True,
+                include_static_shapes=False,
+            )
+            cls._set_model_array_indices(model, "shape_material_ke", shape_ids, proxy_cfg.shape_material_ke)
+            cls._set_model_array_indices(model, "shape_material_kd", shape_ids, proxy_cfg.shape_material_kd)
+            cls._set_model_array_indices(model, "shape_material_mu", shape_ids, proxy_cfg.shape_material_mu)
+            cls._set_model_array_indices(model, "shape_margin", shape_ids, proxy_cfg.shape_margin)
+            cls._set_model_array_indices(model, "shape_gap", shape_ids, proxy_cfg.shape_gap)
 
     @staticmethod
     def _build_proxy_mode(mode: str | int) -> str:

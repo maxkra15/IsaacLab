@@ -20,24 +20,34 @@ from isaaclab.utils.math import (
     subtract_frame_transforms,
 )
 
-# Current RBY1DF USD has no right_gripper_end_effector body; use the measured
-# midpoint between the right finger bodies in right_gripper_base local frame.
+# Midpoint between the right finger link frames in right_gripper_base local frame.
 _RIGHT_EE_FROM_BASE_POS = (0.0, 0.0, -0.075)
 # USD stores xformOp:orient as (w, x, y, z); IsaacLab frame math uses (x, y, z, w).
 _RIGHT_EE_FROM_BASE_QUAT = (0.70710677, 0.70710677, 0.0, 0.0)
 _PLUG_TIP_OFFSET = (0.0, 0.0, -0.014106234)
-_PLUG_GRASP_OFFSET = (0.0, 0.05, 0.0)
+_PLUG_GRASP_OFFSET = (0.0, 0.0, 0.006)
 _CABLE1_PLUG_SEGMENT_ID = 0
 _CABLE1_PLUG_LOCAL_POS = (0.0, 0.0, 0.022)
 _GRIPPER_INITIAL_GRASP_COMMAND = -0.72
-_GRIPPER_FALLBACK_GRASP_COMMAND = -0.86
-_GRIPPER_MAX_FORCE_CLOSE_COMMAND = -0.94
-_GRIPPER_FORCE_TARGET_N = 35.0
-_GRIPPER_TIGHTEN_RATE = 0.45
+_GRIPPER_PREGRASP_COMMAND = -0.80
+_GRIPPER_FALLBACK_GRASP_COMMAND = -0.93
+_GRIPPER_MAX_FORCE_CLOSE_COMMAND = -0.93
+_GRIPPER_FORCE_TARGET_N = 45.0
+_GRIPPER_LOCK_FORCE_N = 35.0
+_GRIPPER_TIGHTEN_RATE = 0.30
+_GRIPPER_CENTERING_K = 0.4
+_GRIPPER_AXIS_CENTERING_K = 0.8
+_GRIPPER_CENTERING_MAX_STEP = 0.002
 
 
 def _normalize_vector(value: torch.Tensor) -> torch.Tensor:
     return value / torch.clamp(torch.linalg.vector_norm(value, dim=-1, keepdim=True), min=1.0e-8)
+
+
+def _clamp_vector_norm(value: torch.Tensor, max_norm: float) -> torch.Tensor:
+    norm = torch.linalg.vector_norm(value, dim=-1, keepdim=True)
+    scale = torch.clamp(float(max_norm) / torch.clamp(norm, min=1.0e-8), max=1.0)
+    return value * scale
 
 
 def _correction_quat_between_vectors(
@@ -92,7 +102,7 @@ class WaterhoseDemoState:
         "WITHDRAW",
         "DONE",
     )
-    DURATIONS = (0.25, 1.0, 1.5, 0.5, 0.5, 1.5, 0.3, 5.0, 5.0, 2.0, 5.0, 1.0, 2.0, 1.0e6)
+    DURATIONS = (0.25, 1.0, 1.5, 0.6, 0.8, 2.0, 0.6, 5.0, 1.0, 1.0, 5.0, 1.0, 2.0, 1.0e6)
 
     def __init__(self, num_envs: int, step_dt: float, device: torch.device | str, settle_time: float, debug: bool):
         self.num_envs = int(num_envs)
@@ -106,6 +116,12 @@ class WaterhoseDemoState:
         self.phase_start_pose_w = torch.zeros((self.num_envs, 7), device=device)
         self.command_pose = torch.zeros((self.num_envs, 7), device=device)
         self.command_pose[:, 6] = 1.0
+        self.phase_plug_pos_w = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
+        self.phase_plug_quat_w = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=device)
+        self.phase_plug_quat_w[:, 3] = 1.0
+        self.phase_grasp_pos_w = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
+        self.phase_grasp_quat_w = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=device)
+        self.phase_grasp_quat_w[:, 3] = 1.0
         durations = list(self.DURATIONS)
         durations[self.REST] = max(float(settle_time), self.step_dt)
         self.durations = torch.tensor(durations, dtype=torch.float32, device=device)
@@ -129,7 +145,7 @@ class WaterhoseDemoState:
             self.num_envs, 1
         )
         self.engage_offset = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
-        self.retract_vector = torch.tensor([0.0, 0.05, 0.0], dtype=torch.float32, device=device).repeat(
+        self.retract_vector = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=device).repeat(
             self.num_envs, 1
         )
         self.withdraw_offset = torch.tensor([-0.10, 0.0, 0.0], dtype=torch.float32, device=device).repeat(
@@ -144,8 +160,9 @@ class WaterhoseDemoState:
         self.insertion_start_depth = 0.005
         self.insert_final_depth = 0.035
         self.insert_duration = 4.0
-        self.align_orientation_gain = 0.35
-        self.insert_orientation_gain = 0.2
+        self.turn_orientation_gain = 0.7
+        self.align_orientation_gain = 0.12
+        self.insert_orientation_gain = 0.05
         self.verify_lateral_gain = 1.0
         self.insert_lateral_gain = 0.5
         self.insert_lateral_integral_gain = 5.0
@@ -183,6 +200,7 @@ class WaterhoseDemoState:
         self.grip_command = torch.full(
             (self.num_envs, 1), _GRIPPER_INITIAL_GRASP_COMMAND, dtype=torch.float32, device=device
         )
+        self.grip_locked = torch.zeros((self.num_envs,), dtype=torch.bool, device=device)
         self.grip_force = torch.zeros((self.num_envs,), dtype=torch.float32, device=device)
         self.grip_feedback_available = False
         self._debug_markers = None
@@ -195,11 +213,21 @@ class WaterhoseDemoState:
         self.last_reported_phase[env_ids] = -1
         self.plug_grasp_offset[env_ids] = self.plug_grasp_fallback_offset[env_ids]
         self.grip_command[env_ids] = _GRIPPER_INITIAL_GRASP_COMMAND
+        self.grip_locked[env_ids] = False
         self.grip_force[env_ids] = 0.0
+        self.phase_plug_pos_w[env_ids] = 0.0
+        self.phase_plug_quat_w[env_ids] = 0.0
+        self.phase_plug_quat_w[env_ids, 3] = 1.0
+        self.phase_grasp_pos_w[env_ids] = 0.0
+        self.phase_grasp_quat_w[env_ids] = 0.0
+        self.phase_grasp_quat_w[env_ids, 3] = 1.0
 
     def compute(self, env) -> torch.Tensor:
         robot = env.scene["robot"]
-        plug = env.scene["plug1"]
+        try:
+            plug = env.scene["plug1"]
+        except KeyError:
+            plug = None  # cable-only debug: no plug spawned; fall back to the live cable frame
         ee_body_id = robot.find_bodies("right_gripper_base")[0][0]
 
         root_pose_w = robot.data.root_link_pose_w.torch
@@ -213,7 +241,11 @@ class WaterhoseDemoState:
             self.ee_offset_pos,
             self.ee_offset_quat,
         )
-        rigid_plug_pose_w = plug.data.root_link_pose_w.torch
+        if plug is not None:
+            rigid_plug_pose_w = plug.data.root_link_pose_w.torch
+        else:
+            rigid_plug_pose_w = torch.zeros((self.num_envs, 7), device=self.device)
+            rigid_plug_pose_w[..., 6] = 1.0
         rigid_plug_pos_w = rigid_plug_pose_w[:, :3]
         plug_pos_w, plug_quat_w = self._get_live_plug_frame(env, rigid_plug_pose_w)
         plug_grasp_offset = self.plug_grasp_offset
@@ -256,16 +288,34 @@ class WaterhoseDemoState:
             target_pose[mask, :3] = pos_b[mask]
             target_pose[mask, 3:] = quat_b[mask]
 
+        def set_grasp_target(mask: torch.Tensor, desired_grasp_pos_w: torch.Tensor, quat_w: torch.Tensor) -> None:
+            target_ee_pos_w = ee_pos_w + (desired_grasp_pos_w - grasp_pos_w)
+            set_world_target(mask, target_ee_pos_w, quat_w)
+
         plug_grasp_quat_w = normalize(quat_mul(grasp_quat_w, self.grasp_orientation_offset))
         socket_grasp_quat_w = normalize(quat_mul(self.socket_quat_w, self.grasp_orientation_offset))
+        if torch.any(first_step):
+            self.phase_plug_pos_w[first_step] = plug_pos_w[first_step]
+            self.phase_plug_quat_w[first_step] = grasp_quat_w[first_step]
+            self.phase_grasp_pos_w[first_step] = grasp_pos_w[first_step]
+            self.phase_grasp_quat_w[first_step] = plug_grasp_quat_w[first_step]
+        phase_plug_tip_z_w = _normalize_vector(quat_apply(self.phase_plug_quat_w, socket_z_axis))
         grip_command = self._update_grip_command()
 
         approach = self.phase == self.APPROACH
-        approach_pos_w = plug_pos_w + quat_apply(grasp_quat_w, plug_grasp_offset + self.approach_offset)
-        set_world_target(approach, approach_pos_w, plug_grasp_quat_w)
+        approach_pos_w = self.phase_plug_pos_w + quat_apply(
+            self.phase_plug_quat_w,
+            plug_grasp_offset + self.approach_offset,
+        )
+        set_world_target(approach, approach_pos_w, self.phase_grasp_quat_w)
 
         engage = self.phase == self.ENGAGE
-        set_world_target(engage, grasp_pos_w + self.engage_offset, plug_grasp_quat_w)
+        engage_duration = torch.clamp(self.durations[self.ENGAGE], min=1.0e-6)
+        engage_alpha = torch.clamp((self.elapsed / engage_duration).unsqueeze(-1), 0.0, 1.0)
+        engage_alpha = engage_alpha * engage_alpha * (3.0 - 2.0 * engage_alpha)
+        pregrasp = torch.full_like(gripper, _GRIPPER_PREGRASP_COMMAND)
+        gripper[engage] = 1.0 + (pregrasp[engage] - 1.0) * engage_alpha[engage]
+        set_world_target(engage, self.phase_grasp_pos_w + self.engage_offset, self.phase_grasp_quat_w)
 
         grasp = self.phase == self.GRASP
         grasp_duration = torch.clamp(self.durations[self.GRASP], min=1.0e-6)
@@ -277,20 +327,35 @@ class WaterhoseDemoState:
         gripper[hold_grasp] = grip_command[hold_grasp]
 
         retract = self.phase == self.RETRACT
-        retract_pos_w = self.phase_start_pose_w[:, :3] + quat_apply(plug_quat_w, self.retract_vector)
-        set_world_target(retract, retract_pos_w, self.phase_start_pose_w[:, 3:])
+        desired_plug_z_w = insertion_dir_w
+        turn_correction_w = _correction_quat_between_vectors(
+            phase_plug_tip_z_w,
+            desired_plug_z_w,
+            self.turn_orientation_gain,
+        )
+        turn_quat_w = normalize(quat_mul(turn_correction_w, self.phase_start_pose_w[:, 3:]))
+        retract_pos_w = self.phase_start_pose_w[:, :3] + self.retract_vector
+        set_world_target(retract, retract_pos_w, turn_quat_w)
         gripper[retract] = grip_command[retract]
 
         settle = self.phase == self.SETTLE
+        set_world_target(settle, self.phase_start_pose_w[:, :3], self.phase_start_pose_w[:, 3:])
         gripper[settle] = grip_command[settle]
 
         approach_target = self.phase == self.APPROACH_TARGET
         socket_start_pos_w = socket_pos_w + self.insertion_start_depth * insertion_dir_w
-        set_world_target(approach_target, socket_start_pos_w, socket_grasp_quat_w)
+        phase_plug_tip_pos_w = self.phase_plug_pos_w + quat_apply(self.phase_plug_quat_w, self.plug_tip_offset)
+        phase_grasp_tip_offset_w = self.phase_grasp_pos_w - phase_plug_tip_pos_w
+        desired_grasp_start_w = socket_start_pos_w + phase_grasp_tip_offset_w
+        transfer_ee_pos_w = self.phase_start_pose_w[:, :3] + (desired_grasp_start_w - self.phase_grasp_pos_w)
+        set_world_target(approach_target, transfer_ee_pos_w, self.phase_start_pose_w[:, 3:])
         gripper[approach_target] = grip_command[approach_target]
 
-        align_axes = self.phase == self.ALIGN_AXES
-        desired_plug_z_w = -insertion_dir_w
+        lost_grip = self.grip_feedback_available & (self.phase >= self.ALIGN_AXES) & (self.phase <= self.INSERT) & (
+            self.grip_force <= 5.0
+        )
+
+        align_axes = (self.phase == self.ALIGN_AXES) & lost_grip.logical_not()
         align_correction_w = _correction_quat_between_vectors(
             plug_tip_z_w,
             desired_plug_z_w,
@@ -300,12 +365,12 @@ class WaterhoseDemoState:
         set_world_target(align_axes, ee_pos_w, align_quat_w)
         gripper[align_axes] = grip_command[align_axes]
 
-        verify_align = self.phase == self.VERIFY_ALIGN
+        verify_align = (self.phase == self.VERIFY_ALIGN) & lost_grip.logical_not()
         verify_pos_w = ee_pos_w - self.verify_lateral_gain * plug_tip_lateral_error
         set_world_target(verify_align, verify_pos_w, self.phase_start_pose_w[:, 3:])
         gripper[verify_align] = grip_command[verify_align]
 
-        insert = self.phase == self.INSERT
+        insert = (self.phase == self.INSERT) & lost_grip.logical_not()
         insert_elapsed = torch.clamp(self.elapsed, min=0.0, max=self.insert_duration)
         insert_alpha = torch.clamp((insert_elapsed / self.insert_duration).unsqueeze(-1), 0.0, 1.0)
         insert_alpha = insert_alpha * insert_alpha * (3.0 - 2.0 * insert_alpha)
@@ -326,6 +391,9 @@ class WaterhoseDemoState:
         )
         set_world_target(insert, insert_pos_w, insert_quat_w)
         gripper[insert] = grip_command[insert]
+
+        target_pose[lost_grip] = current_pose[lost_grip]
+        gripper[lost_grip] = grip_command[lost_grip]
 
         release = self.phase == self.RELEASE
         release_duration = torch.clamp(self.durations[self.RELEASE], min=1.0e-6)
@@ -349,6 +417,30 @@ class WaterhoseDemoState:
         target_quat = target_pose[:, 3:]
         target_quat = torch.where(torch.sum(start_quat * target_quat, dim=-1, keepdim=True) < 0.0, -target_quat, target_quat)
         self.command_pose[:, 3:] = normalize(start_quat * (1.0 - blend) + target_quat * blend)
+
+        centering_active = self.phase == self.ENGAGE
+        if torch.any(centering_active):
+            left_finger_id = robot.find_bodies("right_gripper_leftfinger")[0][0]
+            right_finger_id = robot.find_bodies("right_gripper_rightfinger")[0][0]
+            left_finger_pos_w = robot.data.body_pos_w.torch[:, left_finger_id]
+            right_finger_pos_w = robot.data.body_pos_w.torch[:, right_finger_id]
+            finger_axis_w = _normalize_vector(right_finger_pos_w - left_finger_pos_w)
+            finger_mid_pos_w = 0.5 * (left_finger_pos_w + right_finger_pos_w)
+            grasp_error_w = grasp_pos_w - finger_mid_pos_w
+            plug_axis_w = plug_tip_z_w
+
+            delta_center_w = _GRIPPER_CENTERING_K * torch.sum(grasp_error_w * finger_axis_w, dim=-1, keepdim=True) * finger_axis_w
+            grasp_error_radial_w = grasp_error_w - torch.sum(grasp_error_w * plug_axis_w, dim=-1, keepdim=True) * plug_axis_w
+            delta_axis_w = _GRIPPER_AXIS_CENTERING_K * grasp_error_radial_w
+            centering_delta_w = delta_center_w + delta_axis_w
+            centering_delta_w = centering_delta_w - torch.sum(
+                centering_delta_w * plug_axis_w,
+                dim=-1,
+                keepdim=True,
+            ) * plug_axis_w
+            centering_delta_w = _clamp_vector_norm(centering_delta_w, _GRIPPER_CENTERING_MAX_STEP)
+            centering_delta_b = quat_apply(quat_inv(root_quat_w), centering_delta_w)
+            self.command_pose[centering_active, :3] += centering_delta_b[centering_active]
 
         actions = torch.cat((self.command_pose, gripper), dim=-1)
 
@@ -397,25 +489,34 @@ class WaterhoseDemoState:
             rotation_error < phase_rot_tolerance
         )
         if self.grip_feedback_available:
-            grip_ready = (self.grip_force >= _GRIPPER_FORCE_TARGET_N) | (
+            grip_ready = self.grip_locked | (self.grip_force >= _GRIPPER_LOCK_FORCE_N) | (
                 self.grip_command.squeeze(-1) <= _GRIPPER_MAX_FORCE_CLOSE_COMMAND + 1.0e-5
             )
-            grip_wait = (self.phase == self.GRASP) | (self.phase == self.HOLD_GRASP)
+            grip_wait = (self.phase == self.GRASP) | (self.phase == self.HOLD_GRASP) | (self.phase == self.SETTLE)
             pose_converged = pose_converged & (grip_wait.logical_not() | grip_ready)
         timed_out = self.elapsed >= self.durations[self.phase]
         should_advance = timed_out & pose_converged
-        custom_advance = approach_target | align_axes | verify_align | insert
+        custom_advance = (
+            retract
+            | approach_target
+            | (self.phase == self.ALIGN_AXES)
+            | (self.phase == self.VERIFY_ALIGN)
+            | (self.phase == self.INSERT)
+        )
         should_advance &= custom_advance.logical_not()
-        align_converged = (self.elapsed >= 0.5) & (plug_axis_cosine < -0.90)
+        align_converged = (self.elapsed >= 0.5) & (plug_axis_cosine > 0.90)
         verify_converged = (
             (self.elapsed >= 0.5)
             & (plug_tip_lateral_norm < 0.010)
-            & (plug_axis_cosine < -0.90)
+            & (plug_axis_cosine > 0.90)
         )
+        should_advance |= retract & timed_out
         should_advance |= approach_target & timed_out
-        should_advance |= align_axes & (align_converged | timed_out)
-        should_advance |= verify_align & (verify_converged | timed_out)
+        grasp_still_held = self.grip_force > 5.0 if self.grip_feedback_available else torch.ones_like(timed_out, dtype=torch.bool)
+        should_advance |= align_axes & grasp_still_held & (align_converged | timed_out)
+        should_advance |= verify_align & grasp_still_held & (verify_converged | timed_out)
         should_advance |= insert & (self.elapsed >= self.insert_duration)
+        should_advance &= lost_grip.logical_not()
         should_advance &= self.phase < self.DONE
         if torch.any(should_advance):
             self.phase[should_advance] += 1
@@ -429,25 +530,35 @@ class WaterhoseDemoState:
         return actions
 
     def _update_grip_command(self) -> torch.Tensor:
-        """Tighten the grasp command until proxy feedback indicates a confident grip."""
+        """Tighten only during capture, then hold the locked command through insertion."""
 
-        active = (self.phase >= self.GRASP) & (self.phase <= self.INSERT)
-        if not torch.any(active):
+        hold_active = (self.phase >= self.GRASP) & (self.phase <= self.INSERT)
+        tighten_active = ((self.phase == self.GRASP) | (self.phase == self.HOLD_GRASP)) & self.grip_locked.logical_not()
+        if not torch.any(hold_active):
             return self.grip_command
 
         proxy_force = self._get_right_proxy_grip_force()
         if proxy_force is None:
             self.grip_feedback_available = False
             fallback = torch.full_like(self.grip_command, _GRIPPER_FALLBACK_GRASP_COMMAND)
-            self.grip_command[active] = torch.minimum(self.grip_command, fallback)[active]
+            self.grip_command[tighten_active] = torch.minimum(self.grip_command, fallback)[tighten_active]
             return self.grip_command
 
         self.grip_feedback_available = True
         self.grip_force[:] = proxy_force
-        tighten = active & (proxy_force < _GRIPPER_FORCE_TARGET_N)
+        lock_now = hold_active & (
+            (proxy_force >= _GRIPPER_LOCK_FORCE_N)
+            | (self.grip_command.squeeze(-1) <= _GRIPPER_MAX_FORCE_CLOSE_COMMAND + 1.0e-5)
+        )
+        self.grip_locked[lock_now] = True
+        tighten = tighten_active & lock_now.logical_not() & (proxy_force < _GRIPPER_FORCE_TARGET_N)
         if torch.any(tighten):
             next_command = self.grip_command[tighten] - _GRIPPER_TIGHTEN_RATE * self.step_dt
             self.grip_command[tighten] = torch.clamp(next_command, min=_GRIPPER_MAX_FORCE_CLOSE_COMMAND)
+            command_limited = tighten & (
+                self.grip_command.squeeze(-1) <= _GRIPPER_MAX_FORCE_CLOSE_COMMAND + 1.0e-5
+            )
+            self.grip_locked[command_limited] = True
         return self.grip_command
 
     def _get_right_proxy_grip_force(self) -> torch.Tensor | None:
@@ -545,10 +656,14 @@ class WaterhoseDemoState:
         body_ids = []
         for env_idx in range(self.num_envs):
             target = f"/World/envs/env_{env_idx}/Plug1"
-            try:
-                body_ids.append(body_labels.index(target))
-            except ValueError:
+            matches = [
+                body_id
+                for body_id, label in enumerate(body_labels)
+                if label == target or label.startswith(f"{target}/")
+            ]
+            if not matches:
                 return None
+            body_ids.append(matches[0])
         self._plug_body_ids = torch.tensor(body_ids, dtype=torch.long, device=self.device)
         return self._plug_body_ids
 

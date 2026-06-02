@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -40,6 +41,42 @@ def _rotate_vector_by_quat_np(quat_xyzw: np.ndarray, vec: np.ndarray) -> np.ndar
     return vec + q_w * t + np.cross(q_vec, t)
 
 
+def _resample_open_polyline(
+    node_positions: list[wp.vec3],
+    edges: list[tuple[int, int]],
+    segment_length: float,
+) -> tuple[list[wp.vec3], list[tuple[int, int]]]:
+    """Arc-length-resample an ordered open polyline to ~uniform segment length.
+
+    The two endpoints are preserved exactly. Only a simple sequential chain
+    (edges ``(0, 1), (1, 2), ...``) is resampled; any other topology or a
+    degenerate/too-short curve is returned unchanged. This mirrors the uniform
+    resampling the Newton ``cable_robot`` reference applies to its rod, which
+    avoids the stiffness/mass discontinuities that destabilize a rod built from
+    non-uniform authored control points (e.g. a long lead-in segment).
+    """
+    n = len(node_positions)
+    if n < 3 or not segment_length or segment_length <= 0.0:
+        return node_positions, edges
+    if list(edges) != [(i, i + 1) for i in range(n - 1)]:
+        return node_positions, edges
+    pts = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in node_positions], dtype=np.float64)
+    arc = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))))
+    total = float(arc[-1])
+    if total <= 0.0:
+        return node_positions, edges
+    num_segments = max(1, int(round(total / float(segment_length))))
+    if num_segments == n - 1:
+        return node_positions, edges
+    targets = np.linspace(0.0, total, num_segments + 1)
+    resampled = np.empty((num_segments + 1, 3), dtype=np.float64)
+    for axis in range(3):
+        resampled[:, axis] = np.interp(targets, arc, pts[:, axis])
+    new_nodes = [wp.vec3(float(x), float(y), float(z)) for x, y, z in resampled]
+    new_edges = [(i, i + 1) for i in range(num_segments)]
+    return new_nodes, new_edges
+
+
 @dataclass
 class CableRegistryEntry:
     """Mutable bridge between :class:`CableObject` and the per-world replicate hook."""
@@ -64,6 +101,164 @@ class CableRegistryEntry:
     # Per-env Newton body indices of each cable segment in edge order; outer list
     # indexed by ``world_idx``, inner indexed by ``CableAttachmentCfg.cable_anchor``.
     segment_body_indices: list[list[int]] = field(default_factory=list)
+
+
+_SDF_CAPTURE_MESH_CACHE: dict[tuple, newton.Mesh] = {}
+
+
+def _quat_from_z_axis_to_vector_np(vec: np.ndarray) -> wp.quat:
+    """Quaternion rotating local +Z onto ``vec``."""
+
+    norm = float(np.linalg.norm(vec))
+    if not np.isfinite(norm) or norm <= 1.0e-12:
+        return wp.quat_identity()
+    target = vec / norm
+    source = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    dot = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    if dot > 1.0 - 1.0e-10:
+        return wp.quat_identity()
+    if dot < -1.0 + 1.0e-10:
+        return wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi)
+    axis = np.cross(source, target)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1.0e-12:
+        return wp.quat_identity()
+    axis /= axis_norm
+    angle = math.acos(dot)
+    return wp.quat_from_axis_angle(wp.vec3(float(axis[0]), float(axis[1]), float(axis[2])), angle)
+
+
+def _make_sdf_capture_mesh(cable_radius: float, segment_length: float, capture_cfg) -> newton.Mesh:
+    """Build or return a cached closed SDF connector mesh for a cable segment."""
+
+    retainer_hole_radius = (
+        0.75 * float(cable_radius)
+        if capture_cfg.retainer_hole_radius is None
+        else float(capture_cfg.retainer_hole_radius)
+    )
+    retainer_hole_radius = max(0.2 * float(cable_radius), min(retainer_hole_radius, 0.95 * float(cable_radius)))
+    bore_radius = max(float(cable_radius) + float(capture_cfg.bore_clearance), 1.05 * float(cable_radius))
+    outer_radius = max(float(capture_cfg.outer_radius), bore_radius + 0.002)
+    radial_segments = max(12, int(capture_cfg.radial_segments))
+    retainer_offset = max(float(capture_cfg.retainer_offset), 1.2 * float(cable_radius))
+    retainer_thickness = max(float(capture_cfg.retainer_thickness), 0.25 * float(cable_radius))
+    tail_clearance = max(float(capture_cfg.tail_clearance), 1.0e-4)
+    sdf_max_resolution = int(capture_cfg.sdf_max_resolution)
+    device_key = str(wp.get_device())
+    key = (
+        round(float(cable_radius), 7),
+        round(float(segment_length), 7),
+        round(outer_radius, 7),
+        round(bore_radius, 7),
+        round(retainer_hole_radius, 7),
+        round(retainer_offset, 7),
+        round(retainer_thickness, 7),
+        round(tail_clearance, 7),
+        bool(capture_cfg.through_sleeve),
+        radial_segments,
+        sdf_max_resolution,
+        device_key,
+    )
+    cached = _SDF_CAPTURE_MESH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if bool(capture_cfg.through_sleeve):
+        stations = (
+            (-retainer_offset, bore_radius),
+            (float(segment_length) + tail_clearance, bore_radius),
+        )
+    else:
+        z0 = -retainer_offset - retainer_thickness
+        z1 = -retainer_offset
+        z2 = -1.05 * float(cable_radius)
+        if z2 <= z1:
+            z2 = 0.5 * (z1 + 0.0)
+        z3 = float(segment_length) + 0.67 * tail_clearance
+        z4 = float(segment_length) + tail_clearance
+        stations = (
+            (z0, retainer_hole_radius),
+            (z1, retainer_hole_radius),
+            (z2, bore_radius),
+            (z3, bore_radius),
+            (z4, 0.0),
+        )
+
+    vertices: list[tuple[float, float, float]] = []
+    outer_rings: list[list[int]] = []
+    inner_rings: list[list[int] | None] = []
+    center_index: int | None = None
+
+    angles = [2.0 * math.pi * i / radial_segments for i in range(radial_segments)]
+    for z, inner_radius in stations:
+        outer_ring = []
+        for theta in angles:
+            outer_ring.append(len(vertices))
+            vertices.append((outer_radius * math.cos(theta), outer_radius * math.sin(theta), z))
+        outer_rings.append(outer_ring)
+
+        if inner_radius > 1.0e-8:
+            inner_ring = []
+            for theta in angles:
+                inner_ring.append(len(vertices))
+                vertices.append((inner_radius * math.cos(theta), inner_radius * math.sin(theta), z))
+            inner_rings.append(inner_ring)
+        else:
+            center_index = len(vertices)
+            vertices.append((0.0, 0.0, z))
+            inner_rings.append(None)
+
+    indices: list[tuple[int, int, int]] = []
+    for ring_idx in range(len(stations) - 1):
+        outer_a = outer_rings[ring_idx]
+        outer_b = outer_rings[ring_idx + 1]
+        for i in range(radial_segments):
+            j = (i + 1) % radial_segments
+            indices.append((outer_a[i], outer_a[j], outer_b[j]))
+            indices.append((outer_a[i], outer_b[j], outer_b[i]))
+
+        inner_a = inner_rings[ring_idx]
+        inner_b = inner_rings[ring_idx + 1]
+        if inner_a is not None and inner_b is not None:
+            for i in range(radial_segments):
+                j = (i + 1) % radial_segments
+                indices.append((inner_a[i], inner_b[j], inner_a[j]))
+                indices.append((inner_a[i], inner_b[i], inner_b[j]))
+        elif inner_a is not None and inner_b is None and center_index is not None:
+            for i in range(radial_segments):
+                j = (i + 1) % radial_segments
+                indices.append((inner_a[i], center_index, inner_a[j]))
+
+    front_outer = outer_rings[0]
+    front_inner = inner_rings[0]
+    if front_inner is not None:
+        for i in range(radial_segments):
+            j = (i + 1) % radial_segments
+            indices.append((front_outer[i], front_inner[j], front_outer[j]))
+            indices.append((front_outer[i], front_inner[i], front_inner[j]))
+
+    back_outer = outer_rings[-1]
+    back_inner = inner_rings[-1]
+    if center_index is not None:
+        for i in range(radial_segments):
+            j = (i + 1) % radial_segments
+            indices.append((back_outer[i], back_outer[j], center_index))
+    elif back_inner is not None:
+        for i in range(radial_segments):
+            j = (i + 1) % radial_segments
+            indices.append((back_outer[i], back_outer[j], back_inner[j]))
+            indices.append((back_outer[i], back_inner[j], back_inner[i]))
+
+    mesh = newton.Mesh(
+        np.asarray(vertices, dtype=np.float32),
+        np.asarray(indices, dtype=np.int32),
+        compute_inertia=True,
+        is_solid=True,
+    )
+    if wp.get_device().is_cuda:
+        mesh.build_sdf(max_resolution=sdf_max_resolution)
+    _SDF_CAPTURE_MESH_CACHE[key] = mesh
+    return mesh
 
 
 def add_cable_entry_to_builder(
@@ -160,6 +355,86 @@ def add_registered_cables_to_builder(
     """Per-world hook that registers all cables in :attr:`SimulationManager._cable_registry`."""
     for cable_idx, entry in enumerate(SimulationManager._cable_registry):
         add_cable_entry_to_builder(builder, entry, world_idx, env_position, env_rotation, cable_idx=cable_idx)
+
+
+def add_cable_sdf_captures_to_builder(
+    builder,
+    world_idx: int,
+    env_position: list[float],
+    env_rotation: list[float] | tuple[float, float, float, float],
+) -> list[int]:
+    """Per-world hook that adds static SDF connector meshes for cable captures."""
+
+    pending = getattr(SimulationManager, "_pending_cable_sdf_captures", None)
+    if not pending:
+        return []
+
+    env_pos = wp.vec3(float(env_position[0]), float(env_position[1]), float(env_position[2]))
+    env_rot = wp.quat(
+        float(env_rotation[0]),
+        float(env_rotation[1]),
+        float(env_rotation[2]),
+        float(env_rotation[3]),
+    )
+
+    shape_ids: list[int] = []
+    for cable_idx, capture in pending:
+        entry = SimulationManager._cable_registry[cable_idx]
+        num_segments = len(entry.edges)
+        anchor_idx = int(capture.cable_anchor)
+        if not -num_segments <= anchor_idx < num_segments:
+            raise ValueError(
+                f"CableSdfCaptureCfg.cable_anchor={anchor_idx} is out of range for cable"
+                f" '{entry.prim_path}' with {num_segments} segments;"
+                f" valid range is [-{num_segments}, {num_segments - 1}]."
+            )
+        edge_idx = anchor_idx if anchor_idx >= 0 else num_segments + anchor_idx
+        u, v = entry.edges[edge_idx]
+        local_start = entry.node_positions[u]
+        local_end = entry.node_positions[v]
+        local_edge = local_end - local_start
+        segment_length = float(wp.length(local_edge))
+        if not np.isfinite(segment_length) or segment_length <= 1.0e-8:
+            continue
+
+        init_pos = wp.vec3(float(entry.init_pos[0]), float(entry.init_pos[1]), float(entry.init_pos[2]))
+        init_rot = wp.quat(
+            float(entry.init_rot[0]),
+            float(entry.init_rot[1]),
+            float(entry.init_rot[2]),
+            float(entry.init_rot[3]),
+        )
+        composed_pos = env_pos + wp.quat_rotate(env_rot, init_pos)
+        composed_rot = env_rot * init_rot
+        world_start = composed_pos + wp.quat_rotate(composed_rot, local_start)
+        world_edge = wp.quat_rotate(composed_rot, local_edge)
+        world_edge_np = np.array(
+            [float(world_edge[0]), float(world_edge[1]), float(world_edge[2])],
+            dtype=np.float64,
+        )
+        shape_xform = wp.transform(world_start, _quat_from_z_axis_to_vector_np(world_edge_np))
+
+        mesh = _make_sdf_capture_mesh(float(entry.radius), segment_length, capture)
+        shape_cfg = builder.default_shape_cfg.copy()
+        shape_cfg.density = 0.0
+        shape_cfg.margin = float(capture.margin)
+        shape_cfg.gap = float(capture.gap)
+        shape_cfg.mu = float(capture.mu)
+
+        expanded_prim_path = entry.prim_path.replace("env_.*", f"env_{world_idx}")
+        shape_ids.append(
+            int(
+                builder.add_shape_mesh(
+                    body=-1,
+                    mesh=mesh,
+                    xform=shape_xform,
+                    cfg=shape_cfg,
+                    label=f"{expanded_prim_path}/{capture.label_suffix}",
+                )
+            )
+        )
+
+    return shape_ids
 
 
 def _resolve_static_target_xform(
@@ -293,6 +568,7 @@ def install_cable_builder_hooks() -> None:
     """Reset the cable registry and install the per-world cable + attachment hooks."""
     SimulationManager._cable_registry = []
     SimulationManager._pending_cable_attachments = []
+    SimulationManager._pending_cable_sdf_captures = []
     if not hasattr(SimulationManager, "_per_world_builder_hooks"):
         SimulationManager._per_world_builder_hooks = []
     SimulationManager._per_world_builder_hooks = [
@@ -301,10 +577,12 @@ def install_cable_builder_hooks() -> None:
         if hook
         not in (
             add_registered_cables_to_builder,
+            add_cable_sdf_captures_to_builder,
             apply_cable_attachments_to_builder,
         )
     ]
     SimulationManager._per_world_builder_hooks.append(add_registered_cables_to_builder)
+    SimulationManager._per_world_builder_hooks.append(add_cable_sdf_captures_to_builder)
     SimulationManager._per_world_builder_hooks.append(apply_cable_attachments_to_builder)
     SimulationManager.register_pre_render_callback("cable_curve_sync", sync_registered_cable_curves_to_usd)
 
@@ -423,6 +701,8 @@ class CableObject(Articulation):
         cable_idx = SimulationManager._cable_registry.index(self._registry_entry)
         for attachment in self.cfg.attachments:
             SimulationManager._pending_cable_attachments.append((cable_idx, attachment))
+        for capture in self.cfg.sdf_captures:
+            SimulationManager._pending_cable_sdf_captures.append((cable_idx, capture))
 
     def _register_cable(self) -> CableRegistryEntry:
         """Read cable geometry + material from the spawned USD prim and append to the registry.
@@ -527,6 +807,12 @@ class CableObject(Articulation):
                 " user-imported curve USDs must add it explicitly."
             )
         edges = [(int(e[0]), int(e[1])) for e in connections_attr.Get()]
+
+        resample_segment_length = getattr(self.cfg, "resample_segment_length", None)
+        if resample_segment_length:
+            node_positions, edges = _resample_open_polyline(
+                node_positions, edges, float(resample_segment_length)
+            )
 
         # Material binding requires ``UsdPhysics.CollisionAPI`` on the curve;
         # without it the spawner's bind silently no-ops.

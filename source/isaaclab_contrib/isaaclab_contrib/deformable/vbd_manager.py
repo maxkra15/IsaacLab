@@ -143,6 +143,7 @@ class NewtonVBDManager(NewtonManager):
         cls._free_joint_ids = None
         NewtonManager._cable_registry = []
         NewtonManager._pending_cable_attachments = []
+        NewtonManager._pending_cable_sdf_captures = []
         NewtonManager._deformable_registry = []
         NewtonManager._per_world_builder_hooks = []
 
@@ -593,6 +594,9 @@ class NewtonVBDManager(NewtonManager):
         """
         kwargs = cls._filter_solver_kwargs(SolverVBD, solver_cfg)
         NewtonManager._solver = SolverVBD(model, **kwargs)
+        if not getattr(solver_cfg, "rigid_joint_hard", True):
+            for joint_index in range(int(getattr(model, "joint_count", 0))):
+                NewtonManager._solver.set_joint_constraint_mode(joint_index, hard=False)
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = True
 
