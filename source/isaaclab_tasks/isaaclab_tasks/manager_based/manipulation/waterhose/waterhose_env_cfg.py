@@ -166,6 +166,72 @@ def _build_waterhose_teleop_pipeline():
     return OutputCombiner({"action": connected_reorderer.output("output")})
 
 
+def _build_waterhose_relative_teleop_pipeline():
+    """Build the IsaacTeleop pipeline for the relative Waterhose IK teleop action space."""
+
+    from isaacteleop.retargeters import (
+        GripperRetargeter,
+        GripperRetargeterConfig,
+        Se3RelRetargeter,
+        Se3RetargeterConfig,
+        TensorReorderer,
+    )
+    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource, HandsSource
+    from isaacteleop.retargeting_engine.interface import OutputCombiner, ValueInput
+    from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
+
+    controllers = ControllersSource(name="controllers")
+    hands = HandsSource(name="hands")
+
+    transform_input = ValueInput("world_T_anchor", TransformMatrix())
+    transformed_hands = hands.transformed(transform_input.output(ValueInput.VALUE))
+
+    se3_cfg = Se3RetargeterConfig(
+        input_device=HandsSource.RIGHT,
+        zero_out_xy_rotation=True,
+        use_wrist_rotation=True,
+        use_wrist_position=True,
+        delta_pos_scale_factor=15.0,
+        delta_rot_scale_factor=2.0,
+        alpha_pos=0.5,
+        alpha_rot=0.5,
+    )
+    se3 = Se3RelRetargeter(se3_cfg, name="ee_delta")
+    connected_se3 = se3.connect({HandsSource.RIGHT: transformed_hands.output(HandsSource.RIGHT)})
+
+    gripper_cfg = GripperRetargeterConfig(hand_side="right")
+    gripper = GripperRetargeter(gripper_cfg, name="gripper")
+    connected_gripper = gripper.connect(
+        {
+            "hand_right": hands.output(HandsSource.RIGHT),
+            "controller_right": controllers.output(ControllersSource.RIGHT),
+        }
+    )
+
+    delta_elements = ["dx", "dy", "dz", "droll", "dpitch", "dyaw"]
+    gripper_elements = ["gripper"]
+    reorderer = TensorReorderer(
+        input_config={
+            "ee_delta": delta_elements,
+            "gripper": gripper_elements,
+        },
+        output_order=delta_elements + gripper_elements,
+        name="action_reorderer",
+        input_types={
+            "ee_delta": "array",
+            "gripper": "scalar",
+        },
+    )
+    connected_reorderer = reorderer.connect(
+        {
+            "ee_delta": connected_se3.output("ee_delta"),
+            "gripper": connected_gripper.output("gripper_command"),
+        }
+    )
+
+    return OutputCombiner({"action": connected_reorderer.output("output")})
+
+
 def _make_proxy_collision_pipeline(model):
     """Build the destination-view collision pipeline used by Newton proxy coupling."""
     from newton import CollisionPipeline
@@ -548,7 +614,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         solver_cfg=VBDSolverCfg(
                             iterations=10,
                             friction_epsilon=0.1,
-                            rigid_contact_hard=False,
+                            rigid_contact_hard=True,
                             rigid_joint_hard=False,
                             rigid_avbd_beta=1.0e5,
                             rigid_contact_history=False,
@@ -652,10 +718,15 @@ class WaterhoseIkActionsCfg:
             "right_gripper_left_finger_joint": -0.045,
             "right_gripper_right_finger_joint": 0.045,
         },
+        # Sized for the ~7.3 mm-radius Plug1 (not the 3 mm cable): each finger closes to
+        # +/-7 mm, ~0.3 mm inside the plug surface, so the fingers squeeze the plug through
+        # the soft VBD contact instead of being driven ~7 mm past the surface (which buried
+        # the fingers in the mesh and let the plug slip out). The reference cable-robot demo
+        # uses 0.0072 because it grips the thin cable capsule directly.
         close_command_expr={
-            "right_gripper_finger_joint_1": 0.0072,
-            "right_gripper_left_finger_joint": -0.0036,
-            "right_gripper_right_finger_joint": 0.0036,
+            "right_gripper_finger_joint_1": 0.014,
+            "right_gripper_left_finger_joint": -0.007,
+            "right_gripper_right_finger_joint": 0.007,
         },
     )
 
@@ -757,7 +828,13 @@ class WaterhoseProxyTeleopEnvCfg(WaterhoseProxyIkEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.isaac_teleop = None
+        if _TELEOP_AVAILABLE:
+            self.isaac_teleop = IsaacTeleopCfg(
+                pipeline_builder=_build_waterhose_relative_teleop_pipeline,
+                sim_device=self.sim.device,
+                xr_cfg=self.xr,
+                app_name="WaterhoseTeleop",
+            )
         self.teleop_devices = DevicesCfg(
             devices={
                 "keyboard": Se3KeyboardCfg(

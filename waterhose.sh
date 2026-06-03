@@ -124,10 +124,12 @@ Demo options:
 Teleop options:
   Uses scripts/environments/teleoperation/teleop_se3_agent.py. Desktop
   teleop uses env_cfg.teleop_devices on Isaac-Waterhose-Coupled-Teleop-v0.
-  XR uses env_cfg.isaac_teleop on Isaac-Waterhose-Coupled-v0.
+  --isaac-teleop uses env_cfg.isaac_teleop on the selected task. XR uses
+  env_cfg.isaac_teleop on Isaac-Waterhose-Coupled-v0 by default.
 
   --workspace DIR            Workspace created by setup. Default: ./waterhose-demo
   --teleop-device DEVICE     keyboard, spacemouse, or gamepad. Default: spacemouse
+  --isaac-teleop             Use env_cfg.isaac_teleop instead of legacy teleop_device.
   --xr / --no-xr             Use IsaacTeleop/OpenXR mode. Default: --no-xr.
   --cloudxr-env VALUE        cloudxrjs, avp, none, or a .env path. Default: none
   --no-auto-launch-cloudxr   Do not auto-launch CloudXR.
@@ -715,6 +717,7 @@ cmd_teleop() {
     local vis="kit"
     local num_envs=1
     local xr=0
+    local use_isaac_teleop=0
     local teleop_device="spacemouse"
     local cloudxr_env="none"
     local cloudxr_explicit=0
@@ -733,12 +736,14 @@ cmd_teleop() {
                 task="$2"; task_explicit=1; shift 2 ;;
             --teleop-device|--teleop_device)
                 teleop_device="$2"; shift 2 ;;
+            --isaac-teleop)
+                use_isaac_teleop=1; shift ;;
             --vis|--visualizer)
                 vis="$2"; shift 2 ;;
             --num-envs|--num_envs)
                 num_envs="$2"; shift 2 ;;
             --xr)
-                xr=1; shift ;;
+                xr=1; use_isaac_teleop=1; shift ;;
             --no-xr)
                 xr=0; shift ;;
             --cloudxr-env|--cloudxr_env)
@@ -776,10 +781,11 @@ cmd_teleop() {
         --cloudxr_env "$cloudxr_env"
     )
 
+    if [[ "$use_isaac_teleop" != "1" ]]; then
+        args+=(--teleop_device "$teleop_device")
+    fi
     if [[ "$xr" == "1" ]]; then
         args+=(--xr)
-    else
-        args+=(--teleop_device "$teleop_device")
     fi
     [[ "$auto_launch_cloudxr" != "1" ]] && args+=(--no-auto_launch_cloudxr)
     [[ "$debug_teleop" == "1" ]] && args+=(--debug_teleop)

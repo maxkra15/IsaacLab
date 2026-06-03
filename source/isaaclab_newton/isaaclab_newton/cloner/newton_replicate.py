@@ -111,8 +111,7 @@ def _build_newton_builder_from_mapping(
             schema_resolvers=schema_resolvers,
             ignore_paths=hook_managed_ignore_paths if hook_managed_ignore_paths else None,
         )
-        if simplify_meshes:
-            p.approximate_meshes("convex_hull", keep_visual_shapes=True)
+
         protos[src_path] = p
 
     # Inject registered sites into prototypes (and global sites into main builder)
