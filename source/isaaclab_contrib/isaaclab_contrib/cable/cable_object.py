@@ -542,12 +542,13 @@ def apply_cable_attachments_to_builder(
         # Keep the articulated cable segment as the loop-joint child. Targets may be
         # static scene bodies (or world, -1) with no articulation, while the cable
         # segment is already reachable through the cable root articulation.
+        suffix = attachment.label_suffix or f"attachment_seg{anchor_idx}"
         joint_id = builder.add_joint_fixed(
             parent=target_body_idx,
             child=cable_body_idx,
             parent_xform=target_xform,
             child_xform=cable_xform,
-            label=f"{entry.prim_path}/attachment_seg{anchor_idx}_w{world_idx}",
+            label=f"{entry.prim_path}/{suffix}_w{world_idx}",
             collision_filter_parent=True,
         )
         joint_id = int(joint_id)

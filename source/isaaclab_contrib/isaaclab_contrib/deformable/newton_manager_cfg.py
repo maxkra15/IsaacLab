@@ -112,6 +112,9 @@ class VBDSolverCfg(NewtonSolverCfg):
     the ceiling for the entire step.
     """
 
+    rigid_avbd_gamma: float = 0.999
+    """Per-step decay for AVBD penalty stiffness and persisted hard-mode lambdas."""
+
     rigid_body_particle_contact_buffer_size: int = 256
     """Per-body rigid body/particle contact list capacity."""
 
@@ -128,6 +131,12 @@ class VBDSolverCfg(NewtonSolverCfg):
     rigid_joint_angular_k_start: float = 1.0e1
     """Initial angular penalty seed for VBD rigid joints [N m/rad]; ramps toward
     :attr:`rigid_joint_angular_ke` when ``rigid_avbd_beta > 0``."""
+
+    rigid_joint_linear_kd: float = 0.0
+    """Rayleigh damping coefficient for non-cable linear joint constraints."""
+
+    rigid_joint_angular_kd: float = 0.0
+    """Rayleigh damping coefficient for non-cable angular joint constraints."""
 
     rigid_joint_hard: bool = True
     """Whether VBD treats non-cable structural joints (e.g. cross-solver welds) as hard

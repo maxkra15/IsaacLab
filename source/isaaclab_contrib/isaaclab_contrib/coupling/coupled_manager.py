@@ -8,7 +8,7 @@
 Dispatches on the config subclass to instantiate either
 :class:`newton.solvers.experimental.coupled.SolverCoupledProxy` (when given a
 :class:`~isaaclab_contrib.coupling.coupled_manager_cfg.CoupledProxySolverCfg`)
-or :class:`newton.solvers.experimental.coupled.SolverCoupledAdmm` (when given a
+or :class:`newton.solvers.experimental.coupled.SolverCoupledADMM` (when given a
 :class:`~isaaclab_contrib.coupling.coupled_manager_cfg.CoupledAdmmSolverCfg`).
 Sub-solver classes are resolved from their configs via
 :attr:`NewtonCoupledSolverManager._SOLVER_CLASS_BY_CFG_TYPE`.
@@ -31,7 +31,11 @@ from isaaclab_newton.physics import (
 from isaaclab_newton.physics.newton_manager import NewtonManager
 from newton import CollisionPipeline, JointType, Model, ShapeFlags
 from newton.solvers import SolverBase, SolverFeatherstone, SolverKamino, SolverMuJoCo, SolverVBD, SolverXPBD
-from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledAdmm, SolverCoupledProxy
+from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledProxy
+try:
+    from newton.solvers.experimental.coupled import SolverCoupledADMM as SolverCoupledAdmm
+except ImportError:
+    from newton.solvers.experimental.coupled import SolverCoupledAdmm
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.physics import PhysicsManager

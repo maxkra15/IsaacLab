@@ -18,4 +18,4 @@ from isaaclab.envs.mdp import (  # noqa: F401
     time_out,
 )
 
-from .actions import WaterhoseGripperPositionActionCfg  # noqa: F401
+from .actions import WaterhoseGripperPositionActionCfg, WaterhoseLocalFrameNewtonInverseKinematicsAction  # noqa: F401

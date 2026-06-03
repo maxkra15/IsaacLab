@@ -21,7 +21,7 @@ import math
 import os
 from types import SimpleNamespace
 
-from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
+from isaaclab.app import add_launcher_args, launch_simulation
 
 parser = argparse.ArgumentParser(description="Newton MPM teapot pour demo.")
 parser.add_argument("--fps", type=float, default=120.0, help="Simulation/control frames per second.")

@@ -6,7 +6,7 @@
 """Waterhose manipulation environment.
 
 MDP config groups are copied from the Franka cable-plug task
-(:mod:`isaaclab_tasks.manager_based.manipulation.lift_franka_soft`), whose
+(:mod:`isaaclab_tasks.core.lift_franka_soft`), whose
 ``mdp`` functions are reused by import.
 """
 
@@ -32,6 +32,9 @@ from isaaclab_visualizers.kit.kit_visualizer_cfg import KitVisualizerCfg
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
 
 import isaaclab.sim as sim_utils
+from isaaclab.sim import schemas as sim_schemas
+from isaaclab.sim.schemas.schemas_cfg import MeshCollisionBaseCfg
+from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.assets.rigid_object.rigid_object_cfg import RigidObjectCfg
@@ -48,9 +51,9 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
+from isaaclab.sim.utils import clone
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
-
 from isaaclab_contrib.cable.cable_object_cfg import CableAttachmentCfg, CableObjectCfg
 from isaaclab_contrib.deformable.newton_manager_cfg import (
     CoupledNewtonCfg,
@@ -58,8 +61,8 @@ from isaaclab_contrib.deformable.newton_manager_cfg import (
     VBDSolverCfg,
 )
 
-import isaaclab_tasks.manager_based.manipulation.waterhose.mdp as mdp
-from isaaclab_tasks.manager_based.manipulation.waterhose.teleop import WaterhoseSpaceMouseCfg
+from . import mdp
+from .teleop import WaterhoseSpaceMouseCfg
 
 try:
     import isaacteleop  # noqa: F401 -- IsaacTeleop pipeline builders need this at runtime.
@@ -94,11 +97,79 @@ _CABLE1_ANCHOR_NODE = _CABLE1_TAIL_NODE_42
 # to the global world body corrupts the multi-env coupled MJWarp+VBD solve (robot joints
 # go NaN at step 0).
 _ANCHOR_POS = tuple(p + n for p, n in zip(_FRIDGE_POS, _CABLE1_ANCHOR_NODE))
+
+# Hand-authored initial visualizer cameras. These used to live in
+# scripts/environments/waterhose/run_robot_demo.py; keep them in the task config
+# so IsaacLab's official --visualizer/--viz path uses the same starting views.
+# KitVisualizer uses eye/lookat; this lookat is one meter along camera-local -Z
+# from the authored Kit transform translate=(-0.9, 0.6, 0.3), rotateXYZ=(73.32259, 0, -112.30437).
 _KIT_CAMERA_EYE = (-0.9, 0.6, 0.3)
 _KIT_CAMERA_LOOKAT = (-0.013736291, 0.236437794, 0.013017143)
-_NEWTON_CAMERA_EYE = (-2.0, 1.5, 0.8)
-_NEWTON_CAMERA_LOOKAT = (0.0, 0.35, 0.2)
+_NEWTON_CAMERA_EYE = (-2.55, -7.1, 2.3)
+_NEWTON_CAMERA_LOOKAT = (0.55, -0.42, 0.9)
 _ROBOT_BASE_PRIM_PATH_ENV0 = "/World/envs/env_0/Robot/origin"
+
+_GRIPPER_ACTUAL_MESH_COLLISION = MeshCollisionBaseCfg(mesh_approximation_name="none")
+_GRIPPER_SDF_COLLISION = sim_utils.NewtonSDFCollisionPropertiesCfg(
+    sdf_max_resolution=64,
+    sdf_narrow_band_inner=0.002,
+    sdf_narrow_band_outer=0.006,
+    sdf_texture_format="float32",
+    sdf_padding=0.001,
+    hydroelastic_enabled=True,
+    hydroelastic_stiffness=1.0e8,
+)
+
+
+def _is_gripper_collision_instance(prim: Usd.Prim) -> bool:
+    """Return true for rby1df instanceable gripper collision Xforms."""
+    if not prim.IsInstance():
+        return False
+    path = prim.GetPath().pathString
+    if "gripper" not in path:
+        return False
+    name = prim.GetName()
+    parent_name = prim.GetParent().GetName()
+    return name.endswith("_collision") or (name == parent_name and name.endswith("finger"))
+
+
+def _apply_actual_mesh_collision_to_grippers(robot_prim: Usd.Prim) -> None:
+    """Use real mesh/SDF collision for gripper meshes while leaving the rest of the robot unchanged."""
+    from pxr import Usd, UsdPhysics
+
+    stage = robot_prim.GetStage()
+    gripper_collision_instances = [
+        prim.GetPath().pathString for prim in Usd.PrimRange(robot_prim) if _is_gripper_collision_instance(prim)
+    ]
+
+    modified_meshes = []
+    for instance_path in gripper_collision_instances:
+        instance_prim = stage.GetPrimAtPath(instance_path)
+        instance_prim.SetInstanceable(False)
+        for child_prim in Usd.PrimRange(instance_prim):
+            if child_prim.GetTypeName() != "Mesh" or not child_prim.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            mesh_path = child_prim.GetPath().pathString
+            sim_schemas.modify_mesh_collision_properties(mesh_path, _GRIPPER_ACTUAL_MESH_COLLISION, stage=stage)
+            sim_schemas.modify_collision_properties(mesh_path, _GRIPPER_SDF_COLLISION, stage=stage)
+            modified_meshes.append(mesh_path)
+
+    if not modified_meshes:
+        logging.warning("Did not find any rby1df gripper collision meshes to switch to actual mesh collision.")
+
+
+@clone
+def spawn_rby1df_with_gripper_mesh_collision(
+    prim_path: str,
+    cfg: sim_utils.UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Spawn rby1df and override only gripper collision meshes to use Newton SDF on real mesh geometry."""
+    prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
+    _apply_actual_mesh_collision_to_grippers(prim)
+    return prim
 
 
 def _build_waterhose_teleop_pipeline():
@@ -297,7 +368,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     ### rby1df robot (28-DOF, fixed base). Drive gains match the reference example.
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
-        spawn=sim_utils.UsdFileCfg(usd_path=_RBY1_USD),
+        spawn=sim_utils.UsdFileCfg(usd_path=_RBY1_USD, func=spawn_rby1df_with_gripper_mesh_collision),
         articulation_root_prim_path="/Geometry/origin",
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 1.0, -1.0),
@@ -329,11 +400,11 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     )
 
     ### Cable 1 (graspable plug welded to the head; tail welded to a kinematic anchor sphere)
+
     plug1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Plug1",
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda"),
-            # Targeted Newton SDF schema smoke-test on the plug mesh only.
             collision_props=sim_utils.NewtonSDFCollisionPropertiesCfg(
                 sdf_max_resolution=64,
                 sdf_narrow_band_inner=0.002,
@@ -394,8 +465,32 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=_ANCHOR_POS),
     )
 
+    # Physical socket collider.
+    #
+    # The fridge socket mouth/bore baked into one standalone triangle mesh
+    # (assets/fridge/socket_collision.usda, generated by
+    # scripts/environments/waterhose/create_socket_collision_asset.py from the
+    # Cable008 socket collider fragments). Its mesh points live in the fridge /root
+    # frame, so spawning it at _FRIDGE_POS lands it exactly over the fridge socket.
+    # A Newton SDF collider is built on it so cable/connector contact can be
+    # tested against the real socket bore.
+    socket_collision = AssetBaseCfg(
+        prim_path="/World/envs/env_.*/SocketCollision",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "socket_collision.usda"),
+            collision_props=sim_utils.NewtonSDFCollisionPropertiesCfg(
+                sdf_max_resolution=64,
+                sdf_narrow_band_inner=0.002,
+                sdf_narrow_band_outer=0.006,
+                sdf_texture_format="float32",
+                sdf_padding=0.001,
+            ),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=_FRIDGE_POS),
+    )
+
     # The deformable cable, simulated as a Cosserat rod by the VBD solver. Material values are
-    # tuned for stability under proxy coupling with the gripper (see the VBD solver entry below):
+    # tuned for the plug-grasp path:
     #   stretch_stiffness -- axial EA; 1e8 resists stretching without exploding (1e12 blew up).
     #   bend_stiffness    -- resistance to bending; keeps the hose from kinking unnaturally.
     #   stretch/bend_damping -- velocity damping; small values quell jitter without over-damping.
@@ -574,6 +669,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             lookat=_NEWTON_CAMERA_LOOKAT,
             window_width=1600,
             window_height=1600,
+            show_static=True,
         )
         self.sim.visualizer_cfgs = [KitVisualizerCfg(**kit_view), NewtonVisualizerCfg(**newton_view)]
 
@@ -606,32 +702,41 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                     ),
                     CoupledSolverEntryCfg(
                         name="vbd",
-                        # The cable weld joints (head->Plug1, tail->Anchor1) are intentionally
-                        # *soft*: rigid_joint_hard=False with linear/angular k_start ramps lets the
-                        # augmented-Lagrangian stiffness grow gradually instead of clamping hard.
-                        # A hard weld plus hard contacts accumulated AL impulses and exploded the
-                        # cable on first gripper contact; the soft ramp keeps it stable.
+                        # Keep plug-era cable welds compliant: the cable head->Plug1 and
+                        # tail->Anchor1 fixed joints have small authored offsets, so hard
+                        # AVBD joints can inject a large startup impulse and explode the cable.
                         solver_cfg=VBDSolverCfg(
                             iterations=10,
                             friction_epsilon=0.1,
                             rigid_contact_hard=True,
                             rigid_joint_hard=False,
                             rigid_avbd_beta=1.0e5,
+                            rigid_avbd_gamma=0.999,
                             rigid_contact_history=False,
                             rigid_contact_k_start=1.0e2,
+                            # The generic cable_robot example uses 128, but this IsaacLab
+                            # scene produces >300 per-body cable/gripper/socket contacts during
+                            # grasp, so 128 overflows and poisons the solve.
                             rigid_body_contact_buffer_size=512,
                             rigid_joint_linear_ke=1.0e5,
                             rigid_joint_angular_ke=1.0e5,
                             rigid_joint_linear_k_start=1.0e4,
                             rigid_joint_angular_k_start=1.0e1,
+                            rigid_joint_linear_kd=0.0,
+                            rigid_joint_angular_kd=0.0,
                         ),
                         solver_class="newton.solvers:SolverVBD",
                         body_entities=[
                             SceneEntityCfg("cable1"),
-                            # Weld targets must live in the VBD model so the cable fixed joints
+                            # Weld targets must live in the VBD model so the cable fixed joint
                             # (head -> Plug1, tail -> Anchor1) can be created against them.
                             SceneEntityCfg("plug1"),
                             SceneEntityCfg("anchor1"),
+                        ],
+                        # Pull the physical socket collider into the VBD solve for direct
+                        # cable/socket contact tests.
+                        shape_label_patterns=[
+                            r"/World/envs/env_\d+/SocketCollision/.*",
                         ],
                         all_particles=True,
                         include_static_shapes=False,
@@ -656,16 +761,12 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                                 )
                             ],
                             mode="lagged",
-                            # Make the finger proxies effectively immovable in the VBD view so the
-                            # cable contact cannot push them back (no two-way energy pumping).
-                            # Refresh proxy contacts every 5th substep to match the Newton
-                            # cable_robot reference (vbd_collide_substeps=5); this cuts collision
-                            # cost ~5x. mass_scale keeps the fingers immovable so the lagged
-                            # contacts stay valid between refreshes.
-                            mass_scale=1.0e0,
+                            # Match Newton's generic MuJoCo+VBD cable_robot proxy-coupled example.
+                            mass_scale=1.0,
                             collision_pipeline_factory=_make_proxy_collision_pipeline,
                             collide_interval=5,
                             shape_material_ke=2.0e5,
+                            shape_material_kd=1.0e-1,
                             shape_material_mu=3.0e6,
                             shape_margin=0.001,
                         )
@@ -681,7 +782,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             model_cfg=NewtonModelCfg(
                 shape_material_ke=1.0e5,
                 shape_material_kd=1.0e-1,
-                soft_contact_mu=1.0,
+                soft_contact_mu=0.5,
                 shape_material_mu=1.0,
             ),
         )
@@ -720,9 +821,7 @@ class WaterhoseIkActionsCfg:
         },
         # Sized for the ~7.3 mm-radius Plug1 (not the 3 mm cable): each finger closes to
         # +/-7 mm, ~0.3 mm inside the plug surface, so the fingers squeeze the plug through
-        # the soft VBD contact instead of being driven ~7 mm past the surface (which buried
-        # the fingers in the mesh and let the plug slip out). The reference cable-robot demo
-        # uses 0.0072 because it grips the thin cable capsule directly.
+        # the soft VBD contact instead of being driven ~7 mm past the surface.
         close_command_expr={
             "right_gripper_finger_joint_1": 0.014,
             "right_gripper_left_finger_joint": -0.007,
@@ -775,6 +874,7 @@ class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
     """Newton-native relative end-effector delta pose plus normalized right-gripper action."""
 
     arm_action = NewtonInverseKinematicsActionCfg(
+        class_type=mdp.WaterhoseLocalFrameNewtonInverseKinematicsAction,
         asset_name="robot",
         joint_names=["torso_joint_.*", "right_arm_joint_.*"],
         body_name="right_gripper_base",

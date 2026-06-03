@@ -17,9 +17,12 @@ from newton import CollisionPipeline, Model
 from newton.solvers.experimental.coupled import (
     CouplingInterface,
     SolverCoupled,
-    SolverCoupledAdmm,
     SolverCoupledProxy,
 )
+try:
+    from newton.solvers.experimental.coupled import SolverCoupledADMM as SolverCoupledAdmm
+except ImportError:
+    from newton.solvers.experimental.coupled import SolverCoupledAdmm
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.physics import PhysicsManager

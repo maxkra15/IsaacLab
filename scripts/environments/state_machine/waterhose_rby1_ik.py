@@ -45,7 +45,7 @@ import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
 
 import isaaclab_tasks  # noqa: F401, E402
-from isaaclab_tasks.manager_based.manipulation.waterhose.scripted_state_machine import WaterhoseDemoState  # noqa: E402
+from isaaclab_tasks.contrib.waterhose.scripted_state_machine import WaterhoseDemoState  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg  # noqa: E402
 
 

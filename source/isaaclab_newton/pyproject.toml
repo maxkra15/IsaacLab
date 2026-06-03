@@ -28,7 +28,12 @@ Repository = "https://github.com/isaac-sim/IsaacLab"
 all = [
     "prettytable>=3.3.0",
     "PyOpenGL-accelerate>=3.1.0",
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@v1.2.0",
+    # RBY1DF's URDF still references a Collada visual mesh. This can be
+    # removed once the demo robot is switched to a USD asset.
+    "pycollada",
+    # Local Newton checkout with the coupled solver work. Keep this aligned with
+    # docs/newton_local_setup.md until the API lands in a release.
+    "newton[sim] @ file:///home/maximiliank/Work/newton-coupled",
 ]
 
 [tool.setuptools]

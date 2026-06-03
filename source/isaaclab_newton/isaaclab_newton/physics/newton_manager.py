@@ -454,7 +454,16 @@ class NewtonManager(PhysicsManager):
             # Kit/Fabric rendering consumes ``body_q``. Some Newton solvers
             # advance joint coordinates without refreshing link transforms, so
             # materialize FK at render cadence before writing Fabric matrices.
-            eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, None)
+            # Coupled VBD entries own their body poses directly; keep the same
+            # FK articulation filter used by forward() so render sync does not
+            # overwrite solver-owned cable/rod state.
+            eval_fk(
+                cls._model,
+                cls._state_0.joint_q,
+                cls._state_0.joint_qd,
+                cls._state_0,
+                cls._fk_articulation_filter,
+            )
             body_delta = cls._debug_usd_sync_body_delta()
 
             # Lazy adapter creation: deferred from initialize_solver() to avoid
@@ -935,7 +944,10 @@ class NewtonManager(PhysicsManager):
 
             SolverImplicitMPM.register_custom_attributes(builder)
         if getattr(solver_cfg, "coupling_type", None) == "admm":
-            from newton.solvers.experimental.coupled import SolverCoupledAdmm
+            try:
+                from newton.solvers.experimental.coupled import SolverCoupledADMM as SolverCoupledAdmm
+            except ImportError:
+                from newton.solvers.experimental.coupled import SolverCoupledAdmm
 
             SolverCoupledAdmm.register_custom_attributes(builder)
 
@@ -1967,7 +1979,7 @@ class NewtonManager(PhysicsManager):
                 if cls._usdrt_stage is None:
                     simulate = cls._simulate_full if cls._is_all_graphable() else cls._simulate_physics_only
                     try:
-                        with wp.ScopedCapture() as capture:
+                        with wp.ScopedDevice(device), wp.ScopedCapture(device=device) as capture:
                             simulate()
                         NewtonManager._graph = capture.graph
                         logger.info("Newton CUDA graph captured (standard Warp mode)")

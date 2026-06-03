@@ -55,7 +55,11 @@ from isaaclab_newton.physics import (
 )
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
 try:
-    from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledAdmm, SolverCoupledProxy
+    from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
+    try:
+        from newton.solvers.experimental.coupled import SolverCoupledADMM as SolverCoupledAdmm
+    except ImportError:
+        from newton.solvers.experimental.coupled import SolverCoupledAdmm
 except ImportError:
     SolverCoupledAdmm = None
     SolverCoupled = None

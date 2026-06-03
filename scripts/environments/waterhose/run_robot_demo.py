@@ -25,48 +25,12 @@ from isaaclab.app import AppLauncher
 
 DEFAULT_TASK = "Isaac-Waterhose-Coupled-v0"
 DEFAULT_MAX_STEPS = 3200
-SUPPORTED_VISUALIZERS = {"kit", "newton", "none"}
-# KitVisualizer uses eye/lookat; this lookat is one meter along camera-local -Z
-# from the authored Kit transform translate=(-0.9, 0.6, 0.3), rotateXYZ=(73.32259, 0, -112.30437).
-KIT_CAMERA_EYE = (-0.9, 0.6, 0.3)
-KIT_CAMERA_LOOKAT = (-0.013736291, 0.236437794, 0.013017143)
-NEWTON_CAMERA_EYE = (-2.55, -7.1, 2.3)
-NEWTON_CAMERA_LOOKAT = (0.55, -0.42, 0.9)
 SCENE_CONFIG_COUPLED_TASKS = {
     "Isaac-Waterhose-Coupled-v0",
 }
 SCENE_CONFIG_SCRIPTED_TASKS = {
     "Isaac-Waterhose-Coupled-v0",
 }
-
-
-class ExplicitVisualizerAction(argparse.Action):
-    """Track explicit use of the local --vis alias."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, values)
-        setattr(namespace, f"{self.dest}_explicit", True)
-
-
-def parse_visualizer_csv(value: str) -> list[str]:
-    """Parse IsaacLab-style comma-delimited visualizer selections."""
-    values = [token.strip().lower() for token in value.split(",")]
-    if not values or any(not token for token in values):
-        raise argparse.ArgumentTypeError("Use a visualizer name such as --vis kit, --vis newton, or --vis none.")
-    if any(" " in token for token in values):
-        raise argparse.ArgumentTypeError("Visualizer names must be comma-separated without spaces.")
-    invalid = [token for token in values if token not in SUPPORTED_VISUALIZERS]
-    if invalid:
-        raise argparse.ArgumentTypeError(f"Unsupported visualizer value(s): {', '.join(invalid)}.")
-    return values
-
-
-def visualizer_types(args_cli: argparse.Namespace) -> set[str]:
-    """Return normalized visualizer names from parsed launcher args."""
-    visualizer = getattr(args_cli, "visualizer", None) or []
-    if isinstance(visualizer, str):
-        visualizer = parse_visualizer_csv(visualizer)
-    return {str(item).strip().lower() for item in visualizer if str(item).strip()}
 
 
 def _debug_runner(message: str) -> None:
@@ -92,51 +56,6 @@ def _prefer_cuda_for_waterhose_xr(args_cli: argparse.Namespace) -> None:
         return
     args_cli.device = "cuda:0"
     args_cli.device_explicit = True
-
-
-def validate_visualizers(args_cli: argparse.Namespace, parser: argparse.ArgumentParser) -> set[str]:
-    """Resolve display selection using IsaacLab visualizer names."""
-    if getattr(args_cli, "visualizer", None) is None:
-        args_cli.visualizer = ["none"] if bool(getattr(args_cli, "headless", False)) else ["kit"]
-        setattr(args_cli, "visualizer_explicit", True)
-
-    selected = visualizer_types(args_cli)
-    if "none" in selected and len(selected) > 1:
-        parser.error("--vis none cannot be combined with other visualizers.")
-
-    unsupported = selected - SUPPORTED_VISUALIZERS
-    if unsupported:
-        parser.error(
-            "This demo supports --vis newton, --vis kit, or --vis none. "
-            f"Unsupported value(s): {', '.join(sorted(unsupported))}."
-        )
-    if {"kit", "newton"}.issubset(selected):
-        parser.error(
-            "The waterhose demo runner supports one visible backend per process. "
-            "Use --vis kit for the Isaac Lab/Kit view, --vis newton for the standalone Newton view, "
-            "or --vis none for headless/profile runs."
-        )
-    if bool(getattr(args_cli, "headless", False)) and selected != {"none"}:
-        parser.error(
-            "Visible visualizers cannot be combined with --headless. "
-            "Remove --headless for --vis kit/newton, or use --vis none for headless runs."
-        )
-
-    if bool(getattr(args_cli, "xr", False)):
-        if "none" in selected:
-            parser.error("--xr requires Kit; use --vis kit.")
-        if "kit" not in selected:
-            args_cli.visualizer = ["kit", *[item for item in args_cli.visualizer if item != "kit"]]
-            selected = visualizer_types(args_cli)
-
-    if "none" in selected:
-        args_cli.headless = True
-        args_cli.visualizer = []
-    else:
-        args_cli.visualizer = list(selected)
-    setattr(args_cli, "visualizer_disable_all", "none" in selected)
-    setattr(args_cli, "visualizer_explicit", True)
-    return selected
 
 
 def _local_isaacsim_kit_args() -> str:
@@ -179,18 +98,52 @@ def _ensure_display_for_visible_visualizer(selected_visualizers: set[str]) -> No
             return
 
 
+def _task_id() -> str:
+    return args_cli.task.split(":")[-1]
+
+
 def _uses_scene_config_coupled_task() -> bool:
     """Whether the selected task needs SimulationApp before config import."""
 
-    return args_cli.task.split(":")[-1] in SCENE_CONFIG_COUPLED_TASKS
+    return _task_id() in SCENE_CONFIG_COUPLED_TASKS
+
+
+def _requested_visualizer_types(args_cli: argparse.Namespace) -> set[str]:
+    """Return visualizer names parsed by IsaacLab's AppLauncher CLI support."""
+
+    visualizer = getattr(args_cli, "visualizer", None)
+    if not visualizer:
+        return set()
+    if isinstance(visualizer, str):
+        visualizer = [token.strip() for token in visualizer.split(",")]
+    return {str(item).strip().lower() for item in visualizer if str(item).strip()}
+
+
+def _startup_visualizer_types(args_cli: argparse.Namespace) -> set[str]:
+    """Visualizers that may need a display before AppLauncher normalizes settings."""
+
+    if bool(getattr(args_cli, "headless", False)) and bool(getattr(args_cli, "headless_explicit", False)):
+        return set()
+    if bool(getattr(args_cli, "visualizer_explicit", False)):
+        return _requested_visualizer_types(args_cli)
+    if _uses_scene_config_coupled_task():
+        return {"kit", "newton"}
+    return _requested_visualizer_types(args_cli)
+
+
+def _set_scene_config_visualizer_intent(args_cli: argparse.Namespace) -> None:
+    """Mirror launch_simulation's config-derived visualizer intent for early AppLauncher startup."""
+
+    if _uses_scene_config_coupled_task():
+        args_cli.visualizer_intent = {"has_any_visualizers": True, "has_kit_visualizer": True}
 
 
 parser = argparse.ArgumentParser(description="Run the scripted waterhose robot demo through IsaacLab.")
 parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--max_steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum manager steps to run.")
-parser.add_argument("--max_demo_steps", type=int, default=0, help="Optional env-level termination bound; 0 disables it.")
-parser.add_argument("--settle_time", type=float, default=4.0, help="Initial settle time for scene-config scripted IK demos.")
+parser.add_argument("--max_demo_steps", type=int, default=-1, help="Optional env-level termination bound; 0 disables it.")
+parser.add_argument("--settle_time", type=float, default=0.1, help="Initial settle time for scene-config scripted IK demos.")
 parser.add_argument("--debug_script", action="store_true", help="Print phase transitions for scene-config scripted IK demos.")
 parser.add_argument(
     "--asset_root",
@@ -200,25 +153,18 @@ parser.add_argument(
 )
 parser.add_argument("--profile", action="store_true", help="Print rollout timing after the run.")
 AppLauncher.add_app_launcher_args(parser)
-parser.add_argument(
-    "--vis",
-    dest="visualizer",
-    type=parse_visualizer_csv,
-    action=ExplicitVisualizerAction,
-    help="Alias for --visualizer. Supported here: newton, kit, none.",
-)
 args_cli = parser.parse_args()
 _install_faulthandler()
 
 if args_cli.num_envs < 1:
     parser.error("--num_envs must be at least 1.")
 
-selected_visualizers = validate_visualizers(args_cli, parser)
+startup_visualizers = _startup_visualizer_types(args_cli)
 _prefer_cuda_for_waterhose_xr(args_cli)
 if args_cli.asset_root:
     os.environ["WATERHOSE_ASSETS_DIR"] = args_cli.asset_root
-_ensure_display_for_visible_visualizer(selected_visualizers)
-_ensure_local_isaacsim_kit_args(args_cli, selected_visualizers)
+_ensure_display_for_visible_visualizer(startup_visualizers)
+_ensure_local_isaacsim_kit_args(args_cli, startup_visualizers)
 
 
 def _configure_env_cfg(env_cfg) -> None:
@@ -230,30 +176,6 @@ def _configure_env_cfg(env_cfg) -> None:
     physics_cfg = env_cfg.sim.physics
     if not isinstance(physics_cfg, NewtonCfg):
         raise TypeError(f"Expected a Newton-backed task config, got {type(physics_cfg).__name__}.")
-
-
-def _configure_visualizers(env_cfg) -> None:
-    visualizer_cfgs = []
-    if "kit" in selected_visualizers:
-        from isaaclab_visualizers.kit import KitVisualizerCfg  # noqa: PLC0415
-
-        visualizer_cfgs.append(
-            KitVisualizerCfg(
-                eye=KIT_CAMERA_EYE,
-                lookat=KIT_CAMERA_LOOKAT,
-            )
-        )
-    if "newton" in selected_visualizers:
-        from isaaclab_visualizers.newton import NewtonVisualizerCfg  # noqa: PLC0415
-
-        visualizer_cfgs.append(
-            NewtonVisualizerCfg(
-                eye=NEWTON_CAMERA_EYE,
-                lookat=NEWTON_CAMERA_LOOKAT,
-                show_static=True,
-            )
-        )
-    env_cfg.sim.visualizer_cfgs = visualizer_cfgs or None
 
 
 def _parse_configured_env_cfg():
@@ -294,7 +216,7 @@ def _run_env(env_cfg) -> None:
         actions = torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device)
         task_name = args_cli.task.split(":")[-1]
         if task_name in SCENE_CONFIG_SCRIPTED_TASKS:
-            from isaaclab_tasks.manager_based.manipulation.waterhose.scripted_state_machine import (  # noqa: PLC0415
+            from isaaclab_tasks.contrib.waterhose.scripted_state_machine import (  # noqa: PLC0415
                 create_scripted_policy,
             )
 
@@ -346,16 +268,14 @@ def _run_env(env_cfg) -> None:
 
 
 def main() -> None:
-    from isaaclab.app import launch_simulation  # noqa: PLC0415
-
-    if "kit" in selected_visualizers or _uses_scene_config_coupled_task():
+    if _uses_scene_config_coupled_task():
         # The scene-config coupled tasks import Newton/USD builders while resolving
         # the task. SimulationApp must own the USD Python bindings first; otherwise
         # Kit extensions can see preloaded pxr modules from the venv and fail at startup.
+        _set_scene_config_visualizer_intent(args_cli)
         app_launcher = AppLauncher(args_cli)
         try:
             env_cfg = _parse_configured_env_cfg()
-            _configure_visualizers(env_cfg)
             if hasattr(app_launcher, "device"):
                 env_cfg.sim.device = app_launcher.device
             _run_env(env_cfg)
@@ -364,7 +284,6 @@ def main() -> None:
         return
 
     env_cfg = _parse_configured_env_cfg()
-    _configure_visualizers(env_cfg)
     from isaaclab.app import launch_simulation  # noqa: PLC0415
 
     with launch_simulation(env_cfg, args_cli):

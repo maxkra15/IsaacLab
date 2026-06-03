@@ -20,7 +20,7 @@ window shows the sand reaction wrench harvested by the proxy coupler.
 import argparse
 from types import SimpleNamespace
 
-from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
+from isaaclab.app import add_launcher_args, launch_simulation
 
 parser = argparse.ArgumentParser(description="Newton proxy-coupled box interacting with MPM sand.")
 parser.add_argument("--fps", type=float, default=60.0, help="Simulation/control frames per second.")

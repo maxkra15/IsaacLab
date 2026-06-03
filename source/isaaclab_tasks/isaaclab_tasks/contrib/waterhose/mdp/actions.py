@@ -12,10 +12,12 @@ from dataclasses import MISSING
 
 import torch
 
+import isaaclab.utils.math as math_utils
 import isaaclab.utils.string as string_utils
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.managers.manager_term_cfg import ActionTermCfg
 from isaaclab.utils.configclass import configclass
+from isaaclab_newton.envs.mdp.actions.newton_ik_actions import NewtonInverseKinematicsAction
 
 
 @configclass
@@ -91,3 +93,33 @@ class WaterhoseGripperPositionAction(ActionTerm):
             env_ids = slice(None)
         self._raw_actions[env_ids] = 1.0
         self._processed_actions[env_ids] = self._open_command
+
+
+class WaterhoseLocalFrameNewtonInverseKinematicsAction(NewtonInverseKinematicsAction):
+    """Newton IK action that applies relative orientation deltas in the end-effector frame."""
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        self._raw_actions[:] = actions
+        self._processed_actions[:] = self.raw_actions * self._scale
+        if self._clip is not None:
+            self._processed_actions = torch.clamp(
+                self._processed_actions, min=self._clip[:, :, 0], max=self._clip[:, :, 1]
+            )
+
+        ee_pos_b, ee_quat_b = self._compute_frame_pose()
+        if self.cfg.controller.command_type != "pose" or not self.cfg.controller.use_relative_mode:
+            super().process_actions(actions)
+            return
+
+        self._target_pos_b[:] = ee_pos_b + self._processed_actions[:, 0:3]
+
+        rot_actions = self._processed_actions[:, 3:6]
+        angle = torch.linalg.vector_norm(rot_actions, dim=1)
+        axis = rot_actions / angle.unsqueeze(-1).clamp_min(1.0e-12)
+        identity_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device).repeat(self.num_envs, 1)
+        rot_delta_quat = torch.where(
+            angle.unsqueeze(-1).repeat(1, 4) > 1.0e-6,
+            math_utils.quat_from_angle_axis(angle, axis),
+            identity_quat,
+        )
+        self._target_quat_b[:] = math_utils.quat_mul(ee_quat_b, rot_delta_quat)

@@ -5,11 +5,11 @@ Last verified: 2026-06-01.
 The waterhose tasks live in:
 
 ```text
-source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/waterhose/
+source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/
 ```
 
-The layout follows the standard manager-based manipulation tasks such as
-`reach`:
+The layout follows IsaacLab's contributed-task structure while keeping the
+manager-based environment style:
 
 ```text
 waterhose/
@@ -48,7 +48,7 @@ Scripted demo with Kit:
 ```bash
 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
   --task Isaac-Waterhose-Coupled-v0 \
-  --vis kit
+  --visualizer kit
 ```
 
 Scripted demo with the Newton viewer:
@@ -56,7 +56,7 @@ Scripted demo with the Newton viewer:
 ```bash
 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
   --task Isaac-Waterhose-Coupled-v0 \
-  --vis newton
+  --visualizer newton
 ```
 
 Headless profile:
@@ -64,7 +64,7 @@ Headless profile:
 ```bash
 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
   --task Isaac-Waterhose-Coupled-v0 \
-  --vis none \
+  --visualizer none \
   --max_steps 200 \
   --profile
 ```
@@ -123,7 +123,7 @@ Multi-env smoke test:
 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
   --task Isaac-Waterhose-Coupled-v0 \
   --num_envs 4 \
-  --vis none \
+  --visualizer none \
   --max_steps 100 \
   --profile
 ```
@@ -133,7 +133,7 @@ Multi-env smoke test:
 By default the task uses packaged assets next to the waterhose package:
 
 ```text
-source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/waterhose/assets/
+source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/
 ```
 
 Required files:

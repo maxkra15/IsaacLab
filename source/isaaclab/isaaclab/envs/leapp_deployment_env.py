@@ -32,6 +32,7 @@ from isaaclab.scene import InteractiveScene
 from isaaclab.sim import SimulationContext
 from isaaclab.sim.utils.stage import use_stage
 from isaaclab.utils.configclass import resolve_cfg_presets
+from isaaclab.utils.version import has_kit
 
 from .ui import ViewportCameraController
 
@@ -191,8 +192,11 @@ class LeappDeploymentEnv:
         self.has_rtx_sensors = bool(self.sim.get_setting("/isaaclab/render/rtx_sensors"))
 
         # Match the standard env initialization path for viewport camera setup.
-        visualizer_types = set(self.sim.resolve_visualizer_types()) if hasattr(self.sim, "resolve_visualizer_types") else set()
-        if self.sim.has_gui or "kit" in visualizer_types:
+        # Explicit visualizers own their cameras via SimulationCfg.visualizer_cfgs.
+        visualizer_types = (
+            set(self.sim.resolve_visualizer_types()) if hasattr(self.sim, "resolve_visualizer_types") else set()
+        )
+        if self.sim.has_gui and not visualizer_types and has_kit():
             self.viewport_camera_controller = ViewportCameraController(cast(Any, self), self.cfg.viewer)
         else:
             self.viewport_camera_controller = None

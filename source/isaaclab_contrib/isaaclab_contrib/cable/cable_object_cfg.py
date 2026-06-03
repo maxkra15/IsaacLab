@@ -53,6 +53,15 @@ class CableAttachmentCfg:
     target_local_quat: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     """Joint anchor orientation ``(x, y, z, w)`` in the target body's local frame."""
 
+    label_suffix: str | None = None
+    """Optional suffix for the Newton joint label, appended under the cable prim path.
+
+    Defaults to ``attachment_seg{cable_anchor}`` when ``None``. Supplying a unique
+    suffix lets multiple attachments share the same ``cable_anchor`` without label
+    collisions, and lets runtime code (e.g. a scripted policy) locate the joint by
+    matching this token against the solver's ``joint_label``.
+    """
+
 
 @configclass
 class CableSdfCaptureCfg:
