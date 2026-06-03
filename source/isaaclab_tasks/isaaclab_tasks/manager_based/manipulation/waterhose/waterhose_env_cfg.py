@@ -20,6 +20,7 @@ from isaaclab_newton.physics import (
     CoupledProxyCfg,
     CoupledSolverCfg,
     CoupledSolverEntryCfg,
+    HydroelasticSDFCfg,
     MJWarpSolverCfg,
     NewtonCollisionPipelineCfg,
     ProxyCouplingCfg,
@@ -264,7 +265,19 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     ### Cable 1 (graspable plug welded to the head; tail welded to a kinematic anchor sphere)
     plug1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Plug1",
-        spawn=sim_utils.UsdFileCfg(usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda")),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda"),
+            # Targeted Newton SDF schema smoke-test on the plug mesh only.
+            collision_props=sim_utils.NewtonSDFCollisionPropertiesCfg(
+                sdf_max_resolution=64,
+                sdf_narrow_band_inner=0.002,
+                sdf_narrow_band_outer=0.006,
+                sdf_texture_format="float32",
+                sdf_padding=0.001,
+                hydroelastic_enabled=True,
+                hydroelastic_stiffness=1.0e8,
+            ),
+        ),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(-0.38398558, 0.34585292, 0.5 - 0.36874688),
             rot=(0.0, -0.57096256, 0.0, 0.8209761),
@@ -595,7 +608,10 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                 ),
             ),
             num_substeps=10,
-            collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
+            collision_cfg=NewtonCollisionPipelineCfg(
+                rigid_contact_max=65536,
+                sdf_hydroelastic_config=HydroelasticSDFCfg(),
+            ),
             model_cfg=NewtonModelCfg(
                 shape_material_ke=1.0e5,
                 shape_material_kd=1.0e-1,

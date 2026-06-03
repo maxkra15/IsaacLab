@@ -95,6 +95,18 @@ NEWTON_FORWARDED_NAMES = [
     "NewtonArticulationRootPropertiesCfg",
 ]
 
+NEWTON_FORWARDED_NAMES = [
+    "MujocoRigidBodyPropertiesCfg",
+    "MujocoJointDrivePropertiesCfg",
+    "NewtonRigidBodyPropertiesCfg",
+    "NewtonJointDrivePropertiesCfg",
+    "NewtonCollisionPropertiesCfg",
+    "NewtonMeshCollisionPropertiesCfg",
+    "NewtonSDFCollisionPropertiesCfg",
+    "NewtonMaterialPropertiesCfg",
+    "NewtonArticulationRootPropertiesCfg",
+]
+
 
 @pytest.mark.parametrize("name", FORWARDED_NAMES)
 def test_schemas_shim_resolves_to_physx_class(name):
