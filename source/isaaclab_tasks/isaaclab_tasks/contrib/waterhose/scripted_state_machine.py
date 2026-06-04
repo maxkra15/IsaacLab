@@ -3,28 +3,28 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Scripted IK state machine for the RBY1 waterhose scene-config tasks.
+"""Scripted IK state machine for the RBY1 waterhose pick-insert-extract demo.
 
-This is a faithful port of the time-scheduled state machine used by the working
-Newton ``cable_robot`` insert/extract success demo
-(``newton/examples/cable_robot/example_waterhose_scene2_insert_extract_success.py``).
+Phases: REST -> APPROACH -> ENGAGE -> GRASP -> HOLD_GRASP -> RETRACT -> SETTLE ->
+ALIGN -> INSERT -> HOLD_INSERTED -> EXTRACT -> WITHDRAW -> DONE.
 
 Design (deliberately simple and robust):
 
 * Each phase has a fixed *duration* and computes a single EE *target pose* from a
-  snapshot taken on phase entry (the EE pose and the plug pose at that instant)
-  plus a fixed geometric offset.
-* The commanded pose is a smoothstep blend from the entry pose to the target
-  pose, with the rotation interpolated by shortest-path normalized lerp.
-* The gripper is a simple open->closed lerp (no force feedback).
-* A phase advances once it has run for at least its duration *and* the EE has
-  converged to the target (with a hard 2x-duration timeout so a phase can never
-  stall the demo).
+  snapshot taken on phase entry, plus a fixed geometric offset; the commanded pose
+  is a smoothstep blend from the entry pose to the target.
 
-There is intentionally no force-feedback grip, finger centering, axis-alignment
-search, or insertion integral control here -- those made the previous version
-brittle. When the plug is present, the timed grasp targets the plug rigid body;
-in temporary plugless cable-grasp mode, it targets the cable head body instead.
+DYNAMIC ALIGNMENT (the insert/extract phases): the plug does not sit in the
+gripper exactly as a fixed grasp-geometry bake-in would assume -- it slips and
+(driven by the anchored cable) rotates during the grasp/retract. So instead of a
+fixed plug-in-EE assumption, the insert/extract phases MEASURE the live plug pose
+relative to the EE on phase entry (``_capture_grasp``) and back out the EE pose
+that places the *connector* coaxially in the socket bore (``_ee_from_plug``). The
+desired plug orientation aligns the connector axis (plug local -Z, the tip
+direction) with the socket hole axis via a minimal rotation that preserves the
+current roll, so the controller compensates for however the plug actually sits.
+Capturing once per phase entry (not every step) keeps it stable -- no oscillating
+live-feedback loop.
 """
 
 from __future__ import annotations
@@ -42,22 +42,26 @@ from isaaclab.utils.math import (
     subtract_frame_transforms,
 )
 
-# Grasp contact frame expressed in the right_gripper_base local frame.
-_RIGHT_EE_FROM_BASE_POS = (0.0, 0.0, -0.1055)
+# Grasp contact frame expressed in the right_gripper_base local frame: grip in the TIP third of
+# the finger pad. Must match _RIGHT_GRIPPER_EE_FRAME_POS in waterhose_env_cfg.py.
+_RIGHT_EE_FROM_BASE_POS = (0.0, 0.0, -0.125)
 _RIGHT_EE_FROM_BASE_QUAT = (0.70710677, 0.70710677, 0.0, 0.0)
 
-# Grasp point relative to the plug frame: side grasp, shifted slightly toward the
-# cable body so both fingers wrap the plug symmetrically.
+# Grasp point relative to the plug frame: side grasp on the CENTRE of the plug's flange body.
+# The graspable flange cylinder (dia ~14.6 mm) spans plug-frame z in [-7.15, +8.0] mm; its centre
+# is ~z=0. The previous +10 mm shift put the grasp 2 mm PAST the flange back (toward the cable),
+# so the fingers only caught the back rim ("half grasped" -> the plug slipped out). z=0 centres the
+# finger surfaces on the full flange so the full gripper surface grips the full plug surface.
 _CABLE_RADIUS = 0.003
-_GRASP_SHIFT = 0.01
+_GRASP_SHIFT = 0.0
 _PLUG_GRASP_OFFSET = (0.0, -_CABLE_RADIUS + 0.002, _GRASP_SHIFT)
 
 # Plug connector tip in the plug frame (the -Z mesh end that enters the socket).
-# Used to drive the *tip* onto the socket axis instead of the EE origin.
 _PLUG_TIP_OFFSET = (0.0, 0.0, -0.014106234)
+# Connector axis in the plug frame (points out of the tip = the insertion direction).
+_PLUG_CONNECTOR_AXIS = (0.0, 0.0, -1.0)
 
-# Gripper joint command convention used by the IK action term: +1 fully open,
-# -1 fully closed.
+# Gripper command convention used by the IK action term: +1 fully open, -1 fully closed.
 _GRIPPER_OPEN = 1.0
 _GRIPPER_CLOSED = -1.0
 
@@ -77,7 +81,7 @@ def _blend_quat(start_quat: torch.Tensor, target_quat: torch.Tensor, blend: torc
 
 
 class WaterhoseDemoState:
-    """Per-environment scripted pick-and-insert state machine."""
+    """Per-environment scripted pick-insert-extract state machine."""
 
     REST = 0
     APPROACH = 1
@@ -86,11 +90,12 @@ class WaterhoseDemoState:
     HOLD_GRASP = 4
     RETRACT = 5
     SETTLE = 6
-    APPROACH_TARGET = 7
+    ALIGN = 7
     INSERT = 8
-    RELEASE = 9
-    WITHDRAW = 10
-    DONE = 11
+    HOLD_INSERTED = 9
+    EXTRACT = 10
+    WITHDRAW = 11
+    DONE = 12
 
     PHASE_NAMES = (
         "REST",
@@ -100,15 +105,16 @@ class WaterhoseDemoState:
         "HOLD_GRASP",
         "RETRACT",
         "SETTLE",
-        "APPROACH_TARGET",
+        "ALIGN",
         "INSERT",
-        "RELEASE",
+        "HOLD_INSERTED",
+        "EXTRACT",
         "WITHDRAW",
         "DONE",
     )
-    # Minimum time spent in each phase (seconds); a phase advances once this has
-    # elapsed and the EE has converged (or a 2x hard timeout is reached).
-    DURATIONS = (0.25, 3.0, 1.5, 0.5, 0.5, 1.5, 0.3, 5.0, 5.0, 1.0, 2.0, 1.0e6)
+    # Minimum time spent in each phase [s]; a phase advances once this elapsed AND the EE
+    # converged (or a 2x hard timeout). Insert/extract phases get generous time + tolerance.
+    DURATIONS = (0.25, 3.0, 1.5, 0.5, 0.5, 1.5, 0.3, 4.0, 4.0, 1.5, 4.0, 2.0, 1.0e6)
 
     def __init__(self, num_envs: int, step_dt: float, device: torch.device | str, settle_time: float, debug: bool):
         self.num_envs = int(num_envs)
@@ -127,6 +133,11 @@ class WaterhoseDemoState:
         self.phase_plug_pos_w = torch.zeros((self.num_envs, 3), device=device)
         self.phase_plug_quat_w = torch.zeros((self.num_envs, 4), device=device)
         self.phase_plug_quat_w[:, 0] = 1.0
+        # Insertion reference EE pose captured at ALIGN entry; insert/extract are pure translations
+        # of the EE along the bore axis from this reference (no reorientation -> the IK stays stable).
+        self.insert_ref_pos = torch.zeros((self.num_envs, 3), device=device)
+        self.insert_ref_quat = torch.zeros((self.num_envs, 4), device=device)
+        self.insert_ref_quat[:, 0] = 1.0
         self.command_pose = torch.zeros((self.num_envs, 7), device=device)
         self.command_pose[:, 3] = 1.0
 
@@ -134,31 +145,26 @@ class WaterhoseDemoState:
         durations[self.REST] = max(float(settle_time), self.step_dt)
         self.durations = torch.tensor(durations, dtype=torch.float32, device=device)
 
-        # Convergence tolerances (generous; combined with the min duration this
-        # gives smooth motion without ever stalling).
+        # Convergence tolerances (generous; combined with the min duration this gives smooth motion).
         self.pos_tolerance = torch.tensor([0.01, 0.01, 0.01], dtype=torch.float32, device=device)
         self.rot_tolerance = 15.0 * torch.pi / 180.0
 
-        # Fixed geometric offsets (all match the reference success demo).
+        # Fixed geometric offsets.
         self.plug_grasp_offset = self._vec(_PLUG_GRASP_OFFSET)
         self.plug_tip_offset = self._vec(_PLUG_TIP_OFFSET)
+        self.connector_axis_local = self._vec(_PLUG_CONNECTOR_AXIS)
         self.approach_offset = self._vec((0.0, 0.08, 0.0))
         self.engage_offset = self._vec((0.01, 0.0, 0.0))
         self.retract_vector = self._vec((0.0, 0.05, 0.0))
-        # Distance to back the (open) gripper off the seated plug after release. Applied
-        # along the socket-frame +Y axis -- the same grasp-clearance direction RETRACT
-        # uses -- so the fingers slide cleanly off the side grasp instead of sweeping
-        # sideways across the plug (world -X, as in the reference demo, is perpendicular
-        # to our angled socket because this robot is mounted rotated 90 deg about Z).
         self.withdraw_distance = 0.10
 
-        # Insertion geometry, relative to the socket mouth centre along the hole axis.
-        # APPROACH_TARGET parks the connector tip this far *outside* the mouth (along
-        # -hole_axis) so the plug is pre-aligned coaxially with the bore; INSERT then
-        # drives the tip this far *into* the bore (along +hole_axis), letting the
-        # static SocketCollision SDF guide the final seating.
+        # Insertion geometry along the bore (= connector) axis, relative to the socket mouth.
+        # The mouth is authored a standoff ahead of the post-settle connector tip, so ALIGN (tip at
+        # mouth - approach_standoff) is ~where the plug already sits; INSERT drives the tip into the
+        # bore; EXTRACT pulls it back outside. Kept small because no reorientation is needed now.
         self.approach_standoff = 0.04
-        self.insert_depth = 0.015
+        self.insert_depth = 0.006
+        self.extract_clearance = 0.05
 
         # EE orientation that grasps the plug from the side: Rx(+90) * Rz(-90).
         z_axis = self._vec((0.0, 0.0, 1.0))
@@ -167,26 +173,12 @@ class WaterhoseDemoState:
         q_rx = quat_from_angle_axis(torch.full((self.num_envs,), torch.pi / 2.0, device=device), x_axis)
         self.grasp_orientation_offset = normalize(quat_mul(q_rx, q_rz))
 
-        # Connector tip expressed in the EE frame for the *nominal* grasp -- a constant
-        # (independent of the live plug pose), since the plug is rigidly grasped:
-        #   tip_in_ee = R(grasp_offset)^-1 (plug_tip_offset - plug_grasp_offset).
-        # Driving the EE origin to (socket_target - R(socket_grasp) * tip_in_ee) lands
-        # the connector *tip* (not the EE origin) on the socket target, so the plug
-        # actually enters the socket instead of hanging ~2-3 cm short. This is a fixed
-        # axial bake-in (no live per-step feedback), so it cannot swing the arm sideways.
-        self.tip_in_ee_fixed = quat_apply(
-            quat_inv(self.grasp_orientation_offset), self.plug_tip_offset - self.plug_grasp_offset
-        )
-
-        # Socket mouth pose (env-local; env_origins added at runtime). The position is
-        # the centroid of the SocketCollision rim mesh
-        # (source/.../assets/fridge/socket_collision.usda, fridge /root frame + the
-        # _FRIDGE_POS=(0,0,0.5) offset), so the connector is driven straight at the real
-        # hole. The orientation is a 20 deg tilt about +X, whose +Z is exactly the
-        # socket hole axis (0, -sin20, cos20) baked into that asset.
+        # Socket mouth pose (env-local; env_origins added at runtime). MUST mirror the spawned
+        # Socket1 collider (waterhose_env_cfg._SOCKET_MOUTH_POS / _SOCKET_ROT). The socket is placed
+        # to match the grasped plug's natural post-settle connector presentation, so the bore axis =
+        # the connector axis and insertion is a short straight push. socket_quat maps +Z -> bore axis.
         self.socket_pos_w = self._vec((-0.259345, 0.344709, 0.28698))
-        socket_angle = torch.full((self.num_envs,), 0.3490658503988659, device=device)
-        self.socket_quat_w = quat_from_angle_axis(socket_angle, self._vec((1.0, 0.0, 0.0)))
+        self.socket_quat_w = normalize(self._vec((0.984808, 0.173648, 0.0, 0.0)))
 
         self.ee_offset_pos = self._vec(_RIGHT_EE_FROM_BASE_POS)
         self.ee_offset_quat = self._vec(_RIGHT_EE_FROM_BASE_QUAT)
@@ -208,6 +200,9 @@ class WaterhoseDemoState:
         self.phase_plug_pos_w[env_ids] = 0.0
         self.phase_plug_quat_w[env_ids] = 0.0
         self.phase_plug_quat_w[env_ids, 0] = 1.0
+        self.insert_ref_pos[env_ids] = 0.0
+        self.insert_ref_quat[env_ids] = 0.0
+        self.insert_ref_quat[env_ids, 0] = 1.0
 
     def compute(self, env) -> torch.Tensor:
         robot = env.scene["robot"]
@@ -257,16 +252,20 @@ class WaterhoseDemoState:
         self.phase_start_quat_w[first_step] = ee_quat_w[first_step]
         self.phase_plug_pos_w[first_step] = plug_pos_w[first_step]
         self.phase_plug_quat_w[first_step] = plug_quat_w[first_step]
+        # Capture the insertion reference EE pose on entry to ALIGN (the pre-insert pose). Insert/
+        # extract translate the EE from here along the bore axis -- no reorientation.
+        capture_ref = first_step & (self.phase == self.ALIGN)
+        if torch.any(capture_ref):
+            self.insert_ref_pos[capture_ref] = ee_pos_w[capture_ref]
+            self.insert_ref_quat[capture_ref] = ee_quat_w[capture_ref]
 
         start_pos_w = self.phase_start_pos_w
         start_quat_w = self.phase_start_quat_w
         snap_plug_pos_w = self.phase_plug_pos_w
         snap_plug_quat_w = self.phase_plug_quat_w
 
-        # EE orientation that aligns the gripper with the (snapshotted) plug, and
-        # with the socket for the insertion phases.
+        # EE orientation/position that aligns the gripper with the (snapshotted) plug for the pick.
         grasp_quat_w = normalize(quat_mul(snap_plug_quat_w, self.grasp_orientation_offset))
-        socket_grasp_quat_w = normalize(quat_mul(self.socket_quat_w, self.grasp_orientation_offset))
         grasp_pos_w = snap_plug_pos_w + quat_apply(snap_plug_quat_w, self.plug_grasp_offset)
 
         phase = self.phase
@@ -281,12 +280,7 @@ class WaterhoseDemoState:
 
         # --- Pick ---
         approach = phase == self.APPROACH
-        set_target(
-            approach,
-            grasp_pos_w + quat_apply(snap_plug_quat_w, self.approach_offset),
-            grasp_quat_w,
-            0.0,
-        )
+        set_target(approach, grasp_pos_w + quat_apply(snap_plug_quat_w, self.approach_offset), grasp_quat_w, 0.0)
 
         engage = phase == self.ENGAGE
         set_target(engage, grasp_pos_w + self.engage_offset, grasp_quat_w, 0.0)
@@ -299,58 +293,44 @@ class WaterhoseDemoState:
         t_grip[grasp] = grasp_blend[grasp]
 
         hold = phase == self.HOLD_GRASP
-        t_grip[hold] = 1.0  # pose already starts at the hold pose
+        t_grip[hold] = 1.0
 
         retract = phase == self.RETRACT
-        set_target(
-            retract,
-            start_pos_w + quat_apply(snap_plug_quat_w, self.retract_vector),
-            start_quat_w,
-            1.0,
-        )
+        set_target(retract, start_pos_w + quat_apply(snap_plug_quat_w, self.retract_vector), start_quat_w, 1.0)
 
         settle = phase == self.SETTLE
         t_grip[settle] = 1.0
 
-        # --- Insert ---
-        # Drive the connector *tip* (not the EE origin) onto the socket target, using a
-        # fixed grasp-geometry bake-in: tip_comp = R(socket_grasp) * tip_in_ee_fixed is
-        # the world offset from the EE origin to the connector tip when aligned. The EE
-        # target is socket_target - tip_comp, so the tip lands on socket_target and the
-        # plug enters the socket instead of hanging ~2-3 cm short. Orientation is the
-        # socket-aligned grasp throughout. (This is a constant bake-in, unlike the old
-        # live feed-forward that swung the arm off-target after grasp.)
-        tip_comp_w = quat_apply(socket_grasp_quat_w, self.tip_in_ee_fixed)
+        # --- Insert / extract: drive the EE to the REAL fridge socket with the socket-aligned grasp
+        # orientation (the success-script approach: example_waterhose_scene2_insert_extract_success
+        # set_target_pose_kernel APPROACH_TARGET/INSERT). The grasped plug is carried to the socket
+        # and reoriented to the bore; the snap-lock joint (added separately) then holds it.
+        ins_dir = insertion_dir_w  # bore axis = R(socket_quat) @ +Z
+        socket_grasp_quat = normalize(quat_mul(self.socket_quat_w, self.grasp_orientation_offset))
+        approach_pos = socket_pos_w - self.approach_standoff * ins_dir
+        inserted_pos = socket_pos_w + self.insert_depth * ins_dir
+        extracted_pos = socket_pos_w - self.extract_clearance * ins_dir
 
-        # Pre-insertion: park the connector tip coaxially with the bore, a fixed
-        # standoff *outside* the socket mouth (along -hole_axis).
-        approach_target = phase == self.APPROACH_TARGET
-        set_target(
-            approach_target,
-            socket_pos_w - self.approach_standoff * insertion_dir_w - tip_comp_w,
-            socket_grasp_quat_w,
-            1.0,
-        )
+        # ALIGN: carry the plug to a standoff in front of the socket mouth, socket-aligned.
+        align = phase == self.ALIGN
+        set_target(align, approach_pos, socket_grasp_quat, 1.0)
 
-        # Insertion: push the connector tip from the standoff to just inside the bore
-        # (along +hole_axis). The static SocketCollision SDF mesh catches and guides the
-        # plug for the final mm of seating.
+        # INSERT: push the EE forward into the socket along the bore axis.
         insert = phase == self.INSERT
-        set_target(
-            insert,
-            socket_pos_w + self.insert_depth * insertion_dir_w - tip_comp_w,
-            socket_grasp_quat_w,
-            1.0,
-        )
+        set_target(insert, inserted_pos, socket_grasp_quat, 1.0)
 
-        # RELEASE: hold pose, open the gripper over the phase duration.
-        release = phase == self.RELEASE
-        release_blend = _smoothstep(self.elapsed / torch.clamp(self.durations[self.RELEASE], min=1.0e-6))
-        t_grip[release] = 1.0 - release_blend[release]
+        # HOLD_INSERTED: dwell at the seated pose (where the snap-lock joint will activate).
+        hold_ins = phase == self.HOLD_INSERTED
+        set_target(hold_ins, inserted_pos, socket_grasp_quat, 1.0)
 
+        # EXTRACT: pull the (still-grasped) plug back out of the socket along -bore axis.
+        extract = phase == self.EXTRACT
+        set_target(extract, extracted_pos, socket_grasp_quat, 1.0)
+
+        # WITHDRAW: lift the (still-grasped) plug clear of the socket.
         withdraw = phase == self.WITHDRAW
         withdraw_dir_w = quat_apply(self.socket_quat_w, self._vec((0.0, 1.0, 0.0)))
-        set_target(withdraw, start_pos_w + self.withdraw_distance * withdraw_dir_w, start_quat_w, 0.0)
+        set_target(withdraw, extracted_pos + self.withdraw_distance * withdraw_dir_w, socket_grasp_quat, 1.0)
 
         # Smoothstep blend from the entry pose to the target pose (world frame).
         blend = _smoothstep(self.elapsed / self.durations[self.phase]).unsqueeze(-1)

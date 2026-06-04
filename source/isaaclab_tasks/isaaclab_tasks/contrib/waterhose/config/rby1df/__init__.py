@@ -12,12 +12,37 @@ from . import agents
 ##
 
 
+# Two-way proxy coupling (the gripper proxies are finite-mass bodies that exchange force with the
+# cable in both directions). Stable for a single env; the plug grasp can be marginal for num_envs>1.
+gym.register(
+    id="Isaac-Waterhose-Proxy-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.coupled_env_cfg:WaterhoseCoupledEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:WaterhosePPORunnerCfg",
+    },
+)
+
+# Deprecated alias for the two-way proxy task above; kept so existing scripts/CLIs keep working.
 gym.register(
     id="Isaac-Waterhose-Coupled-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.coupled_env_cfg:WaterhoseCoupledEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:WaterhosePPORunnerCfg",
+    },
+)
+
+# One-way kinematic-proxy coupling (gripper proxies are immovable kinematic colliders): the
+# recommended stable demo path -- the full grasp+insert demo stays stable for num_envs up to 8.
+gym.register(
+    id="Isaac-Waterhose-Kinematic-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.kinematic_env_cfg:WaterhoseKinematicEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:WaterhosePPORunnerCfg",
     },
 )

@@ -54,16 +54,7 @@ from isaaclab_newton.physics import (
     XPBDSolverCfg,
 )
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
-try:
-    from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
-    try:
-        from newton.solvers.experimental.coupled import SolverCoupledADMM as SolverCoupledAdmm
-    except ImportError:
-        from newton.solvers.experimental.coupled import SolverCoupledAdmm
-except ImportError:
-    SolverCoupledAdmm = None
-    SolverCoupled = None
-    SolverCoupledProxy = None
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
 
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
@@ -201,7 +192,7 @@ SOLVER_MATRIX = [
             use_collision_pipeline=False,
         ),
         NewtonCoupledManager,
-        SolverCoupledAdmm,
+        SolverCoupledADMM,
         False,
         False,
         id="admm_coupled_xpbd_body_particle",
@@ -575,7 +566,7 @@ def test_initialize_solver_populates_canonical_state(
                 mass=0.1,
                 radius=0.02,
             )
-        elif SolverCoupledAdmm is not None and expected_solver_cls is SolverCoupledAdmm:
+        elif expected_solver_cls is SolverCoupledADMM:
             assert builder.has_custom_attribute("coupling:body_particle_attachment_body")
             body = builder.add_body(mass=1.0)
             particle = builder.add_particle(
@@ -584,7 +575,7 @@ def test_initialize_solver_populates_canonical_state(
                 mass=0.1,
                 radius=0.02,
             )
-            SolverCoupledAdmm.add_body_particle_attachment(builder, body, particle, stiffness=10.0)
+            SolverCoupledADMM.add_body_particle_attachment(builder, body, particle, stiffness=10.0)
         else:
             # Pre-populate the builder with a minimal scene so MJCF conversion has
             # something to work with.
@@ -605,7 +596,7 @@ def test_initialize_solver_populates_canonical_state(
             rigid_solver = NewtonCoupledManager.get_entry_solver("rigid")
             assert rigid_solver is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
-        if SolverCoupledAdmm is not None and expected_solver_cls is SolverCoupledAdmm:
+        if expected_solver_cls is SolverCoupledADMM:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
         assert NewtonManager._use_single_state is expected_use_single_state

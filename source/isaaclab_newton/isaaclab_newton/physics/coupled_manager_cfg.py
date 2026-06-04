@@ -171,6 +171,19 @@ class CoupledProxyCfg:
     mode: Literal["lagged", "staggered"] | int = "lagged"
     """Proxy transfer mode passed to Newton's ``SolverCoupledProxy``."""
 
+    immovable: bool = False
+    """Make this a one-way kinematic proxy.
+
+    When ``True`` the destination proxy bodies are made immovable in the
+    destination view (inverse mass/inertia zeroed) instead of being given a
+    finite virtual mass, and no reaction is harvested back to the source: the
+    proxy tracks the source pose and drives the destination solver as a
+    kinematic collider, but the destination can never push it back (strictly
+    one-way, source -> destination). Use this for a gripper that must collide
+    with / grasp a deformable without the deformable destabilizing the grip;
+    :attr:`mass_scale` is ignored. ``False`` keeps the default finite-mass,
+    force-feedback (two-way) proxy."""
+
     collision_pipeline_factory: Callable | None = None
     """Optional factory for a proxy-local collision pipeline.
 

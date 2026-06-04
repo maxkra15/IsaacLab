@@ -31,11 +31,7 @@ from isaaclab_newton.physics import (
 from isaaclab_newton.physics.newton_manager import NewtonManager
 from newton import CollisionPipeline, JointType, Model, ShapeFlags
 from newton.solvers import SolverBase, SolverFeatherstone, SolverKamino, SolverMuJoCo, SolverVBD, SolverXPBD
-from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledProxy
-try:
-    from newton.solvers.experimental.coupled import SolverCoupledADMM as SolverCoupledAdmm
-except ImportError:
-    from newton.solvers.experimental.coupled import SolverCoupledAdmm
+from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.physics import PhysicsManager
@@ -208,21 +204,21 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
         model: Model,
         entries: list[SolverCoupled.Entry],
         solver_cfg: CoupledAdmmSolverCfg,
-    ) -> SolverCoupledAdmm:
-        contact_pairs: list[SolverCoupledAdmm.ContactPair] = []
+    ) -> SolverCoupledADMM:
+        contact_pairs: list[SolverCoupledADMM.ContactPair] = []
         if solver_cfg.enable_contacts:
             contact_pairs.append(
-                SolverCoupledAdmm.ContactPair(
+                SolverCoupledADMM.ContactPair(
                     source="src",
                     destination="dst",
                     contact_distance=solver_cfg.contact_distance,
                     detection_margin=solver_cfg.detection_margin,
                 )
             )
-        return SolverCoupledAdmm(
+        return SolverCoupledADMM(
             model=model,
             entries=entries,
-            coupling=SolverCoupledAdmm.Config(
+            coupling=SolverCoupledADMM.Config(
                 iterations=int(solver_cfg.iterations),
                 rho=float(solver_cfg.rho),
                 gamma=float(solver_cfg.gamma),
