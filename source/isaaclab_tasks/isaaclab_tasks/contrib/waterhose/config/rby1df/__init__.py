@@ -23,6 +23,16 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-Waterhose-Admm-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.admm_env_cfg:WaterhoseAdmmEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:WaterhosePPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Isaac-Waterhose-Coupled-Teleop-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

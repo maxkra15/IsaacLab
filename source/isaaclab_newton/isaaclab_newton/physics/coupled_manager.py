@@ -113,6 +113,9 @@ class NewtonCoupledManager(NewtonManager):
         solver_cfg = cls._resolve_solver_cfg(model, solver_cfg)
         cls._validate_solver_cfg(solver_cfg)
 
+        cls._apply_coupled_model_cfg(model)
+        cls._apply_proxy_shape_overrides(model, solver_cfg.proxy_coupling.proxies)
+
         entries = [cls._build_entry(entry_cfg) for entry_cfg in solver_cfg.entries]
         if solver_cfg.coupling_type == "base":
             NewtonManager._solver = SolverCoupled(model=model, entries=entries)
@@ -134,8 +137,6 @@ class NewtonCoupledManager(NewtonManager):
         else:
             raise ValueError(f"Unsupported Newton coupling_type {solver_cfg.coupling_type!r}.")
 
-        cls._apply_coupled_model_cfg(model)
-        cls._apply_proxy_shape_overrides(model, solver_cfg.proxy_coupling.proxies)
         cls._apply_entry_solver_overrides(solver_cfg.entries)
         cls._apply_vbd_joint_constraint_modes(solver_cfg.entries)
         cls._configure_fk_articulation_filter(model, solver_cfg.entries)
@@ -639,6 +640,7 @@ class NewtonCoupledManager(NewtonManager):
             return
         values = data.numpy()
         values[np.asarray(indices, dtype=np.int32)] = float(value)
+        data.assign(values)
 
     @classmethod
     def _apply_coupled_model_cfg(cls, model: Model) -> None:

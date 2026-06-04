@@ -15,12 +15,14 @@ from __future__ import annotations
 import logging
 import math
 import os
+from dataclasses import MISSING
 
 from isaaclab_newton.physics import (
+    AdmmContactPairCfg,
+    AdmmCouplingCfg,
     CoupledProxyCfg,
     CoupledSolverCfg,
     CoupledSolverEntryCfg,
-    HydroelasticSDFCfg,
     MJWarpSolverCfg,
     NewtonCollisionPipelineCfg,
     ProxyCouplingCfg,
@@ -35,6 +37,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.sim import schemas as sim_schemas
 from isaaclab.sim.schemas.schemas_cfg import MeshCollisionBaseCfg
 from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd
+from isaaclab.sim.utils import clone
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.assets.rigid_object.rigid_object_cfg import RigidObjectCfg
@@ -42,7 +45,9 @@ from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.devices.device_base import DevicesCfg
 from isaaclab.devices.keyboard import Se3KeyboardCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+import isaaclab.envs.mdp as mdp
 from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
+from isaaclab.managers.manager_term_cfg import ActionTermCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -51,7 +56,6 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
-from isaaclab.sim.utils import clone
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 from isaaclab_contrib.cable.cable_object_cfg import CableAttachmentCfg, CableObjectCfg
@@ -61,7 +65,6 @@ from isaaclab_contrib.deformable.newton_manager_cfg import (
     VBDSolverCfg,
 )
 
-from . import mdp
 from .teleop import WaterhoseSpaceMouseCfg
 
 try:
@@ -109,66 +112,101 @@ _NEWTON_CAMERA_EYE = (-2.55, -7.1, 2.3)
 _NEWTON_CAMERA_LOOKAT = (0.55, -0.42, 0.9)
 _ROBOT_BASE_PRIM_PATH_ENV0 = "/World/envs/env_0/Robot/origin"
 
-_GRIPPER_ACTUAL_MESH_COLLISION = MeshCollisionBaseCfg(mesh_approximation_name="none")
-_GRIPPER_SDF_COLLISION = sim_utils.NewtonSDFCollisionPropertiesCfg(
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+
+_RIGHT_GRIPPER_FINGER_BODY_TOKENS = (
+    "right_gripper_leftfinger",
+    "right_gripper_rightfinger",
+    "right_gripper_left_finger",
+    "right_gripper_right_finger",
+)
+_RIGHT_GRIPPER_ACTUAL_MESH_COLLISION = MeshCollisionBaseCfg(mesh_approximation_name="none")
+_RIGHT_GRIPPER_SDF_COLLISION = sim_utils.NewtonSDFCollisionPropertiesCfg(
     sdf_max_resolution=64,
     sdf_narrow_band_inner=0.002,
     sdf_narrow_band_outer=0.006,
     sdf_texture_format="float32",
     sdf_padding=0.001,
-    hydroelastic_enabled=True,
-    hydroelastic_stiffness=1.0e8,
+    hydroelastic_enabled=False,
 )
 
 
-def _is_gripper_collision_instance(prim: Usd.Prim) -> bool:
-    """Return true for rby1df instanceable gripper collision Xforms."""
+@configclass
+class WaterhoseGripperPositionActionCfg(ActionTermCfg):
+    """One-dimensional continuous position command for the RBY1 right gripper."""
+
+    class_type: str = "isaaclab_tasks.contrib.waterhose.mdp.actions:WaterhoseGripperPositionAction"
+
+    joint_names: list[str] = MISSING
+    """Right gripper driver and finger joints to command explicitly."""
+
+    open_command_expr: dict[str, float] = MISSING
+    """Joint position targets for a normalized action of ``+1``."""
+
+    close_command_expr: dict[str, float] = MISSING
+    """Joint position targets for a normalized action of ``-1``."""
+
+
+def _is_right_gripper_finger_collision_instance(prim) -> bool:
+    """Return true for right gripper finger collision instances in the rby1df USD."""
     if not prim.IsInstance():
         return False
-    path = prim.GetPath().pathString
-    if "gripper" not in path:
+    path = prim.GetPath().pathString.lower()
+    if not any(token in path for token in _RIGHT_GRIPPER_FINGER_BODY_TOKENS):
         return False
-    name = prim.GetName()
-    parent_name = prim.GetParent().GetName()
+    name = prim.GetName().lower()
+    parent_name = prim.GetParent().GetName().lower()
     return name.endswith("_collision") or (name == parent_name and name.endswith("finger"))
 
 
-def _apply_actual_mesh_collision_to_grippers(robot_prim: Usd.Prim) -> None:
-    """Use real mesh/SDF collision for gripper meshes while leaving the rest of the robot unchanged."""
+def _apply_collision_overrides_to_right_gripper_fingers(robot_prim) -> None:
+    """Use actual mesh collision and optional Newton SDF only for the right gripper finger meshes."""
     from pxr import Usd, UsdPhysics
 
     stage = robot_prim.GetStage()
-    gripper_collision_instances = [
-        prim.GetPath().pathString for prim in Usd.PrimRange(robot_prim) if _is_gripper_collision_instance(prim)
+    # Newton's current texture-SDF mesh contact path hits a CUDA illegal access
+    # when the plug reaches these proxy finger meshes. Keep SDF opt-in until
+    # that solver path is fixed; actual mesh collision stays enabled either way.
+    enable_sdf = _env_flag("WATERHOSE_RIGHT_GRIPPER_SDF", False)
+    collision_instance_paths = [
+        prim.GetPath().pathString
+        for prim in Usd.PrimRange(robot_prim)
+        if _is_right_gripper_finger_collision_instance(prim)
     ]
 
-    modified_meshes = []
-    for instance_path in gripper_collision_instances:
+    modified_meshes: list[str] = []
+    for instance_path in collision_instance_paths:
         instance_prim = stage.GetPrimAtPath(instance_path)
         instance_prim.SetInstanceable(False)
         for child_prim in Usd.PrimRange(instance_prim):
             if child_prim.GetTypeName() != "Mesh" or not child_prim.HasAPI(UsdPhysics.CollisionAPI):
                 continue
             mesh_path = child_prim.GetPath().pathString
-            sim_schemas.modify_mesh_collision_properties(mesh_path, _GRIPPER_ACTUAL_MESH_COLLISION, stage=stage)
-            sim_schemas.modify_collision_properties(mesh_path, _GRIPPER_SDF_COLLISION, stage=stage)
+            sim_schemas.modify_mesh_collision_properties(mesh_path, _RIGHT_GRIPPER_ACTUAL_MESH_COLLISION, stage=stage)
+            if enable_sdf:
+                sim_schemas.modify_collision_properties(mesh_path, _RIGHT_GRIPPER_SDF_COLLISION, stage=stage)
             modified_meshes.append(mesh_path)
 
     if not modified_meshes:
-        logging.warning("Did not find any rby1df gripper collision meshes to switch to actual mesh collision.")
+        logging.warning("Did not find right gripper finger collision meshes to override.")
 
 
 @clone
-def spawn_rby1df_with_gripper_mesh_collision(
+def spawn_rby1df_with_right_gripper_finger_collision_overrides(
     prim_path: str,
     cfg: sim_utils.UsdFileCfg,
     translation: tuple[float, float, float] | None = None,
     orientation: tuple[float, float, float, float] | None = None,
     **kwargs,
-) -> Usd.Prim:
-    """Spawn rby1df and override only gripper collision meshes to use Newton SDF on real mesh geometry."""
+):
+    """Spawn rby1df and override only the right gripper finger collision meshes."""
     prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
-    _apply_actual_mesh_collision_to_grippers(prim)
+    _apply_collision_overrides_to_right_gripper_fingers(prim)
     return prim
 
 
@@ -354,7 +392,7 @@ _RBY1_IK_INITIAL_JOINT_POS = {
 
 @configclass
 class WaterhoseSceneCfg(InteractiveSceneCfg):
-    """Cable + plug with the cable tail captured by SDF contact; sky light and ground."""
+    """Cable + plug with the cable tail welded to a kinematic anchor; sky light and ground."""
 
     ### Static fridge body
     fridge = AssetBaseCfg(
@@ -368,7 +406,10 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     ### rby1df robot (28-DOF, fixed base). Drive gains match the reference example.
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
-        spawn=sim_utils.UsdFileCfg(usd_path=_RBY1_USD, func=spawn_rby1df_with_gripper_mesh_collision),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=_RBY1_USD,
+            func=spawn_rby1df_with_right_gripper_finger_collision_overrides,
+        ),
         articulation_root_prim_path="/Geometry/origin",
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 1.0, -1.0),
@@ -405,15 +446,6 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         prim_path="/World/envs/env_.*/Plug1",
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda"),
-            collision_props=sim_utils.NewtonSDFCollisionPropertiesCfg(
-                sdf_max_resolution=64,
-                sdf_narrow_band_inner=0.002,
-                sdf_narrow_band_outer=0.006,
-                sdf_texture_format="float32",
-                sdf_padding=0.001,
-                hydroelastic_enabled=True,
-                hydroelastic_stiffness=1.0e8,
-            ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(-0.38398558, 0.34585292, 0.5 - 0.36874688),
@@ -421,39 +453,12 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # Cable tail anchor.
-    #
-    # The cable tail is pinned to the world so it does not fall under gravity while the robot
-    # grasps and inserts the head. Two mechanisms can do this; we use the *weld* (option A):
-    #
-    #   Option A -- fixed-joint weld (used here).
-    #     A 1 mm kinematic sphere (`Anchor1`) is placed exactly at the tail node's world pose
-    #     and the cable tail node is welded to it with a Newton `add_joint_fixed` constraint
-    #     (see the `CableAttachmentCfg` on `cable1`). Pros: exact, drift-free, cheap (two
-    #     constraint rows, no collision geometry). With the softened VBD joints used here
-    #     (`rigid_joint_hard=False` + `k_start` ramps) the weld is compliant rather than
-    #     infinitely stiff, so it no longer pumps energy on contact the way a hard weld did.
-    #     A per-env body is used rather than the global world body (-1): a fixed joint to the
-    #     shared world body corrupts the multi-env coupled MJWarp+VBD solve (robot joints go
-    #     NaN at step 0).
-    #
-    #   Option B -- static SDF capture (alternative; see `CableSdfCaptureCfg`).
-    #     Instead of a joint, generate a static collision fixture (a "retaining cup" at the tail
-    #     tip plus several "through-sleeves" around the last segments) as signed-distance-field
-    #     meshes built once and reused across envs. The cable is mechanically trapped inside the
-    #     fixture by contact rather than constrained by a joint. To switch to it, drop the tail
-    #     `CableAttachmentCfg` below and instead pass e.g.::
-    #
-    #         sdf_captures=[
-    #             CableSdfCaptureCfg(cable_anchor=-1, label_suffix="tail_sdf_capture", ...),
-    #             *(CableSdfCaptureCfg(cable_anchor=i, through_sleeve=True, ...) for i in range(-2, -8, -1)),
-    #         ]
-    #
-    #     and add the generated shapes to the VBD entry's `shape_label_patterns`
-    #     (e.g. r"/World/envs/env_\\d+/Cable1/tail_sdf_.*"). Pros: contact can slip/settle via
-    #     friction and only constrains the cable where it actually touches, so it yields more
-    #     gracefully than a stiff weld. Cons: 8 collision shapes per cable cost more contact work
-    #     at runtime than the two-row weld, and the tail is held only as firmly as friction allows.
+    # Cable tail anchor. The cable tail is pinned to a 1 mm per-env kinematic sphere
+    # so it does not fall under gravity while the robot grasps and inserts the head.
+    # The cable tail node is welded to this body with a Newton `add_joint_fixed`
+    # constraint (see the `CableAttachmentCfg` on `cable1`). A per-env body is used
+    # rather than the global world body (-1): a fixed joint to the shared world body
+    # corrupts the multi-env coupled MJWarp+VBD solve (robot joints go NaN at step 0).
     anchor1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Anchor1",
         spawn=sim_utils.SphereCfg(
@@ -465,29 +470,8 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=_ANCHOR_POS),
     )
 
-    # Physical socket collider.
-    #
-    # The fridge socket mouth/bore baked into one standalone triangle mesh
-    # (assets/fridge/socket_collision.usda, generated by
-    # scripts/environments/waterhose/create_socket_collision_asset.py from the
-    # Cable008 socket collider fragments). Its mesh points live in the fridge /root
-    # frame, so spawning it at _FRIDGE_POS lands it exactly over the fridge socket.
-    # A Newton SDF collider is built on it so cable/connector contact can be
-    # tested against the real socket bore.
-    socket_collision = AssetBaseCfg(
-        prim_path="/World/envs/env_.*/SocketCollision",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "socket_collision.usda"),
-            collision_props=sim_utils.NewtonSDFCollisionPropertiesCfg(
-                sdf_max_resolution=64,
-                sdf_narrow_band_inner=0.002,
-                sdf_narrow_band_outer=0.006,
-                sdf_texture_format="float32",
-                sdf_padding=0.001,
-            ),
-        ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=_FRIDGE_POS),
-    )
+    # The standalone physical socket collider is intentionally excluded from the training scene for now.
+    # Keep the visual fridge socket in `fridge.usda`, but do not spawn the standalone SocketCollision asset.
 
     # The deformable cable, simulated as a Cosserat rod by the VBD solver. Material values are
     # tuned for the plug-grasp path:
@@ -505,7 +489,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
                 bend_stiffness=30.0,
                 stretch_damping=1e-3,
                 bend_damping=1e0,
-                density=1000.0,
+                density=10000.0,
             ),
         ),
         init_state=CableObjectCfg.InitialStateCfg(
@@ -527,7 +511,6 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
                 cable_anchor=42,  # last segment start node; Anchor1 sits exactly there
             ),
         ],
-        sdf_captures=[],
     )
 
     sky_light = AssetBaseCfg(
@@ -684,7 +667,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         # This avoids two-way energy pumping while still letting the gripper grasp the cable.
         self.sim.physics = CoupledNewtonCfg(
             scene_cfg=self.scene,
-            use_cuda_graph=True,
+            use_cuda_graph=_env_flag("WATERHOSE_USE_CUDA_GRAPH", True),
             solver_cfg=CoupledSolverCfg(
                 coupling_type="proxy",
                 scene_cfg=self.scene,
@@ -708,16 +691,16 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         solver_cfg=VBDSolverCfg(
                             iterations=10,
                             friction_epsilon=0.1,
-                            rigid_contact_hard=True,
+                            rigid_contact_hard=False,
                             rigid_joint_hard=False,
                             rigid_avbd_beta=1.0e5,
                             rigid_avbd_gamma=0.999,
                             rigid_contact_history=False,
                             rigid_contact_k_start=1.0e2,
-                            # The generic cable_robot example uses 128, but this IsaacLab
-                            # scene produces >300 per-body cable/gripper/socket contacts during
-                            # grasp, so 128 overflows and poisons the solve.
-                            rigid_body_contact_buffer_size=512,
+                            # The generic cable_robot example uses 128, but the authored
+                            # cable/gripper contact can exceed 600 contacts on one body
+                            # during grasp, so smaller buffers overflow and poison the solve.
+                            rigid_body_contact_buffer_size=768,
                             rigid_joint_linear_ke=1.0e5,
                             rigid_joint_angular_ke=1.0e5,
                             rigid_joint_linear_k_start=1.0e4,
@@ -732,11 +715,6 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             # (head -> Plug1, tail -> Anchor1) can be created against them.
                             SceneEntityCfg("plug1"),
                             SceneEntityCfg("anchor1"),
-                        ],
-                        # Pull the physical socket collider into the VBD solve for direct
-                        # cable/socket contact tests.
-                        shape_label_patterns=[
-                            r"/World/envs/env_\d+/SocketCollision/.*",
                         ],
                         all_particles=True,
                         include_static_shapes=False,
@@ -760,25 +738,24 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                                     ],
                                 )
                             ],
-                            mode="lagged",
-                            # Match Newton's generic MuJoCo+VBD cable_robot proxy-coupled example.
+                            # Use the source solver's end-of-step pose and velocity together.
+                            # The lagged path copies begin pose + end velocity, which can inject
+                            # inconsistent proxy motion while the gripper closes on the plug.
+                            mode="staggered",
                             mass_scale=1.0,
                             collision_pipeline_factory=_make_proxy_collision_pipeline,
-                            collide_interval=5,
+                            collide_interval=1,
                             shape_material_ke=2.0e5,
                             shape_material_kd=1.0e-1,
-                            shape_material_mu=3.0e6,
-                            shape_margin=0.001,
+                            shape_material_mu=1.0,
+                            shape_margin=0.0,
                         )
                     ],
                     iterations=1,
                 ),
             ),
             num_substeps=10,
-            collision_cfg=NewtonCollisionPipelineCfg(
-                rigid_contact_max=65536,
-                sdf_hydroelastic_config=HydroelasticSDFCfg(),
-            ),
+            collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
             model_cfg=NewtonModelCfg(
                 shape_material_ke=1.0e5,
                 shape_material_kd=1.0e-1,
@@ -807,7 +784,7 @@ class WaterhoseIkActionsCfg:
             rot=_RIGHT_GRIPPER_EE_FRAME_ROT,
         ),
     )
-    gripper_action = mdp.WaterhoseGripperPositionActionCfg(
+    gripper_action = WaterhoseGripperPositionActionCfg(
         asset_name="robot",
         joint_names=[
             "right_gripper_finger_joint_1",
@@ -820,12 +797,11 @@ class WaterhoseIkActionsCfg:
             "right_gripper_right_finger_joint": 0.045,
         },
         # Sized for the ~7.3 mm-radius Plug1 (not the 3 mm cable): each finger closes to
-        # +/-7 mm, ~0.3 mm inside the plug surface, so the fingers squeeze the plug through
-        # the soft VBD contact instead of being driven ~7 mm past the surface.
+        # +/-8.5 mm, giving a conservative ~17 mm nominal gap around the ~14.5 mm plug.
         close_command_expr={
-            "right_gripper_finger_joint_1": 0.014,
-            "right_gripper_left_finger_joint": -0.007,
-            "right_gripper_right_finger_joint": 0.007,
+            "right_gripper_finger_joint_1": 0.017,
+            "right_gripper_left_finger_joint": -0.0085,
+            "right_gripper_right_finger_joint": 0.0085,
         },
     )
 
@@ -874,7 +850,7 @@ class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
     """Newton-native relative end-effector delta pose plus normalized right-gripper action."""
 
     arm_action = NewtonInverseKinematicsActionCfg(
-        class_type=mdp.WaterhoseLocalFrameNewtonInverseKinematicsAction,
+        class_type="isaaclab_tasks.contrib.waterhose.mdp.actions:WaterhoseLocalFrameNewtonInverseKinematicsAction",
         asset_name="robot",
         joint_names=["torso_joint_.*", "right_arm_joint_.*"],
         body_name="right_gripper_base",
@@ -918,6 +894,30 @@ class WaterhoseProxyIkEnvCfg(WaterhoseEnvCfg):
                 xr_cfg=self.xr,
                 target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
             )
+
+
+@configclass
+class WaterhoseAdmmIkEnvCfg(WaterhoseProxyIkEnvCfg):
+    """Waterhose task variant using Newton ADMM contact coupling instead of proxy bodies."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        solver_cfg = self.sim.physics.solver_cfg
+        solver_cfg.coupling_type = "admm"
+        solver_cfg.use_collision_pipeline = False
+        solver_cfg.admm_coupling = AdmmCouplingCfg(
+            iterations=5,
+            rho=50.0,
+            gamma=0.1,
+            baumgarte=0.01,
+            contact_pairs=[
+                AdmmContactPairCfg(
+                    source="mjc",
+                    destination="vbd",
+                    detection_margin=0.005,
+                )
+            ],
+        )
 
 
 @configclass

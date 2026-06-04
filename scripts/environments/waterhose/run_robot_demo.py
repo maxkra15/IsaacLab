@@ -27,9 +27,11 @@ DEFAULT_TASK = "Isaac-Waterhose-Coupled-v0"
 DEFAULT_MAX_STEPS = 3200
 SCENE_CONFIG_COUPLED_TASKS = {
     "Isaac-Waterhose-Coupled-v0",
+    "Isaac-Waterhose-Admm-v0",
 }
 SCENE_CONFIG_SCRIPTED_TASKS = {
     "Isaac-Waterhose-Coupled-v0",
+    "Isaac-Waterhose-Admm-v0",
 }
 
 
@@ -75,6 +77,8 @@ def _local_isaacsim_kit_args() -> str:
 def _ensure_local_isaacsim_kit_args(args_cli: argparse.Namespace, selected_visualizers: set[str]) -> None:
     """Make direct runner launches see local Isaac Sim extensions."""
     if "kit" not in selected_visualizers or getattr(args_cli, "kit_args", ""):
+        return
+    if os.getenv("WATERHOSE_USE_LOCAL_ISAACSIM_EXTS", "").lower() not in {"1", "true", "yes", "on"}:
         return
 
     kit_args = _local_isaacsim_kit_args()
@@ -163,6 +167,8 @@ startup_visualizers = _startup_visualizer_types(args_cli)
 _prefer_cuda_for_waterhose_xr(args_cli)
 if args_cli.asset_root:
     os.environ["WATERHOSE_ASSETS_DIR"] = args_cli.asset_root
+if "kit" in startup_visualizers and os.getenv("WATERHOSE_KIT_MULTI_GPU", "").lower() not in {"1", "true", "yes", "on"}:
+    args_cli.multi_gpu = False
 _ensure_display_for_visible_visualizer(startup_visualizers)
 _ensure_local_isaacsim_kit_args(args_cli, startup_visualizers)
 
