@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 _COMMAND_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\breset\b", re.IGNORECASE), "reset"),
     (re.compile(r"\bstop\b", re.IGNORECASE), "stop"),
-    (re.compile(r"\bstart\b", re.IGNORECASE), "start"),
+    (re.compile(r"\b(start|play|run)\b", re.IGNORECASE), "start"),
 ]
 """Ordered patterns for classifying a command string.
 
@@ -87,7 +87,7 @@ class TeleopMessageProcessor(BaseRetargeter):
            {"type": "teleop_command", "message": {"command": "start teleop"}}
 
     2. **Plain text (fallback)**: raw UTF-8 string matched by word boundary
-       (``"start"``, ``"stop"``, ``"reset"``).
+       (``"start"``, ``"play"``, ``"run"``, ``"stop"``, ``"reset"``).
 
     Host-initiated resets (e.g. environment success) are injected via
     :meth:`inject_reset`, which sets the ``reset`` output ``True`` on the

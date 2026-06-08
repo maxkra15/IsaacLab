@@ -335,6 +335,8 @@ def _build_waterhose_teleop_pipeline():
 def _build_waterhose_relative_teleop_pipeline():
     """Build the IsaacTeleop pipeline for the relative Waterhose IK teleop action space."""
 
+    import numpy as np
+
     from isaacteleop.retargeters import (
         GripperRetargeter,
         GripperRetargeterConfig,
@@ -343,8 +345,37 @@ def _build_waterhose_relative_teleop_pipeline():
         TensorReorderer,
     )
     from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource, HandsSource
-    from isaacteleop.retargeting_engine.interface import OutputCombiner, ValueInput
-    from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
+    from isaacteleop.retargeting_engine.interface import BaseRetargeter, OutputCombiner, TensorGroupType, ValueInput
+    from isaacteleop.retargeting_engine.tensor_types import DLDataType, NDArrayType, TransformMatrix
+
+    class WaterhoseDeltaFrameRemapper(BaseRetargeter):
+        """Rotate AVP hand deltas into the waterhose robot's relative IK frame."""
+
+        def input_spec(self):
+            return {
+                "ee_delta": TensorGroupType(
+                    "ee_delta",
+                    [NDArrayType("delta", shape=(6,), dtype=DLDataType.FLOAT, dtype_bits=32)],
+                )
+            }
+
+        def output_spec(self):
+            return {
+                "ee_delta": TensorGroupType(
+                    "ee_delta",
+                    [NDArrayType("delta", shape=(6,), dtype=DLDataType.FLOAT, dtype_bits=32)],
+                )
+            }
+
+        def _compute_fn(self, inputs, outputs, context) -> None:
+            delta = np.asarray(inputs["ee_delta"][0], dtype=np.float32).flatten()
+            remapped = delta.copy()
+            remapped[0] = -delta[1]
+            remapped[1] = delta[0]
+            remapped[3] = delta[3]
+            remapped[4] = 0.0
+            remapped[5] = 0.0
+            outputs["ee_delta"][0] = remapped
 
     controllers = ControllersSource(name="controllers")
     hands = HandsSource(name="hands")
@@ -354,7 +385,7 @@ def _build_waterhose_relative_teleop_pipeline():
 
     se3_cfg = Se3RetargeterConfig(
         input_device=HandsSource.RIGHT,
-        zero_out_xy_rotation=True,
+        zero_out_xy_rotation=False,
         use_wrist_rotation=True,
         use_wrist_position=True,
         delta_pos_scale_factor=15.0,
@@ -364,6 +395,8 @@ def _build_waterhose_relative_teleop_pipeline():
     )
     se3 = Se3RelRetargeter(se3_cfg, name="ee_delta")
     connected_se3 = se3.connect({HandsSource.RIGHT: transformed_hands.output(HandsSource.RIGHT)})
+    delta_remapper = WaterhoseDeltaFrameRemapper(name="waterhose_delta_frame")
+    connected_delta = delta_remapper.connect({"ee_delta": connected_se3.output("ee_delta")})
 
     gripper_cfg = GripperRetargeterConfig(hand_side="right")
     gripper = GripperRetargeter(gripper_cfg, name="gripper")
@@ -390,7 +423,7 @@ def _build_waterhose_relative_teleop_pipeline():
     )
     connected_reorderer = reorderer.connect(
         {
-            "ee_delta": connected_se3.output("ee_delta"),
+            "ee_delta": connected_delta.output("ee_delta"),
             "gripper": connected_gripper.output("gripper_command"),
         }
     )
@@ -973,14 +1006,18 @@ class WaterhoseProxyIkEnvCfg(WaterhoseEnvCfg):
         self.scene.robot.init_state.joint_pos = _RBY1_IK_INITIAL_JOINT_POS
         if _TELEOP_AVAILABLE:
             self.xr = XrCfg(
-                anchor_pos=(0.0, 0.0, 0.0),
-                anchor_rot=(0.0, 0.0, 0.0, 1.0),
+                anchor_pos=(0.0, 0.9, -1),
+                # XrCfg quaternions are xyzw. Rotate the simulation 180 deg
+                # around world up so the headset initially faces the fridge.
+                anchor_rot=(0.0, 0.0, 1.0, 0.0),
             )
             self.isaac_teleop = IsaacTeleopCfg(
                 pipeline_builder=_build_waterhose_teleop_pipeline,
                 sim_device=self.sim.device,
                 xr_cfg=self.xr,
                 target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
+                teleoperation_active_default=True,
+                control_channel_uuid=None,
             )
 
 
@@ -1051,6 +1088,9 @@ class WaterhoseProxyTeleopEnvCfg(WaterhoseProxyIkEnvCfg):
                 sim_device=self.sim.device,
                 xr_cfg=self.xr,
                 app_name="WaterhoseTeleop",
+                target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
+                teleoperation_active_default=True,
+                control_channel_uuid=None,
             )
         self.teleop_devices = DevicesCfg(
             devices={
