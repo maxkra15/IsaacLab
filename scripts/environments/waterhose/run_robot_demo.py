@@ -151,7 +151,7 @@ parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--max_steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum manager steps to run.")
 parser.add_argument("--max_demo_steps", type=int, default=-1, help="Optional env-level termination bound; 0 disables it.")
-parser.add_argument("--settle_time", type=float, default=0.1, help="Initial settle time for scene-config scripted IK demos.")
+parser.add_argument("--settle_time", type=float, default=2.0, help="Initial settle time for scene-config scripted IK demos.")
 parser.add_argument("--debug_script", action="store_true", help="Print phase transitions for scene-config scripted IK demos.")
 parser.add_argument(
     "--asset_root",

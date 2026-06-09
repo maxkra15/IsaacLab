@@ -193,6 +193,25 @@ def spawn_socket_collider(
     return prim
 
 
+@clone
+def spawn_fridge_visual_without_collision(
+    prim_path: str,
+    cfg: sim_utils.UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+):
+    """Spawn the visual fridge USD and disable its dense authored collision meshes."""
+
+    prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
+    sim_schemas.modify_collision_properties(
+        prim.GetPath().pathString,
+        sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        stage=prim.GetStage(),
+    )
+    return prim
+
+
 @configclass
 class WaterhoseGripperPositionActionCfg(ActionTermCfg):
     """One-dimensional continuous position command for the RBY1 right gripper."""
@@ -488,6 +507,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         prim_path="/World/envs/env_.*/Fridge",
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "fridge.usda"),
+            func=spawn_fridge_visual_without_collision,
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=_FRIDGE_POS),
     )
@@ -956,7 +976,7 @@ class WaterhoseNewtonIkActionsCfg(WaterhoseIkActionsCfg):
 
     arm_action = NewtonInverseKinematicsActionCfg(
         asset_name="robot",
-        joint_names=["torso_joint_.*", "right_arm_joint_.*"],
+        joint_names=["torso_joint_.*", "left_arm_joint_.*", "right_arm_joint_.*"],
         body_name="right_gripper_base",
         controller=NewtonIKManagerCfg(
             command_type="pose",
@@ -984,7 +1004,7 @@ class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
     arm_action = NewtonInverseKinematicsActionCfg(
         class_type="isaaclab_tasks.contrib.waterhose.mdp.actions:WaterhoseLocalFrameNewtonInverseKinematicsAction",
         asset_name="robot",
-        joint_names=["torso_joint_.*", "right_arm_joint_.*"],
+        joint_names=["torso_joint_.*", "left_arm_joint_.*", "right_arm_joint_.*"],
         body_name="right_gripper_base",
         controller=NewtonIKManagerCfg(
             command_type="pose",
