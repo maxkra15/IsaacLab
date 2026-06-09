@@ -345,6 +345,77 @@ def main() -> None:
     rf_idx = _find_idx("right_gripper_rightfinger")
     print(f"[instr] plug_idx={plug_idx} grip_idx={grip_idx} lf_idx={lf_idx} rf_idx={rf_idx}", flush=True)
 
+    # One-time ground-truth dump: actual world poses of the socket (static mesh shape), robot base,
+    # EE and plug, so we can verify the scripted state machine's hardcoded socket_pos_w/socket_quat_w.
+    def _qrot_xyzw(q, v):
+        x, y, z, w = q
+        t = 2.0 * np.cross([x, y, z], v)
+        return v + w * t + np.cross([x, y, z], t)
+
+    def _dump_socket_and_base():
+        m = model
+        st0 = NewtonManager._state_0
+        bq = st0.body_q.numpy()
+        try:
+            sbody = m.shape_body.numpy()
+            sxf = m.shape_transform.numpy()
+            msrc = getattr(m, "shape_source", None)
+        except Exception as e:
+            print(f"[gt] cannot read shapes: {e}", flush=True)
+            return
+        # robot base = lowest robot body; print a few key robot bodies
+        for token in ("base", "torso", "right_arm", "right_gripper_base"):
+            bi = _find_idx(token)
+            if bi >= 0:
+                print(f"[gt] body '{labels[bi]}' world_pos={np.round(bq[bi,:3],4).tolist()} "
+                      f"quat_xyzw={np.round(bq[bi,3:],4).tolist()}", flush=True)
+        if plug_idx >= 0:
+            print(f"[gt] PLUG world_pos={np.round(bq[plug_idx,:3],4).tolist()} "
+                  f"quat_xyzw={np.round(bq[plug_idx,3:],4).tolist()}", flush=True)
+        # static mesh shapes (shape_body == -1) — the socket/fridge colliders
+        for s in range(len(sbody)):
+            src = msrc[s] if msrc is not None else None
+            V = None
+            if src is not None:
+                V = getattr(src, "vertices", None)
+                if V is None:
+                    V = getattr(src, "points", None)
+            if V is None:
+                continue
+            V = np.asarray(V, dtype=np.float64)
+            if V.shape[0] < 8:
+                continue
+            b = int(sbody[s])
+            xf = sxf[s]
+            # shape -> world: world = body_q[b] o shape_transform   (xyzw quats)
+            if b >= 0:
+                bp, bqu = bq[b, :3], bq[b, 3:]
+                Vw = np.array([bp + _qrot_xyzw(bqu, _qrot_xyzw(xf[3:], v) + xf[:3]) for v in V])
+            else:
+                Vw = np.array([_qrot_xyzw(xf[3:], v) + xf[:3] for v in V])
+            c = Vw.mean(0)
+            ext = Vw.max(0) - Vw.min(0)
+            # only small colliders (the socket tube ~1-2cm), skip the big fridge body
+            if ext.max() > 0.06:
+                continue
+            # PCA principal axes. For a short hollow socket the BORE axis = SMALLEST-variance
+            # direction (Wt[2]); the ring plane is spanned by the two larger ones.
+            U, S, Wt = np.linalg.svd(Vw - c)
+            axis = Wt[0]
+            tag = ""
+            if 120 <= V.shape[0] <= 320 and ext.max() < 0.018:
+                tag = (f"  <-- SOCKET? S={np.round(S[:3]/ max(S[0],1e-9),3).tolist()} "
+                       f"largest_axis={np.round(Wt[0],3).tolist()} bore_axis(smallest)={np.round(Wt[2],3).tolist()}")
+            print(f"[gt] static-shape s={s} body={b} nV={V.shape[0]} world_centroid={np.round(c,4).tolist()} "
+                  f"bbox_mm={np.round(ext*1000,1).tolist()} pca_axis={np.round(axis,3).tolist()}{tag}", flush=True)
+        print(f"[gt] SM hardcoded socket_pos_w=(-0.259345,0.344709,0.28698) "
+              f"socket bore axis(Rx20)=(0,-0.342,0.940)", flush=True)
+
+    try:
+        _dump_socket_and_base()
+    except Exception as e:
+        print(f"[gt] dump failed: {e}", flush=True)
+
     # One-time dump of collision geometry for the right fingers + plug (shape extents + transform
     # relative to their body), to understand the finger gripping surface and the plug flange.
     def _dump_geom():

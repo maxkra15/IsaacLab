@@ -114,7 +114,7 @@ class WaterhoseDemoState:
     )
     # Minimum time spent in each phase [s]; a phase advances once this elapsed AND the EE
     # converged (or a 2x hard timeout). Insert/extract phases get generous time + tolerance.
-    DURATIONS = (0.25, 3.0, 1.5, 0.5, 0.5, 1.5, 0.3, 4.0, 4.0, 1.5, 4.0, 2.0, 1.0e6)
+    DURATIONS = (0.25, 3.0, 1.5, 0.5, 0.5, 1.5, 0.3, 6.0, 6.0, 1.5, 4.0, 2.0, 1.0e6)
 
     def __init__(self, num_envs: int, step_dt: float, device: torch.device | str, settle_time: float, debug: bool):
         self.num_envs = int(num_envs)
@@ -138,6 +138,16 @@ class WaterhoseDemoState:
         self.insert_ref_pos = torch.zeros((self.num_envs, 3), device=device)
         self.insert_ref_quat = torch.zeros((self.num_envs, 4), device=device)
         self.insert_ref_quat[:, 0] = 1.0
+        # Closed-loop insertion state (mirrors success _init_insert/_compute_insert): the commanded EE
+        # orientation is nudged each frame so the live plug connector axis points into the bore, and a
+        # lateral PI keeps the tip centred. Robust to grasp/EE-frame offset (it measures the real plug).
+        self.insert_ee_quat = torch.zeros((self.num_envs, 4), device=device)
+        self.insert_ee_quat[:, 0] = 1.0
+        self.insert_start_pos = torch.zeros((self.num_envs, 3), device=device)
+        self.lateral_integral = torch.zeros((self.num_envs, 3), device=device)
+        self.insert_t_paused = torch.zeros(self.num_envs, device=device)
+        self.insert_depth_paused = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        self.insert_command_depth = torch.zeros(self.num_envs, device=device)
         self.command_pose = torch.zeros((self.num_envs, 7), device=device)
         self.command_pose[:, 3] = 1.0
 
@@ -159,12 +169,28 @@ class WaterhoseDemoState:
         self.withdraw_distance = 0.10
 
         # Insertion geometry along the bore (= connector) axis, relative to the socket mouth.
-        # The mouth is authored a standoff ahead of the post-settle connector tip, so ALIGN (tip at
-        # mouth - approach_standoff) is ~where the plug already sits; INSERT drives the tip into the
-        # bore; EXTRACT pulls it back outside. Kept small because no reorientation is needed now.
-        self.approach_standoff = 0.04
-        self.insert_depth = 0.006
+        # Mirrors the success demo: ALIGN drives the EE to socket + insertion_start_depth (just inside
+        # the mouth); INSERT ramps to socket + insert_final_depth (seated); EXTRACT pulls back outside.
+        self.insertion_start_depth = 0.005
+        # SHALLOW seat: the Ø14.5 plug cannot enter the Ø6 bore; pushing it ~35 mm deep (success
+        # value, for a Ø6 cable tip) jams the plug at the mouth and compresses the cable toward the
+        # nearby anchor (~8 cm) until it explodes. Seat the connector tip ~at the mouth instead and
+        # let the snap-lock joint hold it.
+        self.insert_final_depth = 0.015
+        self.insert_snap_depth = 0.0  # advance once the connector tip reaches the socket mouth
         self.extract_clearance = 0.05
+        # Closed-loop insert controller gains (success _init_insert values).
+        self.insert_lateral_gain = 0.5
+        self.insert_lateral_integral_gain = 5.0
+        self.insert_orient_gain = 0.2
+        self.insert_max_nudge = 0.05  # cap EE reorientation per frame [rad] so the PD IK can track
+        # Alignment = connector axis points INTO the bore (cos(connector,ins) -> +1). Ramp depth only
+        # when well aligned (cos > pause); pause again if it degrades below resume.
+        self.insert_cos_pause = 0.95
+        self.insert_cos_resume = 0.97
+        self.insert_integral_clamp = 0.01  # anti-windup on the lateral PI integral [m]
+        # In the IsaacLab plug frame +Z is the connector axis; the connector tip is ~14 mm along it.
+        self.connector_tip_len = 0.014106234
 
         # EE orientation that grasps the plug from the side: Rx(+90) * Rz(-90).
         z_axis = self._vec((0.0, 0.0, 1.0))
@@ -258,6 +284,17 @@ class WaterhoseDemoState:
         if torch.any(capture_ref):
             self.insert_ref_pos[capture_ref] = ee_pos_w[capture_ref]
             self.insert_ref_quat[capture_ref] = ee_quat_w[capture_ref]
+            # Seed the closed-loop EE orientation from the pose held entering ALIGN.
+            self.insert_ee_quat[capture_ref] = ee_quat_w[capture_ref]
+            self.lateral_integral[capture_ref] = 0.0
+        # On INSERT entry: anchor the depth ramp at the current EE pose; reset the ramp state.
+        capture_insert = first_step & (self.phase == self.INSERT)
+        if torch.any(capture_insert):
+            self.insert_start_pos[capture_insert] = ee_pos_w[capture_insert]
+            self.lateral_integral[capture_insert] = 0.0
+            self.insert_t_paused[capture_insert] = 0.0
+            self.insert_depth_paused[capture_insert] = False
+            self.insert_command_depth[capture_insert] = self.insertion_start_depth
 
         start_pos_w = self.phase_start_pos_w
         start_quat_w = self.phase_start_quat_w
@@ -301,21 +338,24 @@ class WaterhoseDemoState:
         settle = phase == self.SETTLE
         t_grip[settle] = 1.0
 
-        # --- Insert / extract: drive the EE to the REAL fridge socket with the socket-aligned grasp
-        # orientation (the success-script approach: example_waterhose_scene2_insert_extract_success
-        # set_target_pose_kernel APPROACH_TARGET/INSERT). The grasped plug is carried to the socket
-        # and reoriented to the bore; the snap-lock joint (added separately) then holds it.
-        ins_dir = insertion_dir_w  # bore axis = R(socket_quat) @ +Z
+        # --- Insert / extract: carry the grasped plug to the fridge socket with a FIXED socket-aligned
+        # EE orientation (the success demo's approach), reached by the shortest-arc blend below. In
+        # the IsaacLab plug frame +Z is the connector axis and socket_quat_w maps +Z -> +ins (into the
+        # bore), so the plug target orientation is socket_quat_w directly and the EE target is
+        # socket_quat_w * grasp_orientation_offset. Do NOT close a per-frame orientation loop on the
+        # live plug: the soft grip lets the plug pivot, so such a loop just cranks the gripper the
+        # wrong way. Final precise alignment is left to the snap-lock joint.
+        ins_dir = insertion_dir_w  # bore axis into the socket = R(socket_quat) @ +Z
         socket_grasp_quat = normalize(quat_mul(self.socket_quat_w, self.grasp_orientation_offset))
-        approach_pos = socket_pos_w - self.approach_standoff * ins_dir
-        inserted_pos = socket_pos_w + self.insert_depth * ins_dir
+        approach_pos = socket_pos_w + self.insertion_start_depth * ins_dir
+        inserted_pos = socket_pos_w + self.insert_final_depth * ins_dir
         extracted_pos = socket_pos_w - self.extract_clearance * ins_dir
 
-        # ALIGN: carry the plug to a standoff in front of the socket mouth, socket-aligned.
+        # ALIGN (success APPROACH_TARGET): carry the plug to just inside the socket mouth, bore-aligned.
         align = phase == self.ALIGN
         set_target(align, approach_pos, socket_grasp_quat, 1.0)
 
-        # INSERT: push the EE forward into the socket along the bore axis.
+        # INSERT: push the EE forward into the socket along the bore axis to the seated depth.
         insert = phase == self.INSERT
         set_target(insert, inserted_pos, socket_grasp_quat, 1.0)
 
@@ -337,6 +377,63 @@ class WaterhoseDemoState:
         cmd_pos_w = start_pos_w * (1.0 - blend) + target_pos_w * blend
         cmd_quat_w = _blend_quat(start_quat_w, target_quat_w, blend)
 
+        # ---- Position control during insert. The EE ORIENTATION is the fixed socket_grasp_quat blend
+        # above (no orientation loop -- the soft grip lets the plug pivot, so a loop just cranks the
+        # gripper the wrong way). POSITION is controllable through the carried plug: ramp the depth and
+        # keep the connector tip centred on the bore axis with a lateral PI.
+        ins = ins_dir
+        connector_dir = quat_apply(plug_quat_w, self._vec((0.0, 0.0, 1.0)))  # plug +Z = connector axis
+        cos_val = torch.sum(connector_dir * ins, dim=-1)  # connector vs bore (+1 = pointing in); depth gate + debug
+        # Connector tip in the world (plug +Z is the connector; tip ~14 mm along it).
+        tip_pos_w = plug_pos_w + connector_dir * self.connector_tip_len
+
+        # Depth ramp with alignment pause/resume (INSERT only): ramp only while reasonably aligned.
+        insert_mask = self.phase == self.INSERT
+        paused_next = torch.where(
+            cos_val < self.insert_cos_pause,
+            torch.ones_like(self.insert_depth_paused),
+            torch.where(
+                (cos_val > self.insert_cos_resume) & self.insert_depth_paused,
+                torch.zeros_like(self.insert_depth_paused),
+                self.insert_depth_paused,
+            ),
+        )
+        self.insert_depth_paused = torch.where(insert_mask, paused_next, self.insert_depth_paused)
+        self.insert_t_paused = torch.where(
+            insert_mask & self.insert_depth_paused, self.insert_t_paused + self.step_dt, self.insert_t_paused
+        )
+        effective_t = (self.elapsed - self.insert_t_paused).clamp(min=0.0)
+        t_lin = (effective_t / self.durations[self.INSERT]).clamp(0.0, 1.0)
+        t_ramp = t_lin * t_lin * (3.0 - 2.0 * t_lin)
+        depth_travel = t_ramp * (self.insert_final_depth - self.insertion_start_depth)
+        command_depth = self.insertion_start_depth + depth_travel
+        self.insert_command_depth = torch.where(insert_mask, command_depth, self.insert_command_depth)
+        ee_target = self.insert_start_pos + depth_travel.unsqueeze(-1) * ins
+        # Lateral error of the connector tip from the bore axis.
+        tip_target = socket_pos_w + command_depth.unsqueeze(-1) * ins
+        delta = tip_pos_w - tip_target
+        lateral = delta - torch.sum(delta * ins, dim=-1, keepdim=True) * ins
+        # INSERT lateral PI (integral clamped -> anti-windup so a large initial lateral cannot blow up).
+        self.lateral_integral = torch.where(
+            insert_mask.unsqueeze(-1), self.lateral_integral + lateral * self.step_dt, self.lateral_integral
+        )
+        self.lateral_integral = self.lateral_integral.clamp(-self.insert_integral_clamp, self.insert_integral_clamp)
+        corrected_pos = (
+            ee_target - self.insert_lateral_gain * lateral - self.insert_lateral_integral_gain * self.lateral_integral
+        )
+        # ALIGN: proportional lateral centring on top of the carry blend (no integral -> no windup),
+        # so INSERT begins with the connector tip already on the bore axis.
+        align_tip_target = socket_pos_w + self.insertion_start_depth * ins
+        align_delta = tip_pos_w - align_tip_target
+        align_lateral = align_delta - torch.sum(align_delta * ins, dim=-1, keepdim=True) * ins
+        align_corrected = cmd_pos_w - self.insert_lateral_gain * align_lateral
+        align_mask = self.phase == self.ALIGN
+
+        # Override POSITION only (orientation stays the fixed socket_grasp_quat shortest-arc blend):
+        # ramped + lateral-PI position for INSERT, carry + lateral-centred position for ALIGN.
+        cmd_pos_w = torch.where(insert_mask.unsqueeze(-1), corrected_pos, cmd_pos_w)
+        cmd_pos_w = torch.where(align_mask.unsqueeze(-1), align_corrected, cmd_pos_w)
+
         cmd_pos_b, cmd_quat_b = subtract_frame_transforms(root_pos_w, root_quat_w, cmd_pos_w, cmd_quat_w)
         self.command_pose[:, :3] = cmd_pos_b
         self.command_pose[:, 3:] = cmd_quat_b
@@ -349,6 +446,8 @@ class WaterhoseDemoState:
         rotation_error = quat_error_magnitude(target_quat_w, ee_quat_w)
         converged = torch.all(position_error < self.pos_tolerance, dim=-1) & (rotation_error < self.rot_tolerance)
 
+        axial_depth = torch.sum((tip_pos_w - socket_pos_w) * ins, dim=-1)
+
         if self.debug:
             changed = self.phase != self.last_reported_phase
             if bool(changed[0].item()):
@@ -357,6 +456,8 @@ class WaterhoseDemoState:
                     f"[waterhose_ik] {name}: "
                     f"pos_err={position_error[0].detach().cpu().tolist()} "
                     f"rot_err={float(rotation_error[0].detach().cpu()):.4f} "
+                    f"cos={float(cos_val[0].detach().cpu()):+.2f} "
+                    f"depth_mm={float(axial_depth[0].detach().cpu()) * 1000.0:.1f} "
                     f"grip={float(gripper[0, 0].detach().cpu()):.2f}",
                     flush=True,
                 )
@@ -365,7 +466,14 @@ class WaterhoseDemoState:
         self.elapsed += self.step_dt
         timed_out = self.elapsed >= self.durations[self.phase]
         hard_timeout = self.elapsed >= 2.0 * self.durations[self.phase]
-        should_advance = timed_out & (converged | hard_timeout) & (self.phase < self.DONE)
+        # INSERT advances when the connector tip actually reaches snap depth (or times out); ALIGN
+        # runs its full duration to carry + align; other phases use the converged/hard-timeout gate.
+        insert_reached = (axial_depth >= self.insert_snap_depth) & (self.insert_command_depth >= self.insert_snap_depth)
+        align_advance = (self.phase == self.ALIGN) & timed_out
+        insert_advance = (self.phase == self.INSERT) & (insert_reached | timed_out)
+        is_special = (self.phase == self.ALIGN) | (self.phase == self.INSERT)
+        other_advance = (~is_special) & timed_out & (converged | hard_timeout)
+        should_advance = (align_advance | insert_advance | other_advance) & (self.phase < self.DONE)
 
         self.phase[should_advance] += 1
         self.elapsed[should_advance] = 0.0

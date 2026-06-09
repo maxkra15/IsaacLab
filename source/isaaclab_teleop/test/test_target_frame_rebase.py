@@ -12,9 +12,13 @@ These tests exercise pure math (no Omniverse/Isaac Sim stack required).
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
+from isaaclab_teleop.isaac_teleop_device import IsaacTeleopDevice
 from isaaclab_teleop.session_lifecycle import _to_numpy_4x4
 
 # ---------------------------------------------------------------------------
@@ -262,3 +266,36 @@ class TestConfigDrivenAutoSelection:
         )
         assert called
         assert result is None
+
+
+class TestTargetFrameWarnings:
+    """Tests for target-frame unavailability warning state."""
+
+    def _make_device_shell(self) -> IsaacTeleopDevice:
+        device = IsaacTeleopDevice.__new__(IsaacTeleopDevice)
+        device._cfg = SimpleNamespace(target_frame_prim_path="/World/Robot/base_link")
+        device._last_target_frame_warning_reason = None
+        return device
+
+    def test_warning_emits_once_per_reason(self, caplog: pytest.LogCaptureFixture):
+        device = self._make_device_shell()
+        caplog.set_level(logging.WARNING, logger="isaaclab_teleop.isaac_teleop_device")
+
+        device._warn_target_frame_unavailable("prim path is invalid")
+        device._warn_target_frame_unavailable("prim path is invalid")
+        device._warn_target_frame_unavailable("Fabric hierarchy world matrix is not available yet")
+
+        warning_records = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warning_records) == 2
+        assert "prim path is invalid" in warning_records[0].message
+        assert "Fabric hierarchy world matrix is not available yet" in warning_records[1].message
+
+    def test_resolved_clears_warning_state(self, caplog: pytest.LogCaptureFixture):
+        device = self._make_device_shell()
+        caplog.set_level(logging.INFO, logger="isaaclab_teleop.isaac_teleop_device")
+
+        device._warn_target_frame_unavailable("prim path is invalid")
+        device._mark_target_frame_resolved()
+
+        assert device._last_target_frame_warning_reason is None
+        assert "resolved" in caplog.text

@@ -114,7 +114,7 @@ _KIT_CAMERA_EYE = (-0.9, 0.6, 0.3)
 _KIT_CAMERA_LOOKAT = (-0.013736291, 0.236437794, 0.013017143)
 _NEWTON_CAMERA_EYE = (-2.55, -7.1, 2.3)
 _NEWTON_CAMERA_LOOKAT = (0.55, -0.42, 0.9)
-_ROBOT_BASE_PRIM_PATH_ENV0 = "/World/envs/env_0/Robot/origin"
+_ROBOT_BASE_PRIM_PATH_ENV0 = "/World/envs/env_0/Robot/Geometry/origin"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -277,12 +277,11 @@ def _build_waterhose_teleop_pipeline():
         Se3RetargeterConfig,
         TensorReorderer,
     )
-    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource, HandsSource
+    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
     from isaacteleop.retargeting_engine.interface import OutputCombiner, ValueInput
     from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
 
     controllers = ControllersSource(name="controllers")
-    hands = HandsSource(name="hands")
     transform_input = ValueInput("world_T_anchor", TransformMatrix())
     transformed_controllers = controllers.transformed(transform_input.output(ValueInput.VALUE))
 
@@ -307,7 +306,6 @@ def _build_waterhose_teleop_pipeline():
     connected_gripper = gripper.connect(
         {
             ControllersSource.RIGHT: transformed_controllers.output(ControllersSource.RIGHT),
-            HandsSource.RIGHT: hands.output(HandsSource.RIGHT),
         }
     )
 
@@ -349,7 +347,7 @@ def _build_waterhose_relative_teleop_pipeline():
     from isaacteleop.retargeting_engine.tensor_types import DLDataType, NDArrayType, TransformMatrix
 
     class WaterhoseDeltaFrameRemapper(BaseRetargeter):
-        """Rotate AVP hand deltas into the waterhose robot's relative IK frame."""
+        """Adapt AVP wrist deltas to the waterhose relative IK action semantics."""
 
         def input_spec(self):
             return {
@@ -370,8 +368,9 @@ def _build_waterhose_relative_teleop_pipeline():
         def _compute_fn(self, inputs, outputs, context) -> None:
             delta = np.asarray(inputs["ee_delta"][0], dtype=np.float32).flatten()
             remapped = delta.copy()
-            remapped[0] = -delta[1]
-            remapped[1] = delta[0]
+            # Position deltas are already rebased into the robot root frame by
+            # IsaacTeleopCfg.target_frame_prim_path.  The waterhose action only
+            # wants wrist roll as a local EE rotation command.
             remapped[3] = delta[3]
             remapped[4] = 0.0
             remapped[5] = 0.0
@@ -586,6 +585,11 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "cable001.usda"),
             physics_material=NewtonCableMaterialCfg(
+                # Success-demo value (1e6). Required for stability *with* a grip strong enough to hold
+                # the plug: the proxy grips the cable HEAD, so a high-friction grip injects force into
+                # the cable -- a stiff 1e8 cable then explodes, the softer 1e6 absorbs it. 1e6 + VBD
+                # iters=15 ran the full demo with no explosion. (1e8 alone was stable but the plug
+                # slipped out of the grip on the carry.)
                 stretch_stiffness=1e8,
                 bend_stiffness=30.0,
                 stretch_damping=1e-3,
@@ -801,7 +805,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # tail->Anchor1 fixed joints have small authored offsets, so hard
                         # AVBD joints can inject a large startup impulse and explode the cable.
                         solver_cfg=VBDSolverCfg(
-                            iterations=10,
+                            iterations=10,  # success value; needed to keep the (softer) cable stable on the carry
                             friction_epsilon=0.1,
                             rigid_contact_hard=False,
                             rigid_joint_hard=False,
@@ -862,12 +866,16 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             mass_scale=1.0,
                             collision_pipeline_factory=_make_proxy_collision_pipeline,
                             collide_interval=1,
+                            # Match the success demo's VBD proxy contact: SOFT normal (ke=1e3, kd=0)
+                            # + very high friction (mu=1e6) + small margin. The soft contact keeps the
+                            # normal force gentle so mu=1e6 can HOLD the plug+cable through the carry
+                            # without the force spike that exploded the plug at our old ke=2e5.
                             shape_material_ke=2.0e5,
                             shape_material_kd=1.0e-1,
                             # mu=3 is ample Coulomb friction to hold the clamped plug (mu>1 means
                             # friction can exceed the normal load); the previous 1e6 is unphysical.
                             shape_material_mu=3.0,
-                            shape_margin=0.0,
+                            shape_margin=0.001,
                         )
                     ],
                     iterations=1,
@@ -876,6 +884,9 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             num_substeps=10,
             collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
             model_cfg=NewtonModelCfg(
+                # ke=1e5 keeps the cable's own contacts well-conditioned. (Lowering to the success
+                # VBD_KE=1e3 made the cable explode EARLIER -- the cable needs the stiffer self/socket
+                # contact here; the deep-insert cable blow-up is fixed by a SHALLOW insert depth.)
                 shape_material_ke=1.0e5,
                 shape_material_kd=1.0e-1,
                 soft_contact_mu=1.0,
