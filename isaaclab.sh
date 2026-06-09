@@ -25,8 +25,25 @@ else
     python_exe="python3"
 fi
 
-# Add source/isaaclab to PYTHONPATH so we can import isaaclab.cli.
-export PYTHONPATH="$ISAACLAB_PATH/source/isaaclab:$PYTHONPATH"
+# Add repo-local source packages to PYTHONPATH so this checkout does not
+# accidentally import matching packages from a shared virtual environment.
+source_roots="$ISAACLAB_PATH/source/isaaclab"
+for source_dir in "$ISAACLAB_PATH"/source/*; do
+    if [ "$source_dir" = "$ISAACLAB_PATH/source/isaaclab" ]; then
+        continue
+    fi
+    if [ -d "$source_dir" ]; then
+        source_roots="$source_roots:$source_dir"
+    fi
+done
+
+# Prefer the adjacent Newton PR checkout when present. Set NEWTON_SOURCE_DIR to
+# another checkout, or to an empty string, to override this local default.
+newton_source_dir="${NEWTON_SOURCE_DIR-$ISAACLAB_PATH/../newton-coupled}"
+if [ -n "$newton_source_dir" ] && [ -d "$newton_source_dir/newton" ]; then
+    source_roots="$newton_source_dir:$source_roots"
+fi
+export PYTHONPATH="$source_roots:${PYTHONPATH:-}"
 
 # If a local Isaac Sim binary is present, source its env setup so that
 # PYTHONPATH/PATH/EXP_PATH are correct without depending on a conda

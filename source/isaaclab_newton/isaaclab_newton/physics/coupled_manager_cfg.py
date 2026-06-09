@@ -157,7 +157,7 @@ class CoupledProxyCfg:
     """Scale factor for proxy mass/inertia in the destination view."""
 
     mode: Literal["lagged", "staggered"] | int = "lagged"
-    """Proxy transfer mode passed to Newton's ``SolverProxyCoupled``."""
+    """Proxy transfer mode passed to Newton's ``SolverCoupledProxy``."""
 
     collision_pipeline_factory: Callable | None = None
     """Optional factory for a proxy-local collision pipeline.
@@ -175,7 +175,7 @@ class ProxyCouplingCfg:
     """Lagged-impulse proxy coupling configuration."""
 
     proxies: list[CoupledProxyCfg] = field(default_factory=list)
-    """Proxy mappings used by ``SolverProxyCoupled``."""
+    """Proxy mappings used by ``SolverCoupledProxy``."""
 
     iterations: int = 1
     """Number of proxy relaxation passes per coupled step."""

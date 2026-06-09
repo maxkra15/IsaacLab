@@ -54,17 +54,11 @@ from isaaclab_newton.physics import (
     XPBDSolverCfg,
 )
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
-
-try:
-    from newton.solvers.experimental.coupled import (
-        SolverCoupled,
-        SolverCoupledAdmm as SolverAdmmCoupled,
-        SolverCoupledProxy as SolverProxyCoupled,
-    )
-except ImportError:
-    SolverAdmmCoupled = None
-    SolverCoupled = None
-    SolverProxyCoupled = None
+from newton.solvers.experimental.coupled import (
+    SolverCoupled,
+    SolverCoupledADMM,
+    SolverCoupledProxy,
+)
 
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
@@ -183,10 +177,9 @@ SOLVER_MATRIX = [
             ),
         ),
         NewtonCoupledManager,
-        SolverProxyCoupled,
+        SolverCoupledProxy,
         False,
         True,
-        marks=pytest.mark.skipif(SolverProxyCoupled is None, reason="Newton SolverProxyCoupled is unavailable"),
         id="proxy_coupled_mjwarp_mpm",
     ),
     pytest.param(
@@ -209,10 +202,9 @@ SOLVER_MATRIX = [
             use_collision_pipeline=False,
         ),
         NewtonCoupledManager,
-        SolverAdmmCoupled,
+        SolverCoupledADMM,
         False,
         False,
-        marks=pytest.mark.skipif(SolverAdmmCoupled is None, reason="Newton SolverAdmmCoupled is unavailable"),
         id="admm_coupled_xpbd_body_particle",
     ),
 ]
@@ -419,8 +411,20 @@ def test_coupled_selectors_resolve_bodies_shapes_joints_particles():
     )
     assert entry.bodies == [base, finger]
     assert joint in entry.joints
-    assert entry.shapes == [base_shape, finger_shape, ground_shape]
+    assert entry.shapes == []
     assert entry.particles == [0, 1]
+
+    body_shape_entry = NewtonCoupledManager._resolve_entry_cfg(
+        model,
+        CoupledSolverEntryCfg(
+            name="rigid",
+            solver_cfg=XPBDSolverCfg(iterations=1),
+            body_entities=[SceneEntityCfg("robot")],
+            include_static_shapes=False,
+        ),
+        scene_cfg,
+    )
+    assert body_shape_entry.shapes == [base_shape, finger_shape]
 
     proxy = NewtonCoupledManager._resolve_proxy_cfg(
         model,
@@ -606,7 +610,7 @@ def test_initialize_solver_populates_canonical_state(
                 jitter=0.0,
                 radius_mean=0.02,
             )
-        elif SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
+        elif expected_solver_cls is SolverCoupledProxy:
             assert builder.has_custom_attribute("mpm:young_modulus")
             body = builder.add_body(mass=1.0)
             builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
@@ -625,7 +629,7 @@ def test_initialize_solver_populates_canonical_state(
                 jitter=0.0,
                 radius_mean=0.02,
             )
-        elif SolverCoupled is not None and expected_solver_cls is SolverCoupled:
+        elif expected_solver_cls is SolverCoupled:
             body = builder.add_body(mass=1.0)
             builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
             builder.add_particle(
@@ -634,7 +638,7 @@ def test_initialize_solver_populates_canonical_state(
                 mass=0.1,
                 radius=0.02,
             )
-        elif SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
+        elif expected_solver_cls is SolverCoupledADMM:
             assert builder.has_custom_attribute("coupling:body_particle_attachment_body")
             body = builder.add_body(mass=1.0)
             particle = builder.add_particle(
@@ -643,7 +647,7 @@ def test_initialize_solver_populates_canonical_state(
                 mass=0.1,
                 radius=0.02,
             )
-            SolverAdmmCoupled.add_body_particle_attachment(builder, body, particle, stiffness=10.0)
+            SolverCoupledADMM.add_body_particle_attachment(builder, body, particle, stiffness=10.0)
         else:
             # Pre-populate the builder with a minimal scene so MJCF conversion has
             # something to work with.
@@ -657,13 +661,13 @@ def test_initialize_solver_populates_canonical_state(
         # Canonical state lives on the base class.
         assert NewtonManager._solver is not None
         assert isinstance(NewtonManager._solver, expected_solver_cls)
-        if SolverCoupled is not None and expected_solver_cls is SolverCoupled:
+        if expected_solver_cls is SolverCoupled:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
-        if SolverProxyCoupled is not None and expected_solver_cls is SolverProxyCoupled:
+        if expected_solver_cls is SolverCoupledProxy:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("sand") is not None
-        if SolverAdmmCoupled is not None and expected_solver_cls is SolverAdmmCoupled:
+        if expected_solver_cls is SolverCoupledADMM:
             assert NewtonCoupledManager.get_entry_solver("rigid") is not None
             assert NewtonCoupledManager.get_entry_solver("particle") is not None
         assert NewtonManager._use_single_state is expected_use_single_state

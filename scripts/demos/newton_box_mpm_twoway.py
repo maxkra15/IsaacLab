@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
-"""Single rigid box two-way coupled with MPM sand through Newton proxy coupling.
+"""Rigid boxes two-way coupled with MPM sand through Newton proxy coupling.
 
-This demo is intentionally small: one MuJoCo-Warp rigid box, one implicit-MPM
+This demo is intentionally small: MuJoCo-Warp rigid boxes, one implicit-MPM
 sand bed, and one lagged proxy mapping from the rigid solver into the MPM solver.
-The Newton OpenGL viewer can right-mouse drag the box, and the live "Plots"
+The Newton OpenGL viewer can right-mouse drag the boxes, and the live "Plots"
 window shows the sand reaction wrench harvested by the proxy coupler.
 
 .. code-block:: bash
@@ -25,15 +25,17 @@ from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulati
 parser = argparse.ArgumentParser(description="Newton proxy-coupled box interacting with MPM sand.")
 parser.add_argument("--fps", type=float, default=60.0, help="Simulation/control frames per second.")
 parser.add_argument("--max-steps", type=int, default=900, help="Stop after this many frames; negative runs forever.")
-parser.add_argument("--voxel-size", type=float, default=0.05, help="MPM grid voxel size in meters.")
+parser.add_argument("--voxel-size", type=float, default=0.1, help="MPM grid voxel size in meters.")
 parser.add_argument("--particles-per-cell", type=float, default=3.0, help="Sand particles per grid cell.")
 parser.add_argument("--mpm-iterations", type=int, default=50, help="Maximum MPM rheology iterations.")
 parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy relaxation passes per coupled step.")
 parser.add_argument("--proxy-mass-relaxation", type=float, default=1.0, help="Scale proxy box mass inside MPM.")
 parser.add_argument("--rigid-substeps", type=int, default=4, help="MJWarp substeps inside each coupled step.")
+parser.add_argument("--box-count", type=int, default=4, help="Number of rigid boxes to drop.")
 parser.add_argument("--box-mass", type=float, default=150.0, help="Rigid box mass in kg.")
 parser.add_argument("--box-size", type=float, default=0.5, help="Box side length in meters.")
 parser.add_argument("--box-height", type=float, default=2.0, help="Initial box center height in meters.")
+parser.add_argument("--box-spacing", type=float, default=0.1, help="Newton-style XY offset between stacked boxes.")
 parser.add_argument("--sand-friction", type=float, default=0.35, help="MPM Drucker-Prager friction coefficient.")
 parser.add_argument("--sand-damping", type=float, default=0.30, help="MPM elastic damping relaxation time in seconds.")
 parser.add_argument("--sand-young-modulus", type=float, default=1.0e15, help="MPM Young's modulus in Pa.")
@@ -46,6 +48,7 @@ parser.add_argument(
     help="MPM collider thickness/margin in meters; Newton's reference example uses 0.0.",
 )
 parser.add_argument("--log-interval", type=int, default=60, help="Print simulation progress every N steps; 0 disables.")
+parser.add_argument("--log-contacts", action="store_true", help="Print raw and rigid-entry contact counts.")
 parser.add_argument("--disable-cuda-graph", action="store_true", help="Disable Newton CUDA graph capture.")
 parser.add_argument(
     "--kit-sand-stride",
@@ -132,6 +135,44 @@ def solid_box_inertia(mass: float, half_extent: float) -> wp.mat33:
     return wp.mat33(diagonal, 0.0, 0.0, 0.0, diagonal, 0.0, 0.0, 0.0, diagonal)
 
 
+def box_body_path(index: int) -> str:
+    """Return the USD/Newton label for one box body."""
+    if args_cli.box_count == 1:
+        return BOX_BODY_PATH
+    return f"{BOX_BODY_PATH}_{index}"
+
+
+def box_label_pattern() -> str:
+    """Return a regex that selects all demo boxes."""
+    if args_cli.box_count == 1:
+        return BOX_BODY_PATH
+    return rf"{BOX_BODY_PATH}_[0-9]+"
+
+
+def box_initial_position(index: int) -> tuple[float, float, float]:
+    """Return the Newton reference example's staggered vertical box stack."""
+    if args_cli.box_count == 1:
+        return (0.0, 0.0, float(args_cli.box_height))
+
+    offsets_xy = (
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+        (1.0, 1.0),
+        (-1.0, 1.0),
+        (1.0, -1.0),
+        (-1.0, -1.0),
+        (1.5, 0.0),
+        (-1.5, 0.0),
+        (0.0, 1.5),
+    )
+    ox, oy = offsets_xy[index % len(offsets_xy)]
+    z = args_cli.box_height + float(index) * 0.6
+    return (float(ox * args_cli.box_spacing), float(oy * args_cli.box_spacing), float(z))
+
+
 def spawn_sand(builder: newton.ModelBuilder) -> tuple[int, int]:
     """Add a compact MPM sand bed and return the particle index range."""
     density = 2500.0
@@ -169,30 +210,36 @@ def spawn_sand(builder: newton.ModelBuilder) -> tuple[int, int]:
     return particle_start, builder.particle_count
 
 
-def build_box_sand_model() -> tuple[newton.ModelBuilder, CoupledSolverCfg, int]:
+def build_box_sand_model() -> tuple[newton.ModelBuilder, CoupledSolverCfg, list[int]]:
     """Build a shared Newton model and the Isaac Lab proxy-coupled solver config."""
+    if args_cli.box_count < 1:
+        raise ValueError("--box-count must be >= 1.")
+
     builder = NewtonManager.create_builder()
     SolverImplicitMPM.register_custom_attributes(builder)
     builder.default_shape_cfg.mu = 0.5
 
     half_extent = 0.5 * args_cli.box_size
     collider_margin = args_cli.collider_margin
-    box_body = builder.add_body(
-        xform=wp.transform(wp.vec3(0.0, 0.0, args_cli.box_height), wp.quat_identity()),
-        mass=args_cli.box_mass,
-        inertia=solid_box_inertia(args_cli.box_mass, half_extent),
-        lock_inertia=True,
-        label=BOX_BODY_PATH,
-    )
     box_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.5, margin=collider_margin)
-    builder.add_shape_box(
-        box_body,
-        hx=half_extent,
-        hy=half_extent,
-        hz=half_extent,
-        cfg=box_cfg,
-        color=(0.12, 0.34, 0.85),
-    )
+    box_bodies = []
+    for box_index in range(args_cli.box_count):
+        box_body = builder.add_body(
+            xform=wp.transform(wp.vec3(*box_initial_position(box_index)), wp.quat_identity()),
+            mass=args_cli.box_mass,
+            inertia=solid_box_inertia(args_cli.box_mass, half_extent),
+            lock_inertia=True,
+            label=box_body_path(box_index),
+        )
+        box_bodies.append(box_body)
+        builder.add_shape_box(
+            box_body,
+            hx=half_extent,
+            hy=half_extent,
+            hz=half_extent,
+            cfg=box_cfg,
+            color=(0.12, 0.34, 0.85),
+        )
     builder.add_ground_plane(
         cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, margin=collider_margin),
         color=(0.46, 0.38, 0.24),
@@ -205,11 +252,11 @@ def build_box_sand_model() -> tuple[newton.ModelBuilder, CoupledSolverCfg, int]:
             CoupledSolverEntryCfg(
                 name=RIGID_ENTRY,
                 solver_cfg=MJWarpSolverCfg(
-                    # Match Newton's mujoco_mpm_coupled_solver: Newton collision detection feeds MuJoCo contacts.
-                    use_mujoco_contacts=False,
+                    # MuJoCo handles rigid-rigid and rigid-ground contacts; proxy coupling handles MPM exchange.
+                    use_mujoco_contacts=True,
                     njmax=100,
                 ),
-                body_label_patterns=[BOX_BODY_PATH],
+                body_label_patterns=[box_label_pattern()],
                 include_static_shapes=True,
                 substeps=args_cli.rigid_substeps,
             ),
@@ -230,14 +277,13 @@ def build_box_sand_model() -> tuple[newton.ModelBuilder, CoupledSolverCfg, int]:
                 in_place=True,
             ),
         ],
-        # Match Newton's reference example: call model.collide() externally, then pass contacts to MuJoCo.
-        use_collision_pipeline=True,
+        use_collision_pipeline=False,
         proxy_coupling=ProxyCouplingCfg(
             proxies=[
                 CoupledProxyCfg(
                     source=RIGID_ENTRY,
                     destination=SAND_ENTRY,
-                    body_label_patterns=[BOX_BODY_PATH],
+                    body_label_patterns=[box_label_pattern()],
                     mass_scale=args_cli.proxy_mass_relaxation,
                     mode="lagged",
                 )
@@ -245,7 +291,7 @@ def build_box_sand_model() -> tuple[newton.ModelBuilder, CoupledSolverCfg, int]:
             iterations=args_cli.proxy_iterations,
         ),
     )
-    return builder, solver_cfg, box_body
+    return builder, solver_cfg, box_bodies
 
 
 def setup_kit_scene(sim: sim_utils.SimulationContext) -> None:
@@ -254,17 +300,19 @@ def setup_kit_scene(sim: sim_utils.SimulationContext) -> None:
         return
 
     stage = sim_utils.get_current_stage()
-    if not stage.GetPrimAtPath(BOX_BODY_PATH).IsValid():
-        box_cfg = sim_utils.CuboidCfg(
-            size=(args_cli.box_size, args_cli.box_size, args_cli.box_size),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.12, 0.34, 0.85)),
-        )
-        box_cfg.func(
-            BOX_BODY_PATH,
-            box_cfg,
-            translation=(0.0, 0.0, args_cli.box_height),
-            orientation=(0.0, 0.0, 0.0, 1.0),
-        )
+    box_cfg = sim_utils.CuboidCfg(
+        size=(args_cli.box_size, args_cli.box_size, args_cli.box_size),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.12, 0.34, 0.85)),
+    )
+    for box_index in range(args_cli.box_count):
+        path = box_body_path(box_index)
+        if not stage.GetPrimAtPath(path).IsValid():
+            box_cfg.func(
+                path,
+                box_cfg,
+                translation=box_initial_position(box_index),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+            )
 
     if not stage.GetPrimAtPath("/World/Ground").IsValid():
         ground_cfg = sim_utils.GroundPlaneCfg(size=(6.0, 6.0), color=(0.46, 0.38, 0.24))
@@ -305,16 +353,16 @@ class KitBoxVisual:
             self._xform_op.Set(matrix)
 
 
-def create_kit_box_visual(sim: sim_utils.SimulationContext, box_body: int) -> KitBoxVisual | None:
-    """Create a Kit-side box transform synchronizer when Kit visualization is active."""
+def create_kit_box_visuals(sim: sim_utils.SimulationContext, box_bodies: list[int]) -> list[KitBoxVisual]:
+    """Create Kit-side box transform synchronizers when Kit visualization is active."""
     if "kit" not in sim.resolve_visualizer_types():
-        return None
-    return KitBoxVisual(BOX_BODY_PATH, box_body)
+        return []
+    return [KitBoxVisual(box_body_path(box_index), body_id) for box_index, body_id in enumerate(box_bodies)]
 
 
-def update_kit_box_visual(box_visual: KitBoxVisual | None, state: newton.State) -> None:
-    """Push the box pose into the Kit USD visual."""
-    if box_visual is not None:
+def update_kit_box_visuals(box_visuals: list[KitBoxVisual], state: newton.State) -> None:
+    """Push the box poses into the Kit USD visuals."""
+    for box_visual in box_visuals:
         box_visual.update(state)
 
 
@@ -408,11 +456,14 @@ def keep_running(sim: sim_utils.SimulationContext, count: int) -> bool:
     return any(not viz.is_closed and viz.is_running() for viz in sim.visualizers)
 
 
-def read_proxy_wrench(box_body: int, dt: float) -> torch.Tensor:
-    """Return the latest sand reaction wrench harvested by the proxy coupler."""
+def read_proxy_wrenches(box_bodies: list[int], dt: float) -> torch.Tensor:
+    """Return latest sand reaction wrenches harvested by the proxy coupler."""
+    if not box_bodies:
+        return torch.empty((0, 6), device=wp.to_torch(NewtonManager.get_state_0().joint_q).device)
+
     wrenches = NewtonCoupledManager.get_proxy_body_wrenches(RIGID_ENTRY, SAND_ENTRY)
     if wrenches is not None:
-        return wp.to_torch(wrenches)[box_body].detach().clone()
+        return wp.to_torch(wrenches)[box_bodies].detach().clone()
 
     try:
         mpm_solver = NewtonCoupledManager.get_entry_solver(SAND_ENTRY)
@@ -431,19 +482,27 @@ def read_proxy_wrench(box_body: int, dt: float) -> torch.Tensor:
             valid = (collider_ids_t >= 0) & (collider_ids_t < collider_body_index.shape[0])
             body_ids = torch.full_like(collider_ids_t, -1)
             body_ids[valid] = collider_body_index[collider_ids_t[valid]]
-            body_mask = body_ids == int(box_body)
-            if bool(body_mask.any()):
-                force_samples = wp.to_torch(impulses)[body_mask] / float(dt)
-                force = force_samples.sum(dim=0)
-                points = wp.to_torch(positions)[body_mask]
-                body_center = wp.to_torch(state.body_q)[box_body, 0:3]
-                torque = torch.cross(points - body_center, force_samples, dim=1).sum(dim=0)
-                return torch.cat((force, torque)).detach().clone()
-    return torch.zeros(6, device=wp.to_torch(NewtonManager.get_state_0().joint_q).device)
+            out = []
+            for box_body in box_bodies:
+                body_mask = body_ids == int(box_body)
+                if bool(body_mask.any()):
+                    force_samples = wp.to_torch(impulses)[body_mask] / float(dt)
+                    force = force_samples.sum(dim=0)
+                    points = wp.to_torch(positions)[body_mask]
+                    body_center = wp.to_torch(state.body_q)[box_body, 0:3]
+                    torque = torch.cross(points - body_center, force_samples, dim=1).sum(dim=0)
+                    out.append(torch.cat((force, torque)))
+                else:
+                    out.append(torch.zeros(6, device=wp.to_torch(state.joint_q).device))
+            return torch.stack(out).detach().clone()
+    return torch.zeros((len(box_bodies), 6), device=wp.to_torch(NewtonManager.get_state_0().joint_q).device)
 
 
-def log_wrench_plots(sim: sim_utils.SimulationContext, wrench: torch.Tensor) -> None:
-    """Push force and torque components into the Newton viewer plot window."""
+def log_wrench_plots(sim: sim_utils.SimulationContext, wrenches: torch.Tensor) -> None:
+    """Push aggregate force and torque components into the Newton viewer plot window."""
+    if wrenches.numel() == 0:
+        return
+    wrench = wrenches.sum(dim=0)
     force = wrench[0:3]
     torque = wrench[3:6]
     force_mag = float(torch.linalg.norm(force).item())
@@ -463,31 +522,67 @@ def log_wrench_plots(sim: sim_utils.SimulationContext, wrench: torch.Tensor) -> 
         viewer.log_scalar("Sand Reaction tau_z [Nm]", float(torque[2].item()), smoothing=4)
 
 
-def log_progress(count: int, state: newton.State, wrench: torch.Tensor) -> None:
+def read_contact_counts() -> tuple[int, int, int]:
+    """Return external raw, external rigid-entry, and MuJoCo-native contact counts."""
+    raw_rigid_count = -1
+    filtered_rigid_count = -1
+    mujoco_count = -1
+
+    raw_contacts = getattr(NewtonManager, "_contacts", None)
+    if raw_contacts is not None and raw_contacts.rigid_contact_count is not None:
+        raw_rigid_count = int(raw_contacts.rigid_contact_count.numpy()[0])
+
+    solver = getattr(NewtonManager, "_solver", None)
+    if solver is not None:
+        filtered = getattr(solver, "_entry_contact_buffers", {}).get(RIGID_ENTRY)
+        if filtered is not None and filtered.rigid_contact_count is not None:
+            filtered_rigid_count = int(filtered.rigid_contact_count.numpy()[0])
+
+    try:
+        rigid_solver = NewtonCoupledManager.get_entry_solver(RIGID_ENTRY)
+    except RuntimeError:
+        rigid_solver = None
+    mjw_data = getattr(rigid_solver, "mjw_data", None)
+    if mjw_data is not None and getattr(mjw_data, "nacon", None) is not None:
+        mujoco_count = int(mjw_data.nacon.numpy()[0])
+
+    return raw_rigid_count, filtered_rigid_count, mujoco_count
+
+
+def log_progress(count: int, state: newton.State, box_bodies: list[int], wrenches: torch.Tensor) -> None:
     """Print a compact heartbeat showing motion and coupling forces."""
     if args_cli.log_interval <= 0 or count % args_cli.log_interval != 0:
         return
     body_q = wp.to_torch(state.body_q)
     particle_q = wp.to_torch(state.particle_q)
-    box_pos = body_q[0, 0:3].detach().cpu().numpy()
+    box_z = body_q[box_bodies, 2].detach().cpu().tolist()
+    box_z_text = ", ".join(f"{float(z):.3f}" for z in box_z)
     sand_min = particle_q.min(dim=0).values.detach().cpu().numpy()
     sand_max = particle_q.max(dim=0).values.detach().cpu().numpy()
+    wrench = wrenches.sum(dim=0) if wrenches.numel() else torch.zeros(6, device=body_q.device)
     force_mag = float(torch.linalg.norm(wrench[0:3]).item())
     torque_mag = float(torch.linalg.norm(wrench[3:6]).item())
+    contact_text = ""
+    if args_cli.log_contacts:
+        raw_rigid_count, filtered_rigid_count, mujoco_count = read_contact_counts()
+        contact_text = (
+            f" contacts(external_raw={raw_rigid_count}, external_rigid={filtered_rigid_count}, mujoco={mujoco_count})"
+        )
     print(
         "[INFO]: step "
         f"{count:06d} t={count / args_cli.fps:.2f}s "
-        f"box=({box_pos[0]:.3f}, {box_pos[1]:.3f}, {box_pos[2]:.3f}) "
+        f"box_z=[{box_z_text}] "
         f"|F_sand|={force_mag:.2f}N |tau_sand|={torque_mag:.2f}Nm "
-        f"sand_z=[{sand_min[2]:.3f}, {sand_max[2]:.3f}]",
+        f"sand_z=[{sand_min[2]:.3f}, {sand_max[2]:.3f}]"
+        f"{contact_text}",
         flush=True,
     )
 
 
 def run_simulator(
     sim: sim_utils.SimulationContext,
-    box_body: int,
-    box_visual: KitBoxVisual | None,
+    box_bodies: list[int],
+    box_visuals: list[KitBoxVisual],
     sand_points: KitSandPoints | None,
 ) -> None:
     """Run the two-way coupled box/sand simulation loop."""
@@ -497,12 +592,12 @@ def run_simulator(
         sim.step(render=False)
 
         state = NewtonManager.get_state_0()
-        wrench = read_proxy_wrench(box_body, dt=1.0 / args_cli.fps)
-        log_wrench_plots(sim, wrench)
-        log_progress(count, state, wrench)
+        wrenches = read_proxy_wrenches(box_bodies, dt=1.0 / args_cli.fps)
+        log_wrench_plots(sim, wrenches)
+        log_progress(count, state, box_bodies, wrenches)
 
         if sim.is_rendering:
-            update_kit_box_visual(box_visual, state)
+            update_kit_box_visuals(box_visuals, state)
             update_sand_points(sand_points, state)
             sim.render()
         count += 1
@@ -526,12 +621,12 @@ def create_launcher_sim_cfg():
 
 
 def main() -> None:
-    """Set up and run the Isaac Lab one-box MPM coupling demo."""
+    """Set up and run the Isaac Lab box/MPM coupling demo."""
     sim_cfg = create_launcher_sim_cfg()
 
     with launch_simulation(SimpleNamespace(sim=sim_cfg), args_cli):
         import_runtime_dependencies()
-        builder, solver_cfg, box_body = build_box_sand_model()
+        builder, solver_cfg, box_bodies = build_box_sand_model()
         sim_cfg.physics = NewtonCfg(
             solver_cfg=solver_cfg,
             num_substeps=1,
@@ -546,16 +641,16 @@ def main() -> None:
             configure_newton_viewer(sim)
             model = NewtonManager.get_model()
             state = NewtonManager.get_state_0()
-            box_visual = create_kit_box_visual(sim, box_body)
-            update_kit_box_visual(box_visual, state)
+            box_visuals = create_kit_box_visuals(sim, box_bodies)
+            update_kit_box_visuals(box_visuals, state)
             sand_points = create_sand_points(sim, model)
             update_sand_points(sand_points, state)
 
-            print("[INFO]: Isaac Lab Newton one-box MPM two-way coupling demo ready.")
+            print("[INFO]: Isaac Lab Newton box MPM two-way coupling demo ready.")
             print(
-                "[INFO]: Right-mouse drag the box in the Newton viewer; see the Plots window for sand reaction wrench."
+                "[INFO]: Right-mouse drag the boxes in the Newton viewer; see the Plots window for sand reaction wrench."
             )
-            run_simulator(sim, box_body, box_visual, sand_points)
+            run_simulator(sim, box_bodies, box_visuals, sand_points)
         finally:
             sim.clear_instance()
 
