@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "isaaclab-visualizers"
-version = "0.1.0"
+version = "0.1.4"
 description = "Visualizer backends for Isaac Lab (Kit, Newton, Rerun, Viser)."
 license = {text = "BSD-3-Clause"}
 authors = [{name = "Isaac Lab Project Developers"}]
@@ -32,10 +32,12 @@ newton = [
     "newton[sim] @ git+https://github.com/newton-physics/newton.git@8be890dd7ff7fc4e2e1e67b1a9b4552adab1e6de",
     "PyOpenGL-accelerate",
     "imgui-bundle>=1.92.5",
+    "typing-extensions>=4.15.0",
 ]
 rerun = [
     "newton[sim] @ git+https://github.com/newton-physics/newton.git@8be890dd7ff7fc4e2e1e67b1a9b4552adab1e6de",
     "rerun-sdk>=0.29.0",
+    "pyarrow==22.0.0",
 ]
 viser = [
     "newton[sim] @ git+https://github.com/newton-physics/newton.git@8be890dd7ff7fc4e2e1e67b1a9b4552adab1e6de",
@@ -45,7 +47,10 @@ all = [
     "imgui-bundle>=1.92.5",
     "newton[sim] @ git+https://github.com/newton-physics/newton.git@8be890dd7ff7fc4e2e1e67b1a9b4552adab1e6de",
     "PyOpenGL-accelerate",
+    # Match rerun-sdk's supported Arrow stack and avoid resolver drift across environments.
+    "pyarrow==22.0.0",
     "rerun-sdk>=0.29.0",
+    "typing-extensions>=4.15.0",
     "viser>=1.0.16",
     "warp-lang",
 ]

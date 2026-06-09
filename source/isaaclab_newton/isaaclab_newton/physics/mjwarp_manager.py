@@ -84,8 +84,9 @@ class NewtonMJWarpManager(NewtonManager):
         """Construct :class:`SolverMuJoCo` and populate the base-class slots.
 
         Filters cfg fields against the solver's ``__init__`` signature so
-        non-constructor metadata (``solver_type``, ``class_type``) is not
-        forwarded.  Sets :attr:`NewtonManager._needs_collision_pipeline` to
+        non-constructor metadata (``solver_type``, ``class_type``) and the
+        ignored deprecated ``ls_parallel`` field are not forwarded. Sets
+        :attr:`NewtonManager._needs_collision_pipeline` to
         ``True`` only when ``use_mujoco_contacts=False``.
         """
         solver = SolverMuJoCo(model, **resolve_mujoco_solver_kwargs(solver_cfg))
