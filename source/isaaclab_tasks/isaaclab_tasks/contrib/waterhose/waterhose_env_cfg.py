@@ -178,13 +178,12 @@ def spawn_socket_collider(
     from pxr import Usd, UsdPhysics
 
     prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
-    # SDF is OFF by default: on the current Newton build, plug(plain mesh) vs socket(mesh+texture
+    # SDF is ON by default: on the current Newton build, plug(plain mesh) vs socket(mesh+texture
     # SDF) routes through the texture-SDF mesh-mesh narrow-phase kernel that raises a CUDA illegal
     # memory access the instant the plug nears the socket (the same bug that keeps the gripper-finger
-    # SDF opt-in). Empirically, the plain-mesh socket uses the BVH mesh-mesh fallback and the plug
-    # inserts/holds/extracts by friction without crashing. Re-enable WATERHOSE_SOCKET_SDF (and/or
-    # WATERHOSE_SOCKET_HYDRO, which also needs the plug made hydroelastic) once that kernel is fixed.
-    if not _env_flag("WATERHOSE_SOCKET_SDF", False):
+    # SDF opt-in). Keep WATERHOSE_SOCKET_SDF=0 available as a fast fallback to the stable BVH
+    # mesh-mesh path if that kernel regresses.
+    if not _env_flag("WATERHOSE_SOCKET_SDF", True):
         return prim
     stage = prim.GetStage()
     for child in Usd.PrimRange(prim):
@@ -581,40 +580,31 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
 
     # Insertion socket: the REAL fridge socket collider (``socket_collision.usda``), a single
     # concave mesh (``physics:approximation = "none"``) forming a tube with an inner bore Ø~6 mm and
-    # outer Ø~11.7 mm. NO SDF: plug/cable-vs-mesh uses Newton's BVH mesh narrow-phase (verified
-    # stable); a texture SDF on this mesh hits the CUDA-illegal-access bug. The mesh points are
+    # outer Ø~11.7 mm. SDF is enabled by default for cable/plug guidance; set
+    # ``WATERHOSE_SOCKET_SDF=0`` to fall back to Newton's stable BVH mesh narrow-phase if needed. The mesh points are
     # authored in the fridge ``/root`` frame, so it spawns at the fridge pose (identity rot). It is
     # a static ``body=-1`` shape pulled into the VBD solver via the vbd entry's ``shape_label_patterns``.
     # NOTE: the Ø6 mm bore matches the cable (Ø6 mm); the Ø11 mm plug connector only tip-seats on the
     # mouth -- a shallow male/female mate, not a deep slide.
     socket1 = AssetBaseCfg(
         prim_path="/World/envs/env_.*/Socket1",
-        spawn=sim_utils.UsdFileCfg(usd_path=_SOCKET_USD),
+        spawn=sim_utils.UsdFileCfg(usd_path=_SOCKET_USD, func=spawn_socket_collider),
         init_state=AssetBaseCfg.InitialStateCfg(pos=_FRIDGE_POS, rot=(1.0, 0.0, 0.0, 0.0)),
     )
 
-    # The deformable cable, simulated as a Cosserat rod by the VBD solver. Material values are
-    # tuned for the plug-grasp path:
-    #   stretch_stiffness -- axial EA; 1e8 resists stretching without exploding (1e12 blew up).
-    #   bend_stiffness    -- resistance to bending; keeps the hose from kinking unnaturally.
-    #   stretch/bend_damping -- velocity damping; small values quell jitter without over-damping.
-    #   density           -- mass per unit volume; balanced against the gripper proxy mass_scale
-    #                        so contact does not pump energy into the rod.
+    # The deformable cable, simulated as a Cosserat rod by the VBD solver. These values track the
+    # Newton waterhose success demo closely; the previous 1e8 stretch stiffness made the hose behave
+    # like a rigid rod during plug motion.
     cable1 = CableObjectCfg(
         prim_path="/World/envs/env_.*/Cable1",
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "cable001.usda"),
             physics_material=NewtonCableMaterialCfg(
-                # Success-demo value (1e6). Required for stability *with* a grip strong enough to hold
-                # the plug: the proxy grips the cable HEAD, so a high-friction grip injects force into
-                # the cable -- a stiff 1e8 cable then explodes, the softer 1e6 absorbs it. 1e6 + VBD
-                # iters=15 ran the full demo with no explosion. (1e8 alone was stable but the plug
-                # slipped out of the grip on the carry.)
-                stretch_stiffness=1e8,
-                bend_stiffness=30.0,
-                stretch_damping=1e-3,
+                stretch_stiffness=1.0e6,
+                bend_stiffness=20.0,
+                stretch_damping=1.0e-5,
                 bend_damping=1e0,
-                density=10000.0,
+                density=1000.0,
             ),
         ),
         init_state=CableObjectCfg.InitialStateCfg(
@@ -825,7 +815,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # tail->Anchor1 fixed joints have small authored offsets, so hard
                         # AVBD joints can inject a large startup impulse and explode the cable.
                         solver_cfg=VBDSolverCfg(
-                            iterations=10,  # success value; needed to keep the (softer) cable stable on the carry
+                            iterations=15,  # matches the Newton waterhose success demo for the softer cable
                             friction_epsilon=0.1,
                             rigid_contact_hard=False,
                             rigid_joint_hard=False,
@@ -836,7 +826,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             # The generic cable_robot example uses 128, but the authored
                             # cable/gripper contact can exceed 600 contacts on one body
                             # during grasp, so smaller buffers overflow and poison the solve.
-                            rigid_body_contact_buffer_size=768,
+                            rigid_body_contact_buffer_size=1024,
                             rigid_joint_linear_ke=1.0e5,
                             rigid_joint_angular_ke=1.0e5,
                             rigid_joint_linear_k_start=1.0e4,
@@ -886,15 +876,11 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             mass_scale=1.0,
                             collision_pipeline_factory=_make_proxy_collision_pipeline,
                             collide_interval=1,
-                            # Match the success demo's VBD proxy contact: SOFT normal (ke=1e3, kd=0)
-                            # + very high friction (mu=1e6) + small margin. The soft contact keeps the
-                            # normal force gentle so mu=1e6 can HOLD the plug+cable through the carry
-                            # without the force spike that exploded the plug at our old ke=2e5.
-                            shape_material_ke=2.0e5,
-                            shape_material_kd=1.0e-1,
-                            # mu=3 is ample Coulomb friction to hold the clamped plug (mu>1 means
-                            # friction can exceed the normal load); the previous 1e6 is unphysical.
-                            shape_material_mu=3.0,
+                            # Newton success-script proxy material values. Previous IsaacLab-coupled
+                            # values were ke=2e5, kd=1e-1, mu=3.0.
+                            shape_material_ke=1.0e3,
+                            shape_material_kd=0.0,
+                            shape_material_mu=1.0e6,
                             shape_margin=0.001,
                         )
                     ],
@@ -904,13 +890,15 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             num_substeps=10,
             collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
             model_cfg=NewtonModelCfg(
-                # ke=1e5 keeps the cable's own contacts well-conditioned. (Lowering to the success
-                # VBD_KE=1e3 made the cable explode EARLIER -- the cable needs the stiffer self/socket
-                # contact here; the deep-insert cable blow-up is fixed by a SHALLOW insert depth.)
-                shape_material_ke=1.0e5,
-                shape_material_kd=1.0e-1,
-                soft_contact_mu=1.0,
-                shape_material_mu=2.0,
+                # Newton success-script default VBD material values. Previous IsaacLab-coupled
+                # values were shape_ke=1e5, shape_kd=1e-1, soft_mu=1.0, shape_mu=2.0.
+                # The standalone success script also overrides the plug-head mesh friction to 10.0
+                # after model creation; this config path currently has no equivalent per-label
+                # material override, so plug-head shapes inherit shape_material_mu=0.2 here.
+                shape_material_ke=1.0e3,
+                shape_material_kd=0.0,
+                soft_contact_mu=0.2,
+                shape_material_mu=0.2,
             ),
         )
 

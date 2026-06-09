@@ -74,6 +74,32 @@ def _xyzw_from_wxyz(quat_wxyz: tuple[float, float, float, float]) -> tuple[float
     return (x, y, z, w)
 
 
+def _quat_from_two_vectors(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Quaternion rotating normalized ``source`` vectors onto ``target`` vectors."""
+
+    source = normalize(source)
+    target = normalize(target)
+    cross = torch.linalg.cross(source, target, dim=-1)
+    cross_norm = torch.linalg.norm(cross, dim=-1, keepdim=True)
+    dot = torch.sum(source * target, dim=-1, keepdim=True).clamp(-1.0, 1.0)
+
+    x_axis = torch.zeros_like(source)
+    x_axis[:, 0] = 1.0
+    y_axis = torch.zeros_like(source)
+    y_axis[:, 1] = 1.0
+    fallback = torch.linalg.cross(source, x_axis, dim=-1)
+    fallback_norm = torch.linalg.norm(fallback, dim=-1, keepdim=True)
+    fallback_y = torch.linalg.cross(source, y_axis, dim=-1)
+    fallback = torch.where(fallback_norm > 1.0e-6, fallback, fallback_y)
+    fallback = normalize(fallback)
+
+    axis = torch.where(cross_norm > 1.0e-6, cross / cross_norm.clamp_min(1.0e-6), fallback)
+    angle = torch.atan2(cross_norm.squeeze(-1), dot.squeeze(-1))
+    opposite = (cross_norm.squeeze(-1) <= 1.0e-6) & (dot.squeeze(-1) < 0.0)
+    angle = torch.where(opposite, torch.full_like(angle, torch.pi), angle)
+    return normalize(quat_from_angle_axis(angle, axis))
+
+
 class WaterhoseDemoState:
     """Per-environment scripted pick-insert-extract state machine."""
 
@@ -110,7 +136,7 @@ class WaterhoseDemoState:
     )
     # Minimum time spent in each phase [s]; a phase advances once this elapsed AND the EE
     # converged (or a 2x hard timeout). Insert/extract phases get generous time + tolerance.
-    DURATIONS = (0.25, 3.0, 1.5, 0.5, 0.5, 1.5, 0.3, 5.0, 1.0, 4.0, 1.5, 4.0, 2.0, 1.0e6)
+    DURATIONS = (0.25, 3.0, 1.5, 0.5, 0.5, 1.5, 0.3, 5.0, 2.0, 4.0, 1.5, 4.0, 2.0, 1.0e6)
 
     def __init__(self, num_envs: int, step_dt: float, device: torch.device | str, settle_time: float, debug: bool):
         self.num_envs = int(num_envs)
@@ -184,6 +210,7 @@ class WaterhoseDemoState:
 
         self._ee_body_id = None
         self._cable_grasp_body_id = 0
+        self._cable_tip_body_id = 0
 
     def _vec(self, values) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.float32, device=self.device).repeat(self.num_envs, 1)
@@ -250,6 +277,15 @@ class WaterhoseDemoState:
         self.phase_plug_quat_w[first_step] = plug_quat_w[first_step]
         connector_dir = quat_apply(plug_quat_w, self.connector_axis_local)
         tip_pos_w = plug_pos_w + connector_dir * self.connector_tip_len
+        measured_tip_pos_w = tip_pos_w
+        cable_tip_axis_w = connector_dir
+        if cable is not None:
+            try:
+                measured_tip_pos_w = cable.data.body_pos_w.torch[:, self._cable_tip_body_id]
+                cable_tip_quat_w = normalize(cable.data.body_quat_w.torch[:, self._cable_tip_body_id])
+                cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self.connector_axis_local))
+            except (AttributeError, IndexError):
+                pass
 
         start_pos_w = self.phase_start_pos_w
         start_quat_w = self.phase_start_quat_w
@@ -296,9 +332,13 @@ class WaterhoseDemoState:
         # --- Insert / extract ---
         # Targets are computed from the connector tip pose.  The gripper frame is offset behind the
         # tip, so aiming the EE itself at the socket mouth overshoots and drives the plug into the
-        # fridge.  CARRY rotates while moving up, then ALIGN is only a short dwell at the 1 cm standoff.
+        # fridge.  CARRY moves to the standoff; ALIGN/INSERT then use the measured cable-tip capsule
+        # axis so the hose, not just the plug rigid body, becomes coaxial with the socket bore.
         ins_dir = insertion_dir_w  # bore axis into the socket = R(socket_quat) @ +Z
         socket_grasp_quat = normalize(quat_mul(self.socket_quat_w, self.grasp_orientation_offset))
+        # Cable segment local +Z points back along the hose, so -Z should point into the socket.
+        coax_delta_quat = _quat_from_two_vectors(cable_tip_axis_w, -ins_dir)
+        coaxial_grasp_quat = normalize(quat_mul(coax_delta_quat, ee_quat_w))
 
         def ee_pos_for_tip(target_tip_pos_w, target_ee_quat_w):
             return target_tip_pos_w - quat_apply(target_ee_quat_w, self.connector_tip_pos_in_ee)
@@ -307,33 +347,34 @@ class WaterhoseDemoState:
         inserted_tip_pos = socket_pos_w + self.insert_final_depth * ins_dir
         extracted_tip_pos = socket_pos_w - self.extract_clearance * ins_dir
         approach_pos = ee_pos_for_tip(preinsert_tip_pos, socket_grasp_quat)
-        inserted_pos = ee_pos_for_tip(inserted_tip_pos, socket_grasp_quat)
-        extracted_pos = ee_pos_for_tip(extracted_tip_pos, socket_grasp_quat)
+        coax_approach_pos = ee_pos_for_tip(preinsert_tip_pos, coaxial_grasp_quat)
+        coax_inserted_pos = ee_pos_for_tip(inserted_tip_pos, coaxial_grasp_quat)
+        coax_extracted_pos = ee_pos_for_tip(extracted_tip_pos, coaxial_grasp_quat)
 
         # CARRY: move up to the pre-insert standoff and rotate into socket alignment during the move.
         carry = phase == self.CARRY
         set_target(carry, approach_pos, socket_grasp_quat, 1.0)
 
-        # ALIGN: hold 1 cm outside the mouth so the cable/plug settles before the straight insertion.
+        # ALIGN: hold 1 cm outside the mouth while correcting the measured cable axis onto the bore.
         align = phase == self.ALIGN
-        set_target(align, approach_pos, socket_grasp_quat, 1.0)
+        set_target(align, coax_approach_pos, coaxial_grasp_quat, 1.0)
 
         # INSERT: push the connector tip forward along the bore axis to the shallow seated depth.
         insert = phase == self.INSERT
-        set_target(insert, inserted_pos, socket_grasp_quat, 1.0)
+        set_target(insert, coax_inserted_pos, coaxial_grasp_quat, 1.0)
 
         # HOLD_INSERTED: dwell at the seated pose (where the snap-lock joint will activate).
         hold_ins = phase == self.HOLD_INSERTED
-        set_target(hold_ins, inserted_pos, socket_grasp_quat, 1.0)
+        set_target(hold_ins, coax_inserted_pos, coaxial_grasp_quat, 1.0)
 
         # EXTRACT: pull the (still-grasped) plug back out of the socket along -bore axis.
         extract = phase == self.EXTRACT
-        set_target(extract, extracted_pos, socket_grasp_quat, 1.0)
+        set_target(extract, coax_extracted_pos, coaxial_grasp_quat, 1.0)
 
         # WITHDRAW: lift the (still-grasped) plug clear of the socket.
         withdraw = phase == self.WITHDRAW
         withdraw_dir_w = quat_apply(self.socket_quat_w, self._vec((0.0, 1.0, 0.0)))
-        set_target(withdraw, extracted_pos + self.withdraw_distance * withdraw_dir_w, socket_grasp_quat, 1.0)
+        set_target(withdraw, coax_extracted_pos + self.withdraw_distance * withdraw_dir_w, coaxial_grasp_quat, 1.0)
 
         # Smoothstep blend from the entry pose to the target pose (world frame).
         blend = _smoothstep(self.elapsed / self.durations[self.phase]).unsqueeze(-1)
@@ -341,7 +382,8 @@ class WaterhoseDemoState:
         cmd_quat_w = _blend_quat(start_quat_w, target_quat_w, blend)
 
         # Debug-only plug diagnostics; targets remain phase-entry smoothstep poses.
-        cos_val = torch.sum(connector_dir * ins_dir, dim=-1)
+        plug_cos_val = torch.sum(connector_dir * ins_dir, dim=-1)
+        tip_cos_val = torch.sum(cable_tip_axis_w * ins_dir, dim=-1)
 
         cmd_pos_b, cmd_quat_b = subtract_frame_transforms(root_pos_w, root_quat_w, cmd_pos_w, cmd_quat_w)
         self.command_pose[:, :3] = cmd_pos_b
@@ -355,7 +397,7 @@ class WaterhoseDemoState:
         rotation_error = quat_error_magnitude(target_quat_w, ee_quat_w)
         converged = torch.all(position_error < self.pos_tolerance, dim=-1) & (rotation_error < self.rot_tolerance)
 
-        axial_depth = torch.sum((tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
+        axial_depth = torch.sum((measured_tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
 
         if self.debug:
             changed = self.phase != self.last_reported_phase
@@ -365,7 +407,8 @@ class WaterhoseDemoState:
                     f"[waterhose_ik] {name}: "
                     f"pos_err={position_error[0].detach().cpu().tolist()} "
                     f"rot_err={float(rotation_error[0].detach().cpu()):.4f} "
-                    f"cos={float(cos_val[0].detach().cpu()):+.2f} "
+                    f"plug_cos={float(plug_cos_val[0].detach().cpu()):+.2f} "
+                    f"tip_cos={float(tip_cos_val[0].detach().cpu()):+.2f} "
                     f"depth_mm={float(axial_depth[0].detach().cpu()) * 1000.0:.1f} "
                     f"grip={float(gripper[0, 0].detach().cpu()):.2f}",
                     flush=True,
