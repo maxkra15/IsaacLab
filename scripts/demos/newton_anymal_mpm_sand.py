@@ -34,7 +34,7 @@ import argparse
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from isaaclab_tasks.utils.sim_launcher import add_launcher_args, launch_simulation
+from isaaclab.app.sim_launcher import add_launcher_args, launch_simulation
 
 parser = argparse.ArgumentParser(description="ANYmal-C walking over Newton implicit MPM sand.")
 parser.add_argument("--voxel-size", type=float, default=0.05, help="MPM grid voxel size in meters.")
