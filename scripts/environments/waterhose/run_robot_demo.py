@@ -28,13 +28,11 @@ DEFAULT_MAX_STEPS = 4500
 SCENE_CONFIG_COUPLED_TASKS = {
     "Isaac-Waterhose-Coupled-v0",
     "Isaac-Waterhose-Proxy-v0",
-    "Isaac-Waterhose-Kinematic-v0",
     "Isaac-Waterhose-Admm-v0",
 }
 SCENE_CONFIG_SCRIPTED_TASKS = {
     "Isaac-Waterhose-Coupled-v0",
     "Isaac-Waterhose-Proxy-v0",
-    "Isaac-Waterhose-Kinematic-v0",
     "Isaac-Waterhose-Admm-v0",
 }
 

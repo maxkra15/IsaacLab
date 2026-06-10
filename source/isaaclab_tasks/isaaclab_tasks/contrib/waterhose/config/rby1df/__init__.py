@@ -13,7 +13,9 @@ from . import agents
 
 
 # Two-way proxy coupling (the gripper proxies are finite-mass bodies that exchange force with the
-# cable in both directions). Stable for a single env; the plug grasp can be marginal for num_envs>1.
+# cable in both directions). This is the default customer demo path. Replicated multi-env smoke
+# runs work, but the coupled VBD/proxy-contact workload is throughput-bound rather than linearly
+# scaling with env count; keep XR/demo runs at one env and profile before using it for RL batches.
 gym.register(
     id="Isaac-Waterhose-Proxy-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

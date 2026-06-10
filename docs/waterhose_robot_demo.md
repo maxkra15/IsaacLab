@@ -190,6 +190,13 @@ Multi-env smoke test:
   --profile
 ```
 
+Batching status: the task uses normal IsaacLab cloned scene setup (`replicate_physics=True`, regex
+prim paths, per-env cable anchors, and batched Torch actions/state). On 2026-06-10, the coupled task
+completed 500-step headless runs with CUDA graph capture at `--num_envs 1`, `4`, and `8`. The rollout
+rate was roughly flat on the local workstation: 28.8, 26.5, and 25.9 manager steps/s respectively.
+That means the current Newton coupled solver path is functionally batched, but not yet a linear
+throughput-scaling RL workload; VBD/proxy contact work dominates.
+
 ## Assets
 
 By default the task uses packaged assets next to the waterhose package:
