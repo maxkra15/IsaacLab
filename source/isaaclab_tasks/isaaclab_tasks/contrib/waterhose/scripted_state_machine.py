@@ -188,9 +188,9 @@ class WaterhoseDemoState:
         # The socket bore axis points mostly upward, so this standoff also keeps the gripper lower
         # and away from the insertion mesh during the lift/align motion.
         self.preinsert_standoff = 0.018
-        # SHALLOW seat: the authored socket mesh is only a thin shell around the mouth. Do not drive
-        # the connector tip through the visible socket asset.
-        self.insert_final_depth = 0.0
+        # The authored socket mesh is a short shell around the mouth. Stop the connector tip just
+        # outside the mouth so the visible cable does not get driven through the socket asset.
+        self.insert_final_depth = -0.010
         self.extract_clearance = 0.05
         self.gripper_backoff_distance = 0.10
         self.connector_tip_len = CONNECTOR_TIP_LEN
@@ -400,7 +400,8 @@ class WaterhoseDemoState:
         rotation_error = quat_error_magnitude(target_quat_w, ee_quat_w)
         converged = torch.all(position_error < self.pos_tolerance, dim=-1) & (rotation_error < self.rot_tolerance)
 
-        axial_depth = torch.sum((plug_tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
+        target_tip_pos_w = target_pos_w + quat_apply(target_quat_w, self.connector_tip_pos_in_ee)
+        target_tip_depth = torch.sum((target_tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
 
         if self.debug:
             changed = self.phase != self.last_reported_phase
@@ -412,7 +413,7 @@ class WaterhoseDemoState:
                     f"rot_err={float(rotation_error[0].detach().cpu()):.4f} "
                     f"plug_cos={float(plug_cos_val[0].detach().cpu()):+.2f} "
                     f"tip_cos={float(tip_cos_val[0].detach().cpu()):+.2f} "
-                    f"depth_mm={float(axial_depth[0].detach().cpu()) * 1000.0:.1f} "
+                    f"target_depth_mm={float(target_tip_depth[0].detach().cpu()) * 1000.0:.1f} "
                     f"grip={float(gripper[0, 0].detach().cpu()):.2f}",
                     flush=True,
                 )
