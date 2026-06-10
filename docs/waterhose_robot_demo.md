@@ -17,7 +17,12 @@ manager-based environment style:
 ```text
 waterhose/
   __init__.py
+  geometry.py
+  scripted_state_machine.py
+  teleop.py
+  teleop_pipelines.py
   waterhose_env_cfg.py
+  assets/
   mdp/
   config/
     rby1df/
@@ -42,6 +47,8 @@ Newton proxy coupling path. It uses normal IsaacLab scene configuration:
 - `RigidObjectCfg` for the plugs and kinematic cable anchors.
 - `CableObjectCfg` for the two USD cable curves.
 - `AssetBaseCfg` for the fridge/static visual scene.
+- wrapper USD layers (`fridge_waterhose.usda`, `rby1df_waterhose.usda`) for task-specific collision
+  overrides, including the socket SDF and right gripper finger SDF colliders.
 - `CoupledNewtonCfg` plus `isaaclab_newton.physics.CoupledSolverCfg`.
 
 `CoupledSolverCfg.class_type` resolves to `isaaclab_newton.physics.coupled_manager:NewtonCoupledManager`. That manager partitions one Newton model into an MJWarp source view for the robot and a VBD destination view for the cable/plug bodies, then builds Newton's `SolverCoupledProxy` from `newton.solvers.experimental.coupled`.
@@ -211,10 +218,12 @@ Required files:
 
 ```text
 fridge/fridge.usda
+fridge/fridge_waterhose.usda
 fridge/cable/cable001.usda
 fridge/cable/cable002.usda
 fridge/cable/plug.usda
 rby1df/rby1df.usda
+rby1df/rby1df_waterhose.usda
 ```
 
 To use another asset directory:

@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-from dataclasses import MISSING
 
 from isaaclab_newton.physics import (
     AdmmContactPairCfg,
@@ -34,10 +33,6 @@ from isaaclab_visualizers.kit.kit_visualizer_cfg import KitVisualizerCfg
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
 
 import isaaclab.sim as sim_utils
-from isaaclab.sim import schemas as sim_schemas
-from isaaclab.sim.schemas.schemas_cfg import MeshCollisionBaseCfg
-from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd
-from isaaclab.sim.utils import clone
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.assets.rigid_object.rigid_object_cfg import RigidObjectCfg
@@ -47,7 +42,6 @@ from isaaclab.devices.keyboard import Se3KeyboardCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
-from isaaclab.managers.manager_term_cfg import ActionTermCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -64,47 +58,29 @@ from isaaclab_contrib.deformable.newton_manager_cfg import (
     NewtonModelCfg,
     VBDSolverCfg,
 )
+from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 
+from .geometry import (
+    ANCHOR_POS,
+    CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z,
+    FRIDGE_POS,
+    RIGHT_GRIPPER_EE_FRAME_POS,
+    RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
+    SOCKET_COLLISION_MESH_PATTERN,
+)
+from .mdp.actions import WaterhoseGripperPositionActionCfg
 from .teleop import WaterhoseSpaceMouseCfg
-
-try:
-    import isaacteleop  # noqa: F401 -- IsaacTeleop pipeline builders need this at runtime.
-    from isaaclab_teleop import IsaacTeleopCfg, XrCfg
-
-    _TELEOP_AVAILABLE = True
-except ImportError:
-    _TELEOP_AVAILABLE = False
-    logging.getLogger(__name__).warning("isaaclab_teleop is not installed. XR teleoperation is disabled.")
+from .teleop_pipelines import build_waterhose_relative_teleop_pipeline, build_waterhose_teleop_pipeline
 
 WATERHOSE_ASSETS_DIR = os.environ.get(
     "WATERHOSE_ASSETS_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"),
 )
 
-# rby1df robot: URDF converted to USD (scripts/tools/convert_urdf.py) then flattened
-# into a single self-contained asset.
-_RBY1_USD = os.path.join(WATERHOSE_ASSETS_DIR, "rby1df", "rby1df.usda")
-# EE contact frame offset from right_gripper_base. The finger pad spans base-z [-0.0735, -0.1355]
-# (base..tip); -0.125 grips in the TIP third of the pad (not the pad centre at -0.1045), so the
-# flat fingertip surface closes on the plug. The plug's long axis lies along the finger width
-# (gripper-Y, 32 mm pad) so the pad spans the 22 mm plug length once centered.
-_RIGHT_GRIPPER_EE_FRAME_POS = (0.0, 0.0, -0.125)
-# USD stores xformOp:orient as (w, x, y, z); IsaacLab action offsets use (x, y, z, w).
-_RIGHT_GRIPPER_EE_FRAME_ROT = (0.70710677, 0.70710677, 0.0, 0.0)
-
-# add_rod_graph places each segment's body frame at the edge's start node u
-# (edge (u, v), +Z from u->v), so cable_local_pos=(0, 0, 0) welds at u and the head
-# plug weld's local offset is authored against segment 0's start frame. cable001's
-# last segment is edge (42, 43) -> u=42, so the tail weld pins node 42.
-_FRIDGE_POS = (0.0, 0.0, 0.5)
-_CABLE1_TAIL_NODE_42 = (-0.18810473382472992, 0.3453156650066376, -0.25986239314079285)
-_CABLE1_ANCHOR_NODE = _CABLE1_TAIL_NODE_42
-# World position of the cable tail node = the per-env kinematic anchor body. The cable
-# welds to this per-env body rather than the shared static world body (-1): a fixed joint
-# to the global world body corrupts the multi-env coupled MJWarp+VBD solve (robot joints
-# go NaN at step 0).
-_ANCHOR_POS = tuple(p + n for p, n in zip(_FRIDGE_POS, _CABLE1_ANCHOR_NODE))
-_CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z = 0.022
+_FRIDGE_USD = os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "fridge_waterhose.usda")
+_RBY1_USD = os.path.join(WATERHOSE_ASSETS_DIR, "rby1df", "rby1df_waterhose.usda")
+_PLUG_USD = os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda")
+_CABLE1_USD = os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "cable001.usda")
 
 # Hand-authored initial visualizer cameras. These used to live in
 # scripts/environments/waterhose/run_robot_demo.py; keep them in the task config
@@ -118,19 +94,6 @@ _NEWTON_CAMERA_LOOKAT = (0.55, -0.42, 0.9)
 _ROBOT_BASE_PRIM_PATH_ENV0 = "/World/envs/env_0/Robot/Geometry/origin"
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return default
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-_RIGHT_GRIPPER_FINGER_BODY_TOKENS = (
-    "right_gripper_leftfinger",
-    "right_gripper_rightfinger",
-    "right_gripper_left_finger",
-    "right_gripper_right_finger",
-)
 _RBY1_GRIPPER_MIMIC_JOINT_TOKENS = (
     "gripper_left_finger_joint",
     "gripper_right_finger_joint",
@@ -167,44 +130,6 @@ _RIGHT_GRIPPER_CLOSE_COMMAND = {
     "right_gripper_left_finger_joint": -0.0071,
     "right_gripper_right_finger_joint": 0.0071,
 }
-_RIGHT_GRIPPER_ACTUAL_MESH_COLLISION = MeshCollisionBaseCfg(mesh_approximation_name="none")
-_RIGHT_GRIPPER_SDF_COLLISION = sim_utils.NewtonSDFCollisionPropertiesCfg(
-    sdf_max_resolution=64,
-    sdf_narrow_band_inner=0.002,
-    sdf_narrow_band_outer=0.006,
-    sdf_texture_format="float32",
-    sdf_padding=0.001,
-    hydroelastic_enabled=False,
-)
-
-# ----- Insertion socket (hollow-cylinder collider the plug connector inserts into) -----
-# Single source of truth for the socket mouth pose (env-local; env_origins added at runtime).
-# The socket is deliberately placed/oriented to MATCH the direction the grasped plug's connector
-# naturally presents after the settle phase (measured from the scripted demo), so insertion is a
-# short straight push along the connector axis instead of an infeasible ~106 deg arm reorientation.
-# The bore axis is the connector axis (0.8613, -0.3011, -0.4092); the mouth sits a standoff ahead
-# of the post-settle connector tip. The scripted state machine (scripted_state_machine.py) uses the
-# SAME pose -- keep them in sync. NOTE: this trades the exact fridge-socket location for a working
-# insert/extract; re-measure if the grasp/settle motion changes.
-_SOCKET_MOUTH_POS = (-0.259345, 0.344709, 0.28698)
-# Socket-mouth frame in USD-style (w, x, y, z): 20 deg about +X, so authored +Z maps onto
-# the real fridge-socket hole axis (0, -sin20, cos20).
-_SOCKET_ROT = (0.984808, 0.173648, 0.0, 0.0)
-_SOCKET_COLLISION_XFORM_OFFSET = (0.0, -0.0010260604299770061, 0.0028190778623577253)
-_SOCKET_COLLISION_XFORM_SUFFIX = "/Cable008/SocketCollision"
-_SOCKET_COLLISION_MESH_SUFFIX = f"{_SOCKET_COLLISION_XFORM_SUFFIX}/Cable008_SocketCollision"
-_SOCKET_COLLISION_MESH_PATTERN = rf".*/Fridge{_SOCKET_COLLISION_MESH_SUFFIX}.*"
-# SDF guides the plug into the bore. Higher resolution than the gripper because the 3 mm bore
-# wall is a thin feature. Enable hydroelastic too when WATERHOSE_SOCKET_HYDRO is set.
-_SOCKET_SDF_COLLISION = sim_utils.NewtonSDFCollisionPropertiesCfg(
-    sdf_max_resolution=128,
-    sdf_narrow_band_inner=-0.004,
-    sdf_narrow_band_outer=0.006,
-    sdf_texture_format="float32",
-    sdf_padding=0.001,
-    hydroelastic_enabled=_env_flag("WATERHOSE_SOCKET_HYDRO", False),
-    hydroelastic_stiffness=1.0e7,
-)
 
 
 def _disable_rby1df_gripper_mimic_constraints(_payload=None) -> None:
@@ -214,12 +139,12 @@ def _disable_rby1df_gripper_mimic_constraints(_payload=None) -> None:
 
     builder = getattr(NewtonManager, "_builder", None)
     if builder is None:
-        return
+        raise RuntimeError("Newton builder is unavailable while disabling RBY1 gripper mimic constraints.")
 
     labels = getattr(builder, "constraint_mimic_label", None)
     enabled = getattr(builder, "constraint_mimic_enabled", None)
-    if not labels or enabled is None:
-        return
+    if labels is None or enabled is None:
+        raise RuntimeError("Newton builder is missing gripper mimic constraint arrays.")
 
     disabled = 0
     for index, label in enumerate(labels):
@@ -227,8 +152,12 @@ def _disable_rby1df_gripper_mimic_constraints(_payload=None) -> None:
             enabled[index] = False
             disabled += 1
 
-    if disabled:
-        logging.debug("Disabled %d RBY1 gripper mimic constraints for explicit finger control.", disabled)
+    if disabled == 0:
+        raise RuntimeError(
+            "No RBY1 gripper mimic constraints matched the expected right/left finger joint labels."
+        )
+
+    logging.debug("Disabled %d RBY1 gripper mimic constraints for explicit finger control.", disabled)
 
 
 def _register_rby1df_gripper_mimic_override() -> None:
@@ -244,296 +173,6 @@ def _register_rby1df_gripper_mimic_override() -> None:
         name="waterhose_disable_rby1df_gripper_mimics",
         wrap_weak_ref=False,
     )
-
-
-@clone
-def spawn_fridge_visual_without_collision(
-    prim_path: str,
-    cfg: sim_utils.UsdFileCfg,
-    translation: tuple[float, float, float] | None = None,
-    orientation: tuple[float, float, float, float] | None = None,
-    **kwargs,
-):
-    """Spawn the visual fridge USD, keeping only its embedded socket collider active."""
-
-    prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
-    stage = prim.GetStage()
-    # Disable the dense authored fridge collision hierarchy first, then explicitly re-enable the
-    # generated socket mesh embedded at /Cable008/SocketCollision/Cable008_SocketCollision. This
-    # keeps the fridge visual-only except for the insertion bore used by the VBD cable/plug solve.
-    sim_schemas.modify_collision_properties(
-        prim.GetPath().pathString,
-        sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-        stage=stage,
-    )
-    socket_mesh_path = f"{prim.GetPath().pathString}{_SOCKET_COLLISION_MESH_SUFFIX}"
-    sim_schemas.modify_collision_properties(
-        socket_mesh_path,
-        sim_utils.CollisionPropertiesCfg(collision_enabled=True),
-        stage=stage,
-    )
-    if _env_flag("WATERHOSE_SOCKET_SDF", True):
-        sim_schemas.modify_collision_properties(socket_mesh_path, _SOCKET_SDF_COLLISION, stage=stage)
-    return prim
-
-
-@configclass
-class WaterhoseGripperPositionActionCfg(ActionTermCfg):
-    """One-dimensional continuous position command for the RBY1 right gripper."""
-
-    class_type: str = "isaaclab_tasks.contrib.waterhose.mdp.actions:WaterhoseGripperPositionAction"
-
-    joint_names: list[str] = MISSING
-    """Right gripper driver and finger joints to command explicitly."""
-
-    open_command_expr: dict[str, float] = MISSING
-    """Joint position targets for a normalized action of ``+1``."""
-
-    close_command_expr: dict[str, float] = MISSING
-    """Joint position targets for a normalized action of ``-1``."""
-
-
-def _is_right_gripper_finger_collision_instance(prim) -> bool:
-    """Return true for right gripper finger collision instances in the rby1df USD."""
-    path = prim.GetPath().pathString.lower()
-    if not any(token in path for token in _RIGHT_GRIPPER_FINGER_BODY_TOKENS):
-        return False
-    name = prim.GetName().lower()
-    parent_name = prim.GetParent().GetName().lower()
-    return name.endswith("_collision") or (name == parent_name and name.endswith("finger"))
-
-
-def _is_robot_collision_instance(prim) -> bool:
-    """Return true for robot collision instance prims that must be editable."""
-    if not prim.IsInstance():
-        return False
-    name = prim.GetName().lower()
-    parent_name = prim.GetParent().GetName().lower()
-    return name.endswith("_collision") or (name == parent_name and name.endswith("finger"))
-
-
-def _apply_collision_overrides_to_right_gripper_fingers(robot_prim) -> None:
-    """Disable robot collisions except the right gripper finger meshes used for grasping."""
-    from pxr import Usd, UsdPhysics
-
-    stage = robot_prim.GetStage()
-    collision_instance_paths = [
-        prim.GetPath().pathString for prim in Usd.PrimRange(robot_prim) if _is_robot_collision_instance(prim)
-    ]
-    for instance_path in collision_instance_paths:
-        stage.GetPrimAtPath(instance_path).SetInstanceable(False)
-
-    sim_schemas.modify_collision_properties(
-        robot_prim.GetPath().pathString,
-        sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-        stage=stage,
-    )
-    # Newton's current texture-SDF mesh contact path hits a CUDA illegal access
-    # when the plug reaches these proxy finger meshes. Keep SDF opt-in until
-    # that solver path is fixed; actual mesh collision stays enabled either way.
-    enable_sdf = _env_flag("WATERHOSE_RIGHT_GRIPPER_SDF", False)
-    right_finger_collision_instance_paths = [
-        prim.GetPath().pathString
-        for prim in Usd.PrimRange(robot_prim)
-        if _is_right_gripper_finger_collision_instance(prim)
-    ]
-
-    modified_meshes: list[str] = []
-    for instance_path in right_finger_collision_instance_paths:
-        instance_prim = stage.GetPrimAtPath(instance_path)
-        for child_prim in Usd.PrimRange(instance_prim):
-            if child_prim.GetTypeName() != "Mesh" or not child_prim.HasAPI(UsdPhysics.CollisionAPI):
-                continue
-            mesh_path = child_prim.GetPath().pathString
-            sim_schemas.modify_collision_properties(
-                mesh_path,
-                sim_utils.CollisionPropertiesCfg(collision_enabled=True),
-                stage=stage,
-            )
-            sim_schemas.modify_mesh_collision_properties(mesh_path, _RIGHT_GRIPPER_ACTUAL_MESH_COLLISION, stage=stage)
-            if enable_sdf:
-                sim_schemas.modify_collision_properties(mesh_path, _RIGHT_GRIPPER_SDF_COLLISION, stage=stage)
-            modified_meshes.append(mesh_path)
-
-    if not modified_meshes:
-        logging.warning("Did not find right gripper finger collision meshes to override.")
-
-
-@clone
-def spawn_rby1df_with_right_gripper_finger_collision_overrides(
-    prim_path: str,
-    cfg: sim_utils.UsdFileCfg,
-    translation: tuple[float, float, float] | None = None,
-    orientation: tuple[float, float, float, float] | None = None,
-    **kwargs,
-):
-    """Spawn rby1df and override only the right gripper finger collision meshes."""
-    prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
-    _apply_collision_overrides_to_right_gripper_fingers(prim)
-    return prim
-
-
-def _build_waterhose_teleop_pipeline():
-    """Build the IsaacTeleop pipeline for the absolute Waterhose IK action space."""
-
-    from isaacteleop.retargeters import (
-        GripperRetargeter,
-        GripperRetargeterConfig,
-        Se3AbsRetargeter,
-        Se3RetargeterConfig,
-        TensorReorderer,
-    )
-    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
-    from isaacteleop.retargeting_engine.interface import OutputCombiner, ValueInput
-    from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
-
-    controllers = ControllersSource(name="controllers")
-    transform_input = ValueInput("world_T_anchor", TransformMatrix())
-    transformed_controllers = controllers.transformed(transform_input.output(ValueInput.VALUE))
-
-    se3_cfg = Se3RetargeterConfig(
-        input_device=ControllersSource.RIGHT,
-        zero_out_xy_rotation=False,
-        use_wrist_rotation=False,
-        use_wrist_position=False,
-        target_offset_roll=90.0,
-        target_offset_pitch=0.0,
-        target_offset_yaw=0.0,
-    )
-    se3 = Se3AbsRetargeter(se3_cfg, name="ee_pose")
-    connected_se3 = se3.connect(
-        {
-            ControllersSource.RIGHT: transformed_controllers.output(ControllersSource.RIGHT),
-        }
-    )
-
-    gripper_cfg = GripperRetargeterConfig(hand_side="right")
-    gripper = GripperRetargeter(gripper_cfg, name="gripper")
-    connected_gripper = gripper.connect(
-        {
-            ControllersSource.RIGHT: transformed_controllers.output(ControllersSource.RIGHT),
-        }
-    )
-
-    ee_pose_elements = ["pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w"]
-    gripper_elements = ["gripper_value"]
-    reorderer = TensorReorderer(
-        input_config={
-            "ee_pose": ee_pose_elements,
-            "gripper_command": gripper_elements,
-        },
-        output_order=ee_pose_elements + gripper_elements,
-        name="action_reorderer",
-        input_types={"ee_pose": "array", "gripper_command": "scalar"},
-    )
-    connected_reorderer = reorderer.connect(
-        {
-            "ee_pose": connected_se3.output("ee_pose"),
-            "gripper_command": connected_gripper.output("gripper_command"),
-        }
-    )
-
-    return OutputCombiner({"action": connected_reorderer.output("output")})
-
-
-def _build_waterhose_relative_teleop_pipeline():
-    """Build the IsaacTeleop pipeline for the relative Waterhose IK teleop action space."""
-
-    import numpy as np
-
-    from isaacteleop.retargeters import (
-        GripperRetargeter,
-        GripperRetargeterConfig,
-        Se3RelRetargeter,
-        Se3RetargeterConfig,
-        TensorReorderer,
-    )
-    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource, HandsSource
-    from isaacteleop.retargeting_engine.interface import BaseRetargeter, OutputCombiner, TensorGroupType, ValueInput
-    from isaacteleop.retargeting_engine.tensor_types import DLDataType, NDArrayType, TransformMatrix
-
-    class WaterhoseDeltaFrameRemapper(BaseRetargeter):
-        """Adapt AVP wrist deltas to the waterhose relative IK action semantics."""
-
-        def input_spec(self):
-            return {
-                "ee_delta": TensorGroupType(
-                    "ee_delta",
-                    [NDArrayType("delta", shape=(6,), dtype=DLDataType.FLOAT, dtype_bits=32)],
-                )
-            }
-
-        def output_spec(self):
-            return {
-                "ee_delta": TensorGroupType(
-                    "ee_delta",
-                    [NDArrayType("delta", shape=(6,), dtype=DLDataType.FLOAT, dtype_bits=32)],
-                )
-            }
-
-        def _compute_fn(self, inputs, outputs, context) -> None:
-            delta = np.asarray(inputs["ee_delta"][0], dtype=np.float32).flatten()
-            remapped = delta.copy()
-            # Position deltas are already rebased into the robot root frame by
-            # IsaacTeleopCfg.target_frame_prim_path.  The waterhose action only
-            # wants wrist roll as a local EE rotation command.
-            remapped[3] = delta[3]
-            remapped[4] = 0.0
-            remapped[5] = 0.0
-            outputs["ee_delta"][0] = remapped
-
-    controllers = ControllersSource(name="controllers")
-    hands = HandsSource(name="hands")
-
-    transform_input = ValueInput("world_T_anchor", TransformMatrix())
-    transformed_hands = hands.transformed(transform_input.output(ValueInput.VALUE))
-
-    se3_cfg = Se3RetargeterConfig(
-        input_device=HandsSource.RIGHT,
-        zero_out_xy_rotation=False,
-        use_wrist_rotation=True,
-        use_wrist_position=True,
-        delta_pos_scale_factor=15.0,
-        delta_rot_scale_factor=2.0,
-        alpha_pos=0.5,
-        alpha_rot=0.5,
-    )
-    se3 = Se3RelRetargeter(se3_cfg, name="ee_delta")
-    connected_se3 = se3.connect({HandsSource.RIGHT: transformed_hands.output(HandsSource.RIGHT)})
-    delta_remapper = WaterhoseDeltaFrameRemapper(name="waterhose_delta_frame")
-    connected_delta = delta_remapper.connect({"ee_delta": connected_se3.output("ee_delta")})
-
-    gripper_cfg = GripperRetargeterConfig(hand_side="right")
-    gripper = GripperRetargeter(gripper_cfg, name="gripper")
-    connected_gripper = gripper.connect(
-        {
-            "hand_right": hands.output(HandsSource.RIGHT),
-            "controller_right": controllers.output(ControllersSource.RIGHT),
-        }
-    )
-
-    delta_elements = ["dx", "dy", "dz", "droll", "dpitch", "dyaw"]
-    gripper_elements = ["gripper"]
-    reorderer = TensorReorderer(
-        input_config={
-            "ee_delta": delta_elements,
-            "gripper": gripper_elements,
-        },
-        output_order=delta_elements + gripper_elements,
-        name="action_reorderer",
-        input_types={
-            "ee_delta": "array",
-            "gripper": "scalar",
-        },
-    )
-    connected_reorderer = reorderer.connect(
-        {
-            "ee_delta": connected_delta.output("ee_delta"),
-            "gripper": connected_gripper.output("gripper_command"),
-        }
-    )
-
-    return OutputCombiner({"action": connected_reorderer.output("output")})
 
 
 def _make_proxy_collision_pipeline(model):
@@ -594,20 +233,14 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     ### Static fridge body
     fridge = AssetBaseCfg(
         prim_path="/World/envs/env_.*/Fridge",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "fridge.usda"),
-            func=spawn_fridge_visual_without_collision,
-        ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=_FRIDGE_POS),
+        spawn=sim_utils.UsdFileCfg(usd_path=_FRIDGE_USD),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=FRIDGE_POS),
     )
 
     ### rby1df robot (28-DOF, fixed base). Gripper drives are force-limited so VBD contacts can stop the fingers.
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=_RBY1_USD,
-            func=spawn_rby1df_with_right_gripper_finger_collision_overrides,
-        ),
+        spawn=sim_utils.UsdFileCfg(usd_path=_RBY1_USD),
         articulation_root_prim_path="/Geometry/origin",
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 1.0, -1.0),
@@ -642,9 +275,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
 
     plug1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Plug1",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "plug.usda"),
-        ),
+        spawn=sim_utils.UsdFileCfg(usd_path=_PLUG_USD),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(-0.38398558, 0.34585292, 0.5 - 0.36874688),
             rot=(0.0, -0.57096256, 0.0, 0.8209761),
@@ -665,7 +296,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.1)),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=_ANCHOR_POS),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=ANCHOR_POS),
     )
 
     # The deformable cable, simulated as a Cosserat rod by the VBD solver. These values track the
@@ -674,7 +305,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     cable1 = CableObjectCfg(
         prim_path="/World/envs/env_.*/Cable1",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "cable", "cable001.usda"),
+            usd_path=_CABLE1_USD,
             physics_material=NewtonCableMaterialCfg(
                 stretch_stiffness=1.0e6,
                 bend_stiffness=20.0,
@@ -684,7 +315,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             ),
         ),
         init_state=CableObjectCfg.InitialStateCfg(
-            pos=_FRIDGE_POS,
+            pos=FRIDGE_POS,
         ),
         # Keep the authored node spacing: the head plug weld's 22 mm offset is authored against
         # the original segment-0 frame, so resampling would invalidate it. None = no resampling.
@@ -694,7 +325,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             CableAttachmentCfg(
                 target_prim_path="/World/envs/env_.*/Plug1",
                 cable_anchor=0,
-                cable_local_pos=(0.0, 0.0, _CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z),
+                cable_local_pos=(0.0, 0.0, CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z),
             ),
             # Tail weld: cable last-segment start node (42) -> kinematic Anchor1 sphere.
             CableAttachmentCfg(
@@ -864,7 +495,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         # the only client-facing demo path.
         self.sim.physics = CoupledNewtonCfg(
             scene_cfg=self.scene,
-            use_cuda_graph=_env_flag("WATERHOSE_USE_CUDA_GRAPH", True),
+            use_cuda_graph=True,
             solver_cfg=CoupledSolverCfg(
                 coupling_type="proxy",
                 scene_cfg=self.scene,
@@ -918,7 +549,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # Pull ONLY the embedded static socket collider into the VBD solver so the
                         # VBD-owned plug collides with the bore (include_static_shapes=False keeps
                         # the cable from colliding with the ground and the rest of the fridge).
-                        shape_label_patterns=[_SOCKET_COLLISION_MESH_PATTERN],
+                        shape_label_patterns=[SOCKET_COLLISION_MESH_PATTERN],
                     ),
                 ],
                 proxy_coupling=ProxyCouplingCfg(
@@ -980,8 +611,8 @@ class WaterhoseIkActionsCfg:
             ik_params={"lambda_val": 0.05},
         ),
         body_offset=DifferentialInverseKinematicsActionCfg.OffsetCfg(
-            pos=_RIGHT_GRIPPER_EE_FRAME_POS,
-            rot=_RIGHT_GRIPPER_EE_FRAME_ROT,
+            pos=RIGHT_GRIPPER_EE_FRAME_POS,
+            rot=RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
         ),
     )
     gripper_action = WaterhoseGripperPositionActionCfg(
@@ -1025,8 +656,8 @@ class WaterhoseNewtonIkActionsCfg(WaterhoseIkActionsCfg):
         fixed_body_names=["left_gripper_base", "torso_hip_yaw"],
         fixed_body_weights=[1.0, 50.0],
         body_offset=NewtonInverseKinematicsActionCfg.OffsetCfg(
-            pos=_RIGHT_GRIPPER_EE_FRAME_POS,
-            rot=_RIGHT_GRIPPER_EE_FRAME_ROT,
+            pos=RIGHT_GRIPPER_EE_FRAME_POS,
+            rot=RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
         ),
     )
 
@@ -1053,8 +684,8 @@ class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
         fixed_body_names=["left_gripper_base", "torso_hip_yaw"],
         fixed_body_weights=[1.0, 50.0],
         body_offset=NewtonInverseKinematicsActionCfg.OffsetCfg(
-            pos=_RIGHT_GRIPPER_EE_FRAME_POS,
-            rot=_RIGHT_GRIPPER_EE_FRAME_ROT,
+            pos=RIGHT_GRIPPER_EE_FRAME_POS,
+            rot=RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
         ),
     )
 
@@ -1069,21 +700,20 @@ class WaterhoseProxyIkEnvCfg(WaterhoseEnvCfg):
         super().__post_init__()
         self.episode_length_s = 30.0
         self.scene.robot.init_state.joint_pos = _RBY1_IK_INITIAL_JOINT_POS
-        if _TELEOP_AVAILABLE:
-            self.xr = XrCfg(
-                anchor_pos=(0.0, 0.9, -1),
-                # XrCfg quaternions are xyzw. Rotate the simulation 180 deg
-                # around world up so the headset initially faces the fridge.
-                anchor_rot=(0.0, 0.0, 1.0, 0.0),
-            )
-            self.isaac_teleop = IsaacTeleopCfg(
-                pipeline_builder=_build_waterhose_teleop_pipeline,
-                sim_device=self.sim.device,
-                xr_cfg=self.xr,
-                target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
-                teleoperation_active_default=True,
-                control_channel_uuid=None,
-            )
+        self.xr = XrCfg(
+            anchor_pos=(0.0, 0.9, -1),
+            # XrCfg quaternions are xyzw. Rotate the simulation 180 deg
+            # around world up so the headset initially faces the fridge.
+            anchor_rot=(0.0, 0.0, 1.0, 0.0),
+        )
+        self.isaac_teleop = IsaacTeleopCfg(
+            pipeline_builder=build_waterhose_teleop_pipeline,
+            sim_device=self.sim.device,
+            xr_cfg=self.xr,
+            target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
+            teleoperation_active_default=True,
+            control_channel_uuid=None,
+        )
 
 
 @configclass
@@ -1126,16 +756,15 @@ class WaterhoseProxyTeleopEnvCfg(WaterhoseProxyIkEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if _TELEOP_AVAILABLE:
-            self.isaac_teleop = IsaacTeleopCfg(
-                pipeline_builder=_build_waterhose_relative_teleop_pipeline,
-                sim_device=self.sim.device,
-                xr_cfg=self.xr,
-                app_name="WaterhoseTeleop",
-                target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
-                teleoperation_active_default=True,
-                control_channel_uuid=None,
-            )
+        self.isaac_teleop = IsaacTeleopCfg(
+            pipeline_builder=build_waterhose_relative_teleop_pipeline,
+            sim_device=self.sim.device,
+            xr_cfg=self.xr,
+            app_name="WaterhoseTeleop",
+            target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
+            teleoperation_active_default=True,
+            control_channel_uuid=None,
+        )
         self.teleop_devices = DevicesCfg(
             devices={
                 "keyboard": Se3KeyboardCfg(

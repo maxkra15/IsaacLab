@@ -31,26 +31,18 @@ from isaaclab.utils.math import (
     subtract_frame_transforms,
 )
 
-# Grasp contact frame expressed in the right_gripper_base local frame: grip in the TIP third of
-# the finger pad. Must match _RIGHT_GRIPPER_EE_FRAME_POS in waterhose_env_cfg.py.
-_RIGHT_EE_FROM_BASE_POS = (0.0, 0.0, -0.125)
-_RIGHT_EE_FROM_BASE_QUAT = (0.70710677, 0.70710677, 0.0, 0.0)
-
-# Grasp point relative to the plug frame: side grasp biased slightly toward the fridge/socket side
-# of the large plug flange. The graspable flange cylinder (dia ~14.6 mm) spans plug-frame z in
-# [-7.15, +8.0] mm; +3 mm keeps the pad on the full flange but moves off the cable-side rim so the
-# full finger surface, not just the trailing edge, carries the plug.
-_CABLE_RADIUS = 0.003
-_GRASP_SHIFT = 0.003
-_PLUG_GRASP_OFFSET = (0.0, -_CABLE_RADIUS + 0.002, _GRASP_SHIFT)
+from .geometry import (
+    CONNECTOR_TIP_LEN,
+    PLUG_GRASP_OFFSET,
+    RIGHT_GRIPPER_EE_FRAME_POS,
+    RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
+    SOCKET_MOUTH_POS,
+    SOCKET_ROT_QUAT_XYZW,
+)
 
 # Gripper command convention used by the IK action term: +1 fully open, -1 fully closed.
 _GRIPPER_OPEN = 1.0
 _GRIPPER_CLOSED = -1.0
-
-_SOCKET_MOUTH_POS = (-0.259345, 0.344709, 0.28698)
-# Matches waterhose_env_cfg._SOCKET_ROT: authored as USD-style (w, x, y, z).
-_SOCKET_ROT_WXYZ = (0.984808, 0.173648, 0.0, 0.0)
 
 
 def _smoothstep(alpha: torch.Tensor) -> torch.Tensor:
@@ -65,13 +57,6 @@ def _blend_quat(start_quat: torch.Tensor, target_quat: torch.Tensor, blend: torc
         torch.sum(start_quat * target_quat, dim=-1, keepdim=True) < 0.0, -target_quat, target_quat
     )
     return normalize(start_quat * (1.0 - blend) + target_quat * blend)
-
-
-def _xyzw_from_wxyz(quat_wxyz: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
-    """Convert an authored/USD quaternion to IsaacLab math helper convention."""
-
-    w, x, y, z = quat_wxyz
-    return (x, y, z, w)
 
 
 def _quat_from_two_vectors(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -191,7 +176,7 @@ class WaterhoseDemoState:
         self.rot_tolerance = 15.0 * torch.pi / 180.0
 
         # Fixed geometric offsets.
-        self.plug_grasp_offset = self._vec(_PLUG_GRASP_OFFSET)
+        self.plug_grasp_offset = self._vec(PLUG_GRASP_OFFSET)
         self.approach_offset = self._vec((0.0, 0.08, 0.0))
         self.engage_offset = self._vec((0.01, 0.0, 0.0))
         self.retract_vector = self._vec((0.0, 0.05, 0.0))
@@ -208,8 +193,7 @@ class WaterhoseDemoState:
         self.insert_final_depth = 0.0
         self.extract_clearance = 0.05
         self.gripper_backoff_distance = 0.10
-        # In the IsaacLab plug frame +Z is the connector axis; the connector tip is ~14 mm along it.
-        self.connector_tip_len = 0.014106234
+        self.connector_tip_len = CONNECTOR_TIP_LEN
 
         # EE orientation that grasps the plug from the side: Rx(+90) * Rz(-90).
         z_axis = self._vec((0.0, 0.0, 1.0))
@@ -222,15 +206,11 @@ class WaterhoseDemoState:
             self.connector_axis_local * self.connector_tip_len - self.plug_grasp_offset,
         )
 
-        # Socket mouth pose (env-local; env_origins added at runtime). MUST mirror the spawned
-        # Embedded fridge socket collider (waterhose_env_cfg._SOCKET_MOUTH_POS / _SOCKET_ROT). The
-        # socket is placed to match the grasped plug's natural post-settle connector presentation,
-        # so the bore axis = the connector axis and insertion is a short straight push.
-        self.socket_pos_w = self._vec(_SOCKET_MOUTH_POS)
-        self.socket_quat_w = normalize(self._vec(_xyzw_from_wxyz(_SOCKET_ROT_WXYZ)))
+        self.socket_pos_w = self._vec(SOCKET_MOUTH_POS)
+        self.socket_quat_w = normalize(self._vec(SOCKET_ROT_QUAT_XYZW))
 
-        self.ee_offset_pos = self._vec(_RIGHT_EE_FROM_BASE_POS)
-        self.ee_offset_quat = self._vec(_RIGHT_EE_FROM_BASE_QUAT)
+        self.ee_offset_pos = self._vec(RIGHT_GRIPPER_EE_FRAME_POS)
+        self.ee_offset_quat = self._vec(RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW)
 
         self._ee_body_id = None
         self._cable_grasp_body_id = 0
@@ -253,14 +233,8 @@ class WaterhoseDemoState:
 
     def compute(self, env) -> torch.Tensor:
         robot = env.scene["robot"]
-        try:
-            plug = env.scene["plug1"]
-        except KeyError:
-            plug = None
-        try:
-            cable = env.scene["cable1"]
-        except KeyError:
-            cable = None
+        plug = env.scene["plug1"]
+        cable = env.scene["cable1"]
 
         if self._ee_body_id is None:
             self._ee_body_id = robot.find_bodies("right_gripper_base")[0][0]
@@ -275,22 +249,11 @@ class WaterhoseDemoState:
             ee_base_pos_w, ee_base_quat_w, self.ee_offset_pos, self.ee_offset_quat
         )
 
-        if plug is not None:
-            plug_pose_w = plug.data.root_link_pose_w.torch
-            plug_pos_w = plug_pose_w[:, :3]
-            plug_quat_w = normalize(plug_pose_w[:, 3:])
-        elif cable is not None:
-            plug_pos_w = cable.data.body_pos_w.torch[:, self._cable_grasp_body_id]
-            plug_quat_w = normalize(cable.data.body_quat_w.torch[:, self._cable_grasp_body_id])
-        else:
-            plug_pos_w = ee_pos_w
-            plug_quat_w = ee_quat_w
+        plug_pose_w = plug.data.root_link_pose_w.torch
+        plug_pos_w = plug_pose_w[:, :3]
+        plug_quat_w = normalize(plug_pose_w[:, 3:])
 
-        # Socket pose in world (offset by the per-env origin).
-        socket_pos_w = self.socket_pos_w
-        env_origins = getattr(env.scene, "env_origins", None)
-        if env_origins is not None:
-            socket_pos_w = socket_pos_w + env_origins.to(device=self.device, dtype=socket_pos_w.dtype)
+        socket_pos_w = self.socket_pos_w + env.scene.env_origins.to(device=self.device, dtype=self.socket_pos_w.dtype)
         insertion_dir_w = normalize(quat_apply(self.socket_quat_w, self._vec((0.0, 0.0, 1.0))))
 
         # Phase-entry snapshots (branch-free masked writes; no host sync).
@@ -300,15 +263,9 @@ class WaterhoseDemoState:
         self.phase_plug_pos_w[first_step] = plug_pos_w[first_step]
         self.phase_plug_quat_w[first_step] = plug_quat_w[first_step]
         connector_dir = quat_apply(plug_quat_w, self.connector_axis_local)
-        tip_pos_w = plug_pos_w + connector_dir * self.connector_tip_len
-        measured_tip_pos_w = tip_pos_w
-        cable_tip_axis_w = connector_dir
-        if cable is not None:
-            try:
-                cable_tip_quat_w = normalize(cable.data.body_quat_w.torch[:, self._cable_tip_body_id])
-                cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self.connector_axis_local))
-            except (AttributeError, IndexError):
-                pass
+        plug_tip_pos_w = plug_pos_w + connector_dir * self.connector_tip_len
+        cable_tip_quat_w = normalize(cable.data.body_quat_w.torch[:, self._cable_tip_body_id])
+        cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self.connector_axis_local))
 
         start_pos_w = self.phase_start_pos_w
         start_quat_w = self.phase_start_quat_w
@@ -355,7 +312,7 @@ class WaterhoseDemoState:
         # --- Insert / extract ---
         # Targets are computed from the connector tip pose.  The gripper frame is offset behind the
         # tip, so aiming the EE itself at the socket mouth overshoots and drives the plug into the
-        # fridge.  CARRY moves to the standoff; ALIGN/INSERT then use the measured cable-tip capsule
+        # fridge.  CARRY moves to the standoff; ALIGN/INSERT then use the cable-tip capsule
         # axis so the hose, not just the plug rigid body, becomes coaxial with the socket bore.
         ins_dir = insertion_dir_w  # bore axis into the socket = R(socket_quat) @ +Z
         socket_grasp_quat = normalize(quat_mul(self.socket_quat_w, self.grasp_orientation_offset))
@@ -378,7 +335,7 @@ class WaterhoseDemoState:
         carry = phase == self.CARRY
         set_target(carry, approach_pos, socket_grasp_quat, 1.0)
 
-        # ALIGN: hold 1 cm outside the mouth while correcting the measured cable axis onto the bore.
+        # ALIGN: hold 1 cm outside the mouth while correcting the cable axis onto the bore.
         align = phase == self.ALIGN
         set_target(align, coax_approach_pos, coaxial_grasp_quat, 1.0)
 
@@ -443,7 +400,7 @@ class WaterhoseDemoState:
         rotation_error = quat_error_magnitude(target_quat_w, ee_quat_w)
         converged = torch.all(position_error < self.pos_tolerance, dim=-1) & (rotation_error < self.rot_tolerance)
 
-        axial_depth = torch.sum((measured_tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
+        axial_depth = torch.sum((plug_tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
 
         if self.debug:
             changed = self.phase != self.last_reported_phase

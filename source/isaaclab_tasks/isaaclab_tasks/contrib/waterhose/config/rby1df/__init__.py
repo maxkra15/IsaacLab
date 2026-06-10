@@ -17,17 +17,6 @@ from . import agents
 # runs work, but the coupled VBD/proxy-contact workload is throughput-bound rather than linearly
 # scaling with env count; keep XR/demo runs at one env and profile before using it for RL batches.
 gym.register(
-    id="Isaac-Waterhose-Proxy-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.coupled_env_cfg:WaterhoseCoupledEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:WaterhosePPORunnerCfg",
-    },
-)
-
-# Deprecated alias for the two-way proxy task above; kept so existing scripts/CLIs keep working.
-gym.register(
     id="Isaac-Waterhose-Coupled-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
