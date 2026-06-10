@@ -151,6 +151,13 @@ class NewtonCfg(PhysicsCfg):
     :class:`NewtonShapeCfg` for the declared fields.
     """
 
+    simplify_meshes: bool = True
+    """Whether Newton replication simplifies mesh colliders to convex hulls.
+
+    Keep this enabled for most rigid-body scenes. Disable it when exact triangle
+    meshes are intentional, for example thin or hollow MPM colliders.
+    """
+
     def __post_init__(self):
         # NewtonCfg.class_type is auto-derived from solver_cfg.class_type.
         # Refuse a user-set value: setting both is ambiguous and was

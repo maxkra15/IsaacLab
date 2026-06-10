@@ -80,6 +80,8 @@ class NewtonViewerGL(ViewerGL):
         self._particle_color_buffer: wp.array | None = None
         self._particle_color_buffer_count = 0
         self._particle_color_buffer_value: tuple[float, float, float] | None = None
+        self._mpm_particle_flags_cache_key: tuple[int, int, int] | None = None
+        self._mpm_particles_all_active = False
 
         try:
             self.register_ui_callback(self._render_training_controls, position="side")
@@ -170,6 +172,16 @@ class NewtonViewerGL(ViewerGL):
             self._particle_color_buffer_value = color
         return self._particle_color_buffer
 
+    def _particle_color_update_array(self, name: str, count: int) -> wp.array | None:
+        """Return particle colors only when Newton needs the GL color buffer refreshed."""
+        color = self._coerce_color3(self.particle_color)
+        obj = getattr(self, "objects", {}).get(name)
+        capacity = getattr(obj, "num_instances", 0)
+        cached_color = getattr(self, "_particle_color_buffer_value", None)
+        if obj is None or count > capacity or cached_color != color or getattr(self, "model_changed", False):
+            return self._particle_color_array(max(count, capacity))
+        return None
+
     def log_points(self, name, points, radii=None, colors=None, hidden=False):
         """Apply configured model-particle appearance while preserving Newton's point logging.
 
@@ -180,8 +192,48 @@ class NewtonViewerGL(ViewerGL):
         if name != "/model/particles" or points is None or self.particle_color is None:
             return super().log_points(name, points, radii, colors, hidden)
 
-        colors = self._particle_color_array(len(points))
+        colors = self._particle_color_update_array(name, len(points))
         return super().log_points(name, points, radii, colors, hidden)
+
+    def _all_mpm_particles_active(self) -> bool:
+        """Return whether an MPM model's static particle flags are all active."""
+        model = getattr(self, "model", None)
+        if model is None or getattr(model, "mpm", None) is None or not getattr(model, "particle_count", 0):
+            return False
+
+        flags = getattr(model, "particle_flags", None)
+        if flags is None:
+            return False
+
+        particle_count = int(model.particle_count)
+        cache_key = (id(model), id(flags), particle_count)
+        if getattr(self, "_mpm_particle_flags_cache_key", None) != cache_key:
+            import newton as nt
+
+            flags_np = flags.numpy()
+            active_flag = int(nt.ParticleFlags.ACTIVE)
+            self._mpm_particles_all_active = bool(((flags_np[:particle_count] & active_flag) != 0).all())
+            self._mpm_particle_flags_cache_key = cache_key
+        return bool(getattr(self, "_mpm_particles_all_active", False))
+
+    def _log_particles(self, state):
+        """Log MPM particles without per-frame active-flag compaction when all particles are active."""
+        model = getattr(self, "model", None)
+        if model is None or not getattr(model, "particle_count", 0) or not self._all_mpm_particles_active():
+            super()._log_particles(state)
+            return
+
+        colors = None
+        if getattr(self, "model_changed", False) and self.particle_color is None:
+            colors = wp.full(shape=len(state.particle_q), value=wp.vec3(0.7, 0.6, 0.4), device=self.device)
+
+        self.log_points(
+            name="/model/particles",
+            points=state.particle_q,
+            radii=model.particle_radius,
+            colors=colors,
+            hidden=not self.show_particles,
+        )
 
     def _color_edit3_compat(self, imgui, label: str, color):
         """
@@ -523,8 +575,6 @@ class NewtonVisualizer(BaseVisualizer):
             self._state = NewtonManager.get_state(self._scene_data_provider)
             return
 
-        self._state = NewtonManager.get_state(self._scene_data_provider)
-
         update_frequency = self._viewer._update_frequency if self._viewer else self._update_frequency
         if self._step_counter % update_frequency != 0:
             return
@@ -533,6 +583,7 @@ class NewtonVisualizer(BaseVisualizer):
 
         try:
             if not self._viewer.is_paused():
+                self._state = NewtonManager.get_state(self._scene_data_provider)
                 self._viewer.begin_frame(self._sim_time)
                 try:
                     if self._state is not None:
@@ -540,9 +591,12 @@ class NewtonVisualizer(BaseVisualizer):
                         if hasattr(body_q, "shape") and body_q.shape[0] == 0:
                             return
                         self._viewer.log_state(self._state)
-                        contacts = NewtonManager.get_contacts()
-                        if contacts is not None:
-                            self._viewer.log_contacts(contacts, self._state)
+                        if self._viewer.show_contacts:
+                            contacts = NewtonManager.get_contacts()
+                            if contacts is not None:
+                                self._viewer.log_contacts(contacts, self._state)
+                            else:
+                                self._log_scene_contact_sensor_arrows(num_envs)
                         else:
                             self._log_scene_contact_sensor_arrows(num_envs)
                         if self.cfg.enable_markers:
