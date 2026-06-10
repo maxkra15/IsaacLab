@@ -62,6 +62,20 @@ class CableAttachmentCfg:
     matching this token against the solver's ``joint_label``.
     """
 
+    enabled: bool = True
+    """Whether the generated Newton fixed joint starts enabled.
+
+    Runtime scripts can toggle :attr:`newton.Model.joint_enabled` for labeled
+    attachments that should act like a latch or snap constraint.
+    """
+
+    add_to_articulation: bool = True
+    """Whether this fixed joint belongs to the cable attachment articulation.
+
+    Runtime latch joints that close a second parent onto an already attached
+    cable body must remain outside the articulation tree.
+    """
+
 
 @configclass
 class CableSdfCaptureCfg:

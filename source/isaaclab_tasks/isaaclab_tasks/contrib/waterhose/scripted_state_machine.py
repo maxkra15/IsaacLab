@@ -6,7 +6,8 @@
 """Scripted IK state machine for the RBY1 waterhose pick-insert-extract demo.
 
 Phases: REST -> APPROACH -> ENGAGE -> GRASP -> HOLD_GRASP -> RETRACT -> SETTLE ->
-CARRY -> ALIGN -> INSERT -> HOLD_INSERTED -> EXTRACT -> WITHDRAW -> DONE.
+CARRY -> ALIGN -> INSERT -> HOLD_INSERTED -> RELEASE -> BACKOFF -> REAPPROACH ->
+REGRASP -> PULL_OUT -> DONE.
 
 Design (deliberately simple and robust):
 
@@ -35,13 +36,12 @@ from isaaclab.utils.math import (
 _RIGHT_EE_FROM_BASE_POS = (0.0, 0.0, -0.125)
 _RIGHT_EE_FROM_BASE_QUAT = (0.70710677, 0.70710677, 0.0, 0.0)
 
-# Grasp point relative to the plug frame: side grasp on the CENTRE of the plug's flange body.
-# The graspable flange cylinder (dia ~14.6 mm) spans plug-frame z in [-7.15, +8.0] mm; its centre
-# is ~z=0. The previous +10 mm shift put the grasp 2 mm PAST the flange back (toward the cable),
-# so the fingers only caught the back rim ("half grasped" -> the plug slipped out). z=0 centres the
-# finger surfaces on the full flange so the full gripper surface grips the full plug surface.
+# Grasp point relative to the plug frame: side grasp biased slightly toward the fridge/socket side
+# of the large plug flange. The graspable flange cylinder (dia ~14.6 mm) spans plug-frame z in
+# [-7.15, +8.0] mm; +3 mm keeps the pad on the full flange but moves off the cable-side rim so the
+# full finger surface, not just the trailing edge, carries the plug.
 _CABLE_RADIUS = 0.003
-_GRASP_SHIFT = 0.0
+_GRASP_SHIFT = 0.003
 _PLUG_GRASP_OFFSET = (0.0, -_CABLE_RADIUS + 0.002, _GRASP_SHIFT)
 
 # Gripper command convention used by the IK action term: +1 fully open, -1 fully closed.
@@ -49,7 +49,7 @@ _GRIPPER_OPEN = 1.0
 _GRIPPER_CLOSED = -1.0
 
 _SOCKET_MOUTH_POS = (-0.259345, 0.344709, 0.28698)
-# Matches waterhose_env_cfg._SOCKET_ROT / AssetBaseCfg.InitialStateCfg: authored as (w, x, y, z).
+# Matches waterhose_env_cfg._SOCKET_ROT: authored as USD-style (w, x, y, z).
 _SOCKET_ROT_WXYZ = (0.984808, 0.173648, 0.0, 0.0)
 
 
@@ -114,9 +114,12 @@ class WaterhoseDemoState:
     ALIGN = 8
     INSERT = 9
     HOLD_INSERTED = 10
-    EXTRACT = 11
-    WITHDRAW = 12
-    DONE = 13
+    RELEASE = 11
+    BACKOFF = 12
+    REAPPROACH = 13
+    REGRASP = 14
+    PULL_OUT = 15
+    DONE = 16
 
     PHASE_NAMES = (
         "REST",
@@ -130,13 +133,34 @@ class WaterhoseDemoState:
         "ALIGN",
         "INSERT",
         "HOLD_INSERTED",
-        "EXTRACT",
-        "WITHDRAW",
+        "RELEASE",
+        "BACKOFF",
+        "REAPPROACH",
+        "REGRASP",
+        "PULL_OUT",
         "DONE",
     )
     # Minimum time spent in each phase [s]; a phase advances once this elapsed AND the EE
     # converged (or a 2x hard timeout). Insert/extract phases get generous time + tolerance.
-    DURATIONS = (0.25, 3.0, 1.5, 0.5, 0.5, 1.5, 0.3, 5.0, 2.0, 4.0, 1.5, 4.0, 2.0, 1.0e6)
+    DURATIONS = (
+        0.25,
+        3.0,
+        1.5,
+        0.5,
+        0.5,
+        1.5,
+        0.3,
+        5.0,
+        2.0,
+        4.0,
+        1.0,
+        0.8,
+        1.5,
+        2.0,
+        0.7,
+        3.0,
+        1.0e6,
+    )
 
     def __init__(self, num_envs: int, step_dt: float, device: torch.device | str, settle_time: float, debug: bool):
         self.num_envs = int(num_envs)
@@ -172,18 +196,18 @@ class WaterhoseDemoState:
         self.engage_offset = self._vec((0.01, 0.0, 0.0))
         self.retract_vector = self._vec((0.0, 0.05, 0.0))
         self.connector_axis_local = self._vec((0.0, 0.0, 1.0))
-        self.withdraw_distance = 0.10
 
         # Insertion geometry along the bore (= connector) axis, relative to the socket mouth.
         # The scripted target is expressed by the cable connector tip, not the EE frame: CARRY stops
-        # with the tip 1 cm outside the mouth, ALIGN dwells there, and INSERT seats the tip shallowly.
-        self.preinsert_standoff = 0.010
-        # SHALLOW seat: the Ø14.5 plug cannot enter the Ø6 bore; pushing it ~35 mm deep (success
-        # value, for a Ø6 cable tip) jams the plug at the mouth and compresses the cable toward the
-        # nearby anchor (~8 cm) until it explodes. Seat the connector tip ~at the mouth instead and
-        # let the snap-lock joint hold it.
-        self.insert_final_depth = 0.015
+        # with the tip outside the mouth, ALIGN dwells there, and INSERT seats the tip shallowly.
+        # The socket bore axis points mostly upward, so this standoff also keeps the gripper lower
+        # and away from the insertion mesh during the lift/align motion.
+        self.preinsert_standoff = 0.018
+        # SHALLOW seat: the authored socket mesh is only a thin shell around the mouth. Do not drive
+        # the connector tip through the visible socket asset.
+        self.insert_final_depth = 0.0
         self.extract_clearance = 0.05
+        self.gripper_backoff_distance = 0.10
         # In the IsaacLab plug frame +Z is the connector axis; the connector tip is ~14 mm along it.
         self.connector_tip_len = 0.014106234
 
@@ -199,9 +223,9 @@ class WaterhoseDemoState:
         )
 
         # Socket mouth pose (env-local; env_origins added at runtime). MUST mirror the spawned
-        # Socket1 collider (waterhose_env_cfg._SOCKET_MOUTH_POS / _SOCKET_ROT). The socket is placed
-        # to match the grasped plug's natural post-settle connector presentation, so the bore axis =
-        # the connector axis and insertion is a short straight push. socket_quat maps +Z -> bore axis.
+        # Embedded fridge socket collider (waterhose_env_cfg._SOCKET_MOUTH_POS / _SOCKET_ROT). The
+        # socket is placed to match the grasped plug's natural post-settle connector presentation,
+        # so the bore axis = the connector axis and insertion is a short straight push.
         self.socket_pos_w = self._vec(_SOCKET_MOUTH_POS)
         self.socket_quat_w = normalize(self._vec(_xyzw_from_wxyz(_SOCKET_ROT_WXYZ)))
 
@@ -281,7 +305,6 @@ class WaterhoseDemoState:
         cable_tip_axis_w = connector_dir
         if cable is not None:
             try:
-                measured_tip_pos_w = cable.data.body_pos_w.torch[:, self._cable_tip_body_id]
                 cable_tip_quat_w = normalize(cable.data.body_quat_w.torch[:, self._cable_tip_body_id])
                 cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self.connector_axis_local))
             except (AttributeError, IndexError):
@@ -289,12 +312,12 @@ class WaterhoseDemoState:
 
         start_pos_w = self.phase_start_pos_w
         start_quat_w = self.phase_start_quat_w
-        snap_plug_pos_w = self.phase_plug_pos_w
-        snap_plug_quat_w = self.phase_plug_quat_w
+        phase_plug_pos_w = self.phase_plug_pos_w
+        phase_plug_quat_w = self.phase_plug_quat_w
 
-        # EE orientation/position that aligns the gripper with the (snapshotted) plug for the pick.
-        grasp_quat_w = normalize(quat_mul(snap_plug_quat_w, self.grasp_orientation_offset))
-        grasp_pos_w = snap_plug_pos_w + quat_apply(snap_plug_quat_w, self.plug_grasp_offset)
+        # EE orientation/position that aligns the gripper with the phase-entry plug pose for the pick.
+        grasp_quat_w = normalize(quat_mul(phase_plug_quat_w, self.grasp_orientation_offset))
+        grasp_pos_w = phase_plug_pos_w + quat_apply(phase_plug_quat_w, self.plug_grasp_offset)
 
         phase = self.phase
         target_pos_w = start_pos_w.clone()
@@ -308,7 +331,7 @@ class WaterhoseDemoState:
 
         # --- Pick ---
         approach = phase == self.APPROACH
-        set_target(approach, grasp_pos_w + quat_apply(snap_plug_quat_w, self.approach_offset), grasp_quat_w, 0.0)
+        set_target(approach, grasp_pos_w + quat_apply(phase_plug_quat_w, self.approach_offset), grasp_quat_w, 0.0)
 
         engage = phase == self.ENGAGE
         set_target(engage, grasp_pos_w + self.engage_offset, grasp_quat_w, 0.0)
@@ -324,7 +347,7 @@ class WaterhoseDemoState:
         t_grip[hold] = 1.0
 
         retract = phase == self.RETRACT
-        set_target(retract, start_pos_w + quat_apply(snap_plug_quat_w, self.retract_vector), start_quat_w, 1.0)
+        set_target(retract, start_pos_w + quat_apply(phase_plug_quat_w, self.retract_vector), start_quat_w, 1.0)
 
         settle = phase == self.SETTLE
         t_grip[settle] = 1.0
@@ -363,18 +386,41 @@ class WaterhoseDemoState:
         insert = phase == self.INSERT
         set_target(insert, coax_inserted_pos, coaxial_grasp_quat, 1.0)
 
-        # HOLD_INSERTED: dwell at the seated pose (where the snap-lock joint will activate).
+        # HOLD_INSERTED: dwell at the seated pose before releasing the first grasp.
         hold_ins = phase == self.HOLD_INSERTED
         set_target(hold_ins, coax_inserted_pos, coaxial_grasp_quat, 1.0)
 
-        # EXTRACT: pull the (still-grasped) plug back out of the socket along -bore axis.
-        extract = phase == self.EXTRACT
-        set_target(extract, coax_extracted_pos, coaxial_grasp_quat, 1.0)
+        # RELEASE: open the fingers while holding the inserted pose; do not pull the cable yet.
+        release = phase == self.RELEASE
+        release_blend = _smoothstep(self.elapsed / torch.clamp(self.durations[self.RELEASE], min=1.0e-6))
+        target_pos_w[release] = start_pos_w[release]
+        target_quat_w[release] = start_quat_w[release]
+        t_grip[release] = 1.0 - release_blend[release]
 
-        # WITHDRAW: lift the (still-grasped) plug clear of the socket.
-        withdraw = phase == self.WITHDRAW
+        # BACKOFF: with the gripper open, move sideways away from the socket/cable.
         withdraw_dir_w = quat_apply(self.socket_quat_w, self._vec((0.0, 1.0, 0.0)))
-        set_target(withdraw, coax_extracted_pos + self.withdraw_distance * withdraw_dir_w, coaxial_grasp_quat, 1.0)
+        backoff_pos = coax_inserted_pos + self.gripper_backoff_distance * withdraw_dir_w
+        backoff = phase == self.BACKOFF
+        set_target(backoff, backoff_pos, start_quat_w, 0.0)
+
+        # REAPPROACH: return open fingers to the inserted cable head.
+        reapproach = phase == self.REAPPROACH
+        set_target(reapproach, coax_inserted_pos, coaxial_grasp_quat, 0.0)
+
+        # REGRASP: close on the inserted cable head before extraction.
+        regrasp = phase == self.REGRASP
+        regrasp_blend = _smoothstep(self.elapsed / torch.clamp(self.durations[self.REGRASP], min=1.0e-6))
+        target_pos_w[regrasp] = start_pos_w[regrasp]
+        target_quat_w[regrasp] = start_quat_w[regrasp]
+        t_grip[regrasp] = regrasp_blend[regrasp]
+
+        # PULL_OUT: after the second grasp, remove the cable by pulling straight out of the socket.
+        pull_out = phase == self.PULL_OUT
+        set_target(pull_out, coax_extracted_pos, coaxial_grasp_quat, 1.0)
+
+        # DONE: keep holding the cable at the pulled-out pose.
+        done = phase == self.DONE
+        t_grip[done] = 1.0
 
         # Smoothstep blend from the entry pose to the target pose (world frame).
         blend = _smoothstep(self.elapsed / self.durations[self.phase]).unsqueeze(-1)

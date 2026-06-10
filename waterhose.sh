@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 DEFAULT_WORKSPACE="${SCRIPT_DIR}/waterhose-demo"
 DEFAULT_REPO_DIR_NAME="IsaacLab-waterhose"
 DEFAULT_REPO_URL="${WATERHOSE_REPO_URL:-https://github.com/maxkra15/IsaacLab.git}"
-DEFAULT_REPO_REF="${WATERHOSE_REPO_REF:-waterhose-demo}"
+DEFAULT_REPO_REF="${WATERHOSE_REPO_REF:-max/waterhose-coupled-experimental}"
 DEFAULT_ISAACSIM_DIR_NAME="IsaacSim"
 DEFAULT_ISAACSIM_URL="${ISAACSIM_REPO_URL:-https://github.com/isaac-sim/IsaacSim.git}"
 DEFAULT_ISAACSIM_REF="${ISAACSIM_REPO_REF:-develop}"
@@ -70,6 +70,7 @@ usage() {
     cat <<'EOF'
 Usage:
   ./waterhose.sh setup [options]
+  ./waterhose.sh init [options]
   ./waterhose.sh demo [options] [-- extra demo args]
   ./waterhose.sh teleop [options] [-- extra teleop args]
   ./waterhose.sh smoke [options]
@@ -79,6 +80,8 @@ Usage:
 
 Fresh-machine setup:
   ./waterhose.sh setup --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz
+  # init is an alias for setup:
+  ./waterhose.sh init --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz
 
 What setup creates by default:
   ./waterhose-demo/
@@ -93,7 +96,7 @@ Clean setup behavior:
 Setup options:
   --workspace DIR            Workspace to create. Default: ./waterhose-demo
   --repo-url URL             IsaacLab waterhose repo URL.
-  --repo-ref REF             IsaacLab waterhose branch/tag. Default: waterhose-demo
+  --repo-ref REF             IsaacLab waterhose branch/tag. Default: max/waterhose-coupled-experimental
   --repo-dir-name NAME       Checkout dir inside workspace. Default: IsaacLab-waterhose
   --isaacsim-url URL         Isaac Sim repo URL.
   --isaacsim-ref REF         Isaac Sim branch/tag. Default: develop
@@ -110,6 +113,10 @@ Setup options:
   --skip-gcc-alternatives    Do not set gcc/g++ alternatives to version 11.
   --skip-lfs                 Do not run git lfs install/pull.
   --skip-smoke               Do not run the post-install headless smoke check.
+
+Setup installs the full Isaac Lab workspace with `isaaclab.sh -i all`. Newton is
+pinned in the source tree to the current upstream Newton PR 2848 head; setup does
+not depend on a developer-local Newton checkout.
 
 Demo options:
   --workspace DIR            Workspace created by setup. Default: ./waterhose-demo
@@ -903,7 +910,7 @@ main() {
     [[ $# -gt 0 ]] && shift || true
 
     case "$command" in
-        setup)
+        setup|init)
             cmd_setup "$@" ;;
         demo)
             cmd_demo "$@" ;;

@@ -480,7 +480,8 @@ def apply_cable_attachments_to_builder(
 
     joint_ids: list[int] = []
     joint_ids_by_cable: dict[int, list[int]] = {}
-    for cable_idx, attachment in pending:
+    ordered_pending = sorted(pending, key=lambda item: 0 if item[1].add_to_articulation else 1)
+    for cable_idx, attachment in ordered_pending:
         entry = SimulationManager._cable_registry[cable_idx]
         segments_in_world = entry.segment_body_indices[world_idx]
         num_segments = len(segments_in_world)
@@ -550,10 +551,12 @@ def apply_cable_attachments_to_builder(
             child_xform=cable_xform,
             label=f"{entry.prim_path}/{suffix}_w{world_idx}",
             collision_filter_parent=True,
+            enabled=bool(attachment.enabled),
         )
         joint_id = int(joint_id)
         joint_ids.append(joint_id)
-        joint_ids_by_cable.setdefault(int(cable_idx), []).append(joint_id)
+        if attachment.add_to_articulation:
+            joint_ids_by_cable.setdefault(int(cable_idx), []).append(joint_id)
 
     for cable_idx, cable_joint_ids in joint_ids_by_cable.items():
         if not cable_joint_ids:
