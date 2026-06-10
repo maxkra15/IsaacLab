@@ -56,7 +56,8 @@ Use the bundled wrapper for a fresh machine:
 
 `init` is an alias for `setup`. It clones this branch by default, builds Isaac Sim, creates `.venv`,
 installs the full Isaac Lab workspace with `isaaclab.sh -i all`, installs Newton from upstream PR
-2848 commit `31f56815a35d3a57b64f3894d574c4814c3c7c1a`, unpacks the demo assets, and runs the
+2848 head (`refs/pull/2848/head`, verified at commit
+`7dcf1677fb4d5a79dc0592d2fcbd094737cf2d48`), unpacks the demo assets, and runs the
 headless smoke check unless `--skip-smoke` is passed.
 
 The setup does not depend on `/home/maximiliank/Work/newton-coupled` or any other local Newton edits.
@@ -192,10 +193,11 @@ Multi-env smoke test:
 
 Batching status: the task uses normal IsaacLab cloned scene setup (`replicate_physics=True`, regex
 prim paths, per-env cable anchors, and batched Torch actions/state). On 2026-06-10, the coupled task
-completed 500-step headless runs with CUDA graph capture at `--num_envs 1`, `4`, and `8`. The rollout
-rate was roughly flat on the local workstation: 28.8, 26.5, and 25.9 manager steps/s respectively.
-That means the current Newton coupled solver path is functionally batched, but not yet a linear
-throughput-scaling RL workload; VBD/proxy contact work dominates.
+completed 100-step headless non-teleop profile runs with CUDA graph capture at `--num_envs 1`, `8`,
+and `128`. The wall-step rates on the local workstation were 25.7, 22.5, and 17.2 manager steps/s,
+which corresponds to about 25.7, 180, and 2202 effective env-steps/s. The current Newton coupled
+solver path is functionally batched in play/demo mode; teleop should still be kept at one env because
+XR input and visualization are single-operator workflows.
 
 ## Assets
 

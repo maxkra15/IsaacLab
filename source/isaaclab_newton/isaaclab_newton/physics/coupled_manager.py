@@ -620,7 +620,6 @@ class NewtonCoupledManager(NewtonManager):
             proxy_bodies=None if proxy_cfg.proxy_bodies is None else list(proxy_cfg.proxy_bodies),
             mass_scale=proxy_cfg.mass_scale,
             mode=cls._build_proxy_mode(proxy_cfg.mode),
-            immovable=proxy_cfg.immovable,
             particles=list(proxy_cfg.particles),
             proxy_particles=None if proxy_cfg.proxy_particles is None else list(proxy_cfg.proxy_particles),
             collision_pipeline=proxy_cfg.collision_pipeline_factory,

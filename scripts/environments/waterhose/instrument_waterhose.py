@@ -182,8 +182,7 @@ def exp_firm_grip(env_cfg):
 
 
 def exp_heavy_proxy(env_cfg):
-    # Make the gripper proxy bodies ~immovable in the VBD view (inv_mass -> ~0),
-    # i.e. true one-way coupling: the proxy drives the cable but is not pushed back.
+    # Increase finite proxy inertia in the VBD view while keeping two-way feedback enabled.
     _proxy_cfg(env_cfg).mass_scale = 1.0e6
 
 
@@ -192,10 +191,6 @@ def exp_heavy_proxy_soft(env_cfg):
     p.mass_scale = 1.0e6
     p.shape_material_ke = 5.0e4
     p.shape_material_kd = 1.0e1
-
-
-def exp_proxy_immovable_1e3(env_cfg):
-    _proxy_cfg(env_cfg).mass_scale = 1.0e3
 
 
 def exp_no_plug_weld(env_cfg):
@@ -271,7 +266,6 @@ EXPERIMENTS = {
     "firm_grip": exp_firm_grip,
     "heavy_proxy": exp_heavy_proxy,
     "heavy_proxy_soft": exp_heavy_proxy_soft,
-    "proxy_immovable_1e3": exp_proxy_immovable_1e3,
     "no_plug_weld": exp_no_plug_weld,
     "softer_plug_weld": exp_softer_plug_weld,
     "heavier_plug": exp_heavier_plug,

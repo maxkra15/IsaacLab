@@ -24,17 +24,17 @@ EXTRAS_REQUIRE = {
     "kit": [],
     "newton": [
         "warp-lang",
-        "newton[sim] @ file:///home/maximiliank/Work/newton-coupled",
+        "newton[sim] @ git+https://github.com/newton-physics/newton.git@refs/pull/2848/head",
         "PyOpenGL-accelerate",
         "imgui-bundle>=1.92.5",
     ],
     "rerun": [
-        "newton[sim] @ file:///home/maximiliank/Work/newton-coupled",
+        "newton[sim] @ git+https://github.com/newton-physics/newton.git@refs/pull/2848/head",
         "rerun-sdk>=0.29.0",
         "pyarrow==22.0.0",
     ],
     "viser": [
-        "newton[sim] @ file:///home/maximiliank/Work/newton-coupled",
+        "newton[sim] @ git+https://github.com/newton-physics/newton.git@refs/pull/2848/head",
         "viser>=1.0.16",
     ],
 }

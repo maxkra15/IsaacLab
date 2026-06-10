@@ -860,9 +860,8 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         #
         # NOTE on coupling direction: proxies are fully dynamic finite-mass bodies
         # (mass = ``mass_scale * effective mass``) that exchange force with the cable in both
-        # directions, so the robot feels cable/plug contacts. Keep this as the only client-facing
-        # demo path; the previous one-way kinematic-proxy task was a local stability workaround and
-        # has intentionally been removed.
+        # directions, so the robot feels cable/plug contacts. Keep this finite-mass proxy path as
+        # the only client-facing demo path.
         self.sim.physics = CoupledNewtonCfg(
             scene_cfg=self.scene,
             use_cuda_graph=_env_flag("WATERHOSE_USE_CUDA_GRAPH", True),
@@ -1100,10 +1099,9 @@ class WaterhoseAdmmIkEnvCfg(WaterhoseProxyIkEnvCfg):
         # explodes the instant the fingers close on the plug (each augmented-Lagrangian iteration
         # overshoots the stiff contact, so *more* iterations make it worse). rho=5 lets the grasp
         # itself succeed, but the scene still destabilizes later during transport (the plug blows
-        # up while the gripper carries it toward the socket). Unlike the proxy path -- where
-        # making the proxy immovable (large mass_scale) gives a fully stable full-demo run -- ADMM
-        # has no comparable single-knob fix here. Prefer the proxy task (Isaac-Waterhose-Coupled-v0)
-        # for a stable demo; treat this ADMM variant as experimental until the ADMM contact
+        # up while the gripper carries it toward the socket). Prefer the finite-mass proxy task
+        # (Isaac-Waterhose-Coupled-v0) for a stable demo; treat this ADMM variant as experimental
+        # until the ADMM contact
         # solve is hardened (lower/auto rho, contact damping, or a robust complementarity step).
         solver_cfg.admm_coupling = AdmmCouplingCfg(
             iterations=5,

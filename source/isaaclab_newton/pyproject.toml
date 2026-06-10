@@ -31,8 +31,8 @@ all = [
     # RBY1DF's URDF still references a Collada visual mesh. This can be
     # removed once the demo robot is switched to a USD asset.
     "pycollada",
-    # Upstream Newton PR 2848 head, pinned by commit until the coupled-solver API lands in a release.
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@31f56815a35d3a57b64f3894d574c4814c3c7c1a",
+    # Upstream Newton PR 2848 head until the coupled-solver API lands in a release.
+    "newton[sim] @ git+https://github.com/newton-physics/newton.git@refs/pull/2848/head",
 ]
 
 [tool.setuptools]
