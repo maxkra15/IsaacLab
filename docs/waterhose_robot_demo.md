@@ -55,27 +55,54 @@ Newton proxy coupling path. It uses normal IsaacLab scene configuration:
 
 ## Standalone Setup
 
-Use the bundled wrapper for a fresh machine:
+For a clean handoff, send these files together:
 
-```bash
-./waterhose.sh init --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz
+```text
+waterhose-setup.sh
+waterhose_demo_assets.tar.gz
+docs/waterhose_robot_demo.md
+docs/newton_local_setup.md
 ```
 
-`init` is an alias for `setup`. It clones this branch by default, builds Isaac Sim, creates `.venv`,
-installs the full Isaac Lab workspace with `isaaclab.sh -i all`, installs Newton from upstream PR
-2848 head (`refs/pull/2848/head`, verified at commit
-`7dcf1677fb4d5a79dc0592d2fcbd094737cf2d48`), unpacks the demo assets, and runs the
-headless smoke check unless `--skip-smoke` is passed.
+On a fresh Linux workstation:
 
-The setup does not depend on `/home/maximiliank/Work/newton-coupled` or any other local Newton edits.
+```bash
+mkdir -p ~/waterhose-handoff
+cd ~/waterhose-handoff
+
+chmod +x ./waterhose-setup.sh
+./waterhose-setup.sh setup --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz
+
+cd waterhose-demo/IsaacLab-waterhose
+```
+
+`init` is an alias for `setup`. The setup script only performs setup: it clones this branch, builds
+Isaac Sim, creates `.venv`, installs the full Isaac Lab workspace with `isaaclab.sh -i all`, unpacks
+the demo assets, and runs a short headless smoke check unless `--skip-smoke` is passed.
+
+Newton is pinned in the source tree to upstream Newton PR 2848 commit
+`97d745063ff5556032a09a7c7f5699032f2de053`, resolved on 2026-06-10. The setup does not depend on
+`/home/maximiliank/Work/newton-coupled` or any other local Newton edits.
+
+The setup script intentionally does not wrap runtime commands. Run demo, profile, and teleop commands
+directly from the `waterhose-demo/IsaacLab-waterhose` checkout so the task, device, CloudXR profile,
+and visualizer choices are explicit.
 
 ## Running
+
+Set the display explicitly for visible Kit/Newton viewer sessions when launching from a shell that does
+not already export `DISPLAY`:
+
+```bash
+export DISPLAY=:1
+```
 
 Scripted demo with Kit:
 
 ```bash
 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
   --task Isaac-Waterhose-Coupled-v0 \
+  --num_envs 1 \
   --visualizer kit
 ```
 
@@ -84,67 +111,88 @@ Scripted demo with the Newton viewer:
 ```bash
 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
   --task Isaac-Waterhose-Coupled-v0 \
+  --num_envs 1 \
   --visualizer newton
 ```
 
-Headless profile:
+Headless profile. Prefer `--visualizer none`; do not add the legacy `--headless` flag:
 
 ```bash
 ./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
   --task Isaac-Waterhose-Coupled-v0 \
+  --num_envs 1 \
   --visualizer none \
   --max_steps 200 \
   --profile
 ```
 
-SpaceMouse teleop:
+Multi-env scaling profile:
+
+```bash
+./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
+  --task Isaac-Waterhose-Coupled-v0 \
+  --num_envs 128 \
+  --visualizer none \
+  --max_steps 100 \
+  --profile
+```
+
+SpaceMouse desktop teleop uses the relative-action teleop task:
 
 ```bash
 ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
   --task Isaac-Waterhose-Coupled-Teleop-v0 \
+  --num_envs 1 \
   --teleop_device spacemouse \
   --visualizer kit
 ```
 
-Keyboard teleop:
+Keyboard desktop teleop uses the same relative-action task:
 
 ```bash
 ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
   --task Isaac-Waterhose-Coupled-Teleop-v0 \
+  --num_envs 1 \
   --teleop_device keyboard \
   --visualizer kit
 ```
 
-XR / IsaacTeleop:
+The scripted/XR task uses an absolute 8D Newton IK action space configured through `env_cfg.isaac_teleop`.
+The desktop teleop task uses a relative 7D action space configured through `env_cfg.teleop_devices`, matching
+IsaacLab's native keyboard and SpaceMouse devices.
+
+The SpaceMouse entry uses a waterhose-specific mapping:
+
+- Cap translation moves the gripper in XYZ with the same signs as the original stable waterhose demo.
+- Cap twist rotates the gripper around the insertion/yaw axis.
+- Roll and pitch are suppressed to keep the plug aligned.
+- Translation suppresses accidental twist noise; use a pure twist motion for yaw.
+
+## Apple Vision Pro
+
+Apple Vision Pro XR teleoperation is verified on this branch with the IsaacTeleop/OpenXR path. Launch from
+the Isaac Lab checkout:
 
 ```bash
+export DISPLAY=:1
+
 ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
   --task Isaac-Waterhose-Coupled-v0 \
-  --visualizer kit \
-  --xr
-```
-
-Apple Vision Pro CloudXR profile:
-
-```bash
-./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
-  --task Isaac-Waterhose-Coupled-v0 \
+  --num_envs 1 \
   --visualizer kit \
   --xr \
-  --cloudxr_env avp
-```
-
-Apple Vision Pro XR teleoperation is verified on this branch with the IsaacTeleop/OpenXR path. Use the
-wrapper command:
-
-```bash
-./waterhose.sh teleop --xr --cloudxr-env avp --vis kit --num-envs 1 --debug-teleop
+  --cloudxr_env avp \
+  --debug_teleop
 ```
 
 Open the XR panel in Isaac Sim, select `OpenXR` and `System OpenXR Runtime`, then click `Start XR`.
 The AVP and workstation must be IP-reachable on the same wireless network or routed VLAN. If the
-workstation also has Ethernet connected, make sure the IP entered on the AVP is the workstation's
-Wi-Fi IP and that firewall rules allow CloudXR on that interface.
+workstation also has Ethernet connected, enter the workstation's Wi-Fi IP in the AVP app and allow the
+CloudXR ports on that interface.
+
+The AVP does not need to use the same iCloud account as the Mac at runtime. For Xcode installation,
+use an Apple developer account/provisioning setup that can sign and trust the Isaac XR Teleop sample app
+on the headset; using the same Apple ID on the Mac and AVP is the simplest path.
 
 Minimum AVP firewall rules for the native CloudXR profile:
 
@@ -159,14 +207,35 @@ sudo ufw allow 48000/udp
 sudo ufw allow 48002/udp
 ```
 
-Meta Quest / Pico via CloudXR.js use the web profile:
+Before wearing the headset, test the signaling port from the Mac:
 
 ```bash
-./waterhose.sh teleop --xr --cloudxr-env cloudxrjs --vis kit --num-envs 1 --debug-teleop
+nc -vz <workstation-wifi-ip> 48010
 ```
 
-Open `https://nvidia.github.io/IsaacTeleop/client` in the headset browser, enter the workstation IP,
-accept the self-signed certificate at `https://<workstation-ip>:48322/`, then connect.
+If this succeeds from the Mac but times out from the AVP, the usual causes are headset local-network
+permission, the AVP being on a different SSID/VLAN, client isolation on the Wi-Fi network, or the AVP app
+still pointing at the Ethernet IP instead of the Wi-Fi IP.
+
+## Meta Quest / Pico
+
+Meta Quest and Pico use the CloudXR.js web profile:
+
+```bash
+export DISPLAY=:1
+
+./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
+  --task Isaac-Waterhose-Coupled-v0 \
+  --num_envs 1 \
+  --visualizer kit \
+  --xr \
+  --cloudxr_env cloudxrjs \
+  --debug_teleop
+```
+
+Open `https://nvidia.github.io/IsaacTeleop/client` in the headset browser, enter the workstation Wi-Fi IP,
+accept the self-signed certificate at `https://<workstation-wifi-ip>:48322/`, return to the CloudXR.js
+client page, then connect.
 
 Minimum CloudXR.js firewall rules:
 
@@ -176,35 +245,15 @@ sudo ufw allow 48322/tcp
 sudo ufw allow 47998/udp
 ```
 
-The scripted/XR task uses an absolute 8D Newton IK action space configured through `env_cfg.isaac_teleop`.
-The desktop teleop task uses a relative 7D action space configured through `env_cfg.teleop_devices`, matching
-IsaacLab's native keyboard and SpaceMouse devices.
+## Batching Status
 
-The SpaceMouse entry uses a waterhose-specific mapping:
-
-- Cap translation moves the gripper in XYZ with the same signs as the original stable waterhose demo.
-- Cap twist rotates the gripper around the insertion/yaw axis.
-- Roll and pitch are suppressed to keep the plug aligned.
-- Translation suppresses accidental twist noise; use a pure twist motion for yaw.
-
-Multi-env smoke test:
-
-```bash
-./isaaclab.sh -p scripts/environments/waterhose/run_robot_demo.py \
-  --task Isaac-Waterhose-Coupled-v0 \
-  --num_envs 4 \
-  --visualizer none \
-  --max_steps 100 \
-  --profile
-```
-
-Batching status: the task uses normal IsaacLab cloned scene setup (`replicate_physics=True`, regex
-prim paths, per-env cable anchors, and batched Torch actions/state). On 2026-06-10, the coupled task
-completed 100-step headless non-teleop profile runs with CUDA graph capture at `--num_envs 1`, `8`,
-and `128`. The wall-step rates on the local workstation were 25.7, 22.5, and 17.2 manager steps/s,
-which corresponds to about 25.7, 180, and 2202 effective env-steps/s. The current Newton coupled
-solver path is functionally batched in play/demo mode; teleop should still be kept at one env because
-XR input and visualization are single-operator workflows.
+The task uses normal IsaacLab cloned scene setup (`replicate_physics=True`, regex prim paths, per-env
+cable anchors, and batched Torch actions/state). On 2026-06-10, the coupled task completed 100-step
+headless non-teleop profile runs with CUDA graph capture at `--num_envs 1`, `8`, and `128`. The wall-step
+rates on the local workstation were 25.7, 22.5, and 17.2 manager steps/s, which corresponds to about 25.7,
+180, and 2202 effective env-steps/s. The current Newton coupled solver path is functionally batched in
+play/demo mode; teleop should still be kept at one env because XR input and visualization are
+single-operator workflows.
 
 ## Assets
 
@@ -270,7 +319,14 @@ These notes address the initial customer feedback from the first RB-Y1 refrigera
 3. Apple Vision Pro: AVP teleoperation works on this branch using:
 
    ```bash
-   ./waterhose.sh teleop --xr --cloudxr-env avp --vis kit --num-envs 1
+   export DISPLAY=:1
+
+   ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
+     --task Isaac-Waterhose-Coupled-v0 \
+     --num_envs 1 \
+     --visualizer kit \
+     --xr \
+     --cloudxr_env avp
    ```
 
    SpaceMouse is optional and only needed for desktop teleop. A missing SpaceMouse should not block AVP.

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
-# Standalone bootstrap and run helper for the IsaacLab waterhose demo.
+# Standalone setup helper for the IsaacLab waterhose demo.
 #
 # Intended use:
 #   mkdir -p /path/to/safe/folder
-#   cp waterhose.sh /path/to/safe/folder/
+#   cp waterhose-setup.sh /path/to/safe/folder/
 #   cp waterhose_demo_assets.tar.gz /path/to/safe/folder/
 #   cd /path/to/safe/folder
-#   ./waterhose.sh setup --accept-eula
+#   ./waterhose-setup.sh setup --accept-eula
 #
 # The setup command creates /path/to/safe/folder/waterhose-demo/ and keeps the
 # IsaacLab checkout, Isaac Sim source checkout, build, venv, symlink, and assets
@@ -27,7 +27,6 @@ DEFAULT_ISAACSIM_REF="${ISAACSIM_REPO_REF:-develop}"
 DEFAULT_VENV=".venv"
 DEFAULT_ASSETS_TAR="${SCRIPT_DIR}/waterhose_demo_assets.tar.gz"
 DEFAULT_TASK="Isaac-Waterhose-Coupled-v0"
-DEFAULT_TELEOP_TASK="Isaac-Waterhose-Coupled-Teleop-v0"
 
 log() {
     printf '[waterhose] %s\n' "$*"
@@ -69,19 +68,14 @@ source_without_nounset() {
 usage() {
     cat <<'EOF'
 Usage:
-  ./waterhose.sh setup [options]
-  ./waterhose.sh init [options]
-  ./waterhose.sh demo [options] [-- extra demo args]
-  ./waterhose.sh teleop [options] [-- extra teleop args]
-  ./waterhose.sh smoke [options]
-  ./waterhose.sh profile [options]
-  ./waterhose.sh python [--workspace DIR] <script.py> [args...]
-  ./waterhose.sh shell [--workspace DIR]
+  ./waterhose-setup.sh setup [options]
+  ./waterhose-setup.sh init [options]
+  ./waterhose-setup.sh help
 
 Fresh-machine setup:
-  ./waterhose.sh setup --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz
+  ./waterhose-setup.sh setup --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz
   # init is an alias for setup:
-  ./waterhose.sh init --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz
+  ./waterhose-setup.sh init --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz
 
 What setup creates by default:
   ./waterhose-demo/
@@ -114,44 +108,9 @@ Setup options:
   --skip-lfs                 Do not run git lfs install/pull.
   --skip-smoke               Do not run the post-install headless smoke check.
 
-Setup installs the full Isaac Lab workspace with `isaaclab.sh -i all`. Newton is
-pinned in the source tree to the current upstream Newton PR 2848 head; setup does
-not depend on a developer-local Newton checkout.
-
-Demo options:
-  --workspace DIR            Workspace created by setup. Default: ./waterhose-demo
-  --task TASK                Task name. Default: Isaac-Waterhose-Coupled-v0
-  --vis VALUE                kit, newton, or none. Default: kit
-  --num-envs N               Number of environments. Default: 1
-  --max-steps N              Demo step limit. Default: 3200
-  --headless                 Legacy IsaacLab headless flag. Prefer --vis none for headless runs.
-  --profile                  Print timing from the runner.
-  --venv DIR                 venv directory inside IsaacLab checkout. Default: .venv
-
-Teleop options:
-  Uses scripts/environments/teleoperation/teleop_se3_agent.py. Desktop
-  teleop uses env_cfg.teleop_devices on Isaac-Waterhose-Coupled-Teleop-v0.
-  --isaac-teleop uses env_cfg.isaac_teleop on the selected task. XR uses
-  env_cfg.isaac_teleop on Isaac-Waterhose-Coupled-v0 by default.
-
-  --workspace DIR            Workspace created by setup. Default: ./waterhose-demo
-  --teleop-device DEVICE     keyboard, spacemouse, or gamepad. Default: spacemouse
-  --isaac-teleop             Use env_cfg.isaac_teleop instead of legacy teleop_device.
-  --xr / --no-xr             Use IsaacTeleop/OpenXR mode. Default: --no-xr.
-  --cloudxr-env VALUE        cloudxrjs, avp, none, or a .env path. Default: none
-  --no-auto-launch-cloudxr   Do not auto-launch CloudXR.
-  --task TASK                Task name. Default: Isaac-Waterhose-Coupled-Teleop-v0
-  --vis VALUE                kit. Default: kit
-  --num-envs N               Number of environments. Default: 1
-  --debug-teleop             Print periodic teleop diagnostics.
-  --venv DIR                 venv directory inside IsaacLab checkout. Default: .venv
-
-Examples:
-  ./waterhose.sh setup --accept-eula
-  ./waterhose.sh demo --vis kit --num-envs 1
-  ./waterhose.sh demo --vis none --profile --max-steps 500
-  ./waterhose.sh teleop --teleop-device spacemouse --vis kit
-  ./waterhose.sh teleop --xr --cloudxr-env avp --vis kit
+Setup installs the full Isaac Lab workspace with `isaaclab.sh -i all`. Runtime
+commands are intentionally documented in docs/waterhose_robot_demo.md instead
+of being hidden behind this setup script.
 EOF
 }
 
@@ -462,70 +421,28 @@ extract_assets() {
     [[ -d "$expected_dir" ]] || die "Asset archive did not create ${expected_dir}"
 }
 
-resolve_repo_root() {
-    local workspace="$1"
-    local repo_dir_name="${2:-$DEFAULT_REPO_DIR_NAME}"
-    local repo_root
-    repo_root="$(repo_dir_for_workspace "$workspace" "$repo_dir_name")"
-    [[ -d "$repo_root" ]] || die "IsaacLab checkout not found: ${repo_root}. Run ./waterhose.sh setup first."
-    [[ -x "${repo_root}/isaaclab.sh" ]] || die "isaaclab.sh not found or not executable in ${repo_root}"
-    printf '%s\n' "$repo_root"
-}
-
-activate_runtime_env() {
+run_setup_smoke_check() {
     local repo_root="$1"
     local venv_name="$2"
-    local venv_dir
-    venv_dir="$(venv_path "$repo_root" "$venv_name")"
-    local activate="${venv_dir}/bin/activate"
-    [[ -f "$activate" ]] || die "Virtual environment not found: ${venv_dir}. Run ./waterhose.sh setup first."
-    source_without_nounset "$activate"
-    if [[ -f "${repo_root}/_isaac_sim/setup_conda_env.sh" ]]; then
-        source_without_nounset "${repo_root}/_isaac_sim/setup_conda_env.sh" >/dev/null 2>&1 || true
-    fi
-    export PYTHONPATH="${repo_root}/source/isaaclab:${PYTHONPATH:-}"
-}
-
-run_isaaclab_python() {
-    local repo_root="$1"
-    local venv_name="$2"
-    shift 2
-    activate_runtime_env "$repo_root" "$venv_name"
-    (cd "$repo_root" && exec "${repo_root}/isaaclab.sh" -p "$@")
-}
-
-isaacsim_kit_args() {
-    local repo_root="$1"
-    local isaacsim_root
-    isaacsim_root="$(readlink -f "${repo_root}/_isaac_sim")"
-
-    local kit_args=()
-    [[ -d "${isaacsim_root}/exts" ]] && kit_args+=("--ext-folder=${isaacsim_root}/exts")
-    [[ -d "${isaacsim_root}/extsDeprecated" ]] && kit_args+=("--ext-folder=${isaacsim_root}/extsDeprecated")
-    [[ -d "${isaacsim_root}/extscache" ]] && kit_args+=("--ext-folder=${isaacsim_root}/extscache")
-
-    printf '%s' "${kit_args[*]}"
-}
-
-run_clean_venv_python() {
-    local repo_root="$1"
-    local venv_name="$2"
-    shift 2
     local venv_dir
     venv_dir="$(venv_path "$repo_root" "$venv_name")"
     local python_exe="${venv_dir}/bin/python"
     [[ -x "$python_exe" ]] || die "Python executable not found: ${python_exe}"
 
-    # --vis none uses the standalone Newton/USD Python path. Do not source
-    # _isaac_sim/setup_conda_env.sh here: its Kit LD_LIBRARY_PATH entries can
-    # shadow pip usd-core's USD libraries and break pxr imports.
+    log "Running post-install smoke check. Use --skip-smoke to skip this step."
     (
         cd "$repo_root"
         export VIRTUAL_ENV="$venv_dir"
         export PATH="${venv_dir}/bin:${PATH}"
         export PYTHONPATH="${repo_root}/source/isaaclab:${PYTHONPATH:-}"
         unset LD_LIBRARY_PATH
-        exec "$python_exe" "$@"
+        run "$python_exe" \
+            scripts/environments/waterhose/run_robot_demo.py \
+            --task "$DEFAULT_TASK" \
+            --num_envs 1 \
+            --max_steps 20 \
+            --visualizer none \
+            --profile
     )
 }
 
@@ -638,271 +555,11 @@ cmd_setup() {
     extract_assets "$repo_root" "$assets_tar" "$resume_existing"
 
     if [[ "$skip_smoke" != "1" ]]; then
-        cmd_smoke --workspace "$workspace" --repo-dir-name "$repo_dir_name" --venv "$venv_name"
+        run_setup_smoke_check "$repo_root" "$venv_name"
     fi
 
     log "Setup complete."
     log "Workspace: ${workspace}"
-}
-
-cmd_demo() {
-    local workspace="$DEFAULT_WORKSPACE"
-    local repo_dir_name="$DEFAULT_REPO_DIR_NAME"
-    local task="$DEFAULT_TASK"
-    local vis="kit"
-    local num_envs=1
-    local max_steps=3200
-    local venv_name="$DEFAULT_VENV"
-    local headless=0
-    local profile=0
-    local extra=()
-
-    while (($#)); do
-        case "$1" in
-            --workspace)
-                workspace="$(abs_path "$2")"; shift 2 ;;
-            --repo-dir-name)
-                repo_dir_name="$2"; shift 2 ;;
-            --task)
-                task="$2"; shift 2 ;;
-            --vis|--visualizer)
-                vis="$2"; shift 2 ;;
-            --num-envs|--num_envs)
-                num_envs="$2"; shift 2 ;;
-            --max-steps|--max_steps)
-                max_steps="$2"; shift 2 ;;
-            --headless)
-                headless=1; shift ;;
-            --profile)
-                profile=1; shift ;;
-            --venv)
-                venv_name="$2"; shift 2 ;;
-            --help|-h)
-                usage; exit 0 ;;
-            --)
-                shift
-                extra+=("$@")
-                break ;;
-            *)
-                extra+=("$1"); shift ;;
-        esac
-    done
-
-    local repo_root
-    repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
-    local args=(
-        scripts/environments/waterhose/run_robot_demo.py
-        --task "$task"
-        --num_envs "$num_envs"
-        --max_steps "$max_steps"
-        --vis "$vis"
-    )
-    [[ "$headless" == "1" ]] && args+=(--headless)
-    [[ "$profile" == "1" ]] && args+=(--profile)
-
-    if [[ "$vis" != "none" ]]; then
-        local kit_args
-        kit_args="$(isaacsim_kit_args "$repo_root")"
-        if [[ -n "$kit_args" && " ${extra[*]} " != *" --kit_args "* ]]; then
-            args+=(--kit_args "$kit_args")
-        fi
-    fi
-    args+=("${extra[@]}")
-
-    if [[ "$vis" == "none" ]]; then
-        run_clean_venv_python "$repo_root" "$venv_name" "${args[@]}"
-    else
-        run_isaaclab_python "$repo_root" "$venv_name" "${args[@]}"
-    fi
-}
-
-cmd_teleop() {
-    local workspace="$DEFAULT_WORKSPACE"
-    local repo_dir_name="$DEFAULT_REPO_DIR_NAME"
-    local task="$DEFAULT_TELEOP_TASK"
-    local task_explicit=0
-    local vis="kit"
-    local num_envs=1
-    local xr=0
-    local use_isaac_teleop=0
-    local teleop_device="spacemouse"
-    local cloudxr_env="none"
-    local cloudxr_explicit=0
-    local auto_launch_cloudxr=0
-    local debug_teleop=0
-    local venv_name="$DEFAULT_VENV"
-    local extra=()
-
-    while (($#)); do
-        case "$1" in
-            --workspace)
-                workspace="$(abs_path "$2")"; shift 2 ;;
-            --repo-dir-name)
-                repo_dir_name="$2"; shift 2 ;;
-            --task)
-                task="$2"; task_explicit=1; shift 2 ;;
-            --teleop-device|--teleop_device)
-                teleop_device="$2"; shift 2 ;;
-            --isaac-teleop)
-                use_isaac_teleop=1; shift ;;
-            --vis|--visualizer)
-                vis="$2"; shift 2 ;;
-            --num-envs|--num_envs)
-                num_envs="$2"; shift 2 ;;
-            --xr)
-                xr=1; use_isaac_teleop=1; shift ;;
-            --no-xr)
-                xr=0; shift ;;
-            --cloudxr-env|--cloudxr_env)
-                cloudxr_env="$2"; cloudxr_explicit=1; shift 2 ;;
-            --no-auto-launch-cloudxr|--no-auto_launch_cloudxr)
-                auto_launch_cloudxr=0; shift ;;
-            --debug-teleop|--debug_teleop)
-                debug_teleop=1; shift ;;
-            --venv)
-                venv_name="$2"; shift 2 ;;
-            --help|-h)
-                usage; exit 0 ;;
-            --)
-                shift
-                extra+=("$@")
-                break ;;
-            *)
-                extra+=("$1"); shift ;;
-        esac
-    done
-
-    if [[ "$xr" == "1" ]]; then
-        [[ "$task_explicit" == "0" ]] && task="$DEFAULT_TASK"
-        [[ "$cloudxr_explicit" == "0" ]] && cloudxr_env="cloudxrjs"
-        [[ "$cloudxr_env" != "none" ]] && auto_launch_cloudxr=1
-    fi
-
-    local repo_root
-    repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
-    local args=(
-        scripts/environments/teleoperation/teleop_se3_agent.py
-        --task "$task"
-        --num_envs "$num_envs"
-        --visualizer "$vis"
-        --cloudxr_env "$cloudxr_env"
-    )
-
-    if [[ "$use_isaac_teleop" != "1" ]]; then
-        args+=(--teleop_device "$teleop_device")
-    fi
-    if [[ "$xr" == "1" ]]; then
-        args+=(--xr)
-    fi
-    [[ "$auto_launch_cloudxr" != "1" ]] && args+=(--no-auto_launch_cloudxr)
-    [[ "$debug_teleop" == "1" ]] && args+=(--debug_teleop)
-
-    local kit_args
-    kit_args="$(isaacsim_kit_args "$repo_root")"
-    if [[ -n "$kit_args" && " ${extra[*]} " != *" --kit_args "* ]]; then
-        args+=(--kit_args "$kit_args")
-    fi
-    args+=("${extra[@]}")
-
-    run_isaaclab_python "$repo_root" "$venv_name" "${args[@]}"
-}
-
-cmd_smoke() {
-    local workspace="$DEFAULT_WORKSPACE"
-    local repo_dir_name="$DEFAULT_REPO_DIR_NAME"
-    local venv_name="$DEFAULT_VENV"
-    local task="$DEFAULT_TASK"
-    local num_envs=1
-    local max_steps=20
-
-    while (($#)); do
-        case "$1" in
-            --workspace)
-                workspace="$(abs_path "$2")"; shift 2 ;;
-            --repo-dir-name)
-                repo_dir_name="$2"; shift 2 ;;
-            --venv)
-                venv_name="$2"; shift 2 ;;
-            --task)
-                task="$2"; shift 2 ;;
-            --num-envs|--num_envs)
-                num_envs="$2"; shift 2 ;;
-            --max-steps|--max_steps)
-                max_steps="$2"; shift 2 ;;
-            --help|-h)
-                usage; exit 0 ;;
-            *)
-                die "Unknown smoke option: $1" ;;
-        esac
-    done
-
-    cmd_demo \
-        --workspace "$workspace" \
-        --repo-dir-name "$repo_dir_name" \
-        --venv "$venv_name" \
-        --task "$task" \
-        --vis none \
-        --profile \
-        --num-envs "$num_envs" \
-        --max-steps "$max_steps"
-}
-
-cmd_profile() {
-    cmd_demo --vis none --profile "$@"
-}
-
-cmd_python() {
-    local workspace="$DEFAULT_WORKSPACE"
-    local repo_dir_name="$DEFAULT_REPO_DIR_NAME"
-    local venv_name="$DEFAULT_VENV"
-
-    while (($#)); do
-        case "$1" in
-            --workspace)
-                workspace="$(abs_path "$2")"; shift 2 ;;
-            --repo-dir-name)
-                repo_dir_name="$2"; shift 2 ;;
-            --venv)
-                venv_name="$2"; shift 2 ;;
-            --help|-h)
-                usage; exit 0 ;;
-            *)
-                break ;;
-        esac
-    done
-
-    (($#)) || die "python command requires a script or module arguments."
-    local repo_root
-    repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
-    run_isaaclab_python "$repo_root" "$venv_name" "$@"
-}
-
-cmd_shell() {
-    local workspace="$DEFAULT_WORKSPACE"
-    local repo_dir_name="$DEFAULT_REPO_DIR_NAME"
-    local venv_name="$DEFAULT_VENV"
-
-    while (($#)); do
-        case "$1" in
-            --workspace)
-                workspace="$(abs_path "$2")"; shift 2 ;;
-            --repo-dir-name)
-                repo_dir_name="$2"; shift 2 ;;
-            --venv)
-                venv_name="$2"; shift 2 ;;
-            --help|-h)
-                usage; exit 0 ;;
-            *)
-                break ;;
-        esac
-    done
-
-    local repo_root
-    repo_root="$(resolve_repo_root "$workspace" "$repo_dir_name")"
-    activate_runtime_env "$repo_root" "$venv_name"
-    cd "$repo_root"
-    log "Activated $(venv_path "$repo_root" "$venv_name"). Type exit to leave the shell."
-    exec "${SHELL:-/bin/bash}" "$@"
 }
 
 main() {
@@ -912,22 +569,10 @@ main() {
     case "$command" in
         setup|init)
             cmd_setup "$@" ;;
-        demo)
-            cmd_demo "$@" ;;
-        teleop)
-            cmd_teleop "$@" ;;
-        smoke)
-            cmd_smoke "$@" ;;
-        profile)
-            cmd_profile "$@" ;;
-        python)
-            cmd_python "$@" ;;
-        shell)
-            cmd_shell "$@" ;;
         help|--help|-h)
             usage ;;
         *)
-            die "Unknown command: ${command}. Run ./waterhose.sh help." ;;
+            die "Unknown command: ${command}. Run ./waterhose-setup.sh help." ;;
     esac
 }
 

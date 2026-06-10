@@ -3,25 +3,31 @@
 Last verified: 2026-06-10.
 
 The waterhose demo depends on Newton PR 2848 until the coupled-solver APIs land in a released Newton version.
-The repository now pins directly to the current upstream PR 2848 head. No developer-local Newton checkout or
-uncommitted Newton edits are required for setup.
+The repository pins directly to the upstream PR 2848 commit verified for this branch. No developer-local
+Newton checkout or uncommitted Newton edits are required for setup.
 
 ## Active Branches
 
 - Isaac Lab fork branch: `max/waterhose-coupled-experimental`.
-- Newton dependency: upstream `newton-physics/newton` PR 2848 head, verified at commit
-  `7dcf1677fb4d5a79dc0592d2fcbd094737cf2d48`.
+- Newton dependency: upstream `newton-physics/newton` PR 2848, verified at commit
+  `97d745063ff5556032a09a7c7f5699032f2de053`.
 
 The verified Newton dependency for this demo is:
 
 ```text
-newton[sim] @ git+https://github.com/newton-physics/newton.git@refs/pull/2848/head
+newton[sim] @ git+https://github.com/newton-physics/newton.git@97d745063ff5556032a09a7c7f5699032f2de053
 ```
 
-This installs the PR 2848 source directly from GitHub. The pull-request commit is not advertised on
-the repository's normal branch/tag refs, so package installers must use the PR ref rather than the raw
-commit SHA. The PR currently requires a Warp development build,
-so Isaac Lab's core Warp requirement must allow `warp-lang>=1.14.0.dev20260514`.
+This installs the verified PR 2848 source directly from GitHub. To refresh the pin, resolve the current
+PR head with:
+
+```bash
+git ls-remote https://github.com/newton-physics/newton.git refs/pull/2848/head
+```
+
+Then update every Newton direct URL in the repo to the same commit and rerun the smoke/profile checks.
+The PR currently requires a Warp development build, so Isaac Lab's core Warp requirement must allow
+`warp-lang>=1.14.0.dev20260514`.
 
 ## Runtime Wiring
 
