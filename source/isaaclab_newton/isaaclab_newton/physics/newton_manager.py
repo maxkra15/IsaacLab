@@ -12,7 +12,7 @@ import ctypes
 import inspect
 import logging
 from abc import abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -1374,15 +1374,6 @@ class NewtonManager(PhysicsManager):
                 )
                 cls._mark_particles_dirty()
                 cls.sync_particles_to_usd()
-
-    @staticmethod
-    def _initialize_fabric_body_prims(stage, fabric_hierarchy, usdrt, body_bindings: Sequence[tuple[str, int]]) -> None:
-        """Initialize Fabric body prims used by Newton transform sync."""
-        for prim_path, body_index in body_bindings:
-            prim = stage.GetPrimAtPath(prim_path)
-            if prim.IsValid():
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.SetWorldXformFromUsd()
 
     @staticmethod
     def _initialize_fabric_particle_prims(stage, fabric_hierarchy, usdrt, prim_paths: Iterable[str]) -> None:
