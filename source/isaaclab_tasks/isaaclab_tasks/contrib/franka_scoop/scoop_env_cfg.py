@@ -269,8 +269,12 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     mpm_max_active_cells: int = 380000
     num_substeps: int = 2  # finer physics substep (dt/4) for better scoop-bowl<->MPM contact
     coupling_type: str = "base"  # robot is rigid-solved; MPM sees kinematic/static colliders
-    grid_type: str = "fixed"
-    use_cuda_graph: bool = True
+    # Training default is the SPARSE grid: at training-scale env counts it beats the fixed grid
+    # on both throughput and memory (see _scratch/reports/scoop_env_scaling_report.tex). Sparse
+    # requires grid_padding=0 (its allocator dilates per voxel) and is not CUDA-graph capturable;
+    # __post_init__ derives both from grid_type. The PLAY cfg switches to fixed + CUDA graph.
+    grid_type: str = "sparse"
+    use_cuda_graph: bool = True  # honored for the fixed grid only
 
     # ---- IK (bowl position + pitch) ----
     # Table-level reach band (env frame, above the table top): the arm reaches forward-and-down to
@@ -405,8 +409,10 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
                         solver_cfg=MPMSolverCfg(
                             voxel_size=self.voxel_size,
                             grid_type=self.grid_type,
-                            grid_padding=self.mpm_grid_padding,
-                            max_active_cell_count=self.mpm_max_active_cells,
+                            # Sparse: padding must be 0 (per-voxel dilation) and the cell cap is
+                            # ignored by Newton's sparse path; both are fixed-grid settings.
+                            grid_padding=0 if self.grid_type == "sparse" else self.mpm_grid_padding,
+                            max_active_cell_count=-1 if self.grid_type == "sparse" else self.mpm_max_active_cells,
                             strain_basis="P0",
                             transfer_scheme="apic",
                             max_iterations=self.mpm_iterations,
@@ -430,13 +436,18 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
                 use_collision_pipeline=False,
             ),
             num_substeps=self.num_substeps,
-            use_cuda_graph=self.use_cuda_graph,
+            use_cuda_graph=self.use_cuda_graph and self.grid_type == "fixed",
         )
 
 
 @configclass
 class FrankaScoopEnvCfg_PLAY(FrankaScoopEnvCfg):
     def __post_init__(self):
+        # Play/eval favors low per-step latency at few envs: fixed grid + CUDA graph (the graph
+        # replay floor beats sparse's eager floor below the ~16-env crossover). Set BEFORE the
+        # base __post_init__ bakes the solver entry.
+        self.grid_type = "fixed"
+        self.use_cuda_graph = True
         super().__post_init__()
         self.scene.num_envs = 4
         # Play/eval defaults to the REAL task: the final curriculum stage (empty cup at the pile,

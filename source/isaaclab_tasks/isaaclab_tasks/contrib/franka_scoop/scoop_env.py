@@ -322,7 +322,20 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         result = super().step(action)
         self._pin_gripper_open_states(update_fk=True)
         self._sync_scoop_bowl_body()
+        self._apply_pending_cup_fill()
         return result
+
+    def _apply_pending_cup_fill(self) -> None:
+        """Write scheduled cup pre-loads once their post-reset settle countdown expires."""
+        active = self._cup_fill_countdown > 0
+        if not bool(active.any()):
+            return
+        self._cup_fill_countdown[active] -= 1
+        due = (self._cup_fill_countdown == 0) & (self._pending_cup_fill > 0)
+        if bool(due.any()):
+            env_ids = due.nonzero(as_tuple=False).squeeze(-1)
+            self._load_cup_media(env_ids, int(self._pending_cup_fill[env_ids[0]]))
+            self._pending_cup_fill[env_ids] = 0
 
     # ------------------------------------------------------------------ build
     @staticmethod
@@ -1494,6 +1507,11 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._weld_rot_t = torch.tensor(self._weld_rot, device=dev, dtype=torch.float32)
         self._home_quat_t = torch.tensor(cfg.hand_home_quat, device=dev, dtype=torch.float32)
         self._bowl_inner_bottom_r = float(self._ee_bowl_inner_bottom_radius)
+        if str(cfg.ee_cup_shape).strip().lower() == "hemisphere":
+            # The inscribed cone (radius 0 at the floor) undercounts media resting in the
+            # spherical cavity by ~2x; widen the counting frustum. It may overlap the solid
+            # shell, which is harmless -- no particles can exist there.
+            self._bowl_inner_bottom_r = 0.6 * float(self._ee_bowl_inner_top_radius)
         self._bowl_inner_top_r = float(self._ee_bowl_inner_top_radius)
         self._bowl_floor = float(self._ee_bowl_center_local[2] - self._ee_bowl_bottom_thickness)
         self._bowl_lip = float(self._ee_bowl_height - self._ee_bowl_center_local[2])
@@ -1536,6 +1554,11 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._pitch[:] = float(cfg.home_pitch)
 
         self._reset_pose_cache: dict[str, torch.Tensor] = {}
+        # Deferred cup pre-load: written a few steps after reset, once the arm has physically
+        # settled (the written reset configuration is not the PD controller's equilibrium; the
+        # cup shifts a few cm in the first 2-3 steps and would slide out from under the media).
+        self._pending_cup_fill = torch.zeros(self.num_envs, device=dev, dtype=torch.long)
+        self._cup_fill_countdown = torch.zeros(self.num_envs, device=dev, dtype=torch.long)
         self.curriculum_stage = torch.zeros(self.num_envs, device=dev, dtype=torch.long)
         self.episode_succeeded = torch.zeros(self.num_envs, device=dev, dtype=torch.bool)
         self.ep_max_in_target = torch.zeros(self.num_envs, device=dev)
@@ -2195,8 +2218,10 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._sync_scoop_bowl_body(s0)
         self._sync_scoop_bowl_body(s1)
         self._refresh_mpm_collider_history()
-        if n_cup > 0:  # pre-load a cupful into the (now opening-up) cavity for the early dump stages
-            self._load_cup_media(env_ids, n_cup)
+        # Schedule the cup pre-load for a few steps after reset (see _pending_cup_fill); loading
+        # immediately drops the media onto a cup that is still settling toward its PD equilibrium.
+        self._pending_cup_fill[env_ids] = int(n_cup)
+        self._cup_fill_countdown[env_ids] = 4 if n_cup > 0 else 0
         # Hold the achieved reset pose. This avoids DiffIK chasing residual Newton-IK/collision error on
         # the first zero-action teleop frame.
         self._target_bowl_e[env_ids] = self.bowl_pos_e()[env_ids].detach()
