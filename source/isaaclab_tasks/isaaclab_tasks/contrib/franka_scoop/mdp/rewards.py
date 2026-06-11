@@ -12,8 +12,9 @@ mild action penalty. The curriculum tightens the success criterion over time.
 
 from __future__ import annotations
 
-import torch
 from typing import TYPE_CHECKING
+
+import torch
 
 from .terminations import transfer_success_mask
 
@@ -52,6 +53,15 @@ def particles_in_target(env: FrankaScoopEnv) -> torch.Tensor:
 def transfer_success_bonus(env: FrankaScoopEnv) -> torch.Tensor:
     """Sparse strict bonus once the required amount has reached the target."""
     return transfer_success_mask(env).float()
+
+
+def delivery_success_bonus(env: FrankaScoopEnv) -> torch.Tensor:
+    """Sparse delivery goal: 1 once more than ``cfg.target_success_count`` particles are in the target bowl.
+
+    Matches the ``delivered`` termination condition; no side effects (the termination latches the per-episode
+    success flag for the curriculum).
+    """
+    return (env.count_in_target() > float(env.cfg.target_success_count)).float()
 
 
 def removed_from_source(env: FrankaScoopEnv, norm: float = 100.0) -> torch.Tensor:

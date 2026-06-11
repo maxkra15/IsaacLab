@@ -7,6 +7,14 @@
 
 from __future__ import annotations
 
+from isaaclab_newton.physics import (
+    CoupledSolverCfg,
+    CoupledSolverEntryCfg,
+    MJWarpSolverCfg,
+    MPMSolverCfg,
+    NewtonCfg,
+)
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -19,15 +27,8 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils.configclass import configclass
-from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 
-from isaaclab_newton.physics import (
-    CoupledSolverCfg,
-    CoupledSolverEntryCfg,
-    MJWarpSolverCfg,
-    MPMSolverCfg,
-    NewtonCfg,
-)
+from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 
 from . import mdp
 
@@ -42,8 +43,9 @@ class ScoopSceneCfg(InteractiveSceneCfg):
     # The task frame follows the Franka reach tasks: table top at z=0, floor below the table.
     # ``FrankaScoopEnvCfg.__post_init__`` sets the exact floor height from ``table_half``.
     ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
-    light = AssetBaseCfg(prim_path="/World/light",
-                         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0))
+    light = AssetBaseCfg(
+        prim_path="/World/light", spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0)
+    )
     robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 
@@ -89,15 +91,17 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    # Sparse, outcome-only rewards for FILLING the cup from the pile. No distance/pose shaping: the easy
-    # start (cup tilted right in front of the pile) makes the objective reachable by exploration.
-    #   fill          = particles currently in the cup (the objective; the bowl counter is reliable here).
-    #   removed_source = light bootstrap for getting media moving out of the pile.
-    #   success        = sparse stage bonus once the cup holds the curriculum's required count.
-    # Dense reach/carry and target-delivery are dropped (delivery becomes a later-stage extension).
-    fill = RewTerm(func=mdp.particles_in_bowl, weight=6.0)
-    removed_source = RewTerm(func=mdp.removed_from_source, weight=1.0, params={"norm": 100.0})
-    success = RewTerm(func=mdp.transfer_success_bonus, weight=10.0)
+    # Scoop-AND-DUMP, OUTCOME-only (no distance/pose shaping -- the curriculum, not shaping, bridges the
+    # exploration gap; early stages start the cup pre-loaded so dumping is reachable):
+    #   delivered      = particles currently in the target bowl (the objective; dense outcome).
+    #   success        = sparse bonus once > target_success_count particles are delivered (matches the
+    #                    `delivered` termination + the curriculum success signal).
+    #   fill           = particles in the cup -- a bootstrap that only matters on the scoop stages.
+    #   removed_source = light bootstrap for getting media out of the pile (scoop stages).
+    delivered = RewTerm(func=mdp.particles_in_target, weight=6.0)
+    success = RewTerm(func=mdp.delivery_success_bonus, weight=10.0)
+    fill = RewTerm(func=mdp.particles_in_bowl, weight=2.0)
+    removed_source = RewTerm(func=mdp.removed_from_source, weight=0.5, params={"norm": 100.0})
     action_l2 = RewTerm(func=mdp.action_l2, weight=-0.002)
 
 
@@ -105,6 +109,9 @@ class RewardsCfg:
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     failure = DoneTerm(func=mdp.nonfinite_failure)
+    # Success termination: end the episode once >target_success_count particles have been delivered to the
+    # target bowl (a real terminal, not a time-out). NOTE the active reward/curriculum are still fill-based.
+    delivered = DoneTerm(func=mdp.delivered_success)
 
 
 @configclass
@@ -143,36 +150,41 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     hide_robot_visual_shapes_in_newton: bool = False  # show the robot's visual meshes in the Newton viewer too.
 
     # ---- scoop-bowl EE (gripped cup; home orientation is exactly opening-up) ----
-    gripper_open_pos: float = 0.04                 # fixed Panda finger opening; not exposed as an action
-    bowl_reach: float = 0.0584                     # fallback procedural bowl centre along +Z_hand [m]
+    gripper_open_pos: float = 0.04  # fixed Panda finger opening; not exposed as an action
+    bowl_reach: float = 0.0584  # fallback procedural bowl centre along +Z_hand [m]
     bowl_home_offset: tuple = (0.06, 0.0, -0.078)  # home bowl-centre target offset from hand (env frame) [m]
-    home_pitch: float = 0.0                        # neutral/ready bowl tilt: opening points up to hold media [rad]
-    ee_bowl_scale: float = 0.20                    # fallback scale for the procedural pour-demo bowl
+    home_pitch: float = 0.0  # neutral/ready bowl tilt: opening points up to hold media [rad]
+    ee_bowl_scale: float = 0.20  # fallback scale for the procedural pour-demo bowl
     ee_bowl_friction: float = 0.05
-    collider_margin: float = 0.002                 # pour-demo style MPM collider margin
+    collider_margin: float = 0.002  # pour-demo style MPM collider margin
     # Watertight scoop cup (own asset, cup_mesh.make_cup_collision_mesh). Walls + bottom are >= ~1.5 MPM
     # voxels (voxel 0.01) so the cup is a solid barrier on the grid and media cannot tunnel through; the
     # ~74 mm cavity spans ~7 cells for retention. It is a COLLIDE_PARTICLES-only shape, so the wider outer
     # wall harmlessly overlaps the (rigid-only) fingers.
-    ee_cup_inner_bottom_radius: float = 0.029
+    # Scoop shape: "hemisphere" = simple thick spherical-shell ladle (grid-robust; cavity depth == radius,
+    # shell thickness == wall, walls stay solid on the MPM grid at voxel 0.015). "mug" = the flared
+    # make_cup_collision_mesh cup below (with the decorative coffee-cup USD visual when gripped_cup_usd_path set).
+    ee_cup_shape: str = "hemisphere"
+    ee_ladle_radius: float = 0.045  # hemisphere cavity radius == cavity depth [m]; opening diameter = 2x
+    ee_ladle_wall_thickness: float = 0.024  # shell thickness [m]; >= ~1.5*voxel_size (0.015) so media can't tunnel
+    ee_cup_inner_bottom_radius: float = 0.029  # --- "mug" shape params (ee_cup_shape="mug") ---
     ee_cup_inner_top_radius: float = 0.037
     ee_cup_wall_thickness: float = 0.012
-    ee_cup_height: float = 0.096               # total: bottom_thickness (0.016) + cavity_depth (0.080)
+    ee_cup_height: float = 0.096  # total: bottom_thickness (0.016) + cavity_depth (0.080)
     ee_cup_bottom_thickness: float = 0.016
-    gripped_cup_hand_front_z: float = 0.066       # front edge of Panda hand collision in panda_hand frame
-    gripped_cup_base_clearance: float = 0.005      # near cup wall sits 5 mm in front of panda_hand base
+    gripped_cup_hand_front_z: float = 0.066  # front edge of Panda hand collision in panda_hand frame
+    gripped_cup_base_clearance: float = 0.005  # near cup wall sits 5 mm in front of panda_hand base
     gripped_cup_usd_path: str = (
         "omniverse://isaac-dev.ov.nvidia.com/Isaac/SimReady/Residential/Kitchen/Dishware/"
         "Coffee_Cup_A01/sm_food_beverage_coffeeCup_a01_01.usd"
     )
     gripped_cup_usd_prim_path: str = (
-        "/RootNode/Geometry/sm_food_beverage_coffeeCup_a01_body_obj_00/"
-        "sm_food_beverage_coffeeCup_a01_body_mesh_00"
+        "/RootNode/Geometry/sm_food_beverage_coffeeCup_a01_body_obj_00/sm_food_beverage_coffeeCup_a01_body_mesh_00"
     )
-    gripped_cup_visual_scale: float = 1.0           # multiplier after auto-fit to the collision proxy diameter
+    gripped_cup_visual_scale: float = 1.0  # multiplier after auto-fit to the collision proxy diameter
     gripped_cup_visual_offset: tuple = (0.0, 0.0, 0.0)
     gripped_cup_visual_quat: tuple = (0.0, 0.0, 0.0, 1.0)
-    gripped_cup_auto_fit_visual: bool = True        # center/bottom-align referenced USD with the open collision proxy
+    gripped_cup_auto_fit_visual: bool = True  # center/bottom-align referenced USD with the open collision proxy
 
     # ---- containers + media ----
     # Two simple source/target buckets sitting flat on the table top (env-frame z=0). ``source_center`` and
@@ -193,35 +205,37 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     container_wall: float = 0.012
     media_fill_frac: float = 0.80
     # ---- granular pile (source) ----
-    pile_box_wall_half: float = 0.015         # retaining-box wall half-height [m] -> 3 cm walls
-    pile_height: float = 0.150                # natural pile (cone apex) height above the table [m]
-    pile_jitter: float = 0.004                # per-particle surface noise on the spawned pile [m]
+    pile_box_wall_half: float = 0.015  # retaining-box wall half-height [m] -> 3 cm walls
+    pile_height: float = 0.150  # natural pile (cone apex) height above the table [m]
+    pile_jitter: float = 0.004  # per-particle surface noise on the spawned pile [m]
     # Pile side slope = angle of repose; ~atan(sand_friction) for dry cohesionless granular media.
 
     # ---- procedural containers + bolt-on table ----
-    container_geometry: str = "box"          # "box" (shallow pile retainer), "bucket", or "pour_bowl"
-    use_pour_bowl_mesh: bool = False         # legacy alias; use container_geometry="pour_bowl" for old bowls
+    container_geometry: str = "box"  # "box" (shallow pile retainer), "bucket", or "pour_bowl"
+    use_pour_bowl_mesh: bool = False  # legacy alias; use container_geometry="pour_bowl" for old bowls
     bucket_inner_radius: float = 0.120
     bucket_wall_thickness: float = 0.017
     bucket_height: float = 0.160
     bucket_bottom_thickness: float = 0.017
     bucket_mesh_segments: int = 32
     bucket_rigid_wall_segments: int = 16
-    bowl_target_diameter: float = 0.20       # uniform-scale source/target bowl outer rim diameter [m]
-    rigid_bowl_wall_segments: int = 16       # open rigid bowl proxies; avoids MuJoCo convex mesh caps
-    pedestal_half: tuple = (0.055, 0.055)    # only used by legacy helper/fallback geometry
-    table_half: tuple = (0.45, 0.55, 0.50)   # compact table; enough room for bowls, smaller fixed MPM grid
-    table_center_xy: tuple = (0.50, 0.00)    # centered under the source/target bowl pair, top at env-frame z=0
+    bowl_target_diameter: float = 0.20  # uniform-scale source/target bowl outer rim diameter [m]
+    rigid_bowl_wall_segments: int = 16  # open rigid bowl proxies; avoids MuJoCo convex mesh caps
+    pedestal_half: tuple = (0.055, 0.055)  # only used by legacy helper/fallback geometry
+    table_half: tuple = (0.43, 0.55, 0.50)  # compact table; enough room for bowls, smaller fixed MPM grid
+    # Shifted -x so the Franka base (bolted at env x=0) sits ON the table: front edge = 0.37 - 0.43 = -0.06,
+    # just behind the ~6 cm base footprint; back edge 0.80 still clears the containers (max x ~0.47). Top at z=0.
+    table_center_xy: tuple = (0.30, 0.00)
     sand_density: float = 1500.0
     # Free-flowing granular sand, matching Newton's MPM granular example: cohesionless and
     # undamped, moderate friction, finite yield pressure so it shears/flows under load. Cohesion
     # (tensile_yield_ratio > 0) or a large damping relaxation time make the media clump into a
     # sticky blob that "clunks" together when the scoop bowl passes through it.
     sand_friction: float = 0.7
-    sand_damping: float = 0.0              # elastic relaxation time [s]; 0 = undamped granular flow
+    sand_damping: float = 0.0  # elastic relaxation time [s]; 0 = undamped granular flow
     sand_tensile_yield_ratio: float = 0.0  # 0 = cohesionless sand (no tensile strength)
-    sand_yield_pressure: float = 1.0e12    # [Pa] pressure cap; below the 1e15 default so it yields/flows
-    sand_young_modulus: float = 1.0e15     # [Pa] near-incompressibility penalty (Newton MPM default)
+    sand_yield_pressure: float = 1.0e12  # [Pa] pressure cap; below the 1e15 default so it yields/flows
+    sand_young_modulus: float = 1.0e15  # [Pa] near-incompressibility penalty (Newton MPM default)
 
     # ---- MPM ----
     # voxel must resolve the small 1/4-scale scoop bowl: at 0.01 m the rim spans ~10 cells;
@@ -231,12 +245,18 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     particles_per_cell: float = 2.0  # MPM particle samples per voxel per axis (media spacing = voxel_size / this)
     mpm_iterations: int = 24
     mpm_grid_padding: int = 8
+    # On episode reset, restore the per-particle MPM state (elastic strain/transform -> identity, Jp -> 1,
+    # APIC velocity gradient/stress -> 0) for the reset envs to its rest values, for a deterministic stress-free
+    # fresh pile. NOTE: for the current granular rheology this is effectively a no-op (plastic flow keeps the
+    # elastic strain at identity); it does NOT explain the post-reset "pop" after a dynamic episode -- that
+    # residual was traced to the solver's grid scratchpad (not cleanly resettable from here). Default on.
+    reset_mpm_particle_state: bool = True
     # For a FIXED grid this hard-preallocates the FEM/BSR matrices. The pile_height=0.10 pile is ~14k
     # particles/env (~1.36M total at 96 envs) -> ~300k active cells after settling; 380k covers it with
     # headroom while keeping the preallocation within the shared GPU's free memory (~24 GB).
     mpm_max_active_cells: int = 380000
-    num_substeps: int = 2                   # finer physics substep (dt/4) for better scoop-bowl<->MPM contact
-    coupling_type: str = "base"            # robot is rigid-solved; MPM sees kinematic/static colliders
+    num_substeps: int = 2  # finer physics substep (dt/4) for better scoop-bowl<->MPM contact
+    coupling_type: str = "base"  # robot is rigid-solved; MPM sees kinematic/static colliders
     grid_type: str = "fixed"
     use_cuda_graph: bool = True
 
@@ -247,34 +267,38 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     workspace_lo: tuple = (0.10, -0.34, 0.020)
     workspace_hi: tuple = (0.52, 0.34, 0.30)
     ik_position_weight: float = 10.0
-    ik_rotation_weight: float = 5.0          # hold the bowl orientation steady during motion (anti-spill)
+    ik_rotation_weight: float = 5.0  # hold the bowl orientation steady during motion (anti-spill)
     ik_joint_limit_weight: float = 10.0
-    ik_lambda_initial: float = 0.1        # LM damping (multi-seed escapes local minima; lambda just stabilizes)
-    ik_step_size: float = 0.5             # LM step
+    ik_lambda_initial: float = 0.1  # LM damping (multi-seed escapes local minima; lambda just stabilizes)
+    ik_step_size: float = 0.5  # LM step
     ik_iterations: int = 12
-    reset_ik_iterations: int = 60          # LM iters per seed at reset (x n_seeds; reset is occasional)
-    ik_backend: str = "diffik"             # "diffik" for smooth runtime tracking, "newton" for full-pose IK
+    reset_ik_iterations: int = 60  # LM iters per seed at reset (x n_seeds; reset is occasional)
+    ik_backend: str = "newton"  # "newton" full-pose LM IK (single warm-started seed) or "diffik" single-step DLS
     diffik_lambda: float = 0.05
-    diffik_max_delta: float = 0.05         # per-step joint delta clamp for DiffIK runtime tracking [rad]
-    max_ik_delta: float = 0.05             # full-IK runtime joint delta clamp [rad]; 0 disables it.
-    cartesian_action_scale: float = 0.30     # m/s per unit action
-    pitch_action_scale: float = 3.0          # rad/s per unit action
-    min_pitch: float = -1.4                  # tilt bowl opening toward -X [rad]
-    max_pitch: float = 2.6                   # max bowl tilt [rad] (allows near-inversion to pour)
+    diffik_max_delta: float = 0.05  # per-step joint delta clamp for DiffIK runtime tracking [rad]
+    max_ik_delta: float = 0.05  # full-IK runtime joint delta clamp [rad]; 0 disables it.
+    cartesian_action_scale: float = 0.30  # m/s per unit action
+    pitch_action_scale: float = 3.0  # rad/s per unit action
+    min_pitch: float = -1.4  # tilt bowl opening toward -X [rad]
+    max_pitch: float = 2.6  # max bowl tilt [rad] (allows near-inversion to pour)
     action_smoothing: float = 0.4
 
     # ---- heightfield obs (env frame) ----
     heightfield_lo: tuple = (0.10, -0.40, -0.02)
     heightfield_hi: tuple = (0.46, 0.40, 0.26)
     heightfield_size: int = 16
+    # Kit-only debug: draw the live policy observations (heightfield grid colored by height + the source/held/
+    # all-media centroids and the bowl target) as USD points that update every render. Off by default (no cost).
+    debug_vis_obs: bool = False
 
     # ---- success / curriculum (mutated by ScoopCurriculum) ----
     # The watertight cup holds thousands of particles, so success is counted in hundreds, not single digits.
     # ``curriculum_target_count`` is particles-in-cup required for success per stage (placeholder scale to
     # tune once training shows a typical scoop size); ``success_particle_count`` normalizes the fill reward.
-    success_particle_count: float = 500.0    # fill-reward normalization scale (a "good scoop" ~ this many)
-    scoop_target_count: float = 50.0         # runtime curriculum target (particles in cup); set by the curriculum
+    success_particle_count: float = 500.0  # fill-reward normalization scale (a "good scoop" ~ this many)
+    scoop_target_count: float = 50.0  # runtime curriculum target (particles in cup); set by the curriculum
     curriculum_target_count: tuple = (50, 120, 250, 400, 600)
+    target_success_count: float = 10.0  # particles-in-target above which the episode ends successfully (delivery)
     # Reset scoop target offset relative to the actual reset source-particle centroid. Stage 0 starts
     # essentially inside the source pile; later stages back the arm away toward the normal home hover.
     # Easy start: the cup resets OPENING-UP just above the source-media surface (offset is relative to the
@@ -295,6 +319,27 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     # scoop-tilt instead of righting the cup. Difficulty ramps via target count + pile jitter, not start pose.
     curriculum_start_pitch: tuple = (2.06, 2.06, 2.06, 2.06, 2.06)
     curriculum_pile_xy_jitter: tuple = (0.0, 0.005, 0.01, 0.02, 0.03)
+    # Staged scoop->DUMP curriculum (per stage). Early stages reset the cup OPENING-UP and pre-loaded with a
+    # cupful so the policy only has to dump; later stages reset empty at the pile (full scoop+carry+dump).
+    #   reset_pose: "home_up" = cup opening-up over the source side (REACHABLE; carry across + dump),
+    #               "target"  = cup opening-up directly over the +y target box -- AVOID: it drives the Franka
+    #                           wrist (joint 6) to its limit (railed/uncontrollable),
+    #               "pile"    = the scoop start (cup tilted at the pile, arm_home).
+    #   cup_fill_count: particles pre-loaded into the cup cavity at reset (0 = empty, must scoop).
+    # Default = scoop-only (all "pile", no pre-load): trains the full scoop->carry->dump with the delivery
+    # reward, and is robust. The loaded-cup easing (e.g. ("home_up","home_up","home_up","pile","pile") with
+    # cup_fill (250,150,80,0,0)) is IMPLEMENTED but currently blocked -- a pre-loaded opening-up cup needs a
+    # pose that is (a) clear of the source pile (else a cup-in-media reset "pop"), (b) not wrist-limit-railed
+    # (the +y target rails joint 6), and (c) cleanly IK-placed (single-seed IK only nails some poses, and a
+    # bad placement mis-spawns the cupful -> blow-up). No single pose yet satisfies all three; revisit with a
+    # captured/validated loaded arm config (or multi-seed reset IK) before enabling.
+    curriculum_reset_pose: tuple = ("pile", "pile", "pile", "pile", "pile")
+    # Pre-load counts must fit the cavity (~450 particles packed) without overlap -> keep well under that.
+    curriculum_cup_fill_count: tuple = (0, 0, 0, 0, 0)
+    dump_hover_z: float = 0.22  # env-frame z the opening-up cup hovers at over a container before dumping [m]
+    # The loaded "home_up" reset hovers the pre-loaded cup HERE: a central spot clear of the source pile (so the
+    # cup is not embedded in media -> no reset pop) and reachable without railing the wrist. Policy carries +y.
+    loaded_hover_xy: tuple = (0.40, 0.0)
     curriculum_success_threshold: float = 0.35
     curriculum_min_resets_per_stage: int = 150
     curriculum_success_ema_alpha: float = 0.05
@@ -308,11 +353,23 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.ground.init_state = AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, table_floor_z))
         self.viewer.eye = (1.4, 1.4, 0.9)
         self.viewer.lookat = (0.50, 0.00, 0.06)
-        self.scene.robot.init_state.joint_pos.update(dict(zip(
-            ("panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4", "panda_joint5", "panda_joint6", "panda_joint7"),
-            self.arm_home,
-            strict=True,
-        )))
+        self.scene.robot.init_state.joint_pos.update(
+            dict(
+                zip(
+                    (
+                        "panda_joint1",
+                        "panda_joint2",
+                        "panda_joint3",
+                        "panda_joint4",
+                        "panda_joint5",
+                        "panda_joint6",
+                        "panda_joint7",
+                    ),
+                    self.arm_home,
+                    strict=True,
+                )
+            )
+        )
         self.scene.robot.init_state.joint_pos["panda_finger_joint.*"] = self.gripper_open_pos
         # The cup is gripped by construction. The Panda fingers are fixed-open joints in this task,
         # not controlled DoFs, so the high-gain default gripper actuator must not fight the state pin.
@@ -335,27 +392,39 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
                         body_entities=[SceneEntityCfg("robot")],
                         body_label_patterns=[r".*/Source(?:Bowl|Bucket)Rigid$", r".*/Target(?:Bowl|Bucket)Rigid$"],
                         include_static_shapes=True,
-                        substeps=self.num_substeps),
+                        substeps=self.num_substeps,
+                    ),
                     CoupledSolverEntryCfg(
                         name=MPM_ENTRY,
-                        solver_cfg=MPMSolverCfg(voxel_size=self.voxel_size, grid_type=self.grid_type,
-                                                grid_padding=self.mpm_grid_padding,
-                                                max_active_cell_count=self.mpm_max_active_cells,
-                                                strain_basis="P0", transfer_scheme="apic",
-                                                max_iterations=self.mpm_iterations, collider_velocity_mode="backward",
-                                                solver="gauss-seidel"),
+                        solver_cfg=MPMSolverCfg(
+                            voxel_size=self.voxel_size,
+                            grid_type=self.grid_type,
+                            grid_padding=self.mpm_grid_padding,
+                            max_active_cell_count=self.mpm_max_active_cells,
+                            strain_basis="P0",
+                            transfer_scheme="apic",
+                            max_iterations=self.mpm_iterations,
+                            collider_velocity_mode="backward",
+                            solver="gauss-seidel",
+                        ),
                         all_particles=True,
-                        body_label_patterns=[r".*/ScoopBowl$", r".*/Source(?:Bowl|Bucket)$", r".*/Target(?:Bowl|Bucket)$"],
+                        body_label_patterns=[
+                            r".*/ScoopBowl$",
+                            r".*/Source(?:Bowl|Bucket)$",
+                            r".*/Target(?:Bowl|Bucket)$",
+                        ],
                         # MUST be False: the giant static ground plane as an MPM collider overflows the
                         # collider rasterization at high env counts (CUDA error 700). The pile-retaining
                         # boxes are kinematic bodies selected via body_label_patterns instead.
                         include_static_shapes=False,
                         include_child_joints=False,
-                        in_place=True),
+                        in_place=True,
+                    ),
                 ],
                 use_collision_pipeline=False,
             ),
-            num_substeps=self.num_substeps, use_cuda_graph=self.use_cuda_graph,
+            num_substeps=self.num_substeps,
+            use_cuda_graph=self.use_cuda_graph,
         )
 
 

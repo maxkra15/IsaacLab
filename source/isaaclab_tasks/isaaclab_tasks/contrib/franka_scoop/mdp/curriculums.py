@@ -47,14 +47,20 @@ class ScoopCurriculum(ManagerTermBase):
             a = float(cfg.curriculum_success_ema_alpha)
             self.success_ema = (1.0 - a) * self.success_ema + a * rate
             self.resets_in_stage += n
-            if (self.stage < self.max_stage and self.resets_in_stage >= cfg.curriculum_min_resets_per_stage
-                    and self.success_ema >= cfg.curriculum_success_threshold):
+            if (
+                self.stage < self.max_stage
+                and self.resets_in_stage >= cfg.curriculum_min_resets_per_stage
+                and self.success_ema >= cfg.curriculum_success_threshold
+            ):
                 self.stage += 1
                 self.success_ema = 0.0
                 self.resets_in_stage = 0
         self._apply(env)
-        out = {"stage": float(self.stage), "success_ema": float(self.success_ema),
-               "target_count": float(env.scoop_target_count)}
+        out = {
+            "stage": float(self.stage),
+            "success_ema": float(self.success_ema),
+            "target_count": float(env.scoop_target_count),
+        }
         if n > 0:
             out["max_in_target"] = float(env.ep_max_in_target[env_ids].mean().item())
             out["max_in_bowl"] = float(env.ep_max_in_bowl[env_ids].mean().item())

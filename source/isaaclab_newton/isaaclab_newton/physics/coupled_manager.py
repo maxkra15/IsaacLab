@@ -117,9 +117,7 @@ class NewtonCoupledManager(NewtonManager):
         """Return a shallow copy of ``solver_cfg`` with selector fields resolved to ids."""
         scene_cfg = cls._resolve_scene_cfg(solver_cfg)
         resolved_cfg = copy.copy(solver_cfg)
-        resolved_cfg.entries = [
-            cls._resolve_entry_cfg(model, entry_cfg, scene_cfg) for entry_cfg in solver_cfg.entries
-        ]
+        resolved_cfg.entries = [cls._resolve_entry_cfg(model, entry_cfg, scene_cfg) for entry_cfg in solver_cfg.entries]
         resolved_proxy_coupling = copy.copy(solver_cfg.proxy_coupling)
         resolved_proxy_coupling.proxies = [
             cls._resolve_proxy_cfg(model, proxy_cfg, scene_cfg) for proxy_cfg in solver_cfg.proxy_coupling.proxies
@@ -151,9 +149,8 @@ class NewtonCoupledManager(NewtonManager):
             use_newton_default_shape_visibility = (
                 not entry_cfg.shapes and entry_cfg.include_body_shapes and entry_cfg.include_static_shapes
             )
-            if (
-                not use_newton_default_shape_visibility
-                and (entry_cfg.include_body_shapes or entry_cfg.include_static_shapes)
+            if not use_newton_default_shape_visibility and (
+                entry_cfg.include_body_shapes or entry_cfg.include_static_shapes
             ):
                 shapes.extend(
                     cls._shapes_for_bodies(

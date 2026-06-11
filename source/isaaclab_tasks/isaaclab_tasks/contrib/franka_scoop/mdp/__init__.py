@@ -25,10 +25,11 @@ from .observations import (  # noqa: F401
 from .rewards import (  # noqa: F401
     action_l2,
     carry_to_target,
+    delivery_success_bonus,
     particles_in_bowl,
     particles_in_target,
     reach_source,
     removed_from_source,
     transfer_success_bonus,
 )
-from .terminations import nonfinite_failure, transfer_success_mask  # noqa: F401
+from .terminations import delivered_success, nonfinite_failure, transfer_success_mask  # noqa: F401

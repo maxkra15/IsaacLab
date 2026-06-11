@@ -882,8 +882,7 @@ class NewtonManager(PhysicsManager):
         from .mpm_manager_cfg import MPMSolverCfg
 
         if any(
-            isinstance(solver_cfg_item, MPMSolverCfg)
-            or getattr(solver_cfg_item, "solver_type", None) == "implicit_mpm"
+            isinstance(solver_cfg_item, MPMSolverCfg) or getattr(solver_cfg_item, "solver_type", None) == "implicit_mpm"
             for solver_cfg_item in solver_cfgs
         ):
             from newton.solvers import SolverImplicitMPM

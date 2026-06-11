@@ -7,8 +7,9 @@
 
 from __future__ import annotations
 
-import torch
 from typing import TYPE_CHECKING
+
+import torch
 
 if TYPE_CHECKING:
     from ..scoop_env import FrankaScoopEnv
@@ -26,6 +27,21 @@ def transfer_success_mask(env: FrankaScoopEnv) -> torch.Tensor:
     env.ep_max_in_target = torch.maximum(env.ep_max_in_target, in_target)
     env.ep_max_in_bowl = torch.maximum(env.ep_max_in_bowl, in_bowl)
     mask = in_bowl >= env.scoop_target_count
+    env.episode_succeeded |= mask
+    return mask
+
+
+def delivered_success(env: FrankaScoopEnv) -> torch.Tensor:
+    """Terminate the episode (success) once more than ``target_success_count`` particles reach the target bowl.
+
+    Unlike :func:`transfer_success_mask` (the fill objective, which does NOT end the episode), delivering to
+    the target ends it. The per-episode success flag and ``ep_max_in_target`` are latched for the curriculum
+    and metrics.
+    """
+    in_target = env.count_in_target()
+    env.ep_max_in_target = torch.maximum(env.ep_max_in_target, in_target)
+    env.ep_max_in_bowl = torch.maximum(env.ep_max_in_bowl, env.count_in_bowl())
+    mask = in_target > float(env.cfg.target_success_count)
     env.episode_succeeded |= mask
     return mask
 

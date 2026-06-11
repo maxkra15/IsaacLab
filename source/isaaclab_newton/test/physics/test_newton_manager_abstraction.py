@@ -29,7 +29,6 @@ from types import SimpleNamespace
 
 import pytest
 import warp as wp
-from isaaclab.managers import SceneEntityCfg
 from isaaclab_newton.physics import (
     AdmmContactPairCfg,
     AdmmCouplingCfg,
@@ -60,6 +59,7 @@ from newton.solvers.experimental.coupled import (
     SolverCoupledProxy,
 )
 
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
 # ---------------------------------------------------------------------------
@@ -378,9 +378,7 @@ def test_coupled_entry_threads_generic_entry_options():
 
 def test_coupled_proxy_int_mode_is_normalized():
     """Integer proxy modes are normalized before constructing Newton proxy configs."""
-    proxy = NewtonCoupledManager._build_proxy(
-        CoupledProxyCfg(source="src", destination="dst", particles=[0], mode=1)
-    )
+    proxy = NewtonCoupledManager._build_proxy(CoupledProxyCfg(source="src", destination="dst", particles=[0], mode=1))
     assert proxy.mode == "staggered"
 
 
@@ -392,7 +390,7 @@ def test_coupled_selectors_resolve_bodies_shapes_joints_particles():
     joint = builder.add_joint_revolute(parent=base, child=finger, axis=(0, 0, 1))
     base_shape = builder.add_shape_box(base, hx=0.05, hy=0.05, hz=0.05)
     finger_shape = builder.add_shape_box(finger, hx=0.02, hy=0.02, hz=0.02)
-    ground_shape = builder.add_ground_plane()
+    builder.add_ground_plane()
     builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.1), vel=wp.vec3(0.0), mass=0.1, radius=0.02)
     builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.2), vel=wp.vec3(0.0), mass=0.1, radius=0.02)
     model = builder.finalize(device="cpu")

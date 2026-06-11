@@ -21,30 +21,38 @@ to the critic only.
 from __future__ import annotations
 
 import math
-import numpy as np
-import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import newton
+import numpy as np
+import torch
 import warp as wp
-from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab_newton.ik.newton_ik_solver import NewtonIKPoseObjective, NewtonIKSolver
 from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.physics import NewtonManager
 from newton.solvers import SolverImplicitMPM
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, Vt
+
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.sim.utils.stage import get_current_stage
-from isaaclab.utils.assets import check_file_path, retrieve_file_path
 from isaaclab.utils import math as math_utils
+from isaaclab.utils.assets import check_file_path, retrieve_file_path
 
 if TYPE_CHECKING:
     from .scoop_env_cfg import FrankaScoopEnvCfg
 
-ARM_JOINTS = ["panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4",
-              "panda_joint5", "panda_joint6", "panda_joint7"]
+ARM_JOINTS = [
+    "panda_joint1",
+    "panda_joint2",
+    "panda_joint3",
+    "panda_joint4",
+    "panda_joint5",
+    "panda_joint6",
+    "panda_joint7",
+]
 FINGER_JOINTS = ["panda_finger_joint1", "panda_finger_joint2"]
 RIGID_ENTRY = "arm"
 MPM_ENTRY = "media"
@@ -77,10 +85,15 @@ def _q_rot(q, v):
 def _q_mul(a, b):
     ax, ay, az, aw = a
     bx, by, bz, bw = b
-    return np.array([aw * bx + ax * bw + ay * bz - az * by,
-                     aw * by - ax * bz + ay * bw + az * bx,
-                     aw * bz + ax * by - ay * bx + az * bw,
-                     aw * bw - ax * bx - ay * by - az * bz], dtype=np.float64)
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ],
+        dtype=np.float64,
+    )
 
 
 def _compose_pos_quat(parent_pos, parent_quat, child_pos, child_quat) -> tuple[np.ndarray, np.ndarray]:
@@ -201,9 +214,7 @@ def _author_xform(prim: Usd.Prim, pos, quat_xyzw=(0.0, 0.0, 0.0, 1.0), scale=Non
     """Author a compact TRS stack on a visual USD prim."""
     xform = UsdGeom.Xformable(prim)
     xform.ClearXformOpOrder()
-    xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
-        Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2]))
-    )
+    xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
     x, y, z, w = [float(v) for v in quat_xyzw]
     xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Quatd(w, Gf.Vec3d(x, y, z)))
     if scale is not None:
@@ -222,12 +233,15 @@ def _author_color(prim: Usd.Prim, color) -> None:
 def _qmul_t(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     ax, ay, az, aw = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
     bx, by, bz, bw = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
-    return torch.stack([
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
-    ], dim=-1)
+    return torch.stack(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ],
+        dim=-1,
+    )
 
 
 @wp.kernel
@@ -291,7 +305,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         super().load_managers()
         # Author task USD visuals (cup/box/table/media points) only when Kit renders them, so headless
         # training neither pays for the authoring nor pulls the remote gripped-cup USD. _setup_kit_visual_sync
-        # then registers the per-render cup-pose sync (it no-ops unless these visuals exist).
+        # then registers the per-render cup-body + media-points sync (a no-op off the Kit visualizer).
         if "kit" in set(self.sim.resolve_visualizer_types()):
             self.spawn_kit_visuals()
         self._setup_kit_visual_sync()
@@ -384,11 +398,20 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._custom_proto, self._custom_meta = self._build_custom_proto(cfg)
         self._hand_ids_l, self._scoop_body_ids_l = [], []
         self._arm_q_l, self._arm_qd_l, self._finger_q_l, self._finger_qd_l, self._psrc_l = [], [], [], [], []
-        self._kit_scoop_bowl_ops = []
         self._authored_visual_envs: set[int] = set()
-        # (usd points path, global particle offset, count) per env, tagged for NewtonManager particle sync.
-        self._media_particle_prims: list[tuple[str, int, int]] = []
+        # (usd points attribute, global particle_q start, count) per env, rewritten each render by
+        # _update_media_particles_visual.
+        self._media_particle_prims: list[tuple[Usd.Attribute, int, int]] = []
         self._media_authored_envs: set[int] = set()
+        # (translate op, orient op) per env on the cup VISUAL prim, rewritten each render from the live cup
+        # body pose by _update_cup_visual_xform (the cup body's own Fabric worldMatrix is not synced -- see
+        # _sync_kit_visuals).
+        self._cup_visual_ops: list[tuple[UsdGeom.XformOp, UsdGeom.XformOp]] = []
+        # Optional Kit obs-debug prims (cfg.debug_vis_obs): heightfield grid + centroid/target markers, both
+        # rewritten each render by _update_obs_debug_visual.
+        self._obs_hf_prims: list[tuple[Usd.Attribute, Usd.Attribute, np.ndarray, float]] = []
+        self._obs_marker_prims: list[tuple[Usd.Attribute, np.ndarray]] = []
+        self._obs_vis_envs: set[int] = set()
         self._resolved_gripped_cup_source_path = None
         self._resolved_gripped_cup_usd_path = None
         self._builder_hook = None
@@ -498,9 +521,8 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 continue
             body_label = str(builder.body_label[body_id])
             shape_label = str(builder.shape_label[shape_id])
-            is_robot_shape = (
-                body_label.startswith(f"/World/envs/env_{env_id}/Robot/")
-                or shape_label.startswith(f"/World/envs/env_{env_id}/Robot/")
+            is_robot_shape = body_label.startswith(f"/World/envs/env_{env_id}/Robot/") or shape_label.startswith(
+                f"/World/envs/env_{env_id}/Robot/"
             )
             if not is_robot_shape:
                 continue
@@ -510,7 +532,10 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
 
     @staticmethod
     def _builder_label_starts(builder) -> dict[str, int]:
-        return {attr: len(getattr(builder, attr)) for attr in ("body_label", "articulation_label", "joint_label", "shape_label")}
+        return {
+            attr: len(getattr(builder, attr))
+            for attr in ("body_label", "articulation_label", "joint_label", "shape_label")
+        }
 
     @staticmethod
     def _env_label(label: str, env_root: str) -> str:
@@ -519,7 +544,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         if label.startswith("/panda"):
             return f"{env_root}{label}"
         if label.startswith("/World/"):
-            return f"{env_root}/{label[len('/World/'):]}"
+            return f"{env_root}/{label[len('/World/') :]}"
         return label
 
     @classmethod
@@ -565,14 +590,17 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         for env_id in range(self.cfg.scene.num_envs):
             self._author_custom_stage_prims(env_id, self.sim.stage)
             self._spawn_media_particles_visual(self.sim.stage, f"/World/envs/env_{env_id}", env_id)
-        self._tag_media_particles_for_kit_sync()
+            self._spawn_obs_debug_visual(self.sim.stage, f"/World/envs/env_{env_id}", env_id)
+        self._update_media_particles_visual()  # seed points before the first render
+        self._update_obs_debug_visual()
 
     def _spawn_media_particles_visual(self, stage: Usd.Stage, root: str, env_id: int) -> None:
-        """Author a points prim that Kit renders as this env's live MPM media.
+        """Author a UsdGeom.Points prim Kit renders as this env's live MPM media.
 
-        The placeholder positions are overwritten every render by :meth:`NewtonManager.sync_particles_to_usd`
-        once the prim is tagged in :meth:`_tag_media_particles_for_kit_sync`; the point count must equal the
-        env's particle count so the sync kernel walks the correct ``particle_q`` slice.
+        Kit renders the prim's USD ``points``; :meth:`_update_media_particles_visual` rewrites them from the
+        live world-space ``particle_q`` every render (mirroring the IsaacLab-mpm pour demo's KitParticlePoints).
+        A direct USD write is used because Kit does not re-render a bare Points prim through the Fabric
+        ``sync_particles_to_usd`` path used for deformable meshes.
         """
         if env_id in self._media_authored_envs:
             return
@@ -584,46 +612,89 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         if count == 0:
             return
         offset = int(ids[0].item())
-        points_path = f"{root}/MediaParticles"
-        points = UsdGeom.Points.Define(stage, points_path)
-        points.CreatePointsAttr([Gf.Vec3f(0.0, 0.0, 0.0) for _ in range(count)])
+        points = UsdGeom.Points.Define(stage, f"{root}/MediaParticles")
         width = float(self.cfg.voxel_size) / max(float(self.cfg.particles_per_cell), 1.0)
-        points.CreateWidthsAttr([width for _ in range(count)])
+        points.CreateWidthsAttr(Vt.FloatArray([width] * count))
         _author_color(points.GetPrim(), (0.85, 0.72, 0.45))
-        self._media_particle_prims.append((points_path, offset, count))
+        # (points attribute, global particle_q start, count) -- updated each render by _update_media_particles_visual.
+        self._media_particle_prims.append((points.GetPointsAttr(), offset, count))
         self._media_authored_envs.add(env_id)
 
-    def _tag_media_particles_for_kit_sync(self) -> None:
-        """Tag the media points prims so :meth:`NewtonManager.sync_particles_to_usd` fills them from particle_q.
+    def _update_media_particles_visual(self) -> None:
+        """Rewrite each media points prim's USD ``points`` from the live world-space ``particle_q``.
 
-        Mirrors the deformable Fabric-sync setup: write ``newton:particleOffset`` / ``newton:particleCount``
-        onto each prim's Fabric counterpart, then trigger one immediate sync. No-ops without a Fabric stage
-        (e.g. the Newton viewer or headless), so it is safe to call unconditionally from
-        :meth:`spawn_kit_visuals`.
+        Direct per-render USD write (the IsaacLab-mpm ``KitParticlePoints`` pattern); no Fabric tagging,
+        since Kit does not re-render a bare Points prim through ``sync_particles_to_usd``.
         """
         if not self._media_particle_prims:
             return
-        try:
-            import usdrt
-        except ImportError:
+        state = NewtonManager.get_state_0()
+        if state is None or getattr(state, "particle_q", None) is None:
             return
-        if NewtonManager._usdrt_stage is None:
-            NewtonManager._usdrt_stage = get_current_stage(fabric=True)
-        usdrt_stage = NewtonManager._usdrt_stage
-        if usdrt_stage is None:
+        pq = wp.to_torch(state.particle_q)
+        with Sdf.ChangeBlock():
+            for points_attr, offset, count in self._media_particle_prims:
+                pts = pq[offset : offset + count].detach().cpu().numpy().astype(np.float32, copy=False)
+                points_attr.Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(pts)))
+
+    def _spawn_obs_debug_visual(self, stage: Usd.Stage, root: str, env_id: int) -> None:
+        """Author the obs-debug points (cfg.debug_vis_obs): the heightfield grid + centroid/target markers.
+
+        Both are :class:`UsdGeom.Points` updated each render by :meth:`_update_obs_debug_visual` (the same
+        direct-USD-write path the media points use), so they visualize exactly what the policy observes.
+        """
+        if not getattr(self.cfg, "debug_vis_obs", False) or env_id in self._obs_vis_envs:
             return
-        for points_path, offset, count in self._media_particle_prims:
-            fab_prim = usdrt_stage.GetPrimAtPath(points_path)
-            if not fab_prim or not fab_prim.IsValid():
-                continue
-            fab_prim.CreateAttribute(
-                NewtonManager._newton_particle_offset_attr, usdrt.Sdf.ValueTypeNames.UInt, True
-            ).Set(offset)
-            fab_prim.CreateAttribute(
-                NewtonManager._newton_particle_count_attr, usdrt.Sdf.ValueTypeNames.UInt, True
-            ).Set(count)
-        NewtonManager._mark_particles_dirty()
-        NewtonManager.sync_particles_to_usd()
+        hsz = self._hf_n
+        lo = np.asarray(self.cfg.heightfield_lo, dtype=np.float64)
+        hi = np.asarray(self.cfg.heightfield_hi, dtype=np.float64)
+        origin = self._origins_np[env_id]
+        idx = np.arange(hsz * hsz)
+        # flattened index k = py*hsz + px (matches heightfield()); cell centres in world xy
+        gx = lo[0] + (idx % hsz + 0.5) / hsz * (hi[0] - lo[0]) + origin[0]
+        gy = lo[1] + (idx // hsz + 0.5) / hsz * (hi[1] - lo[1]) + origin[1]
+        grid_xy = np.column_stack([gx, gy]).astype(np.float32)
+        cell = float(hi[0] - lo[0]) / hsz
+
+        hf = UsdGeom.Points.Define(stage, f"{root}/ObsHeightfield")
+        hf.CreateWidthsAttr(Vt.FloatArray([0.55 * cell] * (hsz * hsz)))
+        hf_col = hf.CreateDisplayColorPrimvar("vertex")
+        hf_col.Set(Vt.Vec3fArray([Gf.Vec3f(0.5, 0.5, 0.5)] * (hsz * hsz)))
+
+        mk = UsdGeom.Points.Define(stage, f"{root}/ObsMarkers")
+        mk.CreateWidthsAttr(Vt.FloatArray([0.035, 0.035, 0.035, 0.04]))  # src, held, all, bowl-target
+        mk_col = mk.CreateDisplayColorPrimvar("vertex")
+        mk_col.Set(
+            Vt.Vec3fArray(
+                [Gf.Vec3f(1.0, 0.2, 0.2), Gf.Vec3f(0.2, 1.0, 0.2), Gf.Vec3f(0.2, 0.8, 1.0), Gf.Vec3f(1.0, 1.0, 0.2)]
+            )
+        )
+        self._obs_hf_prims.append((hf.GetPointsAttr(), hf_col.GetAttr(), grid_xy, float(origin[2])))
+        self._obs_marker_prims.append((mk.GetPointsAttr(), origin.astype(np.float32)))
+        self._obs_vis_envs.add(env_id)
+
+    def _update_obs_debug_visual(self) -> None:
+        """Rewrite the obs-debug points from the live observations: heightfield surface + media centroids."""
+        if not self._obs_hf_prims:
+            return
+        hf = self.heightfield().detach().cpu().numpy()  # (n, H*W) in [0,1]
+        lo_z = float(self.cfg.heightfield_lo[2])
+        rng_z = float(self.cfg.heightfield_hi[2]) - lo_z
+        src = np.nan_to_num(self.source_media_centroid_e().detach().cpu().numpy())
+        held = np.nan_to_num(self.bowl_media_centroid_e().detach().cpu().numpy())
+        allc = np.nan_to_num(self.all_media_centroid_e().detach().cpu().numpy())
+        tgt = np.nan_to_num(self._target_bowl_e.detach().cpu().numpy())
+        with Sdf.ChangeBlock():
+            for env_id, (pts_attr, col_attr, grid_xy, oz) in enumerate(self._obs_hf_prims):
+                h = hf[env_id]
+                pos = np.column_stack([grid_xy[:, 0], grid_xy[:, 1], lo_z + h * rng_z + oz]).astype(np.float32)
+                pts_attr.Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(pos)))
+                # colour by normalized height: low -> blue, high -> red
+                col = np.column_stack([h, np.full_like(h, 0.25), 1.0 - h]).astype(np.float32)
+                col_attr.Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(col)))
+                mk_attr, origin = self._obs_marker_prims[env_id]
+                mk = np.stack([src[env_id], held[env_id], allc[env_id], tgt[env_id]]).astype(np.float32) + origin
+                mk_attr.Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(mk)))
 
     def _author_custom_stage_prims(self, env_id: int, stage: Usd.Stage | None = None) -> None:
         if env_id in self._authored_visual_envs:
@@ -647,32 +718,33 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._authored_visual_envs.add(env_id)
 
     def _spawn_scoop_bowl_visual(self, stage: Usd.Stage, root: str, cfg: FrankaScoopEnvCfg, env_id: int) -> None:
-        """Spawn a visual gripped cup that is explicitly synced from Newton state."""
-        prim = stage.DefinePrim(f"{root}/ScoopBowl", "Xform")
-        if cfg.gripped_cup_usd_path:
-            self._spawn_gripped_cup_reference(stage, f"{root}/ScoopBowl", cfg)
+        """Spawn the gripped-cup visual and drive it with an authored world xform updated each render.
+
+        The visual is authored at ``ScoopBowlVisual`` -- deliberately NOT the cup body's label path
+        (``ScoopBowl``) -- so :meth:`NewtonManager.start_simulation` does not tag it as a rigid body.
+        ``sync_transforms_to_usd`` does not update the cup's (kinematic MPM-collider) Fabric worldMatrix, so a
+        body-matched prim would freeze at its start pose; a frozen Fabric worldMatrix would also override any
+        authored xform via cubric. Instead :meth:`_update_cup_visual_xform` rewrites the translate/orient ops
+        here from the live cup body pose every render, the same per-frame USD-write pattern the media points use.
+        """
+        prim = stage.DefinePrim(f"{root}/ScoopBowlVisual", "Xform")
+        # The decorative coffee-cup USD only matches the flared "mug" shape; the hemisphere ladle renders its
+        # own collider mesh so the visual exactly matches the physics.
+        if cfg.gripped_cup_usd_path and str(cfg.ee_cup_shape).lower() == "mug":
+            self._spawn_gripped_cup_reference(stage, f"{root}/ScoopBowlVisual", cfg)
         else:
-            self._spawn_procedural_scoop_bowl_mesh(stage, f"{root}/ScoopBowl")
+            self._spawn_procedural_scoop_bowl_mesh(stage, f"{root}/ScoopBowlVisual")
 
+        # Seed the world xform at the home cup pose; _update_cup_visual_xform refreshes it each render.
         hand_pos = self._origins_np[env_id] + np.asarray(cfg.hand_home_pos, dtype=np.float64)
-        hand_quat = np.asarray(cfg.hand_home_quat, dtype=np.float64)
-        scoop_pos, scoop_quat = self._scoop_bowl_pose_from_hand_pose(hand_pos, hand_quat)
-
+        scoop_pos, scoop_quat = self._scoop_bowl_pose_from_hand_pose(hand_pos, np.asarray(cfg.hand_home_quat))
         xform = UsdGeom.Xformable(prim)
         xform.ClearXformOpOrder()
-        xform.SetResetXformStack(True)
         translate_op = xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
         orient_op = xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
-        scale_op = xform.AddScaleOp(UsdGeom.XformOp.PrecisionDouble)
-        translate_op.Set(Gf.Vec3d(float(scoop_pos[0]), float(scoop_pos[1]), float(scoop_pos[2])))
-        orient_op.Set(
-            Gf.Quatd(
-                float(scoop_quat[3]),
-                Gf.Vec3d(float(scoop_quat[0]), float(scoop_quat[1]), float(scoop_quat[2])),
-            )
-        )
-        scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
-        self._kit_scoop_bowl_ops.append((translate_op, orient_op, scale_op))
+        translate_op.Set(Gf.Vec3d(*(float(x) for x in scoop_pos)))
+        orient_op.Set(Gf.Quatd(float(scoop_quat[3]), Gf.Vec3d(*(float(scoop_quat[i]) for i in range(3)))))
+        self._cup_visual_ops.append((translate_op, orient_op))
 
     def _spawn_procedural_scoop_bowl_mesh(self, stage: Usd.Stage, cup_root: str) -> None:
         mesh = UsdGeom.Mesh.Define(stage, f"{cup_root}/Mesh")
@@ -816,18 +888,27 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         col = (0.55, 0.43, 0.30) if label == "Source" else (0.30, 0.45, 0.55)
         _author_color(mesh.GetPrim(), col)
 
-    def _spawn_box_container_visual(self, stage: Usd.Stage, root: str, cfg: FrankaScoopEnvCfg, center, label: str) -> None:
+    def _spawn_box_container_visual(
+        self, stage: Usd.Stage, root: str, cfg: FrankaScoopEnvCfg, center, label: str
+    ) -> None:
         cx, cy, cz = center
         ihx, ihy, ihz = cfg.container_inner_half
         w = cfg.container_wall
         col = (0.5, 0.4, 0.3) if label == "Source" else (0.3, 0.45, 0.55)
-        pieces = [(0.0, 0.0, cz - ihz - 0.5 * w, ihx + w, ihy + w, 0.5 * w)]
-        pieces.extend([
-            (ihx + 0.5 * w, 0.0, cz, 0.5 * w, ihy + w, ihz),
-            (-(ihx + 0.5 * w), 0.0, cz, 0.5 * w, ihy + w, ihz),
-            (0.0, ihy + 0.5 * w, cz, ihx + w, 0.5 * w, ihz),
-            (0.0, -(ihy + 0.5 * w), cz, ihx + w, 0.5 * w, ihz),
-        ])
+        # Match the kinematic pile-box collider (_add_container): floor at the table top + SHALLOW walls of
+        # half-height pile_box_wall_half (NOT ihz). Previously the visual used ihz, so the Kit walls rendered
+        # ~4x taller than the Newton collider.
+        base_z = cz - ihz
+        wh = float(getattr(cfg, "pile_box_wall_half", ihz))
+        pieces = [(0.0, 0.0, base_z - 0.5 * w, ihx + w, ihy + w, 0.5 * w)]
+        pieces.extend(
+            [
+                (ihx + 0.5 * w, 0.0, base_z + wh, 0.5 * w, ihy + w, wh),
+                (-(ihx + 0.5 * w), 0.0, base_z + wh, 0.5 * w, ihy + w, wh),
+                (0.0, ihy + 0.5 * w, base_z + wh, ihx + w, 0.5 * w, wh),
+                (0.0, -(ihy + 0.5 * w), base_z + wh, ihx + w, 0.5 * w, wh),
+            ]
+        )
         for idx, (dx, dy, pz, hx, hy, hz) in enumerate(pieces):
             cube = UsdGeom.Cube.Define(stage, f"{root}/{label}_{idx}")
             cube.CreateSizeAttr(1.0)
@@ -835,32 +916,48 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             _author_color(cube.GetPrim(), col)
 
     def _init_scoop_bowl_geometry(self, cfg: FrankaScoopEnvCfg) -> None:
-        if cfg.gripped_cup_usd_path:
-            self._ee_bowl_inner_bottom_radius = float(cfg.ee_cup_inner_bottom_radius)
-            self._ee_bowl_inner_top_radius = float(cfg.ee_cup_inner_top_radius)
-            self._ee_bowl_wall_thickness = float(cfg.ee_cup_wall_thickness)
-            self._ee_bowl_height = float(cfg.ee_cup_height)
-            self._ee_bowl_bottom_thickness = float(cfg.ee_cup_bottom_thickness)
+        from .cup_mesh import make_cup_collision_mesh, make_hemisphere_scoop_mesh
+
+        shape = str(getattr(cfg, "ee_cup_shape", "hemisphere")).lower()
+        if shape == "hemisphere":
+            # Simple, grid-robust thick hemispherical ladle: cavity depth == radius, shell thickness == wall.
+            # inner_bottom_radius is 0 (the cavity floor is a point); the 5 geom attrs below still parameterize
+            # the rigid table proxy (a cylinder approx) and the cone counting region.
+            r_in = float(cfg.ee_ladle_radius)
+            wall = float(cfg.ee_ladle_wall_thickness)
+            self._ee_bowl_inner_bottom_radius = 0.0
+            self._ee_bowl_inner_top_radius = r_in
+            self._ee_bowl_wall_thickness = wall
+            self._ee_bowl_bottom_thickness = wall
+            self._ee_bowl_height = r_in + wall
+            self._ee_bowl_vertices, self._ee_bowl_indices = make_hemisphere_scoop_mesh(
+                inner_radius=r_in, wall_thickness=wall, num_segments=32, num_rings=10
+            )
         else:
-            scale = float(cfg.ee_bowl_scale)
-            self._ee_bowl_inner_bottom_radius = POUR_BOWL_INNER_BOTTOM_RADIUS * scale
-            self._ee_bowl_inner_top_radius = POUR_BOWL_INNER_TOP_RADIUS * scale
-            self._ee_bowl_wall_thickness = POUR_BOWL_WALL_THICKNESS * scale
-            self._ee_bowl_height = POUR_BOWL_HEIGHT * scale
-            self._ee_bowl_bottom_thickness = POUR_BOWL_BOTTOM_THICKNESS * scale
+            if cfg.gripped_cup_usd_path:
+                self._ee_bowl_inner_bottom_radius = float(cfg.ee_cup_inner_bottom_radius)
+                self._ee_bowl_inner_top_radius = float(cfg.ee_cup_inner_top_radius)
+                self._ee_bowl_wall_thickness = float(cfg.ee_cup_wall_thickness)
+                self._ee_bowl_height = float(cfg.ee_cup_height)
+                self._ee_bowl_bottom_thickness = float(cfg.ee_cup_bottom_thickness)
+            else:
+                scale = float(cfg.ee_bowl_scale)
+                self._ee_bowl_inner_bottom_radius = POUR_BOWL_INNER_BOTTOM_RADIUS * scale
+                self._ee_bowl_inner_top_radius = POUR_BOWL_INNER_TOP_RADIUS * scale
+                self._ee_bowl_wall_thickness = POUR_BOWL_WALL_THICKNESS * scale
+                self._ee_bowl_height = POUR_BOWL_HEIGHT * scale
+                self._ee_bowl_bottom_thickness = POUR_BOWL_BOTTOM_THICKNESS * scale
+            # Own watertight, thick-walled, low-poly mug asset (vs the thin pour-demo bowl that let media tunnel).
+            self._ee_bowl_vertices, self._ee_bowl_indices = make_cup_collision_mesh(
+                inner_bottom_radius=self._ee_bowl_inner_bottom_radius,
+                inner_top_radius=self._ee_bowl_inner_top_radius,
+                wall_thickness=self._ee_bowl_wall_thickness,
+                cavity_depth=self._ee_bowl_height - self._ee_bowl_bottom_thickness,
+                bottom_thickness=self._ee_bowl_bottom_thickness,
+                num_segments=32,
+            )
         self._ee_bowl_center_local = np.array(
             [0.0, 0.0, 0.5 * (self._ee_bowl_bottom_thickness + self._ee_bowl_height)], dtype=np.float64
-        )
-        from .cup_mesh import make_cup_collision_mesh
-
-        # Own watertight, thick-walled, low-poly cup asset (vs the thin pour-demo bowl that let media tunnel).
-        self._ee_bowl_vertices, self._ee_bowl_indices = make_cup_collision_mesh(
-            inner_bottom_radius=self._ee_bowl_inner_bottom_radius,
-            inner_top_radius=self._ee_bowl_inner_top_radius,
-            wall_thickness=self._ee_bowl_wall_thickness,
-            cavity_depth=self._ee_bowl_height - self._ee_bowl_bottom_thickness,
-            bottom_thickness=self._ee_bowl_bottom_thickness,
-            num_segments=32,
         )
         self._container_bowl_vertices, self._container_bowl_indices = _create_open_bowl_mesh(
             inner_bottom_radius=POUR_BOWL_INNER_BOTTOM_RADIUS,
@@ -909,9 +1006,11 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             self._add_container(proto, cfg, cfg.source_center, "Source")
             self._add_container(proto, cfg, cfg.target_center, "Target")
         # Floor plane matches the visible ground below the table; the table box itself is the MPM tabletop.
-        proto.add_ground_plane(height=-self._table_height,
-                               cfg=newton.ModelBuilder.ShapeConfig(mu=0.8, margin=cfg.collider_margin,
-                               has_particle_collision=True), color=(0.3, 0.3, 0.3))
+        proto.add_ground_plane(
+            height=-self._table_height,
+            cfg=newton.ModelBuilder.ShapeConfig(mu=0.8, margin=cfg.collider_margin, has_particle_collision=True),
+            color=(0.3, 0.3, 0.3),
+        )
         self._assert_mpm_collision_scope(proto, scoop_body)
         p0 = proto.particle_count
         self._add_media(proto, cfg)
@@ -1023,8 +1122,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 continue
             if body_label in allowed_body_labels:
                 continue
-            else:
-                bad.append((sid, label, body, body_label))
+            bad.append((sid, label, body, body_label))
         if bad:
             raise RuntimeError(f"Only source/target/scoop bowl shapes may collide with MPM particles; found {bad}")
 
@@ -1043,7 +1141,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         ihx, ihy, ihz = cfg.container_inner_half
         w = cfg.container_wall
         col = (0.5, 0.4, 0.3) if label == "Source" else (0.3, 0.45, 0.55)
-        base_z = cz - ihz                         # box floor top == table top (env z=0)
+        base_z = cz - ihz  # box floor top == table top (env z=0)
         wh = float(getattr(cfg, "pile_box_wall_half", ihz))
         # (local xform, half-extents, sub-label) for the floor + 4 walls, shared by both bodies.
         box_specs = [(wp.vec3(0.0, 0.0, base_z - 0.5 * w), ihx + w, ihy + w, 0.5 * w, "Floor")]
@@ -1057,13 +1155,27 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             box_specs.append((wp.vec3(dx, dy, base_z + wh), hx, hy, wh, f"Wall_{k}"))
 
         def _spawn_box_body(suffix: str, particle_collision: bool) -> None:
-            c = newton.ModelBuilder.ShapeConfig(mu=0.8, density=0.0, margin=cfg.collider_margin,
-                                                has_particle_collision=particle_collision)
-            body = proto.add_body(xform=wp.transform(wp.vec3(cx, cy, 0.0), wp.quat_identity()),
-                                  mass=0.0, is_kinematic=True, lock_inertia=True, label=f"/World/{label}{suffix}")
-            for (xf, hx, hy, hz, name) in box_specs:
-                sid = proto.add_shape_box(body, xform=wp.transform(xf, wp.quat_identity()),
-                                          hx=hx, hy=hy, hz=hz, cfg=c, color=col, label=f"/World/{label}{suffix}/{name}")
+            c = newton.ModelBuilder.ShapeConfig(
+                mu=0.8, density=0.0, margin=cfg.collider_margin, has_particle_collision=particle_collision
+            )
+            body = proto.add_body(
+                xform=wp.transform(wp.vec3(cx, cy, 0.0), wp.quat_identity()),
+                mass=0.0,
+                is_kinematic=True,
+                lock_inertia=True,
+                label=f"/World/{label}{suffix}",
+            )
+            for xf, hx, hy, hz, name in box_specs:
+                sid = proto.add_shape_box(
+                    body,
+                    xform=wp.transform(xf, wp.quat_identity()),
+                    hx=hx,
+                    hy=hy,
+                    hz=hz,
+                    cfg=c,
+                    color=col,
+                    label=f"/World/{label}{suffix}/{name}",
+                )
                 if particle_collision:
                     proto.shape_flags[sid] |= int(newton.ShapeFlags.COLLIDE_PARTICLES) | int(newton.ShapeFlags.VISIBLE)
                     proto.shape_flags[sid] &= ~int(newton.ShapeFlags.COLLIDE_SHAPES)
@@ -1079,7 +1191,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             proto.body_inertia[body] = wp.mat33()
             proto.body_inv_inertia[body] = wp.mat33()
 
-        _spawn_box_body("Box", particle_collision=True)        # MPM collider: retains the pile.
+        _spawn_box_body("Box", particle_collision=True)  # MPM collider: retains the pile.
         _spawn_box_body("BoxRigid", particle_collision=False)  # rigid collider: blocks the rigid cup.
 
     def _add_table(self, proto, cfg) -> None:
@@ -1092,8 +1204,16 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         hx, hy, hz = cfg.table_half
         cx, cy = cfg.table_center_xy
         c = newton.ModelBuilder.ShapeConfig(mu=0.8, density=0.0, margin=cfg.collider_margin)
-        sid = proto.add_shape_box(-1, xform=wp.transform(wp.vec3(cx, cy, -hz), wp.quat_identity()),
-                                  hx=hx, hy=hy, hz=hz, cfg=c, color=(0.45, 0.38, 0.30), label="/World/Table")
+        sid = proto.add_shape_box(
+            -1,
+            xform=wp.transform(wp.vec3(cx, cy, -hz), wp.quat_identity()),
+            hx=hx,
+            hy=hy,
+            hz=hz,
+            cfg=c,
+            color=(0.45, 0.38, 0.30),
+            label="/World/Table",
+        )
         proto.shape_flags[sid] |= (
             int(newton.ShapeFlags.COLLIDE_SHAPES)
             | int(newton.ShapeFlags.COLLIDE_PARTICLES)
@@ -1105,10 +1225,18 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         if top_z <= 0.02:
             return
         px, py = cfg.pedestal_half
-        c = newton.ModelBuilder.ShapeConfig(mu=0.8, density=0.0, margin=cfg.collider_margin,
-                                            has_particle_collision=True)
-        proto.add_shape_box(-1, xform=wp.transform(wp.vec3(xy[0], xy[1], 0.5 * top_z), wp.quat_identity()),
-                            hx=px, hy=py, hz=0.5 * top_z, cfg=c, color=col)
+        c = newton.ModelBuilder.ShapeConfig(
+            mu=0.8, density=0.0, margin=cfg.collider_margin, has_particle_collision=True
+        )
+        proto.add_shape_box(
+            -1,
+            xform=wp.transform(wp.vec3(xy[0], xy[1], 0.5 * top_z), wp.quat_identity()),
+            hx=px,
+            hy=py,
+            hz=0.5 * top_z,
+            cfg=c,
+            color=col,
+        )
 
     def _add_open_bowl_rigid_proxy(
         self,
@@ -1274,8 +1402,9 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         proto.body_inv_inertia[rigid_body] = wp.mat33()
 
         mesh = newton.Mesh(self._bucket_vertices, self._bucket_indices, compute_inertia=False, is_solid=False)
-        cfg_m = newton.ModelBuilder.ShapeConfig(mu=0.8, density=0.0, margin=cfg.collider_margin,
-                                                has_particle_collision=True)
+        cfg_m = newton.ModelBuilder.ShapeConfig(
+            mu=0.8, density=0.0, margin=cfg.collider_margin, has_particle_collision=True
+        )
         body = proto.add_body(
             xform=wp.transform(wp.vec3(cx, cy, base_z), wp.quat_identity()),
             mass=0.0,
@@ -1317,8 +1446,9 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         base_z = cz - cfg.container_inner_half[2]
         scale = self._container_bowl_scale(cfg)
         col = (0.55, 0.43, 0.30) if label == "Source" else (0.30, 0.45, 0.55)
-        mesh = newton.Mesh(self._container_bowl_vertices, self._container_bowl_indices,
-                           compute_inertia=False, is_solid=False)
+        mesh = newton.Mesh(
+            self._container_bowl_vertices, self._container_bowl_indices, compute_inertia=False, is_solid=False
+        )
 
         rigid_body = proto.add_body(
             xform=wp.transform(wp.vec3(cx, cy, base_z), wp.quat_identity()),
@@ -1334,8 +1464,9 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         proto.body_inertia[rigid_body] = wp.mat33()
         proto.body_inv_inertia[rigid_body] = wp.mat33()
 
-        cfg_m = newton.ModelBuilder.ShapeConfig(mu=0.8, density=0.0, margin=cfg.collider_margin,
-                                                has_particle_collision=True)
+        cfg_m = newton.ModelBuilder.ShapeConfig(
+            mu=0.8, density=0.0, margin=cfg.collider_margin, has_particle_collision=True
+        )
         body = proto.add_body(
             xform=wp.transform(wp.vec3(cx, cy, base_z), wp.quat_identity()),
             mass=0.0,
@@ -1400,18 +1531,23 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
 
         cx, cy, cz = cfg.source_center
         ihz = float(cfg.container_inner_half[2])
-        floor_z = cz - ihz                         # box floor == table top (env z=0)
+        floor_z = cz - ihz  # box floor == table top (env z=0)
         spacing = float(cfg.voxel_size) / max(float(cfg.particles_per_cell), 1.0)
-        angle = _math.atan(max(float(cfg.sand_friction), 0.05))   # angle of repose ~ atan(friction)
+        angle = _math.atan(max(float(cfg.sand_friction), 0.05))  # angle of repose ~ atan(friction)
         height = float(cfg.pile_height)
         base_radius = height / max(_math.tan(angle), 1.0e-3)
         # Keep the pile base inside the retaining box footprint.
         base_radius = min(base_radius, float(cfg.container_inner_half[0]) - 2.0 * spacing)
         cone_volume = (_math.pi / 3.0) * base_radius * base_radius * height
-        count = max(int(cone_volume / (spacing ** 3)), 64)
+        count = max(int(cone_volume / (spacing**3)), 64)
         points = sample_conical_pile(
-            count, (float(cx), float(cy), float(floor_z) + 0.5 * spacing),
-            height=height, base_radius=base_radius, jitter=float(cfg.pile_jitter), seed=7, device="cpu",
+            count,
+            (float(cx), float(cy), float(floor_z) + 0.5 * spacing),
+            height=height,
+            base_radius=base_radius,
+            jitter=float(cfg.pile_jitter),
+            seed=7,
+            device="cpu",
         )
         cell = np.full(3, spacing, dtype=np.float32)
         self._add_filtered_particles(proto, cfg, points, cell)
@@ -1444,9 +1580,8 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             depth = max(0.0, bowl_height * float(cfg.media_fill_frac))
             depth = min(depth, max(bowl_height - 2.0 * clearance, 0.25 * float(cfg.voxel_size)))
             top_t = np.clip(depth / bowl_height, 0.0, 1.0)
-            top_radius = (
-                float(interior["inner_bottom_r"])
-                + top_t * (float(interior["inner_top_r"]) - float(interior["inner_bottom_r"]))
+            top_radius = float(interior["inner_bottom_r"]) + top_t * (
+                float(interior["inner_top_r"]) - float(interior["inner_bottom_r"])
             )
             radius = max(top_radius - clearance, 0.25 * float(cfg.voxel_size))
             floor = float(interior["floor_z"]) + clearance
@@ -1516,7 +1651,9 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             raise RuntimeError(f"Unexpected Franka arm joint order: {self._arm_joint_names}; expected {ARM_JOINTS}.")
         self._finger_joint_ids, self._finger_joint_names = self._robot.find_joints(FINGER_JOINTS, preserve_order=True)
         if self._finger_joint_names != FINGER_JOINTS:
-            raise RuntimeError(f"Unexpected Franka finger joint order: {self._finger_joint_names}; expected {FINGER_JOINTS}.")
+            raise RuntimeError(
+                f"Unexpected Franka finger joint order: {self._finger_joint_names}; expected {FINGER_JOINTS}."
+            )
         hand_body_ids, hand_body_names = self._robot.find_bodies("panda_hand", preserve_order=True)
         if len(hand_body_ids) != 1:
             raise RuntimeError(f"Expected one panda_hand body, found {hand_body_names}.")
@@ -1527,9 +1664,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._hand_ids = torch.tensor(self._hand_ids_l, device=dev, dtype=torch.long)
         self._scoop_body_ids = torch.tensor(self._scoop_body_ids_l, device=dev, dtype=torch.long)
         self._hand_ids_wp = wp.array(self._hand_ids_l, dtype=wp.int32, device=model_dev)
-        self._scoop_body_ids_wp = wp.array(
-            self._scoop_body_ids_l, dtype=wp.int32, device=model_dev
-        )
+        self._scoop_body_ids_wp = wp.array(self._scoop_body_ids_l, dtype=wp.int32, device=model_dev)
         self._media_scoop_body_ids_wp = self._resolve_media_scoop_body_ids_wp(model_dev)
         self._weld_pos_wp = wp.vec3(*self._weld_pos.tolist())
         self._weld_rot_wp = wp.quat(*self._weld_rot.tolist())
@@ -1575,7 +1710,8 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._ws_hi = torch.tensor(cfg.workspace_hi, device=dev, dtype=torch.float32)
 
         self._home_bowl_e = torch.tensor(
-            np.array(cfg.hand_home_pos) + np.array(cfg.bowl_home_offset), device=dev, dtype=torch.float32)
+            np.array(cfg.hand_home_pos) + np.array(cfg.bowl_home_offset), device=dev, dtype=torch.float32
+        )
         self._target_bowl_e = self._home_bowl_e.unsqueeze(0).repeat(self.num_envs, 1)
         self._pitch = torch.zeros(self.num_envs, device=dev)
 
@@ -1693,35 +1829,42 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             )
 
     def _setup_kit_visual_sync(self) -> None:
+        """Register the per-render Kit callback that drives the gripped cup body and the live MPM media points.
+
+        Only meaningful on the Kit visualizer; a no-op otherwise (the Newton viewer renders Newton state
+        directly, without a USD stage to keep in sync).
+        """
         if "kit" not in set(self.sim.resolve_visualizer_types()):
             return
-        if not getattr(self, "_kit_scoop_bowl_ops", None):
-            return
-        self._kit_visual_callback_name = f"franka_scoop_bowl_visuals_{id(self)}"
-        NewtonManager.register_pre_render_callback(self._kit_visual_callback_name, self._sync_kit_scoop_bowl_visuals)
-        self._sync_kit_scoop_bowl_visuals()
+        self._kit_visual_callback_name = f"franka_scoop_visuals_{id(self)}"
+        NewtonManager.register_pre_render_callback(self._kit_visual_callback_name, self._sync_kit_visuals)
+        self._sync_kit_visuals()
 
-    def _sync_kit_scoop_bowl_visuals(self) -> None:
-        # Render after the solver, but before ManagerBasedRLEnv.step() returns, can otherwise
-        # catch fixed-open fingers after contact impulses and before the post-step correction.
+    def _sync_kit_visuals(self) -> None:
+        """Pre-render callback: keep the cup body state live, then refresh the cup visual + media points.
+
+        ``sync_transforms_to_usd`` does not update the cup's (kinematic MPM-collider) Fabric worldMatrix, so
+        the cup visual and the media points are both written directly to USD here every render -- the cup via
+        its authored world xform (:meth:`_update_cup_visual_xform`), the media via its ``points`` attribute.
+        """
+        # Rendering after the solver but before ManagerBasedRLEnv.step() returns can otherwise catch
+        # fixed-open fingers after contact impulses and before the post-step correction.
         self._pin_gripper_open_states(update_fk=True)
         self._sync_scoop_bowl_body()
-        state = NewtonManager.get_state_0()
-        body_q = state.body_q.numpy()
+        self._update_cup_visual_xform()
+        self._update_media_particles_visual()
+        self._update_obs_debug_visual()
+
+    def _update_cup_visual_xform(self) -> None:
+        """Rewrite each cup visual prim's world xform from the live cup body pose ``state_0.body_q``."""
+        if not self._cup_visual_ops:
+            return
+        bq = wp.to_torch(NewtonManager.get_state_0().body_q).detach().cpu().numpy()
         with Sdf.ChangeBlock():
-            for env_id, (translate_op, orient_op, scale_op) in enumerate(self._kit_scoop_bowl_ops):
-                if env_id >= len(self._hand_ids_l):
-                    break
-                hand_pose = body_q[int(self._hand_ids_l[env_id])]
-                scoop_pos, scoop_quat = self._scoop_bowl_pose_from_hand_pose(hand_pose[:3], hand_pose[3:7])
-                translate_op.Set(Gf.Vec3d(float(scoop_pos[0]), float(scoop_pos[1]), float(scoop_pos[2])))
-                orient_op.Set(
-                    Gf.Quatd(
-                        float(scoop_quat[3]),
-                        Gf.Vec3d(float(scoop_quat[0]), float(scoop_quat[1]), float(scoop_quat[2])),
-                    )
-                )
-                scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
+            for env_id, (translate_op, orient_op) in enumerate(self._cup_visual_ops):
+                pose = bq[int(self._scoop_body_ids_l[env_id])]  # [px,py,pz, qx,qy,qz,qw] (newton transform)
+                translate_op.Set(Gf.Vec3d(float(pose[0]), float(pose[1]), float(pose[2])))
+                orient_op.Set(Gf.Quatd(float(pose[6]), Gf.Vec3d(float(pose[3]), float(pose[4]), float(pose[5]))))
 
     def close(self):
         callback_name = getattr(self, "_kit_visual_callback_name", None)
@@ -1768,11 +1911,13 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 use_relative_mode=False,
                 optimizer="lm",
                 jacobian_mode="analytic",
-                # Multi-seed LM: a single seed gets stuck in a folded local minimum (the reset diverged to a
-                # +y/-x branch). Quasi-random seeds across joint space + keep the lowest-error solve -> finds
-                # the correct unfolded branch. Only used at reset (runtime uses DiffIK), so the cost is fine.
-                sampler="roberts",
-                n_seeds=16,
+                # Single warm-started seed (the current arm config, passed each solve): runtime tracking must be
+                # smooth, so we LM-converge from the previous pose rather than re-sampling seeds. Multi-seed
+                # roberts (for escaping folded branches) would let a different branch win each control step ->
+                # joint jumps. The active reset seeds from the captured ``arm_home`` directly (not this IK), so
+                # the branch-finding seeds are not needed here.
+                sampler="none",
+                n_seeds=1,
                 iterations=self.cfg.ik_iterations,
                 step_size=self.cfg.ik_step_size,
                 lambda_initial=self.cfg.ik_lambda_initial,
@@ -1884,7 +2029,11 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
     ) -> torch.Tensor:
         q = self._pitch_to_hand_quat(pitch)
         q = q / torch.clamp(torch.linalg.norm(q, dim=-1, keepdim=True), min=1e-8)
-        solved = self._solve_ik_full(target_bowl_e, q, iterations, arm_seed=arm_seed)[:, self._ik_arm].clone().to(self.device)
+        solved = (
+            self._solve_ik_full(target_bowl_e, q, iterations, arm_seed=arm_seed)[:, self._ik_arm]
+            .clone()
+            .to(self.device)
+        )
         return torch.clamp(solved, self._arm_lo, self._arm_hi)
 
     def solve_arm_ik(self) -> torch.Tensor:
@@ -1919,9 +2068,13 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         )
         return cup_pos_b, hand_quat_b
 
-    def _diffik_target_pose_root(self, target_bowl_e: torch.Tensor, target_hand_quat_w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _diffik_target_pose_root(
+        self, target_bowl_e: torch.Tensor, target_hand_quat_w: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         target_pos_w = target_bowl_e + self.env_origins
-        target_quat_w = target_hand_quat_w / torch.clamp(torch.linalg.norm(target_hand_quat_w, dim=-1, keepdim=True), min=1e-8)
+        target_quat_w = target_hand_quat_w / torch.clamp(
+            torch.linalg.norm(target_hand_quat_w, dim=-1, keepdim=True), min=1e-8
+        )
         return math_utils.subtract_frame_transforms(
             self._robot.data.root_pos_w.torch,
             self._robot.data.root_quat_w.torch,
@@ -2137,22 +2290,25 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         pq = wp.to_torch(st.particle_q)[self._particle_ids]
         bq = wp.to_torch(st.body_q)[self._hand_ids]
         jq = self.arm_joint_q()
-        return (torch.isfinite(pq).all(dim=(1, 2)) & torch.isfinite(jq).all(dim=1)
-                & torch.isfinite(bq).all(dim=1))
+        return torch.isfinite(pq).all(dim=(1, 2)) & torch.isfinite(jq).all(dim=1) & torch.isfinite(bq).all(dim=1)
 
     @staticmethod
     def _quat_conj(q: torch.Tensor) -> torch.Tensor:
         return torch.cat((-q[..., :3], q[..., 3:4]), dim=-1)
 
     # ----------------------------------------------------------------- resets
-    def _curriculum_start_targets(self, env_ids: torch.Tensor, particle_q_w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _curriculum_start_targets(
+        self, env_ids: torch.Tensor, particle_q_w: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         reset_start = str(getattr(self.cfg, "reset_start", "home")).strip().lower()
         if reset_start == "home":
             target = self._home_bowl_e.unsqueeze(0).expand(env_ids.numel(), -1).clone()
             pitches = torch.full((env_ids.numel(),), float(self.cfg.home_pitch), device=self.device)
             return target, pitches
         if reset_start not in {"source_curriculum", "curriculum", "source"}:
-            raise ValueError(f"Unsupported reset_start={self.cfg.reset_start!r}; expected 'home' or 'source_curriculum'.")
+            raise ValueError(
+                f"Unsupported reset_start={self.cfg.reset_start!r}; expected 'home' or 'source_curriculum'."
+            )
         stage = self.curriculum_stage[env_ids].clamp(max=len(self.cfg.curriculum_start_bowl_offset) - 1)
         offsets = torch.tensor(self.cfg.curriculum_start_bowl_offset, device=self.device, dtype=torch.float32)[stage]
         pitches = torch.tensor(self.cfg.curriculum_start_pitch, device=self.device, dtype=torch.float32)[stage]
@@ -2170,14 +2326,19 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         wp.to_torch(s0.particle_qd)[self._particle_ids[env_ids]] = 0.0
         wp.to_torch(s1.particle_q)[self._particle_ids[env_ids]] = new_p
         wp.to_torch(s1.particle_qd)[self._particle_ids[env_ids]] = 0.0
-        self._target_bowl_e[env_ids], self._pitch[env_ids] = self._curriculum_start_targets(env_ids, new_p)
+        self._reset_mpm_particle_state(env_ids, (s0, s1))
         self._region_mask_cache = None
         self._region_mask_cache_step = -1
-        # The one-shot NewtonIK reset folds to a bad branch for these targets; reset to the fixed home arm
-        # config instead (deterministic, no divergence). The pile is placed right in front of this pose and
-        # the policy pitches to dig. ``_solve_target_config`` is kept for diagnostics / a future fix.
-        reset_q = self._default_arm_q
+        # Staged scoop->dump curriculum: the (global) stage picks the reset pose + how much media is pre-loaded
+        # into the cup. "pile" = the scoop start (arm_home, cup tilted at the pile); "target"/"home_up" = cup
+        # opening-up over the target / source (IK converges for these upright poses) so the policy starts
+        # holding a cupful and only has to dump.
+        stage = int(self.curriculum_stage[env_ids][0].clamp(max=len(self.cfg.curriculum_reset_pose) - 1))
+        pose_kind = str(self.cfg.curriculum_reset_pose[stage])
+        n_cup = int(self.cfg.curriculum_cup_fill_count[stage])
+        reset_q, pitch_val = self._reset_arm_config(pose_kind)
         reset_q = torch.where(torch.isfinite(reset_q), reset_q, self._default_arm_q)
+        self._pitch[env_ids] = pitch_val
         zero_vel = torch.zeros_like(reset_q[env_ids])
         self._robot.write_joint_position_to_sim_index(
             position=reset_q[env_ids],
@@ -2203,6 +2364,8 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         newton.eval_fk(NewtonManager.get_model(), s1.joint_q, s1.joint_qd, s1, None)
         self._sync_scoop_bowl_body(s0)
         self._sync_scoop_bowl_body(s1)
+        if n_cup > 0:  # pre-load a cupful into the (now opening-up) cavity for the early dump stages
+            self._load_cup_media(env_ids, n_cup, s0, s1)
         # Hold the achieved reset pose. This avoids DiffIK chasing residual Newton-IK/collision error on
         # the first zero-action teleop frame.
         self._target_bowl_e[env_ids] = self.bowl_pos_e()[env_ids].detach()
@@ -2213,6 +2376,74 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         # Capture how much media sits in the source right after re-piling (baseline for ``removed_from_source``).
         self._region_mask_cache = None
         self._init_source_count[env_ids] = self.count_in_source()[env_ids].detach()
+
+    def _reset_mpm_particle_state(self, env_ids: torch.Tensor, states) -> None:
+        """Reset the reset-envs' per-particle implicit-MPM state to its rest values.
+
+        For each reset env's particles, restore the solver's registered defaults: elastic deformation gradient
+        and particle frame -> identity (a deformation gradient of I means undeformed -- NOT literally zero),
+        plastic ``Jp`` -> 1, APIC velocity gradient and stress -> 0. This guarantees a deterministic, stress-free
+        fresh pile. For the current granular rheology it is effectively a no-op (plastic flow keeps the elastic
+        strain at identity each step), but it is correct hygiene and matters if the material is made elastic.
+        Gated by ``cfg.reset_mpm_particle_state``.
+        """
+        if not getattr(self.cfg, "reset_mpm_particle_state", True):
+            return
+        ids = self._particle_ids[env_ids]
+        eye = torch.eye(3, device=self.device)
+        rest_by_field = (
+            ("particle_elastic_strain", eye),
+            ("particle_transform", eye),
+            ("particle_qd_grad", 0.0),
+            ("particle_stress", 0.0),
+            ("particle_Jp", 1.0),
+        )
+        for state in states:
+            mpm = getattr(state, "mpm", None)
+            if mpm is None:
+                continue
+            for name, rest in rest_by_field:
+                arr = getattr(mpm, name, None)
+                if arr is None:
+                    continue
+                wp.to_torch(arr)[ids] = rest
+
+    def _reset_arm_config(self, pose_kind: str) -> tuple[torch.Tensor, float]:
+        """Arm joint targets (shape ``[num_envs, n_arm]``) + cup pitch state for a curriculum reset pose.
+
+        ``"pile"`` is the fixed scoop start (``arm_home``, cup tilted at the pile). ``"target"``/``"home_up"``
+        solve the cup OPENING-UP over the target / source via IK -- the single-seed NewtonIK converges for
+        these upright targets (verified), unlike the folded scoop poses -- so the cup can hold a pre-loaded
+        cupful. Returns the scoop tilt for ``"pile"`` and ``0`` (opening up) otherwise.
+        """
+        if pose_kind == "pile":
+            return self._default_arm_q, float(self.cfg.curriculum_start_pitch[0])
+        # "home_up" hovers at a central spot clear of the pile (no reset pop) + reachable; "target" is over the
+        # +y box (railed -- avoid).
+        xy = self.cfg.loaded_hover_xy if pose_kind == "home_up" else self.cfg.target_center
+        target = torch.tensor([float(xy[0]), float(xy[1]), float(self.cfg.dump_hover_z)], device=self.device)
+        target = target.unsqueeze(0).expand(self.num_envs, -1)
+        pitch = torch.zeros(self.num_envs, device=self.device)
+        q = self._solve_target_config(target, pitch, int(self.cfg.reset_ik_iterations), arm_seed=self._default_arm_q)
+        return q, 0.0
+
+    def _load_cup_media(self, env_ids: torch.Tensor, n_cup: int, s0, s1) -> None:
+        """Pre-load the first ``n_cup`` of each reset env's particles into the (opening-up) cup cavity.
+
+        Spread across the cavity (not a tight blob) so the pre-loaded media is not overlapping -> stable.
+        """
+        bowl_w, _ = self._bowl_pose_w()  # world cavity centre at the just-set reset pose
+        centers = bowl_w[env_ids].unsqueeze(1)  # (n, 1, 3)
+        n = env_ids.numel()
+        r_in = float(self._ee_bowl_inner_top_radius)
+        off = torch.empty(n, n_cup, 3, device=self.device)
+        off[..., :2] = (torch.rand(n, n_cup, 2, device=self.device) - 0.5) * 2.0 * (0.7 * r_in)
+        off[..., 2] = (torch.rand(n, n_cup, device=self.device) - 0.7) * (0.6 * r_in)  # toward the cavity floor
+        cup_pos = (centers + off).to(torch.float32)
+        ids = self._particle_ids[env_ids][:, :n_cup]  # (n, n_cup) global particle indices
+        for st in (s0, s1):
+            wp.to_torch(st.particle_q)[ids] = cup_pos
+            wp.to_torch(st.particle_qd)[ids] = 0.0
 
     def _sample_media_reset(self, env_ids: torch.Tensor) -> torch.Tensor:
         n = env_ids.numel()
