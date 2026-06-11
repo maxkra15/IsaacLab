@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from isaaclab_newton.assets import MPMObjectCfg
 from isaaclab_newton.physics import (
     CoupledSolverCfg,
     CoupledSolverEntryCfg,
@@ -14,6 +15,7 @@ from isaaclab_newton.physics import (
     MPMSolverCfg,
     NewtonCfg,
 )
+from isaaclab_newton.sim.spawners.mpm import MPMParticleMaterialCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
@@ -47,6 +49,12 @@ class ScoopSceneCfg(InteractiveSceneCfg):
         prim_path="/World/light", spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0)
     )
     robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    # The MPM media as a declarative scene entity. The spawn is built at env-construction time
+    # (``FrankaScoopEnv._prepare_newton_extras`` -> ``build_media_spawn_cfg``) so post-construction
+    # cfg overrides (hydra, play/train scripts) still reach the particle bed. Particle reads/
+    # writes/resets go through the :class:`~isaaclab_newton.assets.MPMObject` asset API; Kit
+    # point-cloud visualization is native.
+    media: MPMObjectCfg | None = None
 
 
 @configclass
@@ -93,9 +101,11 @@ class ObservationsCfg:
 class RewardsCfg:
     # Scoop-AND-DUMP, OUTCOME-only (no distance/pose shaping -- the curriculum, not shaping, bridges the
     # exploration gap; early stages start the cup pre-loaded so dumping is reachable):
-    #   delivered      = particles currently in the target bowl (the objective; dense outcome).
-    #   success        = sparse bonus once > target_success_count particles are delivered (matches the
-    #                    `delivered` termination + the curriculum success signal).
+    #   delivered      = particles currently in the target bowl (the objective; dense outcome). Pays every
+    #                    step after delivery, so delivering EARLY collects more -- this, not a success
+    #                    terminal, is what makes delivering beat holding the media until time-out.
+    #   success        = per-step bonus while > scoop_target_count particles are delivered; also latches
+    #                    the per-episode success flag for the curriculum (delivery_success_mask).
     #   fill           = particles in the cup -- a bootstrap that only matters on the scoop stages.
     #   removed_source = light bootstrap for getting media out of the pile (scoop stages).
     delivered = RewTerm(func=mdp.particles_in_target, weight=6.0)
@@ -107,11 +117,11 @@ class RewardsCfg:
 
 @configclass
 class TerminationsCfg:
+    # Delivery success is deliberately NOT a terminal: ending the episode at success would cut off the
+    # dense post-delivery reward stream and make "hold the media until time-out" out-pay delivering.
+    # Success is latched per episode by the success reward (delivery_success_mask) for the curriculum.
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     failure = DoneTerm(func=mdp.nonfinite_failure)
-    # Success termination: end the episode once >target_success_count particles have been delivered to the
-    # target bowl (a real terminal, not a time-out). NOTE the active reward/curriculum are still fill-based.
-    delivered = DoneTerm(func=mdp.delivered_success)
 
 
 @configclass
@@ -208,7 +218,7 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     pile_box_wall_half: float = 0.015  # retaining-box wall half-height [m] -> 3 cm walls
     pile_height: float = 0.150  # natural pile (cone apex) height above the table [m]
     pile_jitter: float = 0.004  # per-particle surface noise on the spawned pile [m]
-    # Pile side slope = angle of repose; ~atan(sand_friction) for dry cohesionless granular media.
+    # Pile side slope = angle of repose; ~atan(media_material.friction) for dry cohesionless granular media.
 
     # ---- procedural containers + bolt-on table ----
     container_geometry: str = "box"  # "box" (shallow pile retainer), "bucket", or "pour_bowl"
@@ -226,16 +236,16 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     # Shifted -x so the Franka base (bolted at env x=0) sits ON the table: front edge = 0.37 - 0.43 = -0.06,
     # just behind the ~6 cm base footprint; back edge 0.80 still clears the containers (max x ~0.47). Top at z=0.
     table_center_xy: tuple = (0.30, 0.00)
-    sand_density: float = 1500.0
     # Free-flowing granular sand, matching Newton's MPM granular example: cohesionless and
-    # undamped, moderate friction, finite yield pressure so it shears/flows under load. Cohesion
-    # (tensile_yield_ratio > 0) or a large damping relaxation time make the media clump into a
-    # sticky blob that "clunks" together when the scoop bowl passes through it.
-    sand_friction: float = 0.7
-    sand_damping: float = 0.0  # elastic relaxation time [s]; 0 = undamped granular flow
-    sand_tensile_yield_ratio: float = 0.0  # 0 = cohesionless sand (no tensile strength)
-    sand_yield_pressure: float = 1.0e12  # [Pa] pressure cap; below the 1e15 default so it yields/flows
-    sand_young_modulus: float = 1.0e15  # [Pa] near-incompressibility penalty (Newton MPM default)
+    # undamped, moderate friction, finite yield pressure (below the 1e15 default) so it
+    # shears/flows under load. Cohesion (tensile_yield_ratio > 0) or a large damping
+    # relaxation time make the media clump into a sticky blob that "clunks" together when
+    # the scoop bowl passes through it. ``friction`` also sets the pile's angle of repose.
+    media_material: MPMParticleMaterialCfg = MPMParticleMaterialCfg(
+        density=1500.0,
+        friction=0.7,
+        yield_pressure=1.0e12,
+    )
 
     # ---- MPM ----
     # voxel must resolve the small 1/4-scale scoop bowl: at 0.01 m the rim spans ~10 cells;
@@ -273,6 +283,9 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     ik_step_size: float = 0.5  # LM step
     ik_iterations: int = 12
     reset_ik_iterations: int = 60  # LM iters per seed at reset (x n_seeds; reset is occasional)
+    # Multi-seed reset IK: the loaded "target_up"/"home_up" curriculum poses need branch-finding seeds
+    # (a single warm-started seed rails the wrist over the +y target box). Runtime stays single-seed.
+    reset_ik_seeds: int = 16
     ik_backend: str = "newton"  # "newton" full-pose LM IK (single warm-started seed) or "diffik" single-step DLS
     diffik_lambda: float = 0.05
     diffik_max_delta: float = 0.05  # per-step joint delta clamp for DiffIK runtime tracking [rad]
@@ -292,50 +305,36 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     debug_vis_obs: bool = False
 
     # ---- success / curriculum (mutated by ScoopCurriculum) ----
-    # The watertight cup holds thousands of particles, so success is counted in hundreds, not single digits.
-    # ``curriculum_target_count`` is particles-in-cup required for success per stage (placeholder scale to
-    # tune once training shows a typical scoop size); ``success_particle_count`` normalizes the fill reward.
     success_particle_count: float = 500.0  # fill-reward normalization scale (a "good scoop" ~ this many)
-    scoop_target_count: float = 50.0  # runtime curriculum target (particles in cup); set by the curriculum
-    curriculum_target_count: tuple = (50, 120, 250, 400, 600)
-    target_success_count: float = 10.0  # particles-in-target above which the episode ends successfully (delivery)
-    # Reset scoop target offset relative to the actual reset source-particle centroid. Stage 0 starts
-    # essentially inside the source pile; later stages back the arm away toward the normal home hover.
-    # Easy start: the cup resets OPENING-UP just above the source-media surface (offset is relative to the
-    # source pile centroid). z offsets keep the cup cavity floor ABOVE the media (not spawned inside it);
-    # the policy pitches to dip in. Difficulty ramps mainly via target count + pile jitter below.
-    # Cup resets TILTED, just IN FRONT of the pile (robot side), not inside it -> a small move into the pile
-    # fills it. Offsets are relative to the source-pile centroid. Reset uses a damped IK (small step + many
-    # iters) so these close targets converge instead of the DLS overshooting/diverging.
-    reset_start: str = "source_curriculum"
-    curriculum_start_bowl_offset: tuple = (
-        (-0.12, 0.00, 0.060),
-        (-0.13, 0.00, 0.080),
-        (-0.14, 0.00, 0.100),
-        (-0.15, 0.00, 0.130),
-        (-0.16, 0.00, 0.160),
-    )
-    # Pitch STATE at reset must match the fixed arm_home config's tilt (~2.06) so the action term HOLDS the
-    # scoop-tilt instead of righting the cup. Difficulty ramps via target count + pile jitter, not start pose.
-    curriculum_start_pitch: tuple = (2.06, 2.06, 2.06, 2.06, 2.06)
+    # Per-stage DELIVERY success threshold: the success bonus pays (and the per-episode success flag
+    # latches, via ``delivery_success_mask``) while more than ``scoop_target_count`` particles sit in
+    # the target box. ``scoop_target_count`` is the runtime value, set from
+    # ``curriculum_target_count[stage]`` by ScoopCurriculum; early (pre-loaded) stages keep it
+    # lenient, the full-scoop stages ramp it up.
+    scoop_target_count: float = 10.0
+    curriculum_target_count: tuple = (10, 10, 10, 25, 50)
+    # Pitch STATE at the "pile" reset must match the fixed arm_home config's tilt (~2.06) so the action
+    # term HOLDS the scoop-tilt instead of righting the cup.
+    pile_start_pitch: float = 2.06
     curriculum_pile_xy_jitter: tuple = (0.0, 0.005, 0.01, 0.02, 0.03)
-    # Staged scoop->DUMP curriculum (per stage). Early stages reset the cup OPENING-UP and pre-loaded with a
-    # cupful so the policy only has to dump; later stages reset empty at the pile (full scoop+carry+dump).
-    #   reset_pose: "home_up" = cup opening-up over the source side (REACHABLE; carry across + dump),
-    #               "target"  = cup opening-up directly over the +y target box -- AVOID: it drives the Franka
-    #                           wrist (joint 6) to its limit (railed/uncontrollable),
-    #               "pile"    = the scoop start (cup tilted at the pile, arm_home).
+    # Staged DUMP-FIRST scoop curriculum (per stage). The early stages reset the cup OPENING-UP and
+    # PRE-LOADED with a cupful so the policy experiences delivery success (tilt -> particles fall into the
+    # target) within a few steps of episode start; later stages reset empty at the pile and train the full
+    # scoop->carry->dump against the same delivery objective.
+    #   reset_pose: "target_up" = pre-loaded cup opening-up directly ABOVE the target box (dump_hover_z):
+    #                             one tilt away from success. Solved by the multi-seed reset IK -- the old
+    #                             single-seed solve railed the wrist at this pose; multi-seed
+    #                             (``reset_ik_seeds``) lets a non-railed branch win, and the env warns at
+    #                             reset if the solved pose is still rail-adjacent.
+    #               "home_up"   = pre-loaded cup opening-up at ``loaded_hover_xy`` (central, clear of the
+    #                             source pile so the cupful never spawns inside media): carry +y, then dump.
+    #               "pile"      = the scoop start (cup tilted at the pile, fixed ``arm_home``; cup empty).
     #   cup_fill_count: particles pre-loaded into the cup cavity at reset (0 = empty, must scoop).
-    # Default = scoop-only (all "pile", no pre-load): trains the full scoop->carry->dump with the delivery
-    # reward, and is robust. The loaded-cup easing (e.g. ("home_up","home_up","home_up","pile","pile") with
-    # cup_fill (250,150,80,0,0)) is IMPLEMENTED but currently blocked -- a pre-loaded opening-up cup needs a
-    # pose that is (a) clear of the source pile (else a cup-in-media reset "pop"), (b) not wrist-limit-railed
-    # (the +y target rails joint 6), and (c) cleanly IK-placed (single-seed IK only nails some poses, and a
-    # bad placement mis-spawns the cupful -> blow-up). No single pose yet satisfies all three; revisit with a
-    # captured/validated loaded arm config (or multi-seed reset IK) before enabling.
-    curriculum_reset_pose: tuple = ("pile", "pile", "pile", "pile", "pile")
-    # Pre-load counts must fit the cavity (~450 particles packed) without overlap -> keep well under that.
-    curriculum_cup_fill_count: tuple = (0, 0, 0, 0, 0)
+    # Pre-load counts must fit the LOADABLE part of the cavity at the MPM particle spacing or the
+    # overlap pressure ejects the media on the first solve ("pop"). For the hemisphere ladle the
+    # sampled cone band holds ~160 non-overlapping particles at voxel 0.015 / 2 per cell -> stay under.
+    curriculum_reset_pose: tuple = ("target_up", "home_up", "pile", "pile", "pile")
+    curriculum_cup_fill_count: tuple = (120, 80, 0, 0, 0)
     dump_hover_z: float = 0.22  # env-frame z the opening-up cup hovers at over a container before dumping [m]
     # The loaded "home_up" reset hovers the pre-loaded cup HERE: a central spot clear of the source pile (so the
     # cup is not embedded in media -> no reset pop) and reachable without railing the wrist. Policy carries +y.
@@ -433,3 +432,9 @@ class FrankaScoopEnvCfg_PLAY(FrankaScoopEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 4
+        # Play/eval shows the REAL task: always reset empty at the pile (full scoop->carry->dump)
+        # instead of the dump-first training easing, and pin the success threshold to the final stage.
+        self.curriculum_reset_pose = ("pile",) * len(self.curriculum_reset_pose)
+        self.curriculum_cup_fill_count = (0,) * len(self.curriculum_cup_fill_count)
+        self.curriculum_target_count = (self.curriculum_target_count[-1],) * len(self.curriculum_target_count)
+        self.scoop_target_count = float(self.curriculum_target_count[-1])

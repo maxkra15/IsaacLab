@@ -3,11 +3,16 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Staged difficulty curriculum for the scoop transfer task.
+"""Staged dump-first curriculum for the scoop transfer task.
 
-Starts trivially easy (transfer just one particle, no media-position randomization)
-and advances stage only after the rolling success rate clears a threshold, each
-stage requiring more delivered particles and widening the media randomization.
+Starts trivially easy — the cup resets PRE-LOADED with media, opening-up, directly
+above the target box (``curriculum_reset_pose``/``curriculum_cup_fill_count``), so a
+single tilt delivers and the policy experiences success within a few steps — and
+advances stage only after the rolling success-rate EMA clears a threshold. Later
+stages move the start to a loaded hover (carry + dump) and finally to the empty cup
+at the pile (full scoop->carry->dump), while the delivered-particle requirement
+(``curriculum_target_count`` -> ``env.scoop_target_count``, consumed by the
+``delivered`` termination and success bonus) and the pile randomization ramp up.
 """
 
 from __future__ import annotations

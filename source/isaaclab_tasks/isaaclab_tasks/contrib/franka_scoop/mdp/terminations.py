@@ -15,33 +15,22 @@ if TYPE_CHECKING:
     from ..scoop_env import FrankaScoopEnv
 
 
-def transfer_success_mask(env: FrankaScoopEnv) -> torch.Tensor:
-    """True where the cup holds at least the curriculum's required amount of media (a successful scoop).
+def delivery_success_mask(env: FrankaScoopEnv) -> torch.Tensor:
+    """True where more than ``scoop_target_count`` particles currently sit in the target bowl.
 
-    Called every step (from the success reward). Success does NOT terminate the episode, so the policy
-    can keep scooping; the per-episode flag is latched for the curriculum. The objective is FILLING the
-    cup from the pile (``count_in_bowl``), not delivery to a target.
-    """
-    in_target = env.count_in_target()
-    in_bowl = env.count_in_bowl()
-    env.ep_max_in_target = torch.maximum(env.ep_max_in_target, in_target)
-    env.ep_max_in_bowl = torch.maximum(env.ep_max_in_bowl, in_bowl)
-    mask = in_bowl >= env.scoop_target_count
-    env.episode_succeeded |= mask
-    return mask
-
-
-def delivered_success(env: FrankaScoopEnv) -> torch.Tensor:
-    """Terminate the episode (success) once more than ``target_success_count`` particles reach the target bowl.
-
-    Unlike :func:`transfer_success_mask` (the fill objective, which does NOT end the episode), delivering to
-    the target ends it. The per-episode success flag and ``ep_max_in_target`` are latched for the curriculum
-    and metrics.
+    The threshold is the runtime ``env.scoop_target_count``, set per stage by the curriculum
+    (``curriculum_target_count``), so the delivery requirement ramps as training progresses.
+    Called every step (from the success reward). Success deliberately does NOT terminate the
+    episode: a success terminal would cut off the dense post-delivery reward stream, making
+    "hold the media and run out the clock" out-pay delivering. Instead the per-episode success
+    flag and the ``ep_max_*`` metrics are latched here for the curriculum and logging, and the
+    dense delivered/success rewards keep paying for the rest of the episode (deliver earlier ->
+    collect more).
     """
     in_target = env.count_in_target()
     env.ep_max_in_target = torch.maximum(env.ep_max_in_target, in_target)
     env.ep_max_in_bowl = torch.maximum(env.ep_max_in_bowl, env.count_in_bowl())
-    mask = in_target > float(env.cfg.target_success_count)
+    mask = in_target > float(env.scoop_target_count)
     env.episode_succeeded |= mask
     return mask
 

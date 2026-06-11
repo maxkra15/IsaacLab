@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .terminations import transfer_success_mask
+from .terminations import delivery_success_mask
 
 if TYPE_CHECKING:
     from ..scoop_env import FrankaScoopEnv
@@ -50,18 +50,15 @@ def particles_in_target(env: FrankaScoopEnv) -> torch.Tensor:
     return env.count_in_target() / _success_scale(env)
 
 
-def transfer_success_bonus(env: FrankaScoopEnv) -> torch.Tensor:
-    """Sparse strict bonus once the required amount has reached the target."""
-    return transfer_success_mask(env).float()
-
-
 def delivery_success_bonus(env: FrankaScoopEnv) -> torch.Tensor:
-    """Sparse delivery goal: 1 once more than ``cfg.target_success_count`` particles are in the target bowl.
+    """Per-step delivery goal: 1 while more than ``env.scoop_target_count`` particles are in the target bowl.
 
-    Matches the ``delivered`` termination condition; no side effects (the termination latches the per-episode
-    success flag for the curriculum).
+    The threshold is set per curriculum stage (``curriculum_target_count``). Wraps
+    :func:`~.terminations.delivery_success_mask`, which also latches the per-episode success flag
+    consumed by the curriculum. Paying the bonus every step above threshold (instead of once at a
+    success terminal) rewards delivering EARLY and keeps the episode alive for further scooping.
     """
-    return (env.count_in_target() > float(env.cfg.target_success_count)).float()
+    return delivery_success_mask(env).float()
 
 
 def removed_from_source(env: FrankaScoopEnv, norm: float = 100.0) -> torch.Tensor:

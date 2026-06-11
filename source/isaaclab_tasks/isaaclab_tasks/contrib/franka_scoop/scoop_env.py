@@ -20,6 +20,7 @@ to the critic only.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -31,7 +32,6 @@ import warp as wp
 from isaaclab_newton.ik.newton_ik_solver import NewtonIKPoseObjective, NewtonIKSolver
 from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.physics import NewtonManager
-from newton.solvers import SolverImplicitMPM
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 
@@ -41,7 +41,20 @@ from isaaclab.sim.utils.stage import get_current_stage
 from isaaclab.utils import math as math_utils
 from isaaclab.utils.assets import check_file_path, retrieve_file_path
 
+from .media_spawning import (
+    POUR_BOWL_BOTTOM_THICKNESS,
+    POUR_BOWL_HEIGHT,
+    POUR_BOWL_INNER_BOTTOM_RADIUS,
+    POUR_BOWL_INNER_TOP_RADIUS,
+    POUR_BOWL_WALL_THICKNESS,
+    bucket_base_z,
+    container_bowl_scale,
+    container_geometry_kind,
+)
+
 if TYPE_CHECKING:
+    from isaaclab_newton.assets import MPMObject
+
     from .scoop_env_cfg import FrankaScoopEnvCfg
 
 ARM_JOINTS = [
@@ -56,13 +69,8 @@ ARM_JOINTS = [
 FINGER_JOINTS = ["panda_finger_joint1", "panda_finger_joint2"]
 RIGID_ENTRY = "arm"
 MPM_ENTRY = "media"
-# Same procedural open bowl shape as scripts/demos/newton_cup_pour_mpm.py, scaled by
-# cfg.ee_bowl_scale for the robot end-effector.
-POUR_BOWL_INNER_BOTTOM_RADIUS = 0.045
-POUR_BOWL_INNER_TOP_RADIUS = 0.19
-POUR_BOWL_WALL_THICKNESS = 0.025
-POUR_BOWL_HEIGHT = 0.13
-POUR_BOWL_BOTTOM_THICKNESS = 0.025
+
+logger = logging.getLogger(__name__)
 
 
 def _q_rot_arr(q, v: np.ndarray) -> np.ndarray:
@@ -329,21 +337,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
 
     @staticmethod
     def _container_geometry_kind(cfg: FrankaScoopEnvCfg) -> str:
-        kind = str(getattr(cfg, "container_geometry", "") or "").strip().lower()
-        if not kind:
-            kind = "pour_bowl" if getattr(cfg, "use_pour_bowl_mesh", False) else "box"
-        aliases = {
-            "cylinder": "bucket",
-            "cylindrical": "bucket",
-            "buckets": "bucket",
-            "bowl": "pour_bowl",
-            "pour-bowl": "pour_bowl",
-            "pour_bowls": "pour_bowl",
-        }
-        kind = aliases.get(kind, kind)
-        if kind not in {"bucket", "pour_bowl", "box"}:
-            raise ValueError(f"Unsupported container_geometry={kind!r}; expected 'bucket', 'pour_bowl', or 'box'.")
-        return kind
+        return container_geometry_kind(cfg)
 
     @staticmethod
     def _configure_solver_container_patterns(cfg: FrankaScoopEnvCfg, kind: str) -> None:
@@ -372,6 +366,18 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
     def _prepare_newton_extras(self, cfg: FrankaScoopEnvCfg) -> None:
         self._container_geometry = self._container_geometry_kind(cfg)
         self._configure_solver_container_patterns(cfg, self._container_geometry)
+        # Build the media scene entity HERE (not in cfg.__post_init__) so the spawn points see the
+        # FINAL cfg values — hydra/script overrides of the layout/material fields after cfg
+        # construction would otherwise silently miss the baked particle bed.
+        if cfg.scene.media is None:
+            from isaaclab_newton.assets import MPMObjectCfg
+
+            from .media_spawning import build_media_spawn_cfg
+
+            cfg.scene.media = MPMObjectCfg(
+                prim_path="{ENV_REGEX_NS}/Media",
+                spawn=build_media_spawn_cfg(cfg),
+            )
         self._init_scoop_bowl_geometry(cfg)
         if cfg.gripped_cup_usd_path:
             # Physical side-grasp convention: cup +Z maps to panda_hand +X (upright at the
@@ -397,12 +403,8 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
 
         self._custom_proto, self._custom_meta = self._build_custom_proto(cfg)
         self._hand_ids_l, self._scoop_body_ids_l = [], []
-        self._arm_q_l, self._arm_qd_l, self._finger_q_l, self._finger_qd_l, self._psrc_l = [], [], [], [], []
+        self._arm_q_l, self._arm_qd_l, self._finger_q_l, self._finger_qd_l = [], [], [], []
         self._authored_visual_envs: set[int] = set()
-        # (usd points attribute, global particle_q start, count) per env, rewritten each render by
-        # _update_media_particles_visual.
-        self._media_particle_prims: list[tuple[Usd.Attribute, int, int]] = []
-        self._media_authored_envs: set[int] = set()
         # (translate op, orient op) per env on the cup VISUAL prim, rewritten each render from the live cup
         # body pose by _update_cup_visual_xform (the cup body's own Fabric worldMatrix is not synced -- see
         # _sync_kit_visuals).
@@ -446,7 +448,6 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._add_scoop_bowl_rigid_proxy(builder, self.cfg, hand, env_root)
 
         b_off = builder.body_count
-        p_off = builder.particle_count
         label_starts = self._builder_label_starts(builder)
         builder.add_builder(
             self._custom_proto,
@@ -461,7 +462,6 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._arm_qd_l.append(arm_qd)
         self._finger_q_l.append(finger_q)
         self._finger_qd_l.append(finger_qd)
-        self._psrc_l.append(list(range(p_off, p_off + self._custom_meta["npart"])))
 
     @staticmethod
     def _label_world(builder, prefix: str, index: int) -> int:
@@ -582,60 +582,16 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 existing_pairs.add(pair)
 
     def spawn_kit_visuals(self) -> None:
-        """Author task USD visuals for custom Newton bodies, plus the live MPM media points prim.
+        """Author task USD visuals for custom Newton bodies (cup/box/table) plus optional obs-debug points.
 
-        The static visuals (cup/box/table) are also authored during builder construction; the media points
-        need particle bookkeeping (:attr:`_particle_ids`) and so are authored here, once it exists (Kit path).
+        The live MPM media points are NOT authored here: the media is an :class:`MPMObject` scene asset,
+        which creates its own Kit ``UsdGeom.Points`` per env and is synced natively by
+        ``NewtonManager.sync_particles_to_usd``.
         """
         for env_id in range(self.cfg.scene.num_envs):
             self._author_custom_stage_prims(env_id, self.sim.stage)
-            self._spawn_media_particles_visual(self.sim.stage, f"/World/envs/env_{env_id}", env_id)
             self._spawn_obs_debug_visual(self.sim.stage, f"/World/envs/env_{env_id}", env_id)
-        self._update_media_particles_visual()  # seed points before the first render
         self._update_obs_debug_visual()
-
-    def _spawn_media_particles_visual(self, stage: Usd.Stage, root: str, env_id: int) -> None:
-        """Author a UsdGeom.Points prim Kit renders as this env's live MPM media.
-
-        Kit renders the prim's USD ``points``; :meth:`_update_media_particles_visual` rewrites them from the
-        live world-space ``particle_q`` every render (mirroring the IsaacLab-mpm pour demo's KitParticlePoints).
-        A direct USD write is used because Kit does not re-render a bare Points prim through the Fabric
-        ``sync_particles_to_usd`` path used for deformable meshes.
-        """
-        if env_id in self._media_authored_envs:
-            return
-        particle_ids = getattr(self, "_particle_ids", None)
-        if particle_ids is None or env_id >= int(particle_ids.shape[0]):
-            return
-        ids = particle_ids[env_id]  # contiguous global particle_q indices for this env
-        count = int(ids.shape[0])
-        if count == 0:
-            return
-        offset = int(ids[0].item())
-        points = UsdGeom.Points.Define(stage, f"{root}/MediaParticles")
-        width = float(self.cfg.voxel_size) / max(float(self.cfg.particles_per_cell), 1.0)
-        points.CreateWidthsAttr(Vt.FloatArray([width] * count))
-        _author_color(points.GetPrim(), (0.85, 0.72, 0.45))
-        # (points attribute, global particle_q start, count) -- updated each render by _update_media_particles_visual.
-        self._media_particle_prims.append((points.GetPointsAttr(), offset, count))
-        self._media_authored_envs.add(env_id)
-
-    def _update_media_particles_visual(self) -> None:
-        """Rewrite each media points prim's USD ``points`` from the live world-space ``particle_q``.
-
-        Direct per-render USD write (the IsaacLab-mpm ``KitParticlePoints`` pattern); no Fabric tagging,
-        since Kit does not re-render a bare Points prim through ``sync_particles_to_usd``.
-        """
-        if not self._media_particle_prims:
-            return
-        state = NewtonManager.get_state_0()
-        if state is None or getattr(state, "particle_q", None) is None:
-            return
-        pq = wp.to_torch(state.particle_q)
-        with Sdf.ChangeBlock():
-            for points_attr, offset, count in self._media_particle_prims:
-                pts = pq[offset : offset + count].detach().cpu().numpy().astype(np.float32, copy=False)
-                points_attr.Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(pts)))
 
     def _spawn_obs_debug_visual(self, stage: Usd.Stage, root: str, env_id: int) -> None:
         """Author the obs-debug points (cfg.debug_vis_obs): the heightfield grid + centroid/target markers.
@@ -713,8 +669,8 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         else:
             self._spawn_box_container_visual(stage, root, cfg, cfg.source_center, "Source")
             self._spawn_box_container_visual(stage, root, cfg, cfg.target_center, "Target")
-        # NB: media points are authored separately (see spawn_kit_visuals); this method runs during builder
-        # construction before particle bookkeeping (_particle_ids) exists.
+        # NB: the media points are NOT authored here -- the MPMObject scene asset creates its own
+        # Kit points prims and the manager syncs them natively.
         self._authored_visual_envs.add(env_id)
 
     def _spawn_scoop_bowl_visual(self, stage: Usd.Stage, root: str, cfg: FrankaScoopEnvCfg, env_id: int) -> None:
@@ -983,16 +939,15 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
 
     @staticmethod
     def _container_bowl_scale(cfg: FrankaScoopEnvCfg) -> float:
-        outer_diameter = 2.0 * (POUR_BOWL_INNER_TOP_RADIUS + POUR_BOWL_WALL_THICKNESS)
-        return float(cfg.bowl_target_diameter) / outer_diameter
+        return container_bowl_scale(cfg)
 
     @staticmethod
     def _bucket_base_z(cfg: FrankaScoopEnvCfg, center) -> float:
-        return float(center[2]) - 0.5 * float(cfg.bucket_height)
+        return bucket_base_z(cfg, center)
 
     def _build_custom_proto(self, cfg: FrankaScoopEnvCfg):
+        # create_builder() registers the active solver's custom attributes (incl. mpm:*) on the proto.
         proto = NewtonManager.create_builder()
-        SolverImplicitMPM.register_custom_attributes(proto)
         proto.default_shape_cfg.mu = 0.8
         scoop_body = self._add_scoop_bowl_mpm_body(proto, cfg)
         self._add_table(proto, cfg)
@@ -1012,11 +967,9 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             color=(0.3, 0.3, 0.3),
         )
         self._assert_mpm_collision_scope(proto, scoop_body)
-        p0 = proto.particle_count
-        self._add_media(proto, cfg)
-        npart = proto.particle_count - p0
-
-        return proto, {"scoop_body": scoop_body, "npart": npart}
+        # The media particles are NOT part of this proto: they are a scene-level MPMObject
+        # (cfg.scene.media) emitted per world during Newton replication.
+        return proto, {"scoop_body": scoop_body}
 
     def _add_scoop_bowl_rigid_proxy(self, builder, cfg, hand: int, env_root: str) -> None:
         """Add open rigid scoop geometry to the scene-imported Franka hand."""
@@ -1430,15 +1383,6 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         proto.body_inv_mass[body] = 0.0
         proto.body_inertia[body] = wp.mat33()
         proto.body_inv_inertia[body] = wp.mat33()
-        if label == "Source":
-            self._media_interior = {
-                "kind": "bucket",
-                "cx": cx,
-                "cy": cy,
-                "floor_z": base_z + float(cfg.bucket_bottom_thickness),
-                "rim_z": base_z + float(cfg.bucket_height),
-                "inner_radius": float(cfg.bucket_inner_radius),
-            }
 
     def _add_bowl(self, proto, cfg, center, label) -> None:
         """Add a stationary procedural pour-demo bowl as an MPM collider."""
@@ -1491,149 +1435,6 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         proto.body_inv_mass[body] = 0.0
         proto.body_inertia[body] = wp.mat33()
         proto.body_inv_inertia[body] = wp.mat33()
-        if label == "Source":
-            inner_bottom = POUR_BOWL_INNER_BOTTOM_RADIUS * scale
-            inner_top = POUR_BOWL_INNER_TOP_RADIUS * scale
-            floor_z = base_z + POUR_BOWL_BOTTOM_THICKNESS * scale
-            rim_z = base_z + POUR_BOWL_HEIGHT * scale
-            self._media_interior = {
-                "kind": "pour_bowl",
-                "cx": cx,
-                "cy": cy,
-                "floor_z": floor_z,
-                "rim_z": rim_z,
-                "inner_bottom_r": inner_bottom,
-                "inner_top_r": inner_top,
-            }
-
-    def _add_filtered_particles(self, proto, cfg, points: np.ndarray, cell: np.ndarray) -> None:
-        radius = float(np.max(cell) * 0.45)
-        mass = float(np.prod(cell) * cfg.sand_density)
-        proto.add_particles(
-            pos=points.astype(np.float32, copy=False).tolist(),
-            vel=np.zeros_like(points, dtype=np.float32).tolist(),
-            mass=[mass] * int(points.shape[0]),
-            radius=[radius] * int(points.shape[0]),
-            custom_attributes={
-                "mpm:friction": cfg.sand_friction,
-                "mpm:damping": cfg.sand_damping,
-                "mpm:young_modulus": cfg.sand_young_modulus,
-                "mpm:yield_pressure": cfg.sand_yield_pressure,
-                "mpm:tensile_yield_ratio": cfg.sand_tensile_yield_ratio,
-            },
-        )
-
-    def _add_pile_media(self, proto, cfg) -> None:
-        """Spawn the source media as a natural granular pile (cone at the angle of repose) on the table."""
-        import math as _math
-
-        from .pile_sampling import sample_conical_pile
-
-        cx, cy, cz = cfg.source_center
-        ihz = float(cfg.container_inner_half[2])
-        floor_z = cz - ihz  # box floor == table top (env z=0)
-        spacing = float(cfg.voxel_size) / max(float(cfg.particles_per_cell), 1.0)
-        angle = _math.atan(max(float(cfg.sand_friction), 0.05))  # angle of repose ~ atan(friction)
-        height = float(cfg.pile_height)
-        base_radius = height / max(_math.tan(angle), 1.0e-3)
-        # Keep the pile base inside the retaining box footprint.
-        base_radius = min(base_radius, float(cfg.container_inner_half[0]) - 2.0 * spacing)
-        cone_volume = (_math.pi / 3.0) * base_radius * base_radius * height
-        count = max(int(cone_volume / (spacing**3)), 64)
-        points = sample_conical_pile(
-            count,
-            (float(cx), float(cy), float(floor_z) + 0.5 * spacing),
-            height=height,
-            base_radius=base_radius,
-            jitter=float(cfg.pile_jitter),
-            seed=7,
-            device="cpu",
-        )
-        cell = np.full(3, spacing, dtype=np.float32)
-        self._add_filtered_particles(proto, cfg, points, cell)
-
-    def _add_media(self, proto, cfg) -> None:
-        if self._container_geometry == "box":
-            self._add_pile_media(proto, cfg)
-            return
-        interior = getattr(self, "_media_interior", None)
-        if interior is not None and interior.get("kind") == "bucket":
-            clearance = max(float(cfg.voxel_size), 3.0 * float(cfg.collider_margin))
-            bottom_clearance = clearance
-            top_clearance = clearance
-            interior_height = max(float(interior["rim_z"]) - float(interior["floor_z"]), 1.0e-6)
-            min_depth = 0.25 * float(cfg.voxel_size)
-            fill_top = float(interior["floor_z"]) + interior_height * float(cfg.media_fill_frac)
-            fill_top = min(fill_top, float(interior["rim_z"]) - top_clearance)
-            radius = max(float(interior["inner_radius"]) - clearance, 0.25 * float(cfg.voxel_size))
-            floor = float(interior["floor_z"]) + bottom_clearance
-            depth = max(min_depth, fill_top - floor)
-            lo = np.array([interior["cx"] - radius, interior["cy"] - radius, floor], dtype=np.float32)
-            hi = np.array([interior["cx"] + radius, interior["cy"] + radius, floor + depth], dtype=np.float32)
-            center_xy = np.array([interior["cx"], interior["cy"]], dtype=np.float32)
-            radius_mode = "constant"
-        elif self._container_geometry == "pour_bowl" and interior is not None:
-            # Seed like the pour demo: at least one voxel / several margins away from the collider,
-            # small jitter, then filter to the bowl's cylinder instead of relying on large grid jitter.
-            clearance = max(float(cfg.voxel_size), 3.0 * float(cfg.collider_margin))
-            bowl_height = max(float(interior["rim_z"]) - float(interior["floor_z"]), 1.0e-6)
-            depth = max(0.0, bowl_height * float(cfg.media_fill_frac))
-            depth = min(depth, max(bowl_height - 2.0 * clearance, 0.25 * float(cfg.voxel_size)))
-            top_t = np.clip(depth / bowl_height, 0.0, 1.0)
-            top_radius = float(interior["inner_bottom_r"]) + top_t * (
-                float(interior["inner_top_r"]) - float(interior["inner_bottom_r"])
-            )
-            radius = max(top_radius - clearance, 0.25 * float(cfg.voxel_size))
-            floor = float(interior["floor_z"]) + clearance
-            lo = np.array([interior["cx"] - radius, interior["cy"] - radius, floor], dtype=np.float32)
-            hi = np.array([interior["cx"] + radius, interior["cy"] + radius, floor + depth], dtype=np.float32)
-            center_xy = np.array([interior["cx"], interior["cy"]], dtype=np.float32)
-            radius_mode = "frustum"
-        else:
-            cx, cy, cz = cfg.source_center
-            ihx, ihy, ihz = cfg.container_inner_half
-            clearance = max(float(cfg.voxel_size), 3.0 * float(cfg.collider_margin), 0.015)
-            lo = np.array([cx - ihx + clearance, cy - ihy + clearance, cz - ihz + clearance], dtype=np.float32)
-            hi = np.array(
-                [cx + ihx - clearance, cy + ihy - clearance, cz - ihz + clearance + 2 * ihz * cfg.media_fill_frac],
-                dtype=np.float32,
-            )
-            center_xy = None
-            radius_mode = "box"
-        # Particle spacing follows the grid voxel: ``particles_per_cell`` samples per voxel per
-        # axis (Newton MPM best practice, matching example_mujoco_mpm_coupled_solver). The bed is
-        # thus always resolved consistently with the solver grid, and particle size tracks
-        # ``voxel_size`` (coarser voxels -> proportionally larger particles).
-        res = np.maximum(np.ceil(cfg.particles_per_cell * (hi - lo) / cfg.voxel_size), 1).astype(int)
-        cell = (hi - lo) / res
-        px = np.arange(int(res[0]) + 1, dtype=np.float32) * cell[0]
-        py = np.arange(int(res[1]) + 1, dtype=np.float32) * cell[1]
-        pz = np.arange(int(res[2]) + 1, dtype=np.float32) * cell[2]
-        points = np.stack(np.meshgrid(px, py, pz, indexing="ij")).reshape(3, -1).T
-        rng = np.random.default_rng(7)
-        points += (rng.random(points.shape, dtype=np.float32) - 0.5) * (0.10 * float(np.max(cell)))
-        points += lo
-        if center_xy is not None and radius_mode == "frustum":
-            z_t = np.clip(
-                (points[:, 2] - float(interior["floor_z"]))
-                / max(float(interior["rim_z"]) - float(interior["floor_z"]), 1.0e-6),
-                0.0,
-                1.0,
-            )
-            local_radius = (
-                float(interior["inner_bottom_r"])
-                + z_t * (float(interior["inner_top_r"]) - float(interior["inner_bottom_r"]))
-                - clearance
-            )
-            local_radius = np.maximum(local_radius, 0.25 * float(cfg.voxel_size))
-            normalized_xy = (points[:, :2] - center_xy) / local_radius[:, None]
-            points = points[np.sum(normalized_xy * normalized_xy, axis=1) < 1.0]
-        elif center_xy is not None and radius_mode == "constant":
-            normalized_xy = (points[:, :2] - center_xy) / max(radius, 1.0e-6)
-            points = points[np.sum(normalized_xy * normalized_xy, axis=1) < 1.0]
-        if points.shape[0] == 0:
-            raise RuntimeError("Particle initialization produced no media particles; reduce voxel size or clearance.")
-        self._add_filtered_particles(proto, cfg, points, cell)
 
     # ------------------------------------------------------- post-physics setup
     def _setup_after_physics(self) -> None:
@@ -1674,15 +1475,20 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._finger_qd_ids = torch.tensor(self._finger_qd_l, device=dev, dtype=torch.long)
         self._finger_q_ids_wp = wp.array(self._finger_q_l, dtype=wp.int32, device=model_dev)
         self._finger_qd_ids_wp = wp.array(self._finger_qd_l, dtype=wp.int32, device=model_dev)
-        self._particle_ids = torch.tensor(self._psrc_l, device=dev, dtype=torch.long)
-        self._num_particles = int(self._particle_ids.shape[1])
+        # The media is a scene-level MPMObject asset: per-env particle views, writes, and the
+        # reset-default snapshot all come from its data API instead of raw Newton state indexing.
+        self._media: MPMObject = self.scene["media"]
+        self._num_particles = int(self._media.particles_per_object)
+        # Global ``state.particle_q`` indices per env, still needed for the per-particle implicit-MPM
+        # internal state reset (the ``state.mpm`` fields are not part of the MPMObject API).
+        offsets = torch.as_tensor(self._media._recorded_particle_offsets, device=dev, dtype=torch.long)
+        self._particle_ids = offsets.unsqueeze(1) + torch.arange(self._num_particles, device=dev).unsqueeze(0)
 
-        st = NewtonManager.get_state_0()
         self._default_arm_q = self._robot.data.default_joint_pos.torch[:, self._arm_joint_ids].clone()
         self._fixed_finger_q = torch.full(
             (self.num_envs, len(FINGER_JOINTS)), float(cfg.gripper_open_pos), device=dev, dtype=torch.float32
         )
-        self._default_particle_q = wp.to_torch(st.particle_q)[self._particle_ids].clone()
+        self._default_particle_q = self._media.data.default_particle_state_w.torch[..., :3].clone()
 
         self._bowl_center_hand_t = torch.tensor(self._bowl_center_hand, device=dev, dtype=torch.float32)
         self._weld_rot_t = torch.tensor(self._weld_rot, device=dev, dtype=torch.float32)
@@ -1725,11 +1531,11 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._create_diffik_controller()
 
         # Seed every reset from the hand-tuned ``arm_home`` joint config (a known, unfolded kinematic
-        # branch). The DLS ``_solve_ready_config`` can settle into a folded branch, which then seeds the
-        # per-reset IK into divergence, so we keep ``arm_home`` (set in _setup_after_physics) as the seed.
+        # branch) so the per-reset IK never starts from a folded branch.
         self._reset_arm_q = self._default_arm_q.clone()
         self._pitch[:] = float(cfg.home_pitch)
 
+        self._reset_pose_cache: dict[str, torch.Tensor] = {}
         self.curriculum_stage = torch.zeros(self.num_envs, device=dev, dtype=torch.long)
         self.episode_succeeded = torch.zeros(self.num_envs, device=dev, dtype=torch.bool)
         self.ep_max_in_target = torch.zeros(self.num_envs, device=dev)
@@ -1829,7 +1635,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             )
 
     def _setup_kit_visual_sync(self) -> None:
-        """Register the per-render Kit callback that drives the gripped cup body and the live MPM media points.
+        """Register the per-render Kit callback that drives the gripped cup body visual.
 
         Only meaningful on the Kit visualizer; a no-op otherwise (the Newton viewer renders Newton state
         directly, without a USD stage to keep in sync).
@@ -1841,18 +1647,17 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._sync_kit_visuals()
 
     def _sync_kit_visuals(self) -> None:
-        """Pre-render callback: keep the cup body state live, then refresh the cup visual + media points.
+        """Pre-render callback: keep the cup body state live, then refresh the cup visual.
 
         ``sync_transforms_to_usd`` does not update the cup's (kinematic MPM-collider) Fabric worldMatrix, so
-        the cup visual and the media points are both written directly to USD here every render -- the cup via
-        its authored world xform (:meth:`_update_cup_visual_xform`), the media via its ``points`` attribute.
+        the cup visual is written directly to USD here every render via its authored world xform
+        (:meth:`_update_cup_visual_xform`). The media points are synced natively by the manager.
         """
         # Rendering after the solver but before ManagerBasedRLEnv.step() returns can otherwise catch
         # fixed-open fingers after contact impulses and before the post-step correction.
         self._pin_gripper_open_states(update_fk=True)
         self._sync_scoop_bowl_body()
         self._update_cup_visual_xform()
-        self._update_media_particles_visual()
         self._update_obs_debug_visual()
 
     def _update_cup_visual_xform(self) -> None:
@@ -1900,6 +1705,12 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             finger_q.append(_coord_ids(joint_name))
 
         dev = self._ik_model.device
+        # The IK prototype model is baked at env 0's ABSOLUTE world coords (newton_replicate bakes the
+        # first env subtree into the prototype), and ``NewtonIKSolver.set_target_pose`` expects targets
+        # in that model's world frame. Env-frame targets must therefore be shifted by env 0's origin —
+        # without this every solve is offset by ``|env_origins[0]|`` (invisible in 1-env runs where the
+        # origin is zero, and badly wrong in multi-env grids).
+        self._ik_origin = self.env_origins[0].clone()
         self._ik_default = wp.to_torch(self._ik_model.joint_q).clone()
         self._ik_arm = torch.tensor(arm_q, device=self._ik_default.device, dtype=torch.long)
         self._ik_fingers = torch.tensor(finger_q, device=self._ik_default.device, dtype=torch.long)
@@ -1919,6 +1730,36 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 sampler="none",
                 n_seeds=1,
                 iterations=self.cfg.ik_iterations,
+                step_size=self.cfg.ik_step_size,
+                lambda_initial=self.cfg.ik_lambda_initial,
+                position_weight=self.cfg.ik_position_weight,
+                rotation_weight=self.cfg.ik_rotation_weight,
+                joint_limit_weight=self.cfg.ik_joint_limit_weight,
+                use_persistent_seed=False,
+            ),
+            model=self._ik_model,
+            num_envs=self.num_envs,
+            device=dev,
+            pose_objectives=[
+                NewtonIKPoseObjective(
+                    name=self._ik_target_name,
+                    link_index=ee,
+                    link_offset_pos=tuple(float(v) for v in self._bowl_center_hand.tolist()),
+                )
+            ],
+        )
+        # Reset-only multi-seed solver: the loaded "target_up"/"home_up" curriculum poses need
+        # branch-finding seeds (a single warm-started seed rails the wrist over the +y target box).
+        # Kept separate from the runtime solver so per-step tracking stays single-seed and smooth.
+        self._reset_ik_solver = NewtonIKSolver(
+            NewtonIKSolverCfg(
+                command_type="pose",
+                use_relative_mode=False,
+                optimizer="lm",
+                jacobian_mode="analytic",
+                sampler="roberts",
+                n_seeds=int(self.cfg.reset_ik_seeds),
+                iterations=self.cfg.reset_ik_iterations,
                 step_size=self.cfg.ik_step_size,
                 lambda_initial=self.cfg.ik_lambda_initial,
                 position_weight=self.cfg.ik_position_weight,
@@ -1962,50 +1803,28 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         target_quat: torch.Tensor,
         iterations: int,
         arm_seed: torch.Tensor | None = None,
+        solver: NewtonIKSolver | None = None,
     ) -> torch.Tensor:
-        prev_iterations = self._ik_solver.cfg.iterations
-        prev_step_size = self._ik_solver.cfg.step_size
-        self._ik_solver.cfg.iterations = int(iterations)
-        self._ik_solver.cfg.step_size = float(self.cfg.ik_step_size)
+        solver = self._ik_solver if solver is None else solver
+        prev_iterations = solver.cfg.iterations
+        prev_step_size = solver.cfg.step_size
+        solver.cfg.iterations = int(iterations)
+        solver.cfg.step_size = float(self.cfg.ik_step_size)
         try:
             seed = self._ik_default.unsqueeze(0).expand(self.num_envs, -1).clone()
             seed[:, self._ik_arm] = (self.arm_joint_q() if arm_seed is None else arm_seed).to(seed.device)
             seed[:, self._ik_fingers] = float(self.cfg.gripper_open_pos)
-            self._ik_solver.set_target_pose(
+            solver.set_target_pose(
                 self._ik_target_name,
-                target_bowl_e.to(seed.device, dtype=torch.float32),
+                (target_bowl_e + self._ik_origin).to(seed.device, dtype=torch.float32),
                 target_quat.to(seed.device, dtype=torch.float32),
             )
-            result = self._ik_solver.solve(seed)
+            result = solver.solve(seed)
             result[:, self._ik_fingers] = float(self.cfg.gripper_open_pos)
             return result
         finally:
-            self._ik_solver.cfg.iterations = prev_iterations
-            self._ik_solver.cfg.step_size = prev_step_size
-
-    def _solve_ready_config(self) -> torch.Tensor:
-        """IK-solve a clear 'ready' arm config: bowl at the home hover, opening up (``home_pitch``)."""
-        half = 0.5 * float(self.cfg.home_pitch)
-        pq = torch.tensor([0.0, math.sin(half), 0.0, math.cos(half)], device=self.device)
-        q = _qmul_t(pq.unsqueeze(0).expand(self.num_envs, -1), self._home_quat_t.unsqueeze(0).expand(self.num_envs, -1))
-        q = q / torch.clamp(torch.linalg.norm(q, dim=-1, keepdim=True), min=1e-8)
-        seed = self._ik_default.unsqueeze(0).expand(self.num_envs, -1).clone()
-        seed[:, self._ik_arm] = self._default_arm_q.to(seed.device)
-        seed[:, self._ik_fingers] = float(self.cfg.gripper_open_pos)
-        self._ik_solver.set_target_pose(
-            self._ik_target_name,
-            self._home_bowl_e.unsqueeze(0).expand(self.num_envs, -1).to(seed.device, dtype=torch.float32),
-            q.to(seed.device, dtype=torch.float32),
-        )
-        prev_iterations = self._ik_solver.cfg.iterations
-        prev_step_size = self._ik_solver.cfg.step_size
-        self._ik_solver.cfg.iterations = int(self.cfg.reset_ik_iterations)
-        self._ik_solver.cfg.step_size = float(self.cfg.ik_step_size)
-        try:
-            return self._ik_solver.solve(seed)[:, self._ik_arm].clone().to(self.device)
-        finally:
-            self._ik_solver.cfg.iterations = prev_iterations
-            self._ik_solver.cfg.step_size = prev_step_size
+            solver.cfg.iterations = prev_iterations
+            solver.cfg.step_size = prev_step_size
 
     def _pitch_to_hand_quat(self, pitch: torch.Tensor) -> torch.Tensor:
         """Target HAND world orientation = pitch (about world Y) applied to the home hand orientation.
@@ -2026,11 +1845,13 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         pitch: torch.Tensor,
         iterations: int,
         arm_seed: torch.Tensor | None = None,
+        use_reset_solver: bool = False,
     ) -> torch.Tensor:
         q = self._pitch_to_hand_quat(pitch)
         q = q / torch.clamp(torch.linalg.norm(q, dim=-1, keepdim=True), min=1e-8)
+        solver = self._reset_ik_solver if use_reset_solver else None
         solved = (
-            self._solve_ik_full(target_bowl_e, q, iterations, arm_seed=arm_seed)[:, self._ik_arm]
+            self._solve_ik_full(target_bowl_e, q, iterations, arm_seed=arm_seed, solver=solver)[:, self._ik_arm]
             .clone()
             .to(self.device)
         )
@@ -2172,7 +1993,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         wp.to_torch(state_1.joint_qd)[self._finger_qd_ids[env_ids]] = 0.0
 
     def particle_pos_e(self) -> torch.Tensor:
-        pq = wp.to_torch(NewtonManager.get_state_0().particle_q)[self._particle_ids]
+        pq = self._media.data.particle_pos_w.torch
         # sanitize: push any non-finite particle far away so it is excluded from all regions
         pq = torch.nan_to_num(pq, nan=-100.0, posinf=-100.0, neginf=-100.0)
         return pq - self.env_origins[:, None, :]
@@ -2287,7 +2108,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
 
     def state_finite(self) -> torch.Tensor:
         st = NewtonManager.get_state_0()
-        pq = wp.to_torch(st.particle_q)[self._particle_ids]
+        pq = self._media.data.particle_pos_w.torch
         bq = wp.to_torch(st.body_q)[self._hand_ids]
         jq = self.arm_joint_q()
         return torch.isfinite(pq).all(dim=(1, 2)) & torch.isfinite(jq).all(dim=1) & torch.isfinite(bq).all(dim=1)
@@ -2297,42 +2118,22 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         return torch.cat((-q[..., :3], q[..., 3:4]), dim=-1)
 
     # ----------------------------------------------------------------- resets
-    def _curriculum_start_targets(
-        self, env_ids: torch.Tensor, particle_q_w: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        reset_start = str(getattr(self.cfg, "reset_start", "home")).strip().lower()
-        if reset_start == "home":
-            target = self._home_bowl_e.unsqueeze(0).expand(env_ids.numel(), -1).clone()
-            pitches = torch.full((env_ids.numel(),), float(self.cfg.home_pitch), device=self.device)
-            return target, pitches
-        if reset_start not in {"source_curriculum", "curriculum", "source"}:
-            raise ValueError(
-                f"Unsupported reset_start={self.cfg.reset_start!r}; expected 'home' or 'source_curriculum'."
-            )
-        stage = self.curriculum_stage[env_ids].clamp(max=len(self.cfg.curriculum_start_bowl_offset) - 1)
-        offsets = torch.tensor(self.cfg.curriculum_start_bowl_offset, device=self.device, dtype=torch.float32)[stage]
-        pitches = torch.tensor(self.cfg.curriculum_start_pitch, device=self.device, dtype=torch.float32)[stage]
-        particle_centroid_e = particle_q_w.mean(dim=1) - self.env_origins[env_ids]
-        target = torch.clamp(particle_centroid_e + offsets, self._ws_lo, self._ws_hi)
-        return target, pitches
-
     def reset_scoop_scene(self, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0:
             return
         s0, s1 = NewtonManager.get_state_0(), NewtonManager.get_state_1()
-        pq0 = wp.to_torch(s0.particle_q)
+        # Restore the per-env pile via the MPMObject asset API (writes both Newton states and
+        # invalidates the particle data caches), then clear the solver-internal particle state.
         new_p = self._sample_media_reset(env_ids)
-        pq0[self._particle_ids[env_ids]] = new_p
-        wp.to_torch(s0.particle_qd)[self._particle_ids[env_ids]] = 0.0
-        wp.to_torch(s1.particle_q)[self._particle_ids[env_ids]] = new_p
-        wp.to_torch(s1.particle_qd)[self._particle_ids[env_ids]] = 0.0
+        self._media.write_particle_pos_to_sim_index(new_p, env_ids=env_ids)
+        self._media.write_particle_velocity_to_sim_index(torch.zeros_like(new_p), env_ids=env_ids)
         self._reset_mpm_particle_state(env_ids, (s0, s1))
         self._region_mask_cache = None
         self._region_mask_cache_step = -1
-        # Staged scoop->dump curriculum: the (global) stage picks the reset pose + how much media is pre-loaded
-        # into the cup. "pile" = the scoop start (arm_home, cup tilted at the pile); "target"/"home_up" = cup
-        # opening-up over the target / source (IK converges for these upright poses) so the policy starts
-        # holding a cupful and only has to dump.
+        # Staged dump-first curriculum: the (global) stage picks the reset pose + how much media is
+        # pre-loaded into the cup. "pile" = the scoop start (arm_home, cup tilted at the pile, empty);
+        # "target_up"/"home_up" = cup opening-up above the target box / at the loaded hover (multi-seed
+        # reset IK) so the policy starts holding a cupful and only has to dump (and carry, for home_up).
         stage = int(self.curriculum_stage[env_ids][0].clamp(max=len(self.cfg.curriculum_reset_pose) - 1))
         pose_kind = str(self.cfg.curriculum_reset_pose[stage])
         n_cup = int(self.cfg.curriculum_cup_fill_count[stage])
@@ -2365,7 +2166,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._sync_scoop_bowl_body(s0)
         self._sync_scoop_bowl_body(s1)
         if n_cup > 0:  # pre-load a cupful into the (now opening-up) cavity for the early dump stages
-            self._load_cup_media(env_ids, n_cup, s0, s1)
+            self._load_cup_media(env_ids, n_cup)
         # Hold the achieved reset pose. This avoids DiffIK chasing residual Newton-IK/collision error on
         # the first zero-action teleop frame.
         self._target_bowl_e[env_ids] = self.bowl_pos_e()[env_ids].detach()
@@ -2411,39 +2212,83 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
     def _reset_arm_config(self, pose_kind: str) -> tuple[torch.Tensor, float]:
         """Arm joint targets (shape ``[num_envs, n_arm]``) + cup pitch state for a curriculum reset pose.
 
-        ``"pile"`` is the fixed scoop start (``arm_home``, cup tilted at the pile). ``"target"``/``"home_up"``
-        solve the cup OPENING-UP over the target / source via IK -- the single-seed NewtonIK converges for
-        these upright targets (verified), unlike the folded scoop poses -- so the cup can hold a pre-loaded
-        cupful. Returns the scoop tilt for ``"pile"`` and ``0`` (opening up) otherwise.
+        ``"pile"`` is the fixed scoop start (``arm_home``, cup tilted at the pile; no IK).
+        ``"target_up"``/``"home_up"`` solve the cup OPENING-UP above the target box / the loaded hover via
+        the multi-seed reset IK, so the cup can hold a pre-loaded cupful for the dump-first stages. The
+        multi-seed solve lets a non-wrist-railed branch win (the single-seed solve railed joint 7 over the
+        +y target); a warning is logged if the chosen branch is still rail-adjacent. Returns the scoop
+        tilt for ``"pile"`` and ``0`` (opening up) otherwise.
         """
         if pose_kind == "pile":
-            return self._default_arm_q, float(self.cfg.curriculum_start_pitch[0])
-        # "home_up" hovers at a central spot clear of the pile (no reset pop) + reachable; "target" is over the
-        # +y box (railed -- avoid).
-        xy = self.cfg.loaded_hover_xy if pose_kind == "home_up" else self.cfg.target_center
+            return self._default_arm_q, float(self.cfg.pile_start_pitch)
+        if pose_kind == "target_up":
+            xy = self.cfg.target_center
+        elif pose_kind == "home_up":
+            xy = self.cfg.loaded_hover_xy
+        else:
+            raise ValueError(
+                f"Unsupported curriculum reset pose {pose_kind!r}; expected 'pile', 'target_up', or 'home_up'."
+            )
+        # The solve is deterministic (roberts seeds, fixed per-stage target), so cache the solution per
+        # pose kind instead of re-running n_seeds x reset_ik_iterations LM for all envs on every reset.
+        cached = self._reset_pose_cache.get(pose_kind)
+        if cached is not None:
+            return cached, 0.0
         target = torch.tensor([float(xy[0]), float(xy[1]), float(self.cfg.dump_hover_z)], device=self.device)
         target = target.unsqueeze(0).expand(self.num_envs, -1)
         pitch = torch.zeros(self.num_envs, device=self.device)
-        q = self._solve_target_config(target, pitch, int(self.cfg.reset_ik_iterations), arm_seed=self._default_arm_q)
+        q = self._solve_target_config(
+            target,
+            pitch,
+            int(self.cfg.reset_ik_iterations),
+            arm_seed=self._default_arm_q,
+            use_reset_solver=True,
+        )
+        self._reset_pose_cache[pose_kind] = q
+        limit_margin = torch.minimum(q - self._arm_lo, self._arm_hi - q).amin(dim=-1)
+        railed = limit_margin < 0.05
+        if bool(railed.any()):
+            logger.warning(
+                "Reset IK for pose %r left %d/%d envs within 0.05 rad of a joint limit "
+                "(min margin %.4f rad); the loaded-cup start may be rail-adjacent.",
+                pose_kind,
+                int(railed.sum()),
+                self.num_envs,
+                float(limit_margin.min()),
+            )
         return q, 0.0
 
-    def _load_cup_media(self, env_ids: torch.Tensor, n_cup: int, s0, s1) -> None:
+    def _load_cup_media(self, env_ids: torch.Tensor, n_cup: int) -> None:
         """Pre-load the first ``n_cup`` of each reset env's particles into the (opening-up) cup cavity.
 
-        Spread across the cavity (not a tight blob) so the pre-loaded media is not overlapping -> stable.
+        Samples inside the bowl's counting region — the capped cone from the cavity floor
+        (radius ``_bowl_inner_bottom_r`` at z = -``_bowl_floor``) to the rim (``_bowl_inner_top_r``
+        at z = +``_bowl_lip``) — which is also inside the physical cavity for both the hemisphere
+        ladle and the mug, so the pre-load is retained AND counted by ``count_in_bowl``. The cup is
+        opening-up at the loaded reset poses, so bowl-local z is world-up. Radially spread (not a
+        tight blob) so the pre-loaded media is not overlapping -> stable.
         """
         bowl_w, _ = self._bowl_pose_w()  # world cavity centre at the just-set reset pose
         centers = bowl_w[env_ids].unsqueeze(1)  # (n, 1, 3)
         n = env_ids.numel()
-        r_in = float(self._ee_bowl_inner_top_radius)
-        off = torch.empty(n, n_cup, 3, device=self.device)
-        off[..., :2] = (torch.rand(n, n_cup, 2, device=self.device) - 0.5) * 2.0 * (0.7 * r_in)
-        off[..., 2] = (torch.rand(n, n_cup, device=self.device) - 0.7) * (0.6 * r_in)  # toward the cavity floor
+        floor_z, lip_z = -float(self._bowl_floor), float(self._bowl_lip)
+        r_bottom, r_top = float(self._bowl_inner_bottom_r), float(self._bowl_inner_top_r)
+        # z over most of the cavity depth; cone radius at each z with a 20% radial margin. Keep
+        # ``cfg.curriculum_cup_fill_count`` under what this band holds at the MPM particle spacing,
+        # or the overlap pressure ejects the pre-load on the first solve ("pop").
+        z = floor_z + (0.10 + 0.80 * torch.rand(n, n_cup, device=self.device)) * (lip_z - floor_z)
+        t = (z - floor_z) / max(lip_z - floor_z, 1.0e-6)
+        r_max = 0.8 * (r_bottom + t * (r_top - r_bottom))
+        ang = 2.0 * math.pi * torch.rand(n, n_cup, device=self.device)
+        rad = r_max * torch.sqrt(torch.rand(n, n_cup, device=self.device))
+        off = torch.stack([rad * torch.cos(ang), rad * torch.sin(ang), z], dim=-1)
         cup_pos = (centers + off).to(torch.float32)
-        ids = self._particle_ids[env_ids][:, :n_cup]  # (n, n_cup) global particle indices
-        for st in (s0, s1):
-            wp.to_torch(st.particle_q)[ids] = cup_pos
-            wp.to_torch(st.particle_qd)[ids] = 0.0
+        pos = self._media.data.particle_pos_w.torch[env_ids].clone()
+        vel = self._media.data.particle_vel_w.torch[env_ids].clone()
+        pos[:, :n_cup] = cup_pos
+        vel[:, :n_cup] = 0.0
+        self._media.write_particle_pos_to_sim_index(pos, env_ids=env_ids)
+        self._media.write_particle_velocity_to_sim_index(vel, env_ids=env_ids)
 
     def _sample_media_reset(self, env_ids: torch.Tensor) -> torch.Tensor:
         n = env_ids.numel()
