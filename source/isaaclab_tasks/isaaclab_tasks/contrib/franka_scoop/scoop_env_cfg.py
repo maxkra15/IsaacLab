@@ -342,6 +342,11 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     curriculum_success_threshold: float = 0.35
     curriculum_min_resets_per_stage: int = 150
     curriculum_success_ema_alpha: float = 0.05
+    # Initial stage (clamped to the stage count) and an advancement freeze -- set e.g.
+    # ``env.curriculum_start_stage=2 env.curriculum_freeze=True`` on the CLI to train/play a
+    # specific difficulty level.
+    curriculum_start_stage: int = 0
+    curriculum_freeze: bool = False
 
     def __post_init__(self):
         self.decimation = 2
@@ -432,9 +437,9 @@ class FrankaScoopEnvCfg_PLAY(FrankaScoopEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 4
-        # Play/eval shows the REAL task: always reset empty at the pile (full scoop->carry->dump)
-        # instead of the dump-first training easing, and pin the success threshold to the final stage.
-        self.curriculum_reset_pose = ("pile",) * len(self.curriculum_reset_pose)
-        self.curriculum_cup_fill_count = (0,) * len(self.curriculum_cup_fill_count)
-        self.curriculum_target_count = (self.curriculum_target_count[-1],) * len(self.curriculum_target_count)
-        self.scoop_target_count = float(self.curriculum_target_count[-1])
+        # Play/eval defaults to the REAL task: the final curriculum stage (empty cup at the pile,
+        # full scoop->carry->dump, final delivery threshold), with stage advancement frozen.
+        # Override ``env.curriculum_start_stage`` on the CLI to inspect another stage (e.g. =0 for
+        # the pre-loaded dump-only start above the target box).
+        self.curriculum_start_stage = len(self.curriculum_reset_pose) - 1
+        self.curriculum_freeze = True

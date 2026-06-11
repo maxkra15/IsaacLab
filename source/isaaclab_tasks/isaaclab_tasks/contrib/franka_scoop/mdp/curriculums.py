@@ -32,10 +32,10 @@ class ScoopCurriculum(ManagerTermBase):
 
     def __init__(self, cfg: CurriculumTermCfg, env: FrankaScoopEnv):
         super().__init__(cfg, env)
-        self.stage = 0
+        self.max_stage = len(env.cfg.curriculum_target_count) - 1
+        self.stage = int(min(max(int(env.cfg.curriculum_start_stage), 0), self.max_stage))
         self.success_ema = 0.0
         self.resets_in_stage = 0
-        self.max_stage = len(env.cfg.curriculum_target_count) - 1
         self._apply(env)
 
     def _apply(self, env: FrankaScoopEnv) -> None:
@@ -53,7 +53,8 @@ class ScoopCurriculum(ManagerTermBase):
             self.success_ema = (1.0 - a) * self.success_ema + a * rate
             self.resets_in_stage += n
             if (
-                self.stage < self.max_stage
+                not cfg.curriculum_freeze
+                and self.stage < self.max_stage
                 and self.resets_in_stage >= cfg.curriculum_min_resets_per_stage
                 and self.success_ema >= cfg.curriculum_success_threshold
             ):
