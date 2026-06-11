@@ -1634,6 +1634,35 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 device=parent_state.body_q.device,
             )
 
+    def _refresh_mpm_collider_history(self) -> None:
+        """Align the MPM solver's previous-pose history with the just-teleported body poses.
+
+        The implicit MPM solver computes backward finite-difference collider velocities from
+        the body poses of its previous solve (``LastStepData.body_q_prev``). Across a reset
+        teleport that difference becomes a huge fake collider velocity (teleport distance / dt,
+        tens of m/s) that blasts nearby media -- the post-reset "pop". Re-saving the current
+        local body poses zeroes the spurious velocity for the first post-reset solve.
+        """
+        solver = NewtonManager._solver
+        if hasattr(solver, "solver"):
+            mpm = solver.solver(MPM_ENTRY)
+        elif hasattr(solver, "solvers"):
+            mpm = solver.solvers[MPM_ENTRY]
+        else:
+            mpm = solver
+        last = getattr(mpm, "_last_step_data", None)
+        media_state = getattr(self, "_media_entry_state", None)
+        if last is None or media_state is None or media_state.body_q is None:
+            return
+        last.save_collider_current_position(media_state.body_q)
+        # Also drop the solver's warm-start impulse/stress fields: they belong to the pre-reset
+        # particle configuration and otherwise get applied to the freshly placed media.
+        for field_name in ("ws_impulse_field", "ws_stress_field"):
+            field = getattr(last, field_name, None)
+            dof_values = getattr(field, "dof_values", None)
+            if dof_values is not None:
+                dof_values.zero_()
+
     def _setup_kit_visual_sync(self) -> None:
         """Register the per-render Kit callback that drives the gripped cup body visual.
 
@@ -2165,6 +2194,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         newton.eval_fk(NewtonManager.get_model(), s1.joint_q, s1.joint_qd, s1, None)
         self._sync_scoop_bowl_body(s0)
         self._sync_scoop_bowl_body(s1)
+        self._refresh_mpm_collider_history()
         if n_cup > 0:  # pre-load a cupful into the (now opening-up) cavity for the early dump stages
             self._load_cup_media(env_ids, n_cup)
         # Hold the achieved reset pose. This avoids DiffIK chasing residual Newton-IK/collision error on
@@ -2261,27 +2291,54 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
     def _load_cup_media(self, env_ids: torch.Tensor, n_cup: int) -> None:
         """Pre-load the first ``n_cup`` of each reset env's particles into the (opening-up) cup cavity.
 
-        Samples inside the bowl's counting region — the capped cone from the cavity floor
-        (radius ``_bowl_inner_bottom_r`` at z = -``_bowl_floor``) to the rim (``_bowl_inner_top_r``
-        at z = +``_bowl_lip``) — which is also inside the physical cavity for both the hemisphere
-        ladle and the mug, so the pre-load is retained AND counted by ``count_in_bowl``. The cup is
-        opening-up at the loaded reset poses, so bowl-local z is world-up. Radially spread (not a
-        tight blob) so the pre-loaded media is not overlapping -> stable.
+        The pre-load is rained in as a short column just above the cup opening (the cup is
+        opening-up at the loaded reset poses, so bowl-local z is world-up); it falls into the
+        cavity within a few steps. The count is clamped to the cavity capacity at the active
+        particle spacing.
         """
         bowl_w, _ = self._bowl_pose_w()  # world cavity centre at the just-set reset pose
         centers = bowl_w[env_ids].unsqueeze(1)  # (n, 1, 3)
         n = env_ids.numel()
         floor_z, lip_z = -float(self._bowl_floor), float(self._bowl_lip)
-        r_bottom, r_top = float(self._bowl_inner_bottom_r), float(self._bowl_inner_top_r)
-        # z over most of the cavity depth; cone radius at each z with a 20% radial margin. Keep
-        # ``cfg.curriculum_cup_fill_count`` under what this band holds at the MPM particle spacing,
-        # or the overlap pressure ejects the pre-load on the first solve ("pop").
-        z = floor_z + (0.10 + 0.80 * torch.rand(n, n_cup, device=self.device)) * (lip_z - floor_z)
-        t = (z - floor_z) / max(lip_z - floor_z, 1.0e-6)
-        r_max = 0.8 * (r_bottom + t * (r_top - r_bottom))
-        ang = 2.0 * math.pi * torch.rand(n, n_cup, device=self.device)
-        rad = r_max * torch.sqrt(torch.rand(n, n_cup, device=self.device))
-        off = torch.stack([rad * torch.cos(ang), rad * torch.sin(ang), z], dim=-1)
+        r_top = float(self._bowl_inner_top_r)
+        # Clamp the pre-load to what the sampled band physically holds at the active particle
+        # spacing: MPM particles occupy ~spacing^3 each, and overfilling ejects the whole load
+        # ballistically on the first solve. The band volume matches the sampler below (radial
+        # margin 0.8, z band [0.1, 0.9] of the cavity depth; exact for the conical region).
+        spacing = float(self.cfg.voxel_size) / max(float(self.cfg.particles_per_cell), 1.0)
+        band_volume = 0.64 * math.pi * (0.9**3 - 0.1**3) / 3.0 * r_top**2 * (lip_z - floor_z)
+        capacity = int(0.7 * band_volume / spacing**3)
+        if n_cup > capacity:
+            logger.warning(
+                "Cup pre-load %d exceeds the cavity capacity %d at particle spacing %.4f m; clamping.",
+                n_cup,
+                capacity,
+                spacing,
+            )
+            n_cup = capacity
+        if n_cup <= 0:
+            return
+        # Rain the pre-load in from just ABOVE the rim instead of teleporting it inside the
+        # cavity (particles spawned inside the thin-walled collider sit inside its grid-level
+        # blob and are expelled), and place it on a JITTERED LATTICE at the particle spacing:
+        # uniform-random spawns overlap, and at the media's near-incompressible stiffness any
+        # overlap repels explosively (this, not the cup, ejected the pre-load).
+        col_radius = 0.5 * r_top
+        lattice = []
+        layer, i = 0, 0
+        side = max(int(2.0 * col_radius / spacing) + 1, 1)
+        while len(lattice) < n_cup:
+            ix, iy = i % side, (i // side) % side
+            x = (ix - 0.5 * (side - 1)) * spacing
+            y = (iy - 0.5 * (side - 1)) * spacing
+            if x * x + y * y <= col_radius**2:
+                lattice.append((x, y, lip_z + 0.75 * spacing + layer * spacing))
+            i += 1
+            if i % (side * side) == 0:
+                layer += 1
+        lattice_t = torch.tensor(lattice[:n_cup], device=self.device, dtype=torch.float32)
+        jitter = (torch.rand(n, n_cup, 3, device=self.device) - 0.5) * (0.1 * spacing)
+        off = lattice_t.unsqueeze(0) + jitter
         cup_pos = (centers + off).to(torch.float32)
         pos = self._media.data.particle_pos_w.torch[env_ids].clone()
         vel = self._media.data.particle_vel_w.torch[env_ids].clone()

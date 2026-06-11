@@ -85,6 +85,10 @@ def _pile_points(cfg: FrankaScoopEnvCfg) -> tuple[np.ndarray, np.ndarray]:
     base_radius = height / max(math.tan(angle), 1.0e-3)
     # Keep the pile base inside the retaining box footprint.
     base_radius = min(base_radius, float(cfg.container_inner_half[0]) - 2.0 * spacing)
+    # Respect the angle of repose: when the box clips the base radius, cap the height too.
+    # An over-steep cone slumps on the first solves and surges over the shallow retaining
+    # wall (observed as particles spilling off the table right after reset).
+    height = min(height, base_radius * math.tan(angle))
     cone_volume = (math.pi / 3.0) * base_radius * base_radius * height
     count = max(int(cone_volume / (spacing**3)), 64)
     points = sample_conical_pile(

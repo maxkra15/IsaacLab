@@ -212,7 +212,9 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     source_center: tuple = (0.32, -0.23, 0.060)
     target_center: tuple = (0.32, 0.22, 0.060)
     container_inner_half: tuple = (0.14, 0.14, 0.060)
-    container_wall: float = 0.012
+    # Wall thickness must stay >= ~1.5 MPM voxels or pile-edge particles seep through the
+    # retaining box (the MPM grid cannot represent a sub-voxel solid wall).
+    container_wall: float = 0.024
     media_fill_frac: float = 0.80
     # ---- granular pile (source) ----
     pile_box_wall_half: float = 0.015  # retaining-box wall half-height [m] -> 3 cm walls
