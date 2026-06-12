@@ -8,18 +8,21 @@
 from __future__ import annotations
 
 import copy
+import logging
 import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
-from newton import CollisionPipeline, Model
+import warp as wp
+from newton import CollisionPipeline, Model, eval_fk
 from newton.solvers.experimental.coupled import (
     CouplingInterface,
     SolverCoupled,
     SolverCoupledADMM,
     SolverCoupledProxy,
 )
+from newton._src.solvers.coupled.proxy_utils import sync_proxy_particles_kernel, sync_proxy_states_kernel
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.physics import PhysicsManager
@@ -41,6 +44,14 @@ from .solver_factory import (
 
 if TYPE_CHECKING:
     from isaaclab.scene import InteractiveSceneCfg
+
+logger = logging.getLogger(__name__)
+
+
+@wp.kernel(enable_backward=False)
+def _int_mask_to_bool_mask_kernel(src: wp.array(dtype=wp.int32), dst: wp.array(dtype=wp.bool)):
+    tid = wp.tid()
+    dst[tid] = src[tid] != 0
 
 
 class _EntryCollisionPipelineSolver(CouplingInterface):
@@ -77,6 +88,12 @@ class NewtonCoupledManager(NewtonManager):
     cross-entry force or constraint exchange.
     """
 
+    _bool_world_reset_mask: wp.array | None = None
+    """Boolean copy of :attr:`NewtonManager._world_reset_mask` for sub-solver reset kernels."""
+
+    _teleport_protocol_streak: int = 0
+    """Consecutive steps on which the teleport-reset protocol fired (per-step-write detector)."""
+
     @classmethod
     def get_entry_solver(cls, name: str):
         """Return a named sub-solver from the active coupled solver."""
@@ -103,6 +120,132 @@ class NewtonCoupledManager(NewtonManager):
             if mapping.src_name == source and mapping.dst_name == destination:
                 return mapping.coupling_forces
         return None
+
+    @classmethod
+    def step(cls) -> None:
+        """Step coupled physics, re-seeding solver history first if state was teleported."""
+        sim = PhysicsManager._sim
+        if NewtonManager._state_teleport_pending and sim is not None and sim.is_playing():
+            cls._reset_coupled_solver_history()
+            cls._teleport_protocol_streak += 1
+            if cls._teleport_protocol_streak == 16:
+                logger.warning(
+                    "The coupled teleport-reset protocol has fired on 16 consecutive steps: some"
+                    " event or action term writes asset state every step. Each run clears contact"
+                    " warm-start history and sub-solver warm starts, which degrades contact quality"
+                    " and performance. Route continuous targets through actions/controls instead of"
+                    " state writes."
+                )
+        else:
+            cls._teleport_protocol_streak = 0
+        super().step()
+
+    @classmethod
+    def _reset_coupled_solver_history(cls) -> None:
+        """Run the coupled solver's discontinuity protocol after asset state writes.
+
+        The coupled pipeline is history-based: every substep the proxy sync converts
+        source-body pose deltas into destination-proxy velocities, and history-keeping
+        entry solvers (e.g. ``SolverVBD``) reference per-body previous poses for
+        friction and velocity finalization. A state write that teleports bodies (an
+        env reset) must not flow through that incremental path: a 1 m jump at a 1 ms
+        substep becomes a 1000 m/s proxy sweep through resting contacts. This applies
+        Newton's own reset/teleport contracts from the manager side:
+
+        1. FK so the parent state's body poses match the teleported joint state.
+        2. :meth:`SolverCoupled.reset` — distributes the parent state to entry views
+           without velocity folding (``dt=0``), resets sub-solver internals (e.g.
+           MuJoCo warm starts), and clears lagged proxy feedback forces and
+           contact-matching buffers.
+        3. Re-syncs proxy body poses/velocities from their teleported source bodies
+           (the reset cascade clears proxy transients but does not move proxies).
+        4. Re-seeds each entry solver's previous-pose history, per ``SolverVBD``'s
+           documented teleport contract ("Dynamic teleportation: also set
+           ``body_q_prev`` and ``body_qd``").
+
+        Known cost: Newton's reset API clears coupling forces and contact/matching
+        buffers globally (all worlds), so a partial multi-env reset briefly restarts
+        contact warm-start history for non-reset envs as well. This is a bounded
+        one-step transient; per-world clearing would need an upstream Newton change.
+        """
+        solver = NewtonManager._solver
+        state = NewtonManager._state_0
+        if solver is None or state is None:
+            return
+        with wp.ScopedDevice(PhysicsManager._device):
+            # Sub-solver reset kernels expect a boolean world mask; the manager's
+            # accumulated mask is int32 (Kamino convention).
+            world_mask = None
+            int_mask = NewtonManager._world_reset_mask
+            if int_mask is not None:
+                if cls._bool_world_reset_mask is None or cls._bool_world_reset_mask.shape != int_mask.shape:
+                    cls._bool_world_reset_mask = wp.zeros(int_mask.shape, dtype=wp.bool, device=int_mask.device)
+                wp.launch(
+                    _int_mask_to_bool_mask_kernel,
+                    dim=int_mask.shape[0],
+                    inputs=[int_mask, cls._bool_world_reset_mask],
+                )
+                world_mask = cls._bool_world_reset_mask
+            eval_fk(cls._model, state.joint_q, state.joint_qd, state, cls._filtered_fk_reset_mask())
+            # Newton bug workaround: SolverVBD.rebuild_bvh (reached via
+            # SolverCoupled.reset -> _rebuild_entry_solver_state_caches) reads
+            # ``particle_enable_self_contact``, which SolverVBD.__init__ only assigns
+            # when the model has particles. Pre-seed the documented default (False)
+            # so reset also works for rigid-only VBD entries.
+            for entry in solver._entries.values():
+                if callable(getattr(entry.solver, "rebuild_bvh", None)) and not hasattr(
+                    entry.solver, "particle_enable_self_contact"
+                ):
+                    entry.solver.particle_enable_self_contact = False
+            # flags=0: reset NO state quantities — Isaac Lab owns the sim state and
+            # its reset events already wrote the desired values into the parent
+            # state (distributed above); sub-solver state reset would restore MODEL
+            # defaults instead (e.g. SolverMuJoCo snaps joints to USD defaults).
+            # Sub-solvers still clear their internal buffers (MuJoCo warm starts,
+            # applied forces, actuator activations) regardless of flags.
+            # NOTE: with update_data_interval != 1 the immediate qpos push in
+            # SolverMuJoCo.reset is gated on the JOINT_Q flag; the default
+            # interval (1) re-syncs state -> qpos every step, which is what the
+            # coupled configs use.
+            solver.reset(state, world_mask=world_mask, flags=0)
+            for proxy in getattr(solver, "_proxy_mappings", ()):
+                src = solver._entries[proxy.src_name]
+                dst = solver._entries[proxy.dst_name]
+                for dst_state in (dst.state_0, dst.state_1):
+                    if dst_state is None:
+                        continue
+                    wp.launch(
+                        sync_proxy_states_kernel,
+                        dim=proxy.source_local_to_proxy_local.shape[0],
+                        inputs=[
+                            src.state_0.body_q,
+                            src.state_0.body_qd,
+                            proxy.source_local_to_proxy_local,
+                            dst_state.body_q,
+                            dst_state.body_qd,
+                        ],
+                    )
+            for proxy in getattr(solver, "_proxy_particle_mappings", ()):
+                src = solver._entries[proxy.src_name]
+                dst = solver._entries[proxy.dst_name]
+                for dst_state in (dst.state_0, dst.state_1):
+                    if dst_state is None:
+                        continue
+                    wp.launch(
+                        sync_proxy_particles_kernel,
+                        dim=proxy.source_local_to_proxy_local.shape[0],
+                        inputs=[
+                            src.state_0.particle_q,
+                            src.state_0.particle_qd,
+                            proxy.source_local_to_proxy_local,
+                            dst_state.particle_q,
+                            dst_state.particle_qd,
+                        ],
+                    )
+            for entry in solver._entries.values():
+                body_q_prev = getattr(entry.solver, "body_q_prev", None)
+                if body_q_prev is not None:
+                    wp.copy(dest=body_q_prev, src=entry.state_0.body_q)
 
     @classmethod
     def _build_solver(cls, model: Model, solver_cfg: CoupledSolverCfg) -> None:

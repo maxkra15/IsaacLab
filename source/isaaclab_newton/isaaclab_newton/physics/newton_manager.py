@@ -258,6 +258,10 @@ class NewtonManager(PhysicsManager):
     # Per-world reset masks (allocated in start_simulation, consumed in step)
     _world_reset_mask: wp.array | None = None  # (num_envs,) wp.int32 — for SolverKamino.reset(world_mask=...)
     _fk_reset_mask: wp.array | None = None  # (articulation_count,) wp.bool — for eval_fk(mask=...)
+    _state_teleport_pending: bool = False
+    """Host-side flag set by :meth:`invalidate_fk` when asset writes teleported sim state
+    since the last step. Lets manager subclasses run solver reset protocols without a
+    GPU readback of the masks; cleared in :meth:`step` together with the masks."""
     _fk_articulation_filter: wp.array | None = None
     """Optional articulation mask for generic FK. Solver-owned articulations are False."""
 
@@ -678,6 +682,7 @@ class NewtonManager(PhysicsManager):
         # Zero both masks after consumption
         NewtonManager._world_reset_mask.zero_()
         NewtonManager._fk_reset_mask.zero_()
+        NewtonManager._state_teleport_pending = False
 
         physics_dt = cls._solver_dt * cls._num_substeps
         use_graph = cfg is not None and cfg.use_cuda_graph and cls._graph is not None and "cuda" in device  # type: ignore[union-attr]
@@ -1261,6 +1266,8 @@ class NewtonManager(PhysicsManager):
         """
         if cls._world_reset_mask is None or cls._fk_reset_mask is None:
             return
+
+        NewtonManager._state_teleport_pending = True
 
         if articulation_ids is not None and env_mask is not None:
             wp.launch(
