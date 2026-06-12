@@ -310,6 +310,13 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     max_ik_delta: float = 0.05  # full-IK runtime joint delta clamp [rad]; 0 disables it.
     cartesian_action_scale: float = 0.30  # m/s per unit action
     pitch_action_scale: float = 3.0  # rad/s per unit action
+    yaw_action_scale: float = 2.0  # rad/s per unit action (aims the pour direction about vertical)
+    min_yaw: float = -1.57  # yaw range about world Z [rad]; modest so the wrist stays off its rails
+    max_yaw: float = 1.57
+    # Teleop: hold the commanded target through zero-action frames (the arm keeps converging to the
+    # last command). RL keeps this False: a zero action snaps the target to the achieved pose and
+    # skips the IK solve, so it is a true no-op.
+    teleop_hold_target: bool = False
     min_pitch: float = -1.4  # tilt bowl opening toward -X [rad]
     max_pitch: float = 2.6  # max bowl tilt [rad] (allows near-inversion to pour)
     action_smoothing: float = 0.4
@@ -491,3 +498,31 @@ class FrankaScoopEnvCfg_PLAY(FrankaScoopEnvCfg):
         # the pre-loaded dump-only start above the target box).
         self.curriculum_start_stage = len(self.curriculum_reset_pose) - 1
         self.curriculum_freeze = True
+
+
+@configclass
+class FrankaScoopEnvCfg_TELEOP(FrankaScoopEnvCfg_PLAY):
+    """Lift-style teleop feel: low-lag, stateless-feeling, accurately tracked.
+
+    Mirrors the Franka cube-lift ``ik_rel`` teleop interface as closely as the scoop action
+    allows: no action smoothing, a faster Cartesian rate, a looser per-step joint clamp, and
+    the commanded target is HELD through zero-action frames instead of snapping to the
+    achieved pose. The IK stays on the Newton full-pose solver: single-step DLS (the lift
+    teleop controller) cannot track the composed pitch+yaw orientation here (54 deg
+    steady-state error, sloshing the tilted cup empty), while the held Newton solve tracks
+    it and retains the cup load through yaw-and-pour maneuvers.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.action_smoothing = 0.0
+        self.cartesian_action_scale = 0.6
+        self.yaw_action_scale = 1.5
+        self.diffik_max_delta = 0.08
+        self.max_ik_delta = 0.08
+        self.teleop_hold_target = True
+        # No RL time-out mid-session: the operator resets explicitly (device button). Keep the
+        # nonfinite_failure guard. Same pattern as the lift ik_rel teleop agent.
+        self.terminations.time_out = None
+        self.episode_length_s = 3600.0

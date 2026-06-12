@@ -24,14 +24,14 @@ if TYPE_CHECKING:
 
 
 class ScoopAction(ActionTerm):
-    """4-DoF action: scoop-bowl position delta (x,y,z) + bowl pitch delta (tilt to scoop/pour)."""
+    """5-DoF action: scoop-bowl position delta (x,y,z) + bowl pitch delta (tilt) + yaw delta (aim)."""
 
     cfg: ScoopActionCfg
     _env: FrankaScoopEnv
 
     def __init__(self, cfg: ScoopActionCfg, env: FrankaScoopEnv):
         super().__init__(cfg, env)
-        self._dim = 4
+        self._dim = 5
         self._raw = torch.zeros(env.num_envs, self._dim, device=env.device)
         self._proc = torch.zeros_like(self._raw)
         self._joint_targets = env._default_arm_q.clone()
@@ -52,12 +52,20 @@ class ScoopAction(ActionTerm):
         env = self._env
         a = torch.nan_to_num(actions, nan=0.0).clamp(-1.0, 1.0)
         self._raw[:] = a
-        self._proc[:] = torch.lerp(self._proc, a, env.cfg.action_smoothing)
+        smoothing = float(env.cfg.action_smoothing)
+        if smoothing > 0.0:
+            self._proc[:] = torch.lerp(self._proc, a, smoothing)
+        else:
+            self._proc[:] = a
+        # Teleop holds the commanded target through zero-action frames (the operator expects the
+        # arm to keep converging); RL snaps the target to the achieved pose so a zero action is a
+        # true no-op and the IK solve can be skipped entirely.
+        hold = bool(getattr(env.cfg, "teleop_hold_target", False))
         moving = torch.any(torch.abs(self._proc) > 1.0e-6, dim=1)
-        if not bool(moving.any()):
+        if not bool(moving.any()) and not hold:
             env._target_bowl_e[:] = torch.clamp(env.bowl_pos_e(), env._ws_lo, env._ws_hi)
             return
-        if not bool(moving.all()):
+        if not bool(moving.all()) and not hold:
             env._target_bowl_e[~moving] = torch.clamp(env.bowl_pos_e()[~moving], env._ws_lo, env._ws_hi)
         dt = env.step_dt
         env._target_bowl_e[moving] = torch.clamp(
@@ -70,6 +78,11 @@ class ScoopAction(ActionTerm):
             env.cfg.min_pitch,
             env.cfg.max_pitch,
         )
+        env._yaw[moving] = torch.clamp(
+            env._yaw[moving] + self._proc[moving, 4] * env.cfg.yaw_action_scale * dt,
+            env.cfg.min_yaw,
+            env.cfg.max_yaw,
+        )
         joint_targets = env.solve_arm_ik()
         if str(env.cfg.ik_backend).lower() == "diffik":
             max_delta = float(env.cfg.diffik_max_delta)
@@ -78,7 +91,8 @@ class ScoopAction(ActionTerm):
         if max_delta > 0.0:
             delta = torch.clamp(joint_targets - self._joint_targets, -max_delta, max_delta)
             joint_targets = torch.clamp(self._joint_targets + delta, env._arm_lo, env._arm_hi)
-        self._joint_targets[moving] = joint_targets[moving]
+        write = torch.ones_like(moving) if hold else moving
+        self._joint_targets[write] = joint_targets[write]
 
     def apply_actions(self) -> None:
         self._asset.set_joint_position_target_index(

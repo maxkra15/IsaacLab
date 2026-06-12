@@ -24,6 +24,16 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-Scoop-Franka-Teleop-v0",
+    entry_point=_ENV,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{_CFG}:FrankaScoopEnvCfg_TELEOP",
+        "rsl_rl_cfg_entry_point": _AGENT,
+    },
+)
+
+gym.register(
     id="Isaac-Scoop-Franka-Play-v0",
     entry_point=_ENV,
     disable_env_checker=True,

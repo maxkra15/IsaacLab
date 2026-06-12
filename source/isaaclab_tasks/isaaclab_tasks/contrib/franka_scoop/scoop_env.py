@@ -1572,6 +1572,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         )
         self._target_bowl_e = self._home_bowl_e.unsqueeze(0).repeat(self.num_envs, 1)
         self._pitch = torch.zeros(self.num_envs, device=dev)
+        self._yaw = torch.zeros(self.num_envs, device=dev)
 
         # heightfield grid bounds (env frame) covering both containers
         self._hf_lo = torch.tensor(cfg.heightfield_lo, device=dev, dtype=torch.float32)
@@ -1915,18 +1916,29 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             solver.cfg.iterations = prev_iterations
             solver.cfg.step_size = prev_step_size
 
-    def _pitch_to_hand_quat(self, pitch: torch.Tensor) -> torch.Tensor:
-        """Target HAND world orientation = pitch (about world Y) applied to the home hand orientation.
+    def _tilt_to_hand_quat(self, pitch: torch.Tensor, yaw: torch.Tensor | None = None) -> torch.Tensor:
+        """Target HAND world orientation = yaw (about world Z) o pitch (about world Y) o home.
 
-        Tracking the hand near its home orientation keeps the arm reachable; the gripped cup frame is fixed
-        to the hand, so pitch=0 keeps the cup opening up and pitch tilts it to scoop/pour.
+        Tracking the hand near its home orientation keeps the arm reachable; the gripped cup frame is
+        fixed to the hand, so pitch=0 keeps the cup opening up and pitch tilts it to scoop/pour. Yaw
+        rotates the whole tilt direction about the vertical, aiming the pour; yaw=0 reproduces the
+        previous pitch-only behaviour.
         """
         half = 0.5 * pitch
-        pq = torch.stack([torch.zeros_like(half), torch.sin(half), torch.zeros_like(half), torch.cos(half)], dim=-1)
-        return _qmul_t(pq, self._home_quat_t.unsqueeze(0).expand(self.num_envs, -1))
+        zeros = torch.zeros_like(half)
+        q = torch.stack([zeros, torch.sin(half), zeros, torch.cos(half)], dim=-1)
+        if yaw is not None:
+            hy = 0.5 * yaw
+            zy = torch.zeros_like(hy)
+            qz = torch.stack([zy, zy, torch.sin(hy), torch.cos(hy)], dim=-1)
+            q = _qmul_t(qz, q)
+        return _qmul_t(q, self._home_quat_t.unsqueeze(0).expand(self.num_envs, -1))
+
+    def _pitch_to_hand_quat(self, pitch: torch.Tensor) -> torch.Tensor:
+        return self._tilt_to_hand_quat(pitch)
 
     def _pitch_target_quat(self) -> torch.Tensor:
-        return self._pitch_to_hand_quat(self._pitch)
+        return self._tilt_to_hand_quat(self._pitch, self._yaw)
 
     def _solve_target_config(
         self,
@@ -2260,6 +2272,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         reset_q, pitch_val = self._reset_arm_config(pose_kind, reset_pitch)
         reset_q = torch.where(torch.isfinite(reset_q), reset_q, self._default_arm_q)
         self._pitch[env_ids] = pitch_val
+        self._yaw[env_ids] = 0.0
         zero_vel = torch.zeros_like(reset_q[env_ids])
         self._robot.write_joint_position_to_sim_index(
             position=reset_q[env_ids],
@@ -2443,6 +2456,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         # spacing (and current tilt): MPM particles occupy ~spacing^3 each, and overfilling
         # ejects the media on the first solve.
         pitch = float(self._pitch[env_ids].mean())
+        yaw = float(self._yaw[env_ids].mean())
         capacity = self.cup_capacity(pitch)
         if n_cup > capacity:
             # Expected whenever the configured fill counts (sized for the 10 mm voxel) exceed the
@@ -2481,10 +2495,12 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         # The reset tilt is a rotation about world Y around the bowl centre (see
         # _pitch_to_hand_quat); rotate the rain-in column the same way so it falls
         # along the tilted cavity axis instead of clipping the uphill rim.
-        if abs(pitch) > 1.0e-3:
-            c, si = math.cos(pitch), math.sin(pitch)
+        if abs(pitch) > 1.0e-3 or abs(yaw) > 1.0e-3:
+            cp, sp = math.cos(pitch), math.sin(pitch)
             x, y, z = lattice_t[:, 0], lattice_t[:, 1], lattice_t[:, 2]
-            lattice_t = torch.stack([c * x + si * z, y, -si * x + c * z], dim=-1)
+            x, z = cp * x + sp * z, -sp * x + cp * z
+            cy, sy = math.cos(yaw), math.sin(yaw)
+            lattice_t = torch.stack([cy * x - sy * y, sy * x + cy * y, z], dim=-1)
         jitter = (torch.rand(n, n_cup, 3, device=self.device) - 0.5) * (0.1 * spacing)
         off = lattice_t.unsqueeze(0) + jitter
         cup_pos = (centers + off).to(torch.float32)

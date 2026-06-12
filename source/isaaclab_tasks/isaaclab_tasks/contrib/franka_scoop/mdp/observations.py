@@ -48,12 +48,21 @@ def arm_joint_vel_scaled(env: FrankaScoopEnv) -> torch.Tensor:
 
 
 def bowl_pose_obs(env: FrankaScoopEnv) -> torch.Tensor:
-    """Normalized bowl position + tilt (sin/cos of pitch)."""
+    """Normalized bowl position + tilt (sin/cos of pitch and yaw)."""
     center = 0.5 * (env._ws_lo + env._ws_hi)
     half = torch.clamp(0.5 * (env._ws_hi - env._ws_lo), min=1e-6)
     pos = torch.nan_to_num((env.bowl_pos_e() - center) / half, nan=0.0).clamp(-2.0, 2.0)
-    pitch = env._pitch
-    return torch.cat((pos, torch.sin(pitch).unsqueeze(-1), torch.cos(pitch).unsqueeze(-1)), dim=-1)
+    pitch, yaw = env._pitch, env._yaw
+    return torch.cat(
+        (
+            pos,
+            torch.sin(pitch).unsqueeze(-1),
+            torch.cos(pitch).unsqueeze(-1),
+            torch.sin(yaw).unsqueeze(-1),
+            torch.cos(yaw).unsqueeze(-1),
+        ),
+        dim=-1,
+    )
 
 
 def bowl_to_source_obs(env: FrankaScoopEnv) -> torch.Tensor:

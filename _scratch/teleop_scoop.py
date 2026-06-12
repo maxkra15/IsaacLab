@@ -5,9 +5,12 @@
 
 """SpaceMouse teleoperation for the Franka scoop MPM env.
 
-Maps the 6-DoF SpaceMouse to the env's 4-DoF action: lateral/vertical motion drives
+Maps the 6-DoF SpaceMouse to the env's 5-DoF action: lateral/vertical motion drives
 the scoop bowl target in env/world Cartesian (x, y, z); one twist axis tilts the bowl
-(negative = opening up to hold, positive = pour). The right button resets the episode.
+(negative = opening up to hold, positive = pour) and the yaw twist aims the pour
+direction about vertical. The right button resets the episode. Uses the TELEOP cfg
+preset (lift-style feel: held-target Newton full-pose IK, no smoothing, no RL time-out)
+unless --rl-cfg is given.
 
     # interactive (needs a display + the SpaceMouse connected):
     ./scoop_run.sh -p _scratch/teleop_scoop.py --device cuda:0 --visualizer newton
@@ -30,6 +33,10 @@ from isaaclab.app.sim_launcher import add_launcher_args, launch_simulation
 parser = argparse.ArgumentParser()
 parser.add_argument("--pos-gain", type=float, default=1.0, help="SpaceMouse translation -> bowl x/y/z action gain")
 parser.add_argument("--rot-gain", type=float, default=0.30, help="SpaceMouse twist -> bowl pitch action gain")
+parser.add_argument("--yaw-gain", type=float, default=0.30, help="SpaceMouse yaw twist -> bowl yaw action gain")
+parser.add_argument("--yaw-axis", type=int, default=5, help="which SpaceMouse rot axis aims the pour (3=roll,4=pitch,5=yaw)")
+parser.add_argument("--invert-yaw", action="store_true", help="invert selected SpaceMouse yaw axis")
+parser.add_argument("--rl-cfg", action="store_true", help="use the RL training cfg instead of the TELEOP preset")
 parser.add_argument("--spacemouse-pos-sensitivity", type=float, default=0.4, help="SpaceMouse translation sensitivity")
 parser.add_argument("--spacemouse-rot-sensitivity", type=float, default=0.8, help="SpaceMouse rotation sensitivity")
 parser.add_argument("--deadzone", type=float, default=0.05, help="ignore SpaceMouse axes with magnitude below this")
@@ -70,9 +77,9 @@ def _ensure_display_for_kit() -> None:
 
 
 def _make_cfg(device: str):
-    from isaaclab_tasks.contrib.franka_scoop.scoop_env_cfg import FrankaScoopEnvCfg
+    from isaaclab_tasks.contrib.franka_scoop.scoop_env_cfg import FrankaScoopEnvCfg, FrankaScoopEnvCfg_TELEOP
 
-    cfg = FrankaScoopEnvCfg()
+    cfg = FrankaScoopEnvCfg() if args_cli.rl_cfg else FrankaScoopEnvCfg_TELEOP()
     cfg.scene.num_envs = 1
     cfg.sim.device = str(device)
     if args_cli.ik_backend is not None:
@@ -117,14 +124,16 @@ def _run_env(cfg) -> None:
     obs, _ = env.reset()
     act = torch.zeros(1, env.action_manager.total_action_dim, device=dev)
     pax = max(3, min(5, args_cli.pitch_axis))
+    yax = max(3, min(5, args_cli.yaw_axis))
     signs = torch.tensor([
         -1.0 if args_cli.invert_x else 1.0,
         -1.0 if args_cli.invert_y else 1.0,
         -1.0 if args_cli.invert_z else 1.0,
         -1.0 if args_cli.invert_pitch else 1.0,
+        -1.0 if args_cli.invert_yaw else 1.0,
     ], device=dev)
-    print("[TELEOP] ready: translation is env/world x/y/z; selected twist axis tilts bowl. "
-          "Right button=reset.", flush=True)
+    print("[TELEOP] ready: translation is env/world x/y/z; twist axes tilt the bowl (pitch) and "
+          "aim the pour (yaw). Right button=reset.", flush=True)
 
     def viewer_running() -> bool:
         vis = getattr(env.sim, "visualizers", None)
@@ -147,6 +156,7 @@ def _run_env(cfg) -> None:
                 act[0, 1] = torch.clamp(cmd[1] * signs[1] * args_cli.pos_gain, -1.0, 1.0)
                 act[0, 2] = torch.clamp(cmd[2] * signs[2] * args_cli.pos_gain, -1.0, 1.0)
                 act[0, 3] = torch.clamp(cmd[pax] * signs[3] * args_cli.rot_gain, -1.0, 1.0)
+                act[0, 4] = torch.clamp(cmd[yax] * signs[4] * args_cli.yaw_gain, -1.0, 1.0)
                 if args_cli.debug_cmd and count % 15 == 0:
                     print(f"[TELEOP] raw={[round(float(x), 3) for x in raw_cmd]} "
                           f"cmd={[round(float(x), 3) for x in cmd]} "
@@ -154,7 +164,8 @@ def _run_env(cfg) -> None:
             obs, rew, term, trunc, info = env.step(act)
             if count % 30 == 0:
                 print(f"[TELEOP] bowl_e={[round(float(x), 3) for x in env.bowl_pos_e()[0]]} "
-                      f"pitch={float(env._pitch[0]):+.2f} in_bowl={int(env.count_in_bowl()[0])} "
+                      f"pitch={float(env._pitch[0]):+.2f} yaw={float(env._yaw[0]):+.2f} "
+                      f"in_bowl={int(env.count_in_bowl()[0])} "
                       f"src={int(env.count_in_source()[0])} tgt={int(env.count_in_target()[0])} "
                       f"fin={bool(torch.isfinite(obs['policy']).all())}", flush=True)
             count += 1
