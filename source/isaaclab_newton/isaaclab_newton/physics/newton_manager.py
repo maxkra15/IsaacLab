@@ -296,6 +296,7 @@ class NewtonManager(PhysicsManager):
     _newton_particle_count_attr = "newton:particleCount"
     _particle_visual_prims: set[str] = set()
     _pre_render_callbacks: dict[str, Callable[[], None]] = {}
+    _post_solver_init_callbacks: dict[str, Callable[[], None]] = {}
     _usd_xform_ops: dict[str, object] = {}
 
     # cubric GPU transform hierarchy (replaces CPU update_world_xforms)
@@ -429,6 +430,21 @@ class NewtonManager(PhysicsManager):
                 NewtonManager._pre_render_callbacks.pop(name, None)
         cls.sync_transforms_to_usd()
         cls.sync_particles_to_usd()
+
+    @classmethod
+    def register_post_solver_init_callback(cls, name: str, callback: Callable[[], None]) -> None:
+        """Register a one-shot callback that runs once the Newton solver is fully built.
+
+        Callbacks fire at the end of :meth:`initialize_solver`, after the solver and
+        collision pipeline exist but before the CUDA graph is captured — the right
+        place for runtime tuning of solver-owned arrays (e.g. making latch joints
+        dormant). If the solver is already initialized, the callback runs immediately.
+        Each callback is invoked once and then discarded.
+        """
+        if NewtonManager._solver is not None:
+            callback()
+            return
+        NewtonManager._post_solver_init_callbacks[name] = callback
 
     @classmethod
     def register_pre_render_callback(cls, name: str, callback: Callable[[], None]) -> None:
@@ -858,6 +874,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._per_world_builder_hooks = []
         NewtonManager._post_replicate_hooks = []
         NewtonManager._pre_render_callbacks = {}
+        NewtonManager._post_solver_init_callbacks = {}
         NewtonManager._usd_xform_ops = {}
         NewtonManager._up_axis = "Z"
         NewtonManager._visualization_scene_data = None
@@ -1727,6 +1744,11 @@ class NewtonManager(PhysicsManager):
                     "NewtonManager._use_single_state, and NewtonManager._needs_collision_pipeline."
                 )
             cls._initialize_contacts()
+
+        callbacks = NewtonManager._post_solver_init_callbacks
+        NewtonManager._post_solver_init_callbacks = {}
+        for callback in callbacks.values():
+            callback()
 
         if cls._usdrt_stage is not None:
             cls._setup_cubric_bindings()

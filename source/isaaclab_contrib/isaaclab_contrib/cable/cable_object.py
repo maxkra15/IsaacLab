@@ -706,9 +706,99 @@ class CableObject(Articulation):
         # to stay robust if the base init ever mutates the registry concurrently.
         cable_idx = SimulationManager._cable_registry.index(self._registry_entry)
         for attachment in self.cfg.attachments:
+            if attachment.dormant and not attachment.enabled:
+                raise ValueError(
+                    f"CableAttachmentCfg(label_suffix={attachment.label_suffix!r}) sets dormant=True with"
+                    " enabled=False. Dormant latches must be built enabled (a joint enabled only at runtime"
+                    " exerts no force); dormancy comes from zeroing the penalty gains at initialization."
+                )
             SimulationManager._pending_cable_attachments.append((cable_idx, attachment))
         for capture in self.cfg.sdf_captures:
             SimulationManager._pending_cable_sdf_captures.append((cable_idx, capture))
+
+    def _initialize_impl(self):
+        super()._initialize_impl()
+        # Assets initialize before the Newton solver is built; the registered callback
+        # fires once the solver (and its AVBD penalty arrays) exist, before graph capture.
+        SimulationManager.register_post_solver_init_callback(
+            f"cable_dormant_attachments_{self.cfg.prim_path}", self._make_dormant_attachments_dormant
+        )
+
+    def _make_dormant_attachments_dormant(self) -> None:
+        """Zero the AVBD joint-penalty gains of attachments flagged ``dormant``.
+
+        Dormant attachments are built enabled so the solver allocates their
+        build-time joint structures, with whatever default penalty gains the
+        solver seeds. This zeroes ``joint_penalty_k``/``k_min``/``k_max``/``kd``
+        for their constraint slots before the first physics step, writing in
+        place into the existing warp arrays (CUDA-graph safe: captured kernels
+        re-read them every step). Runtime code re-engages a latch by writing the
+        gains back (see the waterhose scripted state machine for an example).
+
+        Raises:
+            RuntimeError: If no AVBD-style solver exposing the penalty arrays is
+                active, or a dormant attachment's joint label does not resolve to
+                exactly one joint per environment.
+        """
+        dormant = [attachment for attachment in self.cfg.attachments if attachment.dormant]
+        if not dormant:
+            return
+
+        solver = SimulationManager._solver
+        if solver is None:
+            raise RuntimeError("Cannot make cable attachments dormant: the Newton solver is not initialized yet.")
+
+        # Collect (sub-solver, joint labels) pairs that expose the AVBD joint-penalty
+        # path: every entry of a coupled solver, or the flat solver itself.
+        penalty_attrs = ("joint_penalty_k", "joint_penalty_k_min", "joint_penalty_k_max", "joint_penalty_kd")
+        pairs = []
+        entry_names = getattr(solver, "_entries", None)
+        if entry_names:
+            for name in entry_names:
+                sub_solver = solver.solver(name)
+                if all(hasattr(sub_solver, attr) for attr in penalty_attrs):
+                    labels = [str(label) for label in solver.view(name).joint_label]
+                    pairs.append((sub_solver, labels))
+        elif all(hasattr(solver, attr) for attr in penalty_attrs):
+            labels = [str(label) for label in SimulationManager.get_model().joint_label]
+            pairs.append((solver, labels))
+        if not pairs:
+            raise RuntimeError(
+                "CableAttachmentCfg.dormant requires an AVBD-style VBD solver exposing the joint_penalty_*"
+                " arrays; the active solver has none."
+            )
+
+        num_worlds = len(self._registry_entry.body_offsets)
+        tokens = [
+            f"{attachment.label_suffix or f'attachment_seg{attachment.cable_anchor}'}_w{world_idx}"
+            for attachment in dormant
+            for world_idx in range(num_worlds)
+        ]
+        matched: dict[str, int] = dict.fromkeys(tokens, 0)
+        for sub_solver, labels in pairs:
+            joints = [j for j, label in enumerate(labels) for token in tokens if label.endswith(token)]
+            for j, label in ((j, labels[j]) for j in joints):
+                for token in tokens:
+                    if label.endswith(token):
+                        matched[token] += 1
+            if not joints:
+                continue
+            constraint_start = sub_solver.joint_constraint_start.numpy()
+            for attr in penalty_attrs:
+                arr = getattr(sub_solver, attr)
+                host = arr.numpy()
+                for j in joints:
+                    slot_begin = int(constraint_start[j])
+                    slot_end = int(constraint_start[j + 1]) if j + 1 < len(constraint_start) else host.shape[0]
+                    host[slot_begin:slot_end] = 0.0
+                arr.assign(host)
+
+        unresolved = {token: count for token, count in matched.items() if count != 1}
+        if unresolved:
+            raise RuntimeError(
+                f"Dormant cable attachments on '{self.cfg.prim_path}' did not resolve to exactly one joint"
+                f" each: {unresolved}."
+            )
 
     def _register_cable(self) -> CableRegistryEntry:
         """Read cable geometry + material from the spawned USD prim and append to the registry.

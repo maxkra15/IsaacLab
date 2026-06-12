@@ -326,9 +326,9 @@ class WaterhoseDemoState:
                     f"k={k_host[c0:c1].tolist()} k_max={kmax_host[c0:c1].tolist()}",
                     flush=True,
                 )
-        # The snap joints are authored ENABLED (so they exist in the solver's build-time
-        # joint structures) with build-default gains; make them dormant before the first
-        # physics step by zeroing all penalty arrays.
+        # The snap joints are authored ENABLED with dormant=True, so CableObject already
+        # zeroed their gains at asset init (cable_object.py). Re-zero here anyway: the SM
+        # owns the latch from now on and this also resets joint_enabled bookkeeping.
         self._snap_write(torch.ones_like(self._snap_active), 0.0, 0.0, 0.0, enable=False)
 
     def _snap_write(

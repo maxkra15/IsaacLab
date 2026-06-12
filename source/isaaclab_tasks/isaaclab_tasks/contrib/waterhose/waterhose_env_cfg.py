@@ -441,8 +441,9 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             # seated pose. The cable-side anchor point reuses the Plug1-weld offset, so the
             # joint pins the PLUG ORIGIN onto SocketAnchor1. Created ENABLED so it is part
             # of the solver's build-time joint structures (a joint enabled only at runtime
-            # exerts no force); dormancy comes from the scripted state machine zeroing its
-            # penalty gains at startup and writing them back when the tip seats.
+            # exerts no force); dormant=True zeroes its penalty gains at asset init so it
+            # exerts nothing in EVERY task variant (teleop included), and the scripted
+            # state machine writes the gains back when the tip seats.
             # add_to_articulation=False: seg 0 already has the Plug1 weld as its
             # articulation parent, so this loop-closing latch must stay outside the tree.
             CableAttachmentCfg(
@@ -452,6 +453,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
                 target_local_pos=SOCKET_SNAP_ANCHOR_LOCAL_OFFSET,
                 label_suffix="socket_snap",
                 enabled=True,
+                dormant=True,
                 add_to_articulation=False,
             ),
         ],

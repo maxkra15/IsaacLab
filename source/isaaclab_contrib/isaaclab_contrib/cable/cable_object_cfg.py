@@ -69,6 +69,18 @@ class CableAttachmentCfg:
     attachments that should act like a latch or snap constraint.
     """
 
+    dormant: bool = False
+    """Whether to zero the joint's AVBD penalty gains before the first physics step.
+
+    A latch/snap attachment must be built **enabled** so it is part of the
+    solver's build-time joint structures (a joint enabled only at runtime exerts
+    no force), but it must not pull until runtime code engages it. Setting this
+    flag keeps the joint enabled while :class:`~isaaclab_contrib.cable.CableObject`
+    zeroes its ``joint_penalty_k``/``k_min``/``k_max``/``kd`` slots at asset
+    initialization, in place (CUDA-graph safe). Runtime code engages the latch by
+    writing the gains back. Requires :attr:`enabled` to be ``True``.
+    """
+
     add_to_articulation: bool = True
     """Whether this fixed joint belongs to the cable attachment articulation.
 
