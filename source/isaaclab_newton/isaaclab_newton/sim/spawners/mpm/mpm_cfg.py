@@ -69,9 +69,6 @@ class MPMParticleSpawnerCfg(SpawnerCfg):
     visual_color: Sequence[float] = (0.7, 0.6, 0.4)
     """Display color for Kit particle visualization."""
 
-    visual_update_frequency: int = 1
-    """Kit particle visualization update frequency in render frames."""
-
 
 @configclass
 class MPMGridCfg(MPMParticleSpawnerCfg):

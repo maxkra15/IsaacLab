@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -180,9 +181,20 @@ class NewtonInverseKinematicsAction(ActionTerm):
         plan = sim_utils.SimulationContext.instance().get_clone_plan()
         source_path, _, asset_suffix = resolve_clone_plan_source(self._asset.cfg.prim_path, plan)
         # The proto builder is keyed by the bare clone source; the articulation
-        # lives at the asset suffix below it (e.g. ".../env_0" + "/Robot").
-        self._source_path = source_path + asset_suffix
-        prototype_model = NewtonManager._cl_protos[source_path].finalize(device=NewtonManager.get_model().device)
+        # lives at the asset suffix below it (e.g. ".../env_0" + "/Robot"), optionally
+        # deeper when the asset authors its articulation root on a child prim
+        # (ArticulationCfg.articulation_root_prim_path, e.g. RBY1's "/Geometry/origin").
+        articulation_root = getattr(self._asset.cfg, "articulation_root_prim_path", None) or ""
+        self._source_path = source_path + asset_suffix + articulation_root
+        # ModelBuilder.finalize() re-finalizes every shape_source geometry IN PLACE,
+        # replacing the wp.Mesh handles whose ids the already-finalized MAIN model
+        # references (the proto builder shares its Mesh objects with the main builder
+        # via add_builder). Finalizing the shared proto directly therefore frees the
+        # main model's collision BVHs and the next narrow-phase launch reads freed
+        # memory. Finalize a geometry-isolated shallow copy instead.
+        proto_builder = copy.copy(NewtonManager._cl_protos[source_path])
+        proto_builder.shape_source = [copy.copy(geo) if geo is not None else None for geo in proto_builder.shape_source]
+        prototype_model = proto_builder.finalize(device=NewtonManager.get_model().device)
         prototype_view = ArticulationView(
             prototype_model,
             self._source_path,
