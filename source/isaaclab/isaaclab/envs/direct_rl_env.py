@@ -163,10 +163,10 @@ class DirectRLEnv(gym.Env):
         # viewport is not available in other rendering modes so the function will throw a warning
         # FIXME: This needs to be fixed in the future when we unify the UI functionalities even for
         # non-rendering modes.
-        # Initialize when a Kit viewport exists. ViewportCameraController uses omni.kit (renderer camera);
-        # skip in kitless Newton-only runs (e.g. --viz rerun) where no Kit app is running.
-        has_visualizers = self.sim.has_active_visualizers()
-        if (self.sim.has_gui or has_visualizers) and has_kit():
+        # Keep ViewerCfg-backed viewport control only for the legacy GUI path.
+        # Explicit visualizers own their cameras via SimulationCfg.visualizer_cfgs.
+        visualizer_types = set(self.sim.resolve_visualizer_types())
+        if self.sim.has_gui and not visualizer_types and has_kit():
             self.viewport_camera_controller = ViewportCameraController(self, self.cfg.viewer)
         else:
             self.viewport_camera_controller = None

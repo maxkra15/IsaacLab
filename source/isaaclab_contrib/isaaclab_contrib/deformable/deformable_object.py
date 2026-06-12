@@ -258,21 +258,6 @@ def install_deformable_builder_hooks() -> None:
         SimulationManager._post_replicate_hooks.append(color_registered_deformables)
 
 
-def clear_deformable_builder_hooks() -> None:
-    """Clear deformable registry state and remove only deformable-owned builder hooks."""
-    SimulationManager._deformable_registry = []
-    if hasattr(SimulationManager, "_per_world_builder_hooks"):
-        SimulationManager._per_world_builder_hooks = [
-            hook
-            for hook in SimulationManager._per_world_builder_hooks
-            if hook is not add_registered_deformables_to_builder
-        ]
-    if hasattr(SimulationManager, "_post_replicate_hooks"):
-        SimulationManager._post_replicate_hooks = [
-            hook for hook in SimulationManager._post_replicate_hooks if hook is not color_registered_deformables
-        ]
-
-
 class DeformableObject(BaseDeformableObject):
     """A deformable object asset class (Newton backend).
 

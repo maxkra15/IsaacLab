@@ -33,6 +33,18 @@ else:
     _MappingBatch = tuple
 
 
+def _solver_cfg_requires_graph_coloring(solver_cfg) -> bool:
+    """Return whether a solver cfg or any coupled sub-solver needs VBD graph coloring."""
+    if solver_cfg is None:
+        return False
+    if getattr(solver_cfg, "requires_graph_coloring", False):
+        return True
+    return any(
+        _solver_cfg_requires_graph_coloring(getattr(entry_cfg, "solver_cfg", None))
+        for entry_cfg in getattr(solver_cfg, "entries", ()) or ()
+    )
+
+
 def _build_newton_builder_from_mapping(
     stage: Usd.Stage,
     sources: Sequence[str],
@@ -100,6 +112,13 @@ def _build_newton_builder_from_mapping(
         per_world_builder_hooks=NewtonManager._per_world_builder_hooks,
         post_replicate_hooks=NewtonManager._post_replicate_hooks,
     )
+
+    # Hook-built entities (e.g. cables from per_world_builder_hooks) are not covered by the
+    # deformable post-replicate coloring hook, so color whenever the active solver cfg (or any
+    # coupled sub-solver entry) requires VBD graph coloring. builder.color() is idempotent-safe
+    # here: it runs once on the fully replicated builder before finalize.
+    if _solver_cfg_requires_graph_coloring(getattr(PhysicsManager._cfg, "solver_cfg", None)):
+        builder.color()
 
     site_index_map = {label: (idx, None) for label, idx in global_sites.items()}
     site_index_map.update((label, (None, per_world)) for label, per_world in local_site_map.items())

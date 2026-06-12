@@ -30,13 +30,20 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import warp as wp
+from isaaclab.managers import SceneEntityCfg
 from isaaclab_newton.physics import (
+    AdmmContactPairCfg,
+    AdmmCouplingCfg,
+    CoupledProxyCfg,
+    CoupledSolverCfg,
+    CoupledSolverEntryCfg,
     FeatherstoneSolverCfg,
     KaminoSolverCfg,
     MJWarpSolverCfg,
     MPMSolverCfg,
     NewtonCfg,
     NewtonCollisionPipelineCfg,
+    NewtonCoupledManager,
     NewtonFeatherstoneManager,
     NewtonKaminoManager,
     NewtonManager,
@@ -44,10 +51,12 @@ from isaaclab_newton.physics import (
     NewtonMPMManager,
     NewtonSolverCfg,
     NewtonXPBDManager,
+    ProxyCouplingCfg,
     XPBDSolverCfg,
 )
 from isaaclab_newton.physics.mpm_manager import _make_solver_config
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
 
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
@@ -113,6 +122,82 @@ SOLVER_MATRIX = [
         True,
         False,
         id="implicit_mpm",
+    ),
+    pytest.param(
+        lambda: CoupledSolverCfg(
+            coupling_type="base",
+            entries=[
+                CoupledSolverEntryCfg(name="rigid", solver_cfg=XPBDSolverCfg(iterations=1), bodies=[0]),
+                CoupledSolverEntryCfg(
+                    name="particle",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    particles=[0],
+                    in_place=True,
+                ),
+            ],
+        ),
+        NewtonCoupledManager,
+        SolverCoupled,
+        False,
+        True,
+        id="base_coupled_xpbd_body_particle",
+    ),
+    pytest.param(
+        lambda: CoupledSolverCfg(
+            entries=[
+                CoupledSolverEntryCfg(
+                    name="rigid",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    bodies=[0],
+                ),
+                CoupledSolverEntryCfg(
+                    name="particle",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    particles=[0],
+                    in_place=True,
+                ),
+            ],
+            proxy_coupling=ProxyCouplingCfg(
+                proxies=[
+                    CoupledProxyCfg(
+                        source="rigid",
+                        destination="particle",
+                        bodies=[0],
+                    )
+                ],
+            ),
+            use_collision_pipeline=True,
+        ),
+        NewtonCoupledManager,
+        SolverCoupledProxy,
+        False,
+        True,
+        id="proxy_coupled_xpbd_body_particle",
+    ),
+    pytest.param(
+        lambda: CoupledSolverCfg(
+            coupling_type="admm",
+            entries=[
+                CoupledSolverEntryCfg(
+                    name="rigid",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    bodies=[0],
+                ),
+                CoupledSolverEntryCfg(
+                    name="particle",
+                    solver_cfg=XPBDSolverCfg(iterations=1),
+                    particles=[0],
+                    in_place=True,
+                ),
+            ],
+            admm_coupling=AdmmCouplingCfg(iterations=1, rho=1.0, gamma=0.0),
+            use_collision_pipeline=False,
+        ),
+        NewtonCoupledManager,
+        SolverCoupledADMM,
+        False,
+        False,
+        id="admm_coupled_xpbd_body_particle",
     ),
 ]
 
@@ -433,7 +518,14 @@ def test_mpm_unsupported_cuda_graph_capture_uses_eager_execution(monkeypatch):
 
 @pytest.mark.parametrize(
     "manager",
-    [NewtonMJWarpManager, NewtonXPBDManager, NewtonFeatherstoneManager, NewtonKaminoManager, NewtonMPMManager],
+    [
+        NewtonMJWarpManager,
+        NewtonXPBDManager,
+        NewtonFeatherstoneManager,
+        NewtonKaminoManager,
+        NewtonMPMManager,
+        NewtonCoupledManager,
+    ],
 )
 def test_subclass_of_newton_manager(manager):
     """All concrete managers inherit from :class:`NewtonManager`."""
@@ -450,13 +542,190 @@ def test_abstract_build_solver_raises():
 
 @pytest.mark.parametrize(
     "manager",
-    [NewtonMJWarpManager, NewtonXPBDManager, NewtonFeatherstoneManager, NewtonKaminoManager, NewtonMPMManager],
+    [
+        NewtonMJWarpManager,
+        NewtonXPBDManager,
+        NewtonFeatherstoneManager,
+        NewtonKaminoManager,
+        NewtonMPMManager,
+        NewtonCoupledManager,
+    ],
 )
 def test_manager_name_starts_with_newton(manager):
     """The ``"newton"`` prefix is required by :class:`InteractiveScene` and the
     various backend factories that dispatch on ``physics_manager.__name__.lower()``.
     """
     assert manager.__name__.lower().startswith("newton")
+
+
+def test_coupled_entry_threads_generic_entry_options():
+    """Isaac Lab entry cfg exposes Newton's generic SolverCoupled.Entry options."""
+
+    def _configure_view(_view):
+        return None
+
+    entry = NewtonCoupledManager._build_entry(
+        CoupledSolverEntryCfg(
+            name="xpbd",
+            solver_cfg=XPBDSolverCfg(iterations=1),
+            particles=[0],
+            configure_view=_configure_view,
+            in_place=True,
+        )
+    )
+    assert entry.configure_view is _configure_view
+    assert callable(entry.solver)
+    assert entry.in_place is True
+
+
+def test_coupled_proxy_int_mode_is_normalized():
+    """Integer proxy modes are normalized before constructing Newton proxy configs."""
+    proxy = NewtonCoupledManager._build_proxy(
+        CoupledProxyCfg(source="src", destination="dst", particles=[0], mode=1)
+    )
+    assert proxy.mode == "staggered"
+
+
+def test_coupled_selectors_resolve_bodies_shapes_joints_particles():
+    """Front-end selectors resolve to the raw ids Newton coupled solvers expect."""
+    builder = NewtonManager.create_builder()
+    base = builder.add_body(mass=1.0, label="/World/envs/env_0/Robot/base")
+    finger = builder.add_body(mass=1.0, label="/World/envs/env_0/Robot/finger")
+    joint = builder.add_joint_revolute(parent=base, child=finger, axis=(0, 0, 1))
+    base_shape = builder.add_shape_box(base, hx=0.05, hy=0.05, hz=0.05)
+    finger_shape = builder.add_shape_box(finger, hx=0.02, hy=0.02, hz=0.02)
+    ground_shape = builder.add_ground_plane()
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.1), vel=wp.vec3(0.0), mass=0.1, radius=0.02)
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.2), vel=wp.vec3(0.0), mass=0.1, radius=0.02)
+    model = builder.finalize(device="cpu")
+
+    scene_cfg = SimpleNamespace(robot=SimpleNamespace(prim_path="/World/envs/env_.*/Robot"))
+    entry = NewtonCoupledManager._resolve_entry_cfg(
+        model,
+        CoupledSolverEntryCfg(
+            name="rigid",
+            solver_cfg=XPBDSolverCfg(iterations=1),
+            body_entities=[SceneEntityCfg("robot")],
+            particle_range=(0, None),
+            include_static_shapes=True,
+        ),
+        scene_cfg,
+    )
+    assert entry.bodies == [base, finger]
+    assert joint in entry.joints
+    assert entry.shapes == [base_shape, finger_shape, ground_shape]
+    assert entry.particles == [0, 1]
+
+    proxy = NewtonCoupledManager._resolve_proxy_cfg(
+        model,
+        CoupledProxyCfg(
+            source="rigid",
+            destination="soft",
+            body_entities=[SceneEntityCfg("robot", body_names=["finger"])],
+            particle_range=(1, None),
+        ),
+        scene_cfg,
+    )
+    assert proxy.bodies == [finger]
+    assert proxy.particles == [1]
+
+    local_id_entry = NewtonCoupledManager._resolve_entry_cfg(
+        model,
+        CoupledSolverEntryCfg(
+            name="finger",
+            solver_cfg=XPBDSolverCfg(iterations=1),
+            body_entities=[SceneEntityCfg("robot", body_ids=[1])],
+        ),
+        scene_cfg,
+    )
+    assert local_id_entry.bodies == [finger]
+
+
+def test_coupled_scene_entity_selectors_require_scene_cfg():
+    """SceneEntityCfg selectors fail early when the solver cfg has no scene cfg."""
+    builder = NewtonManager.create_builder()
+    builder.add_body(mass=1.0, label="/World/envs/env_0/Robot/base")
+    model = builder.finalize(device="cpu")
+
+    with pytest.raises(ValueError, match="scene_cfg"):
+        NewtonCoupledManager._resolve_entry_cfg(
+            model,
+            CoupledSolverEntryCfg(name="rigid", solver_cfg=XPBDSolverCfg(), body_entities=[SceneEntityCfg("robot")]),
+            None,
+        )
+
+
+@pytest.mark.parametrize(
+    "cfg, match",
+    [
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                ],
+            ),
+            "Duplicate",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg(), in_place=True, substeps=2),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+            ),
+            "in_place requires substeps=1",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg(), shapes=[0]),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg(), shapes=[0]),
+                ],
+            ),
+            "shapes index 0 is owned by both",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+                proxy_coupling=ProxyCouplingCfg(
+                    proxies=[CoupledProxyCfg(source="missing", destination="b", particles=[0])]
+                ),
+            ),
+            "source 'missing'",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+                proxy_coupling=ProxyCouplingCfg(
+                    proxies=[CoupledProxyCfg(source="a", destination="b", particles=[0], mode=2)]
+                ),
+            ),
+            "Unsupported CoupledProxyCfg mode",
+        ),
+        (
+            CoupledSolverCfg(
+                coupling_type="admm",
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+                admm_coupling=AdmmCouplingCfg(contact_pairs=[AdmmContactPairCfg(source="a", destination="a")]),
+            ),
+            "source and destination",
+        ),
+    ],
+)
+def test_coupled_cfg_validation_rejects_invalid_configs(cfg, match):
+    """Invalid coupled configs fail before Newton constructs sub-solvers."""
+    with pytest.raises(ValueError, match=match):
+        NewtonCoupledManager._validate_solver_cfg(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +800,38 @@ def test_initialize_solver_populates_canonical_state(
                 jitter=0.0,
                 radius_mean=0.02,
             )
+        elif (
+            SolverCoupledProxy is not None
+            and issubclass(expected_solver_cls, SolverCoupledProxy)
+        ):
+            body = builder.add_body(mass=1.0)
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+            builder.add_ground_plane()
+            builder.add_particle(
+                pos=wp.vec3(0.0, 0.0, 0.1),
+                vel=wp.vec3(0.0),
+                mass=0.1,
+                radius=0.02,
+            )
+        elif SolverCoupled is not None and expected_solver_cls is SolverCoupled:
+            body = builder.add_body(mass=1.0)
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+            builder.add_particle(
+                pos=wp.vec3(0.0, 0.0, 0.1),
+                vel=wp.vec3(0.0),
+                mass=0.1,
+                radius=0.02,
+            )
+        elif expected_solver_cls is SolverCoupledADMM:
+            assert builder.has_custom_attribute("coupling:body_particle_attachment_body")
+            body = builder.add_body(mass=1.0)
+            particle = builder.add_particle(
+                pos=wp.vec3(0.0, 0.0, 0.0),
+                vel=wp.vec3(0.0),
+                mass=0.1,
+                radius=0.02,
+            )
+            SolverCoupledADMM.add_body_particle_attachment(builder, body, particle, stiffness=10.0)
         else:
             # Pre-populate the builder with a minimal scene so MJCF conversion has
             # something to work with.
@@ -544,13 +845,26 @@ def test_initialize_solver_populates_canonical_state(
         # Canonical state lives on the base class.
         assert NewtonManager._solver is not None
         assert isinstance(NewtonManager._solver, expected_solver_cls)
+        if SolverCoupled is not None and expected_solver_cls is SolverCoupled:
+            assert NewtonCoupledManager.get_entry_solver("rigid") is not None
+            assert NewtonCoupledManager.get_entry_solver("particle") is not None
+        if SolverCoupledProxy is not None and issubclass(expected_solver_cls, SolverCoupledProxy):
+            rigid_solver = NewtonCoupledManager.get_entry_solver("rigid")
+            assert rigid_solver is not None
+            assert NewtonCoupledManager.get_entry_solver("particle") is not None
+        if expected_solver_cls is SolverCoupledADMM:
+            assert NewtonCoupledManager.get_entry_solver("rigid") is not None
+            assert NewtonCoupledManager.get_entry_solver("particle") is not None
         assert NewtonManager._use_single_state is expected_use_single_state
         assert NewtonManager._needs_collision_pipeline is expected_needs_collision_pipeline
 
         # ``_contacts`` is allocated whichever way contacts are handled
         # (MuJoCo internal buffer or Newton pipeline output).
-        # Kamino with internal contacts and MPM do not currently set NewtonManager._contacts.
-        if expected_solver_cls not in (SolverKamino, SolverImplicitMPM):
+        # Kamino with internal contacts, MPM, and coupled solvers without the
+        # Newton pipeline do not currently set NewtonManager._contacts.
+        if expected_solver_cls is SolverMuJoCo or (
+            expected_needs_collision_pipeline and expected_solver_cls not in (SolverKamino, SolverImplicitMPM)
+        ):
             assert NewtonManager._contacts is not None
 
         # One step should not raise — proves the dispatch wiring lines up

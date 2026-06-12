@@ -97,6 +97,7 @@ class NewtonKaminoManager(NewtonManager):
         # Zero both masks after consumption
         NewtonManager._world_reset_mask.zero_()
         NewtonManager._fk_reset_mask.zero_()
+        NewtonManager._state_teleport_pending = False
 
         # Step simulation (graphed or not; _graph is None when capture is disabled or failed)
         if cfg is not None and cfg.use_cuda_graph and cls._graph is not None and "cuda" in device:  # type: ignore[union-attr]

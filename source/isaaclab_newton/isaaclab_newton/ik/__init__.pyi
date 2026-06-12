@@ -12,8 +12,12 @@ __all__ = [
     "NewtonIKObjectiveCfg",
     "NewtonIKPoseObjectiveCfg",
     "NewtonIKJointLimitObjectiveCfg",
+    "NewtonIKManager",
+    "NewtonIKManagerCfg",
 ]
 
+from .newton_ik_manager import NewtonIKManager
+from .newton_ik_manager_cfg import NewtonIKManagerCfg
 from .newton_ik_objectives import NewtonIKJointLimitObjective, NewtonIKObjective, NewtonIKPoseObjective
 from .newton_ik_objectives_cfg import (
     NewtonIKJointLimitObjectiveCfg,

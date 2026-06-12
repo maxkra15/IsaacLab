@@ -14,6 +14,14 @@
 **/*.usdc
 **/*.usdz
 
+# Waterhose demo assets are distributed as an unpacked local bundle, not tracked in git.
+/source/isaaclab_assets/data/WaterhoseDemo/
+/source/isaaclab_assets/data/Props/Waterhose/
+/waterhose_demo_assets.tar.gz
+
+# Standalone bootstrap workspace when waterhose.sh is run from the repo root by accident.
+/waterhose-demo/
+
 # Python
 .DS_Store
 **/*.egg-info/
@@ -79,6 +87,11 @@ _build
 
 # Ruff cache
 **/.ruff_cache/
+
+# Dev-time files, generated stuff
+**/__*
+!**/__init__.py
+!**/__init__.pyi
 
 # Isaac Lab CI environments in native mode
 **/_isaaclab_install_ci_*

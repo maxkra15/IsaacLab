@@ -12,10 +12,12 @@ set -e
 export ISAACLAB_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
 # Find python to run CLI.
-if [ -n "$VIRTUAL_ENV" ]; then
+if [ -n "$VIRTUAL_ENV" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
     python_exe="$VIRTUAL_ENV/bin/python"
-elif [ -n "$CONDA_PREFIX" ]; then
+elif [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
     python_exe="$CONDA_PREFIX/bin/python"
+elif [ -x "$ISAACLAB_PATH/.venv/bin/python" ]; then
+    python_exe="$ISAACLAB_PATH/.venv/bin/python"
 elif [ -f "$ISAACLAB_PATH/env_isaaclab/bin/python" ]; then
     python_exe="$ISAACLAB_PATH/env_isaaclab/bin/python"
 elif [ -f "$ISAACLAB_PATH/_isaac_sim/python.sh" ]; then
