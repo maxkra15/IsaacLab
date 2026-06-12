@@ -29,12 +29,15 @@ import newton
 import numpy as np
 import torch
 import warp as wp
-from isaaclab_newton.ik.newton_ik_solver import NewtonIKPoseObjective, NewtonIKSolver
+from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKJointLimitObjectiveCfg, NewtonIKPoseObjectiveCfg
+from isaaclab_newton.ik.newton_ik_solver import NewtonIKSolver
 from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.physics import NewtonManager
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 
+import isaaclab.sim as sim_utils
+from isaaclab.cloner import resolve_clone_plan_source
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.sim.utils.stage import get_current_stage
@@ -335,6 +338,11 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         if bool(due.any()):
             env_ids = due.nonzero(as_tuple=False).squeeze(-1)
             self._load_cup_media(env_ids, int(self._pending_cup_fill[env_ids[0]]))
+            self._reset_mpm_particle_state(
+                env_ids,
+                (*self._mpm_entry_states(), NewtonManager.get_state_0(), NewtonManager.get_state_1()),
+            )
+            self._refresh_mpm_collider_history()
             self._pending_cup_fill[env_ids] = 0
 
     # ------------------------------------------------------------------ build
@@ -453,6 +461,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._origins_np[env_id] = np.asarray(position, dtype=np.float64)
         self._author_custom_stage_prims(env_id)
         self._disable_robot_particle_collision(builder, env_id)
+        self._disable_finger_shape_collision(builder, env_id)
         self._hide_robot_visual_only_shapes(builder, env_id)
 
         hand = self._find_world_body(builder, env_id, "panda_hand")
@@ -521,6 +530,24 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             body_label = str(builder.body_label[body_id])
             if "/Robot/" in body_label or body_label.endswith("/Robot"):
                 builder.shape_flags[shape_id] &= ~collide_particles
+
+    def _disable_finger_shape_collision(self, builder, env_id: int) -> None:
+        """Make the Panda finger shapes non-colliding.
+
+        The gripped-cup proxy (welded to the hand and deliberately overlapping the fingers) is
+        the end-effector's physical interface; the fixed-open (state-pinned) fingers have no
+        collision role. Box wall / table contacts on the 22 g fingers fire >100 N kicks whose
+        reaction shakes the whole arm through the wrist -- with collisions off, the pin only
+        has to correct the (bounded) USD finger drive between substeps.
+        """
+        collide_shapes = int(newton.ShapeFlags.COLLIDE_SHAPES)
+        for shape_id in range(builder.shape_count):
+            body_id = int(builder.shape_body[shape_id])
+            if body_id < 0 or self._label_world(builder, "body", body_id) != env_id:
+                continue
+            body_label = str(builder.body_label[body_id])
+            if body_label.endswith("/panda_leftfinger") or body_label.endswith("/panda_rightfinger"):
+                builder.shape_flags[shape_id] &= ~collide_shapes
 
     def _hide_robot_visual_only_shapes(self, builder, env_id: int) -> None:
         """Hide imported Panda visual meshes from Newton viewers while keeping collision shapes."""
@@ -1705,8 +1732,8 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         the cup visual is written directly to USD here every render via its authored world xform
         (:meth:`_update_cup_visual_xform`). The media points are synced natively by the manager.
         """
-        # Rendering after the solver but before ManagerBasedRLEnv.step() returns can otherwise catch
-        # fixed-open fingers after contact impulses and before the post-step correction.
+        # Rendering inside the step (decimated render_interval) can otherwise catch the
+        # fixed-open fingers mid-substep, after solver integration and before the pin.
         self._pin_gripper_open_states(update_fk=True)
         self._sync_scoop_bowl_body()
         self._update_cup_visual_xform()
@@ -1732,10 +1759,18 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
 
     # -------------------------------------------------------------------- IK
     def _create_ik_solver(self) -> None:
-        prototype_info = NewtonManager.get_prototype_model(self._robot.cfg.prim_path)
-        self._ik_model = prototype_info.model
-        if self._ik_model is None:
-            raise RuntimeError(f"Newton prototype model for '{self._robot.cfg.prim_path}' was not finalized.")
+        # Finalize the single-env prototype builder retained by the cloner (same source
+        # resolution the Newton IK action term uses; replaces the old prototype registry).
+        plan = sim_utils.SimulationContext.instance().get_clone_plan()
+        resolved = resolve_clone_plan_source(self._robot.cfg.prim_path, plan) if plan is not None else None
+        if resolved is None:
+            raise RuntimeError(f"Could not resolve clone-plan source for '{self._robot.cfg.prim_path}'.")
+        source_path = resolved[0]
+        proto_builder = NewtonManager._cl_protos.get(source_path)
+        if proto_builder is None:
+            available = ", ".join(sorted(NewtonManager._cl_protos))
+            raise RuntimeError(f"No Newton prototype builder for '{source_path}'. Available: {available}")
+        self._ik_model = proto_builder.finalize(device=NewtonManager.get_model().device)
         ee_matches = [i for i, label in enumerate(self._ik_model.body_label) if str(label).endswith("panda_hand")]
         if len(ee_matches) != 1:
             raise RuntimeError(f"Expected one panda_hand body in the Newton IK prototype, found {ee_matches}.")
@@ -1768,45 +1803,47 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._ik_fingers = torch.tensor(finger_q, device=self._ik_default.device, dtype=torch.long)
         self._ik_default[self._ik_fingers] = float(self.cfg.gripper_open_pos)
         self._ik_target_name = "scoop_bowl"
+
+        def _ik_objectives() -> list:
+            # The pose target is set directly via the built objective each solve; the cfg's
+            # command/scale fields (used by the generic IK action term) are irrelevant here.
+            return [
+                NewtonIKPoseObjectiveCfg(
+                    body_name="panda_hand",
+                    name=self._ik_target_name,
+                    body_offset_pos=tuple(float(v) for v in self._bowl_center_hand.tolist()),
+                    position_weight=self.cfg.ik_position_weight,
+                    rotation_weight=self.cfg.ik_rotation_weight,
+                ),
+                NewtonIKJointLimitObjectiveCfg(weight=self.cfg.ik_joint_limit_weight),
+            ]
+
+        # Single warm-started seed (the current arm config, passed each solve): runtime tracking must be
+        # smooth, so we LM-converge from the previous pose rather than re-sampling seeds. Multi-seed
+        # roberts (for escaping folded branches) would let a different branch win each control step ->
+        # joint jumps. The active reset seeds from the captured ``arm_home`` directly (not this IK), so
+        # the branch-finding seeds are not needed here.
         self._ik_solver = NewtonIKSolver(
             NewtonIKSolverCfg(
-                command_type="pose",
-                use_relative_mode=False,
                 optimizer="lm",
                 jacobian_mode="analytic",
-                # Single warm-started seed (the current arm config, passed each solve): runtime tracking must be
-                # smooth, so we LM-converge from the previous pose rather than re-sampling seeds. Multi-seed
-                # roberts (for escaping folded branches) would let a different branch win each control step ->
-                # joint jumps. The active reset seeds from the captured ``arm_home`` directly (not this IK), so
-                # the branch-finding seeds are not needed here.
                 sampler="none",
                 n_seeds=1,
                 iterations=self.cfg.ik_iterations,
                 step_size=self.cfg.ik_step_size,
                 lambda_initial=self.cfg.ik_lambda_initial,
-                position_weight=self.cfg.ik_position_weight,
-                rotation_weight=self.cfg.ik_rotation_weight,
-                joint_limit_weight=self.cfg.ik_joint_limit_weight,
-                use_persistent_seed=False,
             ),
             model=self._ik_model,
             num_envs=self.num_envs,
-            device=dev,
-            pose_objectives=[
-                NewtonIKPoseObjective(
-                    name=self._ik_target_name,
-                    link_index=ee,
-                    link_offset_pos=tuple(float(v) for v in self._bowl_center_hand.tolist()),
-                )
-            ],
+            device=str(dev),
+            objectives=_ik_objectives(),
+            link_resolver=lambda body_name, _ee=ee: _ee,
         )
         # Reset-only multi-seed solver: the loaded "target_up"/"home_up" curriculum poses need
         # branch-finding seeds (a single warm-started seed rails the wrist over the +y target box).
         # Kept separate from the runtime solver so per-step tracking stays single-seed and smooth.
         self._reset_ik_solver = NewtonIKSolver(
             NewtonIKSolverCfg(
-                command_type="pose",
-                use_relative_mode=False,
                 optimizer="lm",
                 jacobian_mode="analytic",
                 sampler="roberts",
@@ -1814,21 +1851,12 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 iterations=self.cfg.reset_ik_iterations,
                 step_size=self.cfg.ik_step_size,
                 lambda_initial=self.cfg.ik_lambda_initial,
-                position_weight=self.cfg.ik_position_weight,
-                rotation_weight=self.cfg.ik_rotation_weight,
-                joint_limit_weight=self.cfg.ik_joint_limit_weight,
-                use_persistent_seed=False,
             ),
             model=self._ik_model,
             num_envs=self.num_envs,
-            device=dev,
-            pose_objectives=[
-                NewtonIKPoseObjective(
-                    name=self._ik_target_name,
-                    link_index=ee,
-                    link_offset_pos=tuple(float(v) for v in self._bowl_center_hand.tolist()),
-                )
-            ],
+            device=str(dev),
+            objectives=_ik_objectives(),
+            link_resolver=lambda body_name, _ee=ee: _ee,
         )
         joint_pos_limits = self._robot.data.joint_pos_limits.torch[:, self._arm_joint_ids].clone()
         lo = joint_pos_limits[..., 0]
@@ -1866,12 +1894,12 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             seed = self._ik_default.unsqueeze(0).expand(self.num_envs, -1).clone()
             seed[:, self._ik_arm] = (self.arm_joint_q() if arm_seed is None else arm_seed).to(seed.device)
             seed[:, self._ik_fingers] = float(self.cfg.gripper_open_pos)
-            solver.set_target_pose(
-                self._ik_target_name,
+            solver.objectives_by_name[self._ik_target_name].set_target_pose(
                 (target_bowl_e + self._ik_origin).to(seed.device, dtype=torch.float32),
                 target_quat.to(seed.device, dtype=torch.float32),
             )
-            result = solver.solve(seed)
+            # The solver returns its reused output buffer; clone before mutating.
+            result = wp.to_torch(solver.solve(wp.from_torch(seed.contiguous(), dtype=wp.float32))).clone()
             result[:, self._ik_fingers] = float(self.cfg.gripper_open_pos)
             return result
         finally:
@@ -1902,12 +1930,41 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         q = self._pitch_to_hand_quat(pitch)
         q = q / torch.clamp(torch.linalg.norm(q, dim=-1, keepdim=True), min=1e-8)
         solver = self._reset_ik_solver if use_reset_solver else None
-        solved = (
-            self._solve_ik_full(target_bowl_e, q, iterations, arm_seed=arm_seed, solver=solver)[:, self._ik_arm]
-            .clone()
-            .to(self.device)
-        )
+        solved_full = self._solve_ik_full(target_bowl_e, q, iterations, arm_seed=arm_seed, solver=solver)
+        if use_reset_solver and int(self.cfg.reset_ik_seeds) > 1:
+            solved_full = self._select_reset_branch(solved_full)
+        solved = solved_full[:, self._ik_arm].clone().to(self.device)
         return torch.clamp(solved, self._arm_lo, self._arm_hi)
+
+    def _select_reset_branch(self, best_full: torch.Tensor) -> torch.Tensor:
+        """Among converged reset-IK seeds, pick the branch closest to the ``arm_home`` configuration.
+
+        The solver's raw best-cost pick regularly converges onto a folded-elbow branch that
+        self-collides (link2/link5 penetrating ~2 cm) and rails joint 4 on its limit; written
+        as the reset state it makes MuJoCo fire ~kN separation forces on the first step and
+        the whole arm (and the passively held fingers) blows up. All refined seeds remain in
+        the solver's expanded buffers after a solve, so re-pick by home-distance among the
+        converged ones (with a penalty for rail-adjacent branches).
+        """
+        solver = self._reset_ik_solver
+        n_seeds = int(solver.cfg.n_seeds)
+        costs = wp.to_torch(solver.costs).reshape(self.num_envs, n_seeds)
+        qs = wp.to_torch(solver.joint_q).reshape(self.num_envs, n_seeds, -1).clone()
+        dev = qs.device
+        arm = qs[:, :, self._ik_arm.to(dev)]
+        home = self._default_arm_q.to(dev).unsqueeze(1)
+        converged = costs <= torch.clamp(4.0 * costs.amin(dim=1, keepdim=True), min=1e-3)
+        margin = torch.minimum(arm - self._arm_lo[:1].to(dev).unsqueeze(1), self._arm_hi[:1].to(dev).unsqueeze(1) - arm)
+        railed = (margin.amin(dim=-1) < 0.05).float()
+        score = torch.linalg.norm(arm - home, dim=-1) + 3.0 * railed
+        score = torch.where(converged, score, torch.full_like(score, float("inf")))
+        pick = score.argmin(dim=1)
+        chosen = qs[torch.arange(self.num_envs, device=dev), pick]
+        none_converged = ~converged.any(dim=1)
+        if bool(none_converged.any()):
+            chosen[none_converged] = best_full.to(dev)[none_converged]
+        chosen[:, self._ik_fingers] = float(self.cfg.gripper_open_pos)
+        return chosen
 
     def solve_arm_ik(self) -> torch.Tensor:
         if str(self.cfg.ik_backend).lower() == "diffik":
@@ -2179,7 +2236,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         new_p = self._sample_media_reset(env_ids)
         self._media.write_particle_pos_to_sim_index(new_p, env_ids=env_ids)
         self._media.write_particle_velocity_to_sim_index(torch.zeros_like(new_p), env_ids=env_ids)
-        self._reset_mpm_particle_state(env_ids, (s0, s1))
+        self._reset_mpm_particle_state(env_ids, (s0, s1, *self._mpm_entry_states()))
         self._region_mask_cache = None
         self._region_mask_cache_step = -1
         # Staged dump-first curriculum: the (global) stage picks the reset pose + how much media is
@@ -2254,7 +2311,11 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             ("particle_stress", 0.0),
             ("particle_Jp", 1.0),
         )
+        seen: set[int] = set()
         for state in states:
+            if state is None or id(state) in seen:
+                continue
+            seen.add(id(state))
             mpm = getattr(state, "mpm", None)
             if mpm is None:
                 continue
@@ -2263,6 +2324,21 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 if arr is None:
                     continue
                 wp.to_torch(arr)[ids] = rest
+
+    def _mpm_entry_states(self) -> tuple:
+        """Return coupled MPM entry-local states that own persistent MPM particle history."""
+        solver = getattr(NewtonManager, "_solver", None)
+        entries = getattr(solver, "_entries", {}) if solver is not None else {}
+        entry = entries.get(MPM_ENTRY) if isinstance(entries, dict) else None
+        if entry is None:
+            state = getattr(self, "_media_entry_state", None)
+            return () if state is None else (state,)
+        states = []
+        for name in ("state_0", "state_1", "state_tmp", "state_tmp_1"):
+            state = getattr(entry, name, None)
+            if state is not None:
+                states.append(state)
+        return tuple(states)
 
     def _reset_arm_config(self, pose_kind: str) -> tuple[torch.Tensor, float]:
         """Arm joint targets (shape ``[num_envs, n_arm]``) + cup pitch state for a curriculum reset pose.

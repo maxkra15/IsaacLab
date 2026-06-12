@@ -160,7 +160,9 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     hide_robot_visual_shapes_in_newton: bool = False  # show the robot's visual meshes in the Newton viewer too.
 
     # ---- scoop-bowl EE (gripped cup; home orientation is exactly opening-up) ----
-    gripper_open_pos: float = 0.04  # fixed Panda finger opening; not exposed as an action
+    # Fixed Panda finger opening; not exposed as an action. 1 mm INSIDE the 0.04 joint limit so the
+    # PD-held fingers do not sit exactly on the limit constraint (limit chatter under disturbances).
+    gripper_open_pos: float = 0.039
     bowl_reach: float = 0.0584  # fallback procedural bowl centre along +Z_hand [m]
     bowl_home_offset: tuple = (0.06, 0.0, -0.078)  # home bowl-centre target offset from hand (env frame) [m]
     home_pitch: float = 0.0  # neutral/ready bowl tilt: opening points up to hold media [rad]
@@ -218,7 +220,7 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     media_fill_frac: float = 0.80
     # ---- granular pile (source) ----
     pile_box_wall_half: float = 0.015  # retaining-box wall half-height [m] -> 3 cm walls
-    pile_height: float = 0.150  # natural pile (cone apex) height above the table [m]
+    pile_height: float = 0.2250  # natural pile (cone apex) height above the table [m]
     pile_jitter: float = 0.004  # per-particle surface noise on the spawned pile [m]
     # Pile side slope = angle of repose; ~atan(media_material.friction) for dry cohesionless granular media.
 
@@ -381,8 +383,14 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
             )
         )
         self.scene.robot.init_state.joint_pos["panda_finger_joint.*"] = self.gripper_open_pos
-        # The cup is gripped by construction. The Panda fingers are fixed-open joints in this task,
-        # not controlled DoFs, so the high-gain default gripper actuator must not fight the state pin.
+        # The cup is gripped by construction; the Panda fingers are not action-controlled. The
+        # "panda_hand" actuator group must stay POPPED and the USD-imported finger drive must stay
+        # untouched: ANY change to the finger actuation (an IsaacLab actuator group at any gains,
+        # zeroed drive gains, or added joint friction) makes the whole ARM diverge in the coupled
+        # pipeline -- deterministic exponential joint-error growth against a railed corrective
+        # actuator (A/B-verified pipeline bug). The fixed-open fingers are therefore state-pinned
+        # per substep (env._pin_gripper_open_state); their shapes are non-colliding and the pin is
+        # re-applied before rendering, so the old visible "gripper glitch" is gone.
         self.scene.robot.actuators.pop("panda_hand", None)
         for actuator_name in ("panda_shoulder", "panda_forearm"):
             self.scene.robot.actuators[actuator_name].stiffness = self.arm_stiffness
@@ -396,6 +404,11 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
                 entries=[
                     CoupledSolverEntryCfg(
                         name=RIGID_ENTRY,
+                        # NOTE: integrator must stay "euler" -- "implicitfast" diverges in the coupled
+                        # pipeline (arm drifts to the upright pose within ~4 steps despite correct ctrl
+                        # targets). Actuator gains must therefore satisfy the explicit stability bounds
+                        # sqrt(kp/m)*dt < 2 and kd*dt/m < 2 at the 1/120 s substep (see the gripper
+                        # actuator override above).
                         solver_cfg=MJWarpSolverCfg(use_mujoco_contacts=True, njmax=510, nconmax=400),
                         # Franka collides with the table/ground static shapes and with rigid-only
                         # source/target bowl copies. Normal robot links remain out of MPM particle collision.
