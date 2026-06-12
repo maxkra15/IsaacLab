@@ -62,7 +62,12 @@ def create_mpm_particle_visualization(
     point_prims = []
     for env_idx in range(positions_np.shape[0]):
         env_prim_path = f"{prim_path}/env_{env_idx}"
-        point_prims.append((env_prim_path, UsdGeom.Points.Define(stage, env_prim_path)))
+        points = UsdGeom.Points.Define(stage, env_prim_path)
+        # The point positions are written (and later synced) in WORLD space, but the prim may be
+        # parented under a translated env prim (e.g. /World/envs/env_i/Media): reset the xform
+        # stack so ancestor transforms are not applied on top of the world-space points.
+        UsdGeom.Xformable(points.GetPrim()).SetResetXformStack(True)
+        point_prims.append((env_prim_path, points))
 
     with Sdf.ChangeBlock():
         for env_idx, (env_prim_path, points) in enumerate(point_prims):

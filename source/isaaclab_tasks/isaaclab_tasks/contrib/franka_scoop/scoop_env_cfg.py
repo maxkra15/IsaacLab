@@ -298,7 +298,12 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     reset_ik_iterations: int = 60  # LM iters per seed at reset (x n_seeds; reset is occasional)
     # Multi-seed reset IK: the loaded "target_up"/"home_up" curriculum poses need branch-finding seeds
     # (a single warm-started seed rails the wrist over the +y target box). Runtime stays single-seed.
-    reset_ik_seeds: int = 16
+    reset_ik_seeds: int = 32
+    # Joint-limit residual weight for the RESET solver only. Much stronger than the runtime
+    # tracking weight: a reset pose railed on a joint limit puts every env on the limit
+    # constraint's knife edge, and parallel-sim floating-point noise then diverges the
+    # (identical) envs macroscopically within a few steps.
+    reset_ik_joint_limit_weight: float = 200.0
     ik_backend: str = "newton"  # "newton" full-pose LM IK (single warm-started seed) or "diffik" single-step DLS
     diffik_lambda: float = 0.05
     diffik_max_delta: float = 0.05  # per-step joint delta clamp for DiffIK runtime tracking [rad]

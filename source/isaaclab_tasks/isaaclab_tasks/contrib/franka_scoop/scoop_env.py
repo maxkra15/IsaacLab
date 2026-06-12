@@ -653,11 +653,13 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         cell = float(hi[0] - lo[0]) / hsz
 
         hf = UsdGeom.Points.Define(stage, f"{root}/ObsHeightfield")
+        UsdGeom.Xformable(hf.GetPrim()).SetResetXformStack(True)  # points hold world coords
         hf.CreateWidthsAttr(Vt.FloatArray([0.55 * cell] * (hsz * hsz)))
         hf_col = hf.CreateDisplayColorPrimvar("vertex")
         hf_col.Set(Vt.Vec3fArray([Gf.Vec3f(0.5, 0.5, 0.5)] * (hsz * hsz)))
 
         mk = UsdGeom.Points.Define(stage, f"{root}/ObsMarkers")
+        UsdGeom.Xformable(mk.GetPrim()).SetResetXformStack(True)  # points hold world coords
         mk.CreateWidthsAttr(Vt.FloatArray([0.035, 0.035, 0.035, 0.04]))  # src, held, all, bowl-target
         mk_col = mk.CreateDisplayColorPrimvar("vertex")
         mk_col.Set(
@@ -740,6 +742,11 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         orient_op = xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
         translate_op.Set(Gf.Vec3d(*(float(x) for x in scoop_pos)))
         orient_op.Set(Gf.Quatd(float(scoop_quat[3]), Gf.Vec3d(*(float(scoop_quat[i]) for i in range(3)))))
+        # The pose written here (and per render) is a WORLD pose, but the prim is parented under
+        # the translated /World/envs/env_i prim: without resetting the xform stack the env origin
+        # is applied twice and every non-centre env's cup renders offset by its own origin.
+        # Must come AFTER ClearXformOpOrder, which would drop the reset token.
+        xform.SetResetXformStack(True)
         self._cup_visual_ops.append((translate_op, orient_op))
 
     def _spawn_procedural_scoop_bowl_mesh(self, stage: Usd.Stage, cup_root: str) -> None:
@@ -1804,7 +1811,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         self._ik_default[self._ik_fingers] = float(self.cfg.gripper_open_pos)
         self._ik_target_name = "scoop_bowl"
 
-        def _ik_objectives() -> list:
+        def _ik_objectives(joint_limit_weight: float) -> list:
             # The pose target is set directly via the built objective each solve; the cfg's
             # command/scale fields (used by the generic IK action term) are irrelevant here.
             return [
@@ -1815,7 +1822,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                     position_weight=self.cfg.ik_position_weight,
                     rotation_weight=self.cfg.ik_rotation_weight,
                 ),
-                NewtonIKJointLimitObjectiveCfg(weight=self.cfg.ik_joint_limit_weight),
+                NewtonIKJointLimitObjectiveCfg(weight=joint_limit_weight),
             ]
 
         # Single warm-started seed (the current arm config, passed each solve): runtime tracking must be
@@ -1836,11 +1843,13 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             model=self._ik_model,
             num_envs=self.num_envs,
             device=str(dev),
-            objectives=_ik_objectives(),
+            objectives=_ik_objectives(self.cfg.ik_joint_limit_weight),
             link_resolver=lambda body_name, _ee=ee: _ee,
         )
         # Reset-only multi-seed solver: the loaded "target_up"/"home_up" curriculum poses need
-        # branch-finding seeds (a single warm-started seed rails the wrist over the +y target box).
+        # branch-finding seeds (a single warm-started seed rails the wrist over the +y target box)
+        # and a much stronger joint-limit pull (a rail-adjacent reset pose is a limit-constraint
+        # knife edge that amplifies parallel-sim FP noise into per-env divergence).
         # Kept separate from the runtime solver so per-step tracking stays single-seed and smooth.
         self._reset_ik_solver = NewtonIKSolver(
             NewtonIKSolverCfg(
@@ -1855,7 +1864,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             model=self._ik_model,
             num_envs=self.num_envs,
             device=str(dev),
-            objectives=_ik_objectives(),
+            objectives=_ik_objectives(float(self.cfg.reset_ik_joint_limit_weight)),
             link_resolver=lambda body_name, _ee=ee: _ee,
         )
         joint_pos_limits = self._robot.data.joint_pos_limits.torch[:, self._arm_joint_ids].clone()
