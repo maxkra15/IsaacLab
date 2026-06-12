@@ -2410,12 +2410,17 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         band_volume = 0.64 * math.pi * (0.9**3 - 0.1**3) / 3.0 * r_top**2 * (lip_z - floor_z)
         capacity = int(0.7 * band_volume / spacing**3)
         if n_cup > capacity:
-            logger.warning(
-                "Cup pre-load %d exceeds the cavity capacity %d at particle spacing %.4f m; clamping.",
-                n_cup,
-                capacity,
-                spacing,
-            )
+            # Expected whenever the configured fill counts (sized for the 10 mm voxel) exceed the
+            # cavity at the active spacing; log once instead of on every loaded-stage reset.
+            if not getattr(self, "_cup_capacity_logged", False):
+                self._cup_capacity_logged = True
+                logger.info(
+                    "Cup pre-load %d exceeds the cavity capacity %d at particle spacing %.4f m; "
+                    "clamping (the loaded stages start with a full cup).",
+                    n_cup,
+                    capacity,
+                    spacing,
+                )
             n_cup = capacity
         if n_cup <= 0:
             return
