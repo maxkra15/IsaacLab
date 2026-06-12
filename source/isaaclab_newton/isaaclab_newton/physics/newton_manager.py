@@ -14,7 +14,7 @@ import logging
 import os
 import re
 from abc import abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -127,17 +127,6 @@ def _sync_particle_points(
 
     for j in range(num_points):
         fabric_points[i][j] = wp.transform_point(inv_world_matrix, particle_q[offset + j])
-
-
-@dataclass
-class _ParticleVisualPrim:
-    """A ``UsdGeom.Points`` prim mirroring a slice of Newton's particle state."""
-
-    points_attr: Usd.Attribute
-    offset: int
-    count: int
-    sync_frequency: int
-    frames_since_sync: int
 
 
 @wp.kernel(enable_backward=False)
@@ -307,7 +296,7 @@ class NewtonManager(PhysicsManager):
     _particles_dirty: bool = False
     _newton_particle_offset_attr = "newton:particleOffset"
     _newton_particle_count_attr = "newton:particleCount"
-    _particle_visual_prims: dict[str, _ParticleVisualPrim] = {}
+    _particle_visual_prims: set[str] = set()
     _pre_render_callbacks: dict[str, Callable[[], None]] = {}
     _usd_xform_ops: dict[str, object] = {}
 
@@ -581,14 +570,11 @@ class NewtonManager(PhysicsManager):
     def sync_particles_to_usd(cls) -> None:
         """Write Newton particle positions to USD/Fabric for Kit viewport rendering.
 
-        Two prim families are synced from ``state_0.particle_q``:
-
-        * Fabric mesh prims tagged with ``newton:particleOffset`` /
-          ``newton:particleCount`` (deformable visual meshes) receive
-          local-frame points on the GPU via :meth:`_sync_fabric_mesh_particles`.
-        * ``UsdGeom.Points`` prims registered through
-          :meth:`register_particle_visual_prim` (MPM particle clouds) receive
-          world-frame points via :meth:`_sync_particle_points_prims`.
+        Fabric prims tagged with ``newton:particleOffset`` /
+        ``newton:particleCount`` receive local-frame points on the GPU via
+        :meth:`_sync_fabric_mesh_particles`. This covers deformable visual
+        meshes (``points``) and Kit MPM ``UsdGeom.PointInstancer`` clouds
+        (``positions``).
 
         No-op when there is no particle state or nothing changed since the
         last sync.
@@ -597,62 +583,46 @@ class NewtonManager(PhysicsManager):
             return
         try:
             cls._sync_fabric_mesh_particles()
-            NewtonManager._particles_dirty = cls._sync_particle_points_prims()
+            NewtonManager._particles_dirty = False
         except Exception:
             logger.exception("[NewtonManager] sync_particles_to_usd FAILED")
 
+    # Geometry attributes synced from ``state_0.particle_q``: deformable visual
+    # meshes expose ``points``; MPM ``UsdGeom.PointInstancer`` clouds expose
+    # ``positions``. Both are local-frame ``point3f[]`` driven by the same kernel.
+    _particle_geom_attrs = ("points", "positions")
+
     @classmethod
     def _sync_fabric_mesh_particles(cls) -> None:
-        """Write ``state_0.particle_q`` into Fabric mesh point arrays as local-frame points."""
+        """Write ``state_0.particle_q`` into Fabric point arrays as local-frame points."""
         if cls._usdrt_stage is None:
             return
         import usdrt  # noqa: PLC0415
 
-        selection = cls._usdrt_stage.SelectPrims(
-            require_attrs=[
-                (usdrt.Sdf.ValueTypeNames.Point3fArray, "points", usdrt.Usd.Access.ReadWrite),
-                (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_particle_offset_attr, usdrt.Usd.Access.Read),
-                (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_particle_count_attr, usdrt.Usd.Access.Read),
-                (usdrt.Sdf.ValueTypeNames.Matrix4d, "omni:fabric:worldMatrix", usdrt.Usd.Access.Read),
-            ],
-            device=str(PhysicsManager._device),
-        )
-        if selection.GetCount() == 0:
-            return
-        wp.launch(
-            _sync_particle_points,
-            dim=selection.GetCount(),
-            inputs=[
-                wp.fabricarrayarray(data=selection, attrib="points", dtype=wp.vec3f),
-                wp.fabricarray(data=selection, attrib="omni:fabric:worldMatrix"),
-                wp.fabricarray(data=selection, attrib=cls._newton_particle_offset_attr),
-                wp.fabricarray(data=selection, attrib=cls._newton_particle_count_attr),
-                cls._state_0.particle_q,
-            ],
-            device=PhysicsManager._device,
-        )
-
-    @classmethod
-    def _sync_particle_points_prims(cls) -> bool:
-        """Write registered ``UsdGeom.Points`` prims; return ``True`` while throttled prims remain."""
-        if not cls._particle_visual_prims:
-            return False
-
-        due = []
-        for record in cls._particle_visual_prims.values():
-            record.frames_since_sync += 1
-            if record.frames_since_sync >= record.sync_frequency:
-                record.frames_since_sync = 0
-                due.append(record)
-        if due:
-            from pxr import Sdf, Vt  # noqa: PLC0415
-
-            particle_q = cls._state_0.particle_q.numpy()
-            with Sdf.ChangeBlock():
-                for record in due:
-                    points = particle_q[record.offset : record.offset + record.count]
-                    record.points_attr.Set(Vt.Vec3fArray.FromNumpy(points))
-        return len(due) < len(cls._particle_visual_prims)
+        for geom_attr in cls._particle_geom_attrs:
+            selection = cls._usdrt_stage.SelectPrims(
+                require_attrs=[
+                    (usdrt.Sdf.ValueTypeNames.Point3fArray, geom_attr, usdrt.Usd.Access.ReadWrite),
+                    (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_particle_offset_attr, usdrt.Usd.Access.Read),
+                    (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_particle_count_attr, usdrt.Usd.Access.Read),
+                    (usdrt.Sdf.ValueTypeNames.Matrix4d, "omni:fabric:worldMatrix", usdrt.Usd.Access.Read),
+                ],
+                device=str(PhysicsManager._device),
+            )
+            if selection.GetCount() == 0:
+                continue
+            wp.launch(
+                _sync_particle_points,
+                dim=selection.GetCount(),
+                inputs=[
+                    wp.fabricarrayarray(data=selection, attrib=geom_attr, dtype=wp.vec3f),
+                    wp.fabricarray(data=selection, attrib="omni:fabric:worldMatrix"),
+                    wp.fabricarray(data=selection, attrib=cls._newton_particle_offset_attr),
+                    wp.fabricarray(data=selection, attrib=cls._newton_particle_count_attr),
+                    cls._state_0.particle_q,
+                ],
+                device=PhysicsManager._device,
+            )
 
     @classmethod
     def _mark_transforms_dirty(cls) -> None:
@@ -683,27 +653,25 @@ class NewtonManager(PhysicsManager):
         cls._mark_particles_dirty()
 
     @classmethod
-    def register_particle_visual_prim(
-        cls, prim_path: str, particle_offset: int, particle_count: int, sync_frequency: int = 1
-    ) -> None:
-        """Register a ``UsdGeom.Points`` prim whose points mirror a slice of Newton's particle state.
+    def register_particle_visual_prim(cls, prim_path: str, particle_offset: int, particle_count: int) -> None:
+        """Register a point prim whose geometry mirrors a slice of Newton's particle state.
 
         Args:
-            prim_path: Stage path of an existing ``UsdGeom.Points`` prim.
+            prim_path: Stage path of an existing ``UsdGeom.PointInstancer`` (or
+                point-based mesh) whose points mirror the slice.
             particle_offset: First index of the prim's slice in ``state.particle_q``.
             particle_count: Number of particles in the slice.
-            sync_frequency: Sync the prim every N dirty render frames.
         """
-        from pxr import UsdGeom  # noqa: PLC0415
+        from pxr import Sdf  # noqa: PLC0415
 
         prim = get_current_stage().GetPrimAtPath(prim_path)
-        NewtonManager._particle_visual_prims[prim_path] = _ParticleVisualPrim(
-            points_attr=UsdGeom.Points(prim).GetPointsAttr(),
-            offset=int(particle_offset),
-            count=int(particle_count),
-            sync_frequency=int(sync_frequency),
-            frames_since_sync=int(sync_frequency),
+        prim.CreateAttribute(cls._newton_particle_offset_attr, Sdf.ValueTypeNames.UInt, custom=True).Set(
+            int(particle_offset)
         )
+        prim.CreateAttribute(cls._newton_particle_count_attr, Sdf.ValueTypeNames.UInt, custom=True).Set(
+            int(particle_count)
+        )
+        NewtonManager._particle_visual_prims.add(prim_path)
 
     @classmethod
     def step(cls) -> None:
@@ -800,8 +768,6 @@ class NewtonManager(PhysicsManager):
 
         if cls._usdrt_stage is not None:
             cls._mark_state_dirty()
-        elif cls._particle_visual_prims:
-            cls._mark_particles_dirty()
 
         # Launch solver-specific debug logging after stepping.
         cls._log_solver_debug()
@@ -888,7 +854,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._usdrt_stage = None
         NewtonManager._transforms_dirty = False
         NewtonManager._particles_dirty = False
-        NewtonManager._particle_visual_prims = {}
+        NewtonManager._particle_visual_prims = set()
         NewtonManager._mpm_object_registry = []
         NewtonManager._deformable_registry = []
         NewtonManager._per_world_builder_hooks = []
@@ -1059,6 +1025,8 @@ class NewtonManager(PhysicsManager):
         builder data before :meth:`ModelBuilder.finalize` allocates model arrays.
         The default implementation is a no-op.
         """
+
+    @classmethod
     def _register_solver_custom_attributes(cls, builder: ModelBuilder) -> None:
         """Register custom builder attributes required by the active Newton solver."""
         cfg = PhysicsManager._cfg
@@ -1508,14 +1476,18 @@ class NewtonManager(PhysicsManager):
     def _initialize_fabric_body_prims(stage, fabric_hierarchy, usdrt, body_bindings: Sequence[tuple[str, int]]) -> None:
         """Initialize Fabric body prims used by Newton transform sync."""
         for prim_path, body_index in body_bindings:
+            # Some Newton bodies are generated by builder hooks and have no authored
+            # USD prim. Examples include cable segment bodies, whose visible asset is
+            # the authored BasisCurves prim updated by the VBD curve sync. Skip them:
+            # defining synthetic Fabric Xforms for dozens of hook-built bodies corrupts
+            # the cubric GPU hierarchy when a Kit viewport is attached.
+            if not isinstance(prim_path, str) or not prim_path.startswith("/"):
+                continue
             prim = stage.GetPrimAtPath(prim_path)
-            if prim.IsValid():
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.SetWorldXformFromUsd()
-            else:
-                prim = stage.DefinePrim(prim_path, "Xform")
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.CreateFabricHierarchyWorldMatrixAttr()
+            if not prim.IsValid():
+                continue
+            xformable_prim = usdrt.Rt.Xformable(prim)
+            xformable_prim.SetWorldXformFromUsd()
 
             prim.CreateAttribute(NewtonManager._newton_index_attr, usdrt.Sdf.ValueTypeNames.UInt, custom=True)
             prim.GetAttribute(NewtonManager._newton_index_attr).Set(body_index)
@@ -1527,13 +1499,21 @@ class NewtonManager(PhysicsManager):
         fabric_hierarchy.update_world_xforms()
 
     @staticmethod
-    def _initialize_fabric_particle_prims(stage, fabric_hierarchy, usdrt, prim_paths: Iterable[str]) -> None:
-        """Initialize Fabric world matrices for point prims used by particle sync."""
-        prim_paths = tuple(prim_paths)
+    def _initialize_fabric_particle_prims(stage, fabric_hierarchy, usdrt, prim_paths: set[str]) -> None:
+        """Initialize Fabric world matrices and extents for point prims used by particle sync.
+
+        The Fabric Scene Delegate culls renderable prims that have no world
+        extent. Particle clouds have their ``points`` updated freely on the GPU
+        every frame, so we author a permissive extent once here instead of
+        recomputing bounds each frame; this keeps the points always visible
+        without a per-frame CPU readback.
+        """
+        unbounded_extent = usdrt.Gf.Range3d(usdrt.Gf.Vec3d(-1.0e6, -1.0e6, -1.0e6), usdrt.Gf.Vec3d(1.0e6, 1.0e6, 1.0e6))
         for prim_path in prim_paths:
             prim = stage.GetPrimAtPath(prim_path)
             if prim.IsValid():
                 usdrt.Rt.Xformable(prim).SetWorldXformFromUsd()
+                usdrt.Rt.Boundable(prim).CreateWorldExtentAttr().Set(unbounded_extent)
 
         if prim_paths:
             fabric_hierarchy.update_world_xforms()
@@ -2082,6 +2062,11 @@ class NewtonManager(PhysicsManager):
         :meth:`sync_transforms_to_usd` call to avoid startup-ordering issues
         with the cubric plugin.
         """
+        if os.getenv("ISAACLAB_NEWTON_DISABLE_CUBRIC", "").lower() in {"1", "true", "yes", "on"}:
+            NewtonManager._cubric = None
+            logger.warning("cubric disabled via ISAACLAB_NEWTON_DISABLE_CUBRIC; using update_world_xforms()")
+            return
+
         from isaaclab_newton.physics._cubric import CubricBindings
 
         bindings = CubricBindings()

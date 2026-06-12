@@ -173,17 +173,17 @@ class NewtonCoupledManager(NewtonManager):
         if solver is None or state is None:
             return
         with wp.ScopedDevice(PhysicsManager._device):
-            # Sub-solver reset kernels expect a boolean world mask; the manager's
-            # accumulated mask is int32 (Kamino convention).
-            world_mask = None
-            int_mask = NewtonManager._world_reset_mask
-            if int_mask is not None:
-                if cls._bool_world_reset_mask is None or cls._bool_world_reset_mask.shape != int_mask.shape:
-                    cls._bool_world_reset_mask = wp.zeros(int_mask.shape, dtype=wp.bool, device=int_mask.device)
+            # Sub-solver reset kernels expect a boolean world mask. The manager's
+            # accumulated mask is bool on current upstream; convert when an older
+            # int32 (Kamino-convention) allocation is active.
+            world_mask = NewtonManager._world_reset_mask
+            if world_mask is not None and world_mask.dtype is not wp.bool:
+                if cls._bool_world_reset_mask is None or cls._bool_world_reset_mask.shape != world_mask.shape:
+                    cls._bool_world_reset_mask = wp.zeros(world_mask.shape, dtype=wp.bool, device=world_mask.device)
                 wp.launch(
                     _int_mask_to_bool_mask_kernel,
-                    dim=int_mask.shape[0],
-                    inputs=[int_mask, cls._bool_world_reset_mask],
+                    dim=world_mask.shape[0],
+                    inputs=[world_mask, cls._bool_world_reset_mask],
                 )
                 world_mask = cls._bool_world_reset_mask
             eval_fk(cls._model, state.joint_q, state.joint_qd, state, cls._filtered_fk_reset_mask())
