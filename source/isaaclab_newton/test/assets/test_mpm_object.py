@@ -212,20 +212,18 @@ def test_mpm_object_creates_kit_points_when_kit_visualizer_requested(monkeypatch
         records = NewtonMPMManager._particle_visual_prims
         assert len(records) == media.num_instances
 
-        for env_idx, (prim_path, record) in enumerate(sorted(records.items())):
-            assert record.offset == media._recorded_particle_offsets[env_idx]
-            assert record.count == media.particles_per_object
-            assert record.sync_frequency == 1
-
+        for env_idx, prim_path in enumerate(sorted(records)):
             points_prim = media.stage.GetPrimAtPath(prim_path)
             assert points_prim.IsValid()
             points = UsdGeom.Points(points_prim)
             assert len(points.GetPointsAttr().Get()) == media.particles_per_object
             assert len(points.GetWidthsAttr().Get()) == media.particles_per_object
             assert tuple(points.GetDisplayColorAttr().Get()[0]) == pytest.approx((0.1, 0.2, 0.3))
+            assert points_prim.GetAttribute("newton:particleOffset").Get() == media._recorded_particle_offsets[env_idx]
+            assert points_prim.GetAttribute("newton:particleCount").Get() == media.particles_per_object
 
 
-def test_mpm_kit_points_follow_particle_state(monkeypatch):
+def test_mpm_kit_points_sync_through_fabric(monkeypatch):
     @configclass
     class MPMSceneCfg(InteractiveSceneCfg):
         media = MPMObjectCfg(
@@ -250,20 +248,11 @@ def test_mpm_kit_points_follow_particle_state(monkeypatch):
         scene = InteractiveScene(MPMSceneCfg(num_envs=1, env_spacing=0.0))
         sim.reset()
 
-        from pxr import UsdGeom  # noqa: PLC0415
-
-        media = scene["media"]
-        prim_path = next(iter(NewtonMPMManager._particle_visual_prims))
-        points = UsdGeom.Points(media.stage.GetPrimAtPath(prim_path))
-        points_before = np.asarray(points.GetPointsAttr().Get(), dtype=np.float32)
+        assert NewtonMPMManager._particle_visual_prims
 
         for _ in range(3):
             sim.step(render=False)
             scene.update(sim.get_physics_dt())
+            assert NewtonMPMManager._particles_dirty
             sim.render()
-
-        points_after = np.asarray(points.GetPointsAttr().Get(), dtype=np.float32)
-        particle_pos = media.data.particle_pos_w.torch.detach().cpu().numpy()[0]
-
-        assert np.max(np.abs(points_after - points_before)) > 0.0
-        np.testing.assert_allclose(points_after, particle_pos, rtol=1.0e-5, atol=1.0e-6)
+            assert not NewtonMPMManager._particles_dirty

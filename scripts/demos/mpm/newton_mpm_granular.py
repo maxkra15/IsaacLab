@@ -35,7 +35,7 @@ parser.set_defaults(visualizer=["newton"])
 args_cli = parser.parse_args()
 
 
-FPS = 100.0
+FPS = 60.0
 GRAVITY = (0.0, 0.0, -10.0)
 VOXEL_SIZE = float(args_cli.voxel_size)
 
@@ -46,7 +46,7 @@ VOXEL_SIZE = float(args_cli.voxel_size)
 # and ``max_active_cell_count`` bounds the per-step active set so the
 # graph-captured allocations stay static.
 GRID_TYPE = "fixed"
-GRID_PADDING = 48
+GRID_PADDING = 28
 MAX_ACTIVE_CELL_COUNT = 1 << 18
 
 # Granular block, emitted as a jittered particle grid.
@@ -54,8 +54,6 @@ EMIT_LO = (-1.0, -1.0, 2.0)
 EMIT_HI = (1.0, 1.0, 3.5)
 PARTICLES_PER_CELL = 3.0
 PARTICLE_JITTER = VOXEL_SIZE / PARTICLES_PER_CELL
-NEWTON_VISUAL_UPDATE_FREQUENCY = 1
-KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY = 4
 
 PARTICLE_COLOR = (0.7, 0.6, 0.4)
 
@@ -75,7 +73,6 @@ def create_visualizer_cfgs():
         NewtonVisualizerCfg(
             show_particles=True,
             particle_color=PARTICLE_COLOR,
-            update_frequency=NEWTON_VISUAL_UPDATE_FREQUENCY,
         )
     ]
 
@@ -162,7 +159,6 @@ def create_scene_cfg():
                 particles_per_cell=PARTICLES_PER_CELL,
                 jitter=PARTICLE_JITTER,
                 visual_color=PARTICLE_COLOR,
-                visual_update_frequency=KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY,
             ),
         )
 

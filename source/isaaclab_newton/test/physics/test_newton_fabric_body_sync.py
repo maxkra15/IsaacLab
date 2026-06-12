@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from isaaclab.app import AppLauncher
 
 # Launch Isaac Sim before importing Newton modules so USD schema bindings are initialized.
@@ -134,3 +136,35 @@ def test_initialize_fabric_body_prims_creates_missing_body_as_xform():
     assert prim.GetAttribute("newton:index").value == 7
     assert prim.applied_schemas == ["PhysicsRigidBodyAPI"]
     assert fabric_hierarchy.update_world_xforms_count == 1
+
+
+def test_initialize_fabric_particle_prims_uses_existing_point_prim():
+    prim = _FakePrim()
+    stage = _FakeStage({"/World/Visuals/MPMParticles/Sand/env_0": prim})
+    fabric_hierarchy = _FakeFabricHierarchy()
+
+    NewtonManager._initialize_fabric_particle_prims(
+        stage, fabric_hierarchy, _FakeUsdrt, {"/World/Visuals/MPMParticles/Sand/env_0"}
+    )
+
+    assert stage.defined_prims == []
+    assert prim.set_world_xform_from_usd == 1
+    assert fabric_hierarchy.update_world_xforms_count == 1
+
+
+def test_particle_sync_uses_fabric_path(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(NewtonManager, "_usdrt_stage", object())
+    monkeypatch.setattr(NewtonManager, "_particles_dirty", True)
+    monkeypatch.setattr(NewtonManager, "_state_0", SimpleNamespace(particle_q=object()))
+    monkeypatch.setattr(
+        NewtonManager,
+        "_sync_fabric_mesh_particles",
+        classmethod(lambda cls: calls.append("fabric")),
+    )
+
+    NewtonManager.sync_particles_to_usd()
+
+    assert calls == ["fabric"]
+    assert NewtonManager._particles_dirty is False

@@ -24,15 +24,12 @@ Added
 * Added :attr:`~isaaclab_newton.physics.NewtonCfg.simplify_meshes` to control
   whether Newton replication approximates mesh colliders with convex hulls.
   Disable it for thin or hollow MPM colliders that need exact triangle meshes.
-* Added ``visual_update_frequency`` to MPM particle spawner configs so Kit USD
-  point-cloud visualization can be throttled independently from physics.
-
 Changed
 ^^^^^^^
 
 * :meth:`~isaaclab_newton.physics.NewtonManager.sync_particles_to_usd` now also
-  writes registered ``UsdGeom.Points`` prims (used for MPM particle clouds) in
-  addition to the existing Fabric mesh-points sync for deformable visuals.
+  writes registered ``UsdGeom.Points`` prims (used for MPM particle clouds)
+  through the existing Fabric mesh-points sync path.
 * :meth:`~isaaclab_newton.physics.NewtonManager.create_builder` and the model
   build path now invoke the active manager's solver-specific builder hooks so
   MPM custom attributes (``mpm:young_modulus``, ...) are registered on the

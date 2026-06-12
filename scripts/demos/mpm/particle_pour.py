@@ -53,8 +53,6 @@ args_cli = parser.parse_args()
 
 FPS = 200
 VOXEL_SIZE = float(args_cli.voxel_size)
-NEWTON_VISUAL_UPDATE_FREQUENCY = 1
-KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY = 4
 
 GRID_TYPE = "fixed"
 GRID_PADDING = 64
@@ -125,7 +123,6 @@ def create_visualizer_cfgs():
         NewtonVisualizerCfg(
             show_particles=True,
             particle_color=PARTICLE_COLOR,
-            update_frequency=NEWTON_VISUAL_UPDATE_FREQUENCY,
         )
     ]
 
@@ -450,7 +447,6 @@ def create_scene_cfg():
                     tensile_yield_ratio=5.0,
                 ),
                 visual_color=PARTICLE_COLOR,
-                visual_update_frequency=KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY,
             ),
             init_state=MPMObjectCfg.InitialStateCfg(pos=container_pos),
         )
