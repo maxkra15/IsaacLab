@@ -2246,7 +2246,9 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         stage = int(self.curriculum_stage[env_ids][0].clamp(max=len(self.cfg.curriculum_reset_pose) - 1))
         pose_kind = str(self.cfg.curriculum_reset_pose[stage])
         n_cup = int(self.cfg.curriculum_cup_fill_count[stage])
-        reset_q, pitch_val = self._reset_arm_config(pose_kind)
+        pitches = getattr(self.cfg, "curriculum_reset_pitch", ())
+        reset_pitch = float(pitches[stage]) if stage < len(pitches) else 0.0
+        reset_q, pitch_val = self._reset_arm_config(pose_kind, reset_pitch)
         reset_q = torch.where(torch.isfinite(reset_q), reset_q, self._default_arm_q)
         self._pitch[env_ids] = pitch_val
         zero_vel = torch.zeros_like(reset_q[env_ids])
@@ -2340,7 +2342,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 states.append(state)
         return tuple(states)
 
-    def _reset_arm_config(self, pose_kind: str) -> tuple[torch.Tensor, float]:
+    def _reset_arm_config(self, pose_kind: str, reset_pitch: float = 0.0) -> tuple[torch.Tensor, float]:
         """Arm joint targets (shape ``[num_envs, n_arm]``) + cup pitch state for a curriculum reset pose.
 
         ``"pile"`` is the fixed scoop start (``arm_home``, cup tilted at the pile; no IK).
@@ -2361,13 +2363,14 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 f"Unsupported curriculum reset pose {pose_kind!r}; expected 'pile', 'target_up', or 'home_up'."
             )
         # The solve is deterministic (roberts seeds, fixed per-stage target), so cache the solution per
-        # pose kind instead of re-running n_seeds x reset_ik_iterations LM for all envs on every reset.
-        cached = self._reset_pose_cache.get(pose_kind)
+        # (pose kind, reset pitch) instead of re-running n_seeds x reset_ik_iterations LM on every reset.
+        cache_key = f"{pose_kind}:{reset_pitch:.3f}"
+        cached = self._reset_pose_cache.get(cache_key)
         if cached is not None:
-            return cached, 0.0
+            return cached, reset_pitch
         target = torch.tensor([float(xy[0]), float(xy[1]), float(self.cfg.dump_hover_z)], device=self.device)
         target = target.unsqueeze(0).expand(self.num_envs, -1)
-        pitch = torch.zeros(self.num_envs, device=self.device)
+        pitch = torch.full((self.num_envs,), float(reset_pitch), device=self.device)
         q = self._solve_target_config(
             target,
             pitch,
@@ -2375,7 +2378,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             arm_seed=self._default_arm_q,
             use_reset_solver=True,
         )
-        self._reset_pose_cache[pose_kind] = q
+        self._reset_pose_cache[cache_key] = q
         limit_margin = torch.minimum(q - self._arm_lo, self._arm_hi - q).amin(dim=-1)
         railed = limit_margin < 0.05
         if bool(railed.any()):
@@ -2387,7 +2390,31 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
                 self.num_envs,
                 float(limit_margin.min()),
             )
-        return q, 0.0
+        return q, reset_pitch
+
+    def cup_capacity(self, pitch: float = 0.0) -> int:
+        """Pre-load particle capacity of the cup cavity at the active spacing.
+
+        Matches the rain-in sampler band (radial margin 0.8, z band [0.1, 0.9] of the cavity
+        depth, ~70% packing), derated by cos^2(tilt) -- a tilted cavity overflows its downhill
+        lip earlier.
+        """
+        spacing = float(self.cfg.voxel_size) / max(float(self.cfg.particles_per_cell), 1.0)
+        floor_z, lip_z = -float(self._bowl_floor), float(self._bowl_lip)
+        r_top = float(self._bowl_inner_top_r)
+        band_volume = 0.64 * math.pi * (0.9**3 - 0.1**3) / 3.0 * r_top**2 * (lip_z - floor_z)
+        tilt = max(math.cos(float(pitch)), 0.25) ** 2
+        return int(0.7 * band_volume / spacing**3 * tilt)
+
+    def cup_preload_count(self, stage: int) -> int:
+        """Particles actually pre-loaded at ``stage`` (configured count, capacity-clamped)."""
+        stage = int(min(max(int(stage), 0), len(self.cfg.curriculum_cup_fill_count) - 1))
+        fill = int(self.cfg.curriculum_cup_fill_count[stage])
+        if fill <= 0:
+            return 0
+        pitches = getattr(self.cfg, "curriculum_reset_pitch", ())
+        pitch = float(pitches[stage]) if stage < len(pitches) else 0.0
+        return min(fill, self.cup_capacity(pitch))
 
     def _load_cup_media(self, env_ids: torch.Tensor, n_cup: int) -> None:
         """Pre-load the first ``n_cup`` of each reset env's particles into the (opening-up) cup cavity.
@@ -2400,15 +2427,14 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         bowl_w, _ = self._bowl_pose_w()  # world cavity centre at the just-set reset pose
         centers = bowl_w[env_ids].unsqueeze(1)  # (n, 1, 3)
         n = env_ids.numel()
-        floor_z, lip_z = -float(self._bowl_floor), float(self._bowl_lip)
+        lip_z = float(self._bowl_lip)
         r_top = float(self._bowl_inner_top_r)
-        # Clamp the pre-load to what the sampled band physically holds at the active particle
-        # spacing: MPM particles occupy ~spacing^3 each, and overfilling ejects the whole load
-        # ballistically on the first solve. The band volume matches the sampler below (radial
-        # margin 0.8, z band [0.1, 0.9] of the cavity depth; exact for the conical region).
         spacing = float(self.cfg.voxel_size) / max(float(self.cfg.particles_per_cell), 1.0)
-        band_volume = 0.64 * math.pi * (0.9**3 - 0.1**3) / 3.0 * r_top**2 * (lip_z - floor_z)
-        capacity = int(0.7 * band_volume / spacing**3)
+        # Clamp the pre-load to what the sampled band physically holds at the active particle
+        # spacing (and current tilt): MPM particles occupy ~spacing^3 each, and overfilling
+        # ejects the media on the first solve.
+        pitch = float(self._pitch[env_ids].mean())
+        capacity = self.cup_capacity(pitch)
         if n_cup > capacity:
             # Expected whenever the configured fill counts (sized for the 10 mm voxel) exceed the
             # cavity at the active spacing; log once instead of on every loaded-stage reset.
@@ -2443,6 +2469,13 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
             if i % (side * side) == 0:
                 layer += 1
         lattice_t = torch.tensor(lattice[:n_cup], device=self.device, dtype=torch.float32)
+        # The reset tilt is a rotation about world Y around the bowl centre (see
+        # _pitch_to_hand_quat); rotate the rain-in column the same way so it falls
+        # along the tilted cavity axis instead of clipping the uphill rim.
+        if abs(pitch) > 1.0e-3:
+            c, si = math.cos(pitch), math.sin(pitch)
+            x, y, z = lattice_t[:, 0], lattice_t[:, 1], lattice_t[:, 2]
+            lattice_t = torch.stack([c * x + si * z, y, -si * x + c * z], dim=-1)
         jitter = (torch.rand(n, n_cup, 3, device=self.device) - 0.5) * (0.1 * spacing)
         off = lattice_t.unsqueeze(0) + jitter
         cup_pos = (centers + off).to(torch.float32)

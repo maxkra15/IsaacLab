@@ -213,7 +213,12 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     # solver diverge. Target box is parked clear on the +y side (later-stage pour).
     source_center: tuple = (0.32, -0.23, 0.060)
     target_center: tuple = (0.32, 0.22, 0.060)
-    container_inner_half: tuple = (0.2, 0.2, 0.060)
+    # NOTE the layout constraint: source/target centers are 0.45 m apart (and the -y neighbour
+    # env's target box sits 0.45 m beyond the source box at env_spacing 0.9), so the boxes need
+    # 2*(inner_half_y + wall) < 0.45 with >= ~3 voxels clearance -- inner_half_y <= 0.175. At
+    # (0.2, 0.2) the two boxes of one env physically overlapped and neighbouring envs' boxes came
+    # within 2 mm (< 1 voxel) of each other in the shared MPM grid.
+    container_inner_half: tuple = (0.2, 0.175, 0.060)
     # Wall thickness must stay >= ~1.5 MPM voxels or pile-edge particles seep through the
     # retaining box (the MPM grid cannot represent a sub-voxel solid wall).
     container_wall: float = 0.024
@@ -343,13 +348,25 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     # sampled cone band holds ~160 non-overlapping particles at voxel 0.015 / 2 per cell -> stay under.
     curriculum_reset_pose: tuple = ("target_up", "home_up", "pile", "pile", "pile")
     curriculum_cup_fill_count: tuple = (120, 80, 0, 0, 0)
+    # Per-stage reset cup pitch [rad]: stage 0 starts PRE-TILTED partway toward the dump ("just
+    # before dumping"), so the policy only has to turn a little further to deliver and succeed
+    # within a few steps. Must stay clearly below the spill tilt ~(pi/2 - angle of repose) ~ 0.96
+    # or the pre-load pours out during the reset settle. Later loaded stages start opening-up.
+    curriculum_reset_pitch: tuple = (0.6, 0.0, 0.0, 0.0, 0.0)
     dump_hover_z: float = 0.22  # env-frame z the opening-up cup hovers at over a container before dumping [m]
     # The loaded "home_up" reset hovers the pre-loaded cup HERE: a central spot clear of the source pile (so the
     # cup is not embedded in media -> no reset pop) and reachable without railing the wrist. Policy carries +y.
     loaded_hover_xy: tuple = (0.40, 0.0)
-    curriculum_success_threshold: float = 0.35
-    curriculum_min_resets_per_stage: int = 150
-    curriculum_success_ema_alpha: float = 0.05
+    # Loaded stages must require a REAL dump: the success threshold is at least this fraction of
+    # the actually pre-loaded (capacity-clamped, tilt-derated) cup content, not the bare per-stage
+    # count -- delivering a token ~10 particles of a 73-particle cupful is not success.
+    curriculum_loaded_target_frac: float = 0.5
+    # Advance only after the success-rate EMA shows the stage is genuinely mastered, and only
+    # after enough resets to make the EMA meaningful. NOTE: at ~400 envs one reset batch already
+    # exceeds a small reset minimum -- size it in BATCHES of resets, not single episodes.
+    curriculum_success_threshold: float = 0.8
+    curriculum_min_resets_per_stage: int = 1500
+    curriculum_success_ema_alpha: float = 0.02
     # Initial stage (clamped to the stage count) and an advancement freeze -- set e.g.
     # ``env.curriculum_start_stage=2 env.curriculum_freeze=True`` on the CLI to train/play a
     # specific difficulty level.

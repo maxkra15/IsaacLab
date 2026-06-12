@@ -41,7 +41,14 @@ class ScoopCurriculum(ManagerTermBase):
     def _apply(self, env: FrankaScoopEnv) -> None:
         if hasattr(env, "curriculum_stage"):
             env.curriculum_stage[:] = self.stage
-        env.scoop_target_count = float(env.cfg.curriculum_target_count[self.stage])
+        count = float(env.cfg.curriculum_target_count[self.stage])
+        # Loaded (pre-filled) stages must require a real dump: at least the configured fraction
+        # of the actually pre-loaded cup content, not just the bare per-stage count.
+        frac = float(getattr(env.cfg, "curriculum_loaded_target_frac", 0.0))
+        preload = env.cup_preload_count(self.stage) if hasattr(env, "cup_preload_count") else 0
+        if frac > 0.0 and preload > 0:
+            count = max(count, float(int(frac * preload)))
+        env.scoop_target_count = count
 
     def __call__(self, env: FrankaScoopEnv, env_ids: Sequence[int]):
         cfg = env.cfg
