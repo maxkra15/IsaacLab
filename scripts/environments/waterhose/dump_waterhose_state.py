@@ -1,3 +1,8 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Side-by-side state dumper for the success demo and the IsaacLab env.
 
 Constructs each setup, then prints a comprehensive snapshot of body counts,
@@ -7,12 +12,13 @@ small warmup) per-contact statistics so we can compare them directly.
 Usage:
     # Inside the newton repo (success demo)
     cd /home/maximiliank/Work/newton
-    uv run python /home/maximiliank/Work/IsaacLab-waterhose-demo/scripts/environments/waterhose/dump_waterhose_state.py success
+    uv run python ../IsaacLab-waterhose-demo/scripts/environments/waterhose/dump_waterhose_state.py success
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -65,15 +71,21 @@ def dump_model_group(label, model, body_ids, shape_ids=None, indent="  "):
         print(f"{indent}bodies={len(body_ids)} mass({_stats(bm[idx], precision=4)})")
         print(f"{indent}        inv_mass({_stats(bim[idx], precision=4)})")
         if bf is not None and bf.shape[0] > idx.max():
-            print(f"{indent}        body_flags={[int(bf[i]) for i in idx[:8]]}{'...' if len(idx)>8 else ''}")
+            print(f"{indent}        body_flags={[int(bf[i]) for i in idx[:8]]}{'...' if len(idx) > 8 else ''}")
         # first body pose
         if bq is not None and bq.shape[0] > idx[0]:
             q0 = bq[idx[0]]
-            print(f"{indent}        first_body_q (id={int(idx[0])}): pos=({q0[0]:+.4f}, {q0[1]:+.4f}, {q0[2]:+.4f}) quat_xyzw=({q0[3]:+.4f}, {q0[4]:+.4f}, {q0[5]:+.4f}, {q0[6]:+.4f})")
+            print(
+                f"{indent}        first_body_q (id={int(idx[0])}): pos=({q0[0]:+.4f}, {q0[1]:+.4f}, {q0[2]:+.4f})"
+                f" quat_xyzw=({q0[3]:+.4f}, {q0[4]:+.4f}, {q0[5]:+.4f}, {q0[6]:+.4f})"
+            )
         # last body pose
         if bq is not None and bq.shape[0] > idx[-1]:
             qN = bq[idx[-1]]
-            print(f"{indent}        last_body_q  (id={int(idx[-1])}): pos=({qN[0]:+.4f}, {qN[1]:+.4f}, {qN[2]:+.4f}) quat_xyzw=({qN[3]:+.4f}, {qN[4]:+.4f}, {qN[5]:+.4f}, {qN[6]:+.4f})")
+            print(
+                f"{indent}        last_body_q  (id={int(idx[-1])}): pos=({qN[0]:+.4f}, {qN[1]:+.4f}, {qN[2]:+.4f})"
+                f" quat_xyzw=({qN[3]:+.4f}, {qN[4]:+.4f}, {qN[5]:+.4f}, {qN[6]:+.4f})"
+            )
     else:
         print(f"{indent}bodies=0")
 
@@ -107,7 +119,7 @@ def dump_model_group(label, model, body_ids, shape_ids=None, indent="  "):
         if sm_gap is not None and sm_gap.shape[0] > ss_max:
             print(f"{indent}        gap({_stats(sm_gap[idx], precision=4)})")
         if sf is not None and sf.shape[0] > ss_max:
-            print(f"{indent}        shape_flags={[int(sf[i]) for i in idx[:8]]}{'...' if len(idx)>8 else ''}")
+            print(f"{indent}        shape_flags={[int(sf[i]) for i in idx[:8]]}{'...' if len(idx) > 8 else ''}")
     else:
         print(f"{indent}shapes=0")
 
@@ -124,7 +136,6 @@ def dump_contact_pairs(label, model, groups):
     for raw_a, raw_b in pairs:
         a = int(raw_a)
         b = int(raw_b)
-        pair = {a, b}
         for ga_name, ga in sets.items():
             for gb_name, gb in sets.items():
                 if ga_name > gb_name:
@@ -152,13 +163,13 @@ def dump_success():
     if str(newton_repo) not in sys.path:
         sys.path.insert(0, str(newton_repo))
 
+    # Build a null-viewer args namespace.
+    from argparse import Namespace
+
     import newton  # noqa: F401
-    import warp as wp
     import newton.examples
     from newton.examples.cable_robot.example_waterhose_scene2_insert_extract_success import Example
 
-    # Build a null-viewer args namespace.
-    from argparse import Namespace
     args = Namespace(
         device=None,
         viewer="null",
@@ -277,10 +288,8 @@ def dump_success():
     ]
     for f in fields:
         v = getattr(s, f, "<missing>")
-        try:
+        with contextlib.suppress(Exception):
             v = float(v)
-        except Exception:
-            pass
         print(f"  {f} = {v}")
 
     print()

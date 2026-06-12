@@ -31,6 +31,7 @@ import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
 
 import isaaclab.utils.math as math_utils  # noqa: E402
+
 import isaaclab_tasks  # noqa: F401, E402
 from isaaclab_tasks.contrib.waterhose.geometry import (  # noqa: E402
     RIGHT_GRIPPER_EE_FRAME_POS,

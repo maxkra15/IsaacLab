@@ -36,7 +36,6 @@ import argparse
 import contextlib
 import inspect
 import os
-import sys
 
 # Isaac Lab AppLauncher
 from isaaclab.app import AppLauncher
@@ -68,7 +67,9 @@ parser.add_argument(
     default=10,
     help="Number of continuous steps with task success for concluding a demo as successful. Default is 10.",
 )
-parser.add_argument("--max_steps", type=int, default=0, help="Optional recording loop bound. Set to 0 to run until closed.")
+parser.add_argument(
+    "--max_steps", type=int, default=0, help="Optional recording loop bound. Set to 0 to run until closed."
+)
 parser.add_argument(
     "--cloudxr_env",
     type=str,
@@ -386,7 +387,9 @@ def _create_configured_device(device_name: str, devices_cfg: dict, callbacks: di
     for retargeter_cfg in getattr(device_cfg, "retargeters", None) or []:
         retargeter_constructor = getattr(retargeter_cfg, "retargeter_type", None)
         if retargeter_constructor is None:
-            raise ValueError(f"Retargeter configuration {type(retargeter_cfg).__name__} does not declare retargeter_type.")
+            raise ValueError(
+                f"Retargeter configuration {type(retargeter_cfg).__name__} does not declare retargeter_type."
+            )
         retargeter_cls = _resolve_class_type(retargeter_constructor)
         if not issubclass(retargeter_cls, RetargeterBase):
             raise TypeError(

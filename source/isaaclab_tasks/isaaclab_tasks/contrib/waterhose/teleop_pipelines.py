@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -75,7 +75,6 @@ def build_waterhose_relative_teleop_pipeline():
     """Build the IsaacTeleop pipeline for the relative Waterhose IK teleop action space."""
 
     import numpy as np
-
     from isaacteleop.retargeters import (
         GripperRetargeter,
         GripperRetargeterConfig,

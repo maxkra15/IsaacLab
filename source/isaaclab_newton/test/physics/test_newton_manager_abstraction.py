@@ -30,7 +30,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import warp as wp
-from isaaclab.managers import SceneEntityCfg
 from isaaclab_newton.physics import (
     AdmmContactPairCfg,
     AdmmCouplingCfg,
@@ -58,6 +57,7 @@ from isaaclab_newton.physics.mpm_manager import _make_solver_config
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
 from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
 
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
 # ---------------------------------------------------------------------------
@@ -580,9 +580,7 @@ def test_coupled_entry_threads_generic_entry_options():
 
 def test_coupled_proxy_int_mode_is_normalized():
     """Integer proxy modes are normalized before constructing Newton proxy configs."""
-    proxy = NewtonCoupledManager._build_proxy(
-        CoupledProxyCfg(source="src", destination="dst", particles=[0], mode=1)
-    )
+    proxy = NewtonCoupledManager._build_proxy(CoupledProxyCfg(source="src", destination="dst", particles=[0], mode=1))
     assert proxy.mode == "staggered"
 
 
@@ -800,10 +798,7 @@ def test_initialize_solver_populates_canonical_state(
                 jitter=0.0,
                 radius_mean=0.02,
             )
-        elif (
-            SolverCoupledProxy is not None
-            and issubclass(expected_solver_cls, SolverCoupledProxy)
-        ):
+        elif SolverCoupledProxy is not None and issubclass(expected_solver_cls, SolverCoupledProxy):
             body = builder.add_body(mass=1.0)
             builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
             builder.add_ground_plane()

@@ -1,3 +1,8 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Create an Isaac Sim inspection layer for the Waterhose fridge socket.
 
 The fridge USD has many Blender-exported collider prims without semantic names.
@@ -21,18 +26,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
-FRIDGE_DIR = (
-    REPO_ROOT
-    / "source"
-    / "isaaclab_tasks"
-    / "isaaclab_tasks"
-    / "contrib"
-    / "waterhose"
-    / "assets"
-    / "fridge"
-)
+FRIDGE_DIR = REPO_ROOT / "source" / "isaaclab_tasks" / "isaaclab_tasks" / "contrib" / "waterhose" / "assets" / "fridge"
 DEFAULT_FRIDGE_USD = FRIDGE_DIR / "fridge.usda"
 DEFAULT_OUTPUT_USD = FRIDGE_DIR / "fridge_socket_inspection.usda"
 
@@ -85,7 +80,9 @@ def _parse_vec3(raw: str) -> tuple[float, float, float]:
     return values[0], values[1], values[2]
 
 
-def _aabb_distance(point: tuple[float, float, float], low: tuple[float, float, float], high: tuple[float, float, float]) -> float:
+def _aabb_distance(
+    point: tuple[float, float, float], low: tuple[float, float, float], high: tuple[float, float, float]
+) -> float:
     sq = 0.0
     for value, lo, hi in zip(point, low, high):
         if value < lo:
@@ -267,7 +264,9 @@ def write_inspection_usd(
         path_markers.append(_marker_sphere(f"InsertPath_{i:02d}", position, 0.004, "InsertPath"))
 
     if hide_visuals:
-        visual_override = '            over "Visuals"\n            {\n                token visibility = "invisible"\n            }\n'
+        visual_override = (
+            '            over "Visuals"\n            {\n                token visibility = "invisible"\n            }\n'
+        )
     else:
         visual_override = """            over "Visuals"
             {
@@ -298,17 +297,19 @@ def Xform "Inspection"
             {{
                 uniform token purpose = "default"
                 token visibility = "inherited"
-{''.join(collider_blocks)}            }}
+{"".join(collider_blocks)}            }}
         }}
     }}
 
     def Scope "Materials"
     {{
-{''.join(material_blocks)}    }}
+{"".join(material_blocks)}    }}
 
     def Xform "Markers"
     {{
-{_marker_sphere("SocketTarget", SOCKET_TARGET, 0.012, "SocketTarget")}{_marker_sphere("InsertedTipTarget", INSERTED_TIP_TARGET, 0.01, "InsertedTipTarget")}{''.join(path_markers)}    }}
+{_marker_sphere("SocketTarget", SOCKET_TARGET, 0.012, "SocketTarget")}\
+{_marker_sphere("InsertedTipTarget", INSERTED_TIP_TARGET, 0.01, "InsertedTipTarget")}\
+{"".join(path_markers)}    }}
 }}
 """
     output_usd.write_text(content)
@@ -369,7 +370,9 @@ def main() -> None:
     selected_names = [candidate.name for candidate in colliders[: args.top_n]]
     selected_names.extend(sorted(forced - set(selected_names)))
     selected_by_name = {candidate.name: candidate for candidate in colliders}
-    selected = sorted((selected_by_name[name] for name in selected_names), key=lambda candidate: (candidate.score, candidate.name))
+    selected = sorted(
+        (selected_by_name[name] for name in selected_names), key=lambda candidate: (candidate.score, candidate.name)
+    )
 
     args.output_usd.parent.mkdir(parents=True, exist_ok=True)
     report_path = args.output_usd.with_suffix(".csv")

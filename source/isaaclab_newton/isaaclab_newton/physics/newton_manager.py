@@ -55,8 +55,6 @@ from isaaclab_newton.physics.visualization_builder import build_visualization_bu
 from .newton_manager_cfg import NewtonCfg, NewtonShapeCfg
 
 if TYPE_CHECKING:
-    from pxr import Usd
-
     from isaaclab.sim.simulation_context import SimulationContext
 
     from isaaclab_newton.actuators import NewtonActuatorAdapter
@@ -1035,7 +1033,9 @@ class NewtonManager(PhysicsManager):
         solver_cfgs.extend(getattr(entry, "solver_cfg", entry) for entry in getattr(solver_cfg, "entries", ()) or ())
         from .mpm_manager_cfg import MPMSolverCfg
 
-        if any(isinstance(cfg, MPMSolverCfg) or getattr(cfg, "solver_type", None) == "implicit_mpm" for cfg in solver_cfgs):
+        if any(
+            isinstance(cfg, MPMSolverCfg) or getattr(cfg, "solver_type", None) == "implicit_mpm" for cfg in solver_cfgs
+        ):
             from newton.solvers import SolverImplicitMPM
 
             SolverImplicitMPM.register_custom_attributes(builder)

@@ -16,13 +16,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 from newton import CollisionPipeline, Model, eval_fk
+from newton._src.solvers.coupled.proxy_utils import sync_proxy_particles_kernel, sync_proxy_states_kernel
 from newton.solvers.experimental.coupled import (
     CouplingInterface,
     SolverCoupled,
     SolverCoupledADMM,
     SolverCoupledProxy,
 )
-from newton._src.solvers.coupled.proxy_utils import sync_proxy_particles_kernel, sync_proxy_states_kernel
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.physics import PhysicsManager
@@ -290,9 +290,7 @@ class NewtonCoupledManager(NewtonManager):
         """Return a shallow copy of ``solver_cfg`` with selector fields resolved to ids."""
         scene_cfg = cls._resolve_scene_cfg(solver_cfg)
         resolved_cfg = copy.copy(solver_cfg)
-        resolved_cfg.entries = [
-            cls._resolve_entry_cfg(model, entry_cfg, scene_cfg) for entry_cfg in solver_cfg.entries
-        ]
+        resolved_cfg.entries = [cls._resolve_entry_cfg(model, entry_cfg, scene_cfg) for entry_cfg in solver_cfg.entries]
         resolved_proxy_coupling = copy.copy(solver_cfg.proxy_coupling)
         resolved_proxy_coupling.proxies = [
             cls._resolve_proxy_cfg(model, proxy_cfg, scene_cfg) for proxy_cfg in solver_cfg.proxy_coupling.proxies
@@ -376,9 +374,7 @@ class NewtonCoupledManager(NewtonManager):
             ),
         ]
         if selected_proxy_bodies:
-            resolved.proxy_bodies = cls._unique_ints(
-                [*(proxy_cfg.proxy_bodies or []), *selected_proxy_bodies]
-            )
+            resolved.proxy_bodies = cls._unique_ints([*(proxy_cfg.proxy_bodies or []), *selected_proxy_bodies])
         resolved.particles = cls._resolve_particles(
             model,
             explicit=proxy_cfg.particles,
@@ -743,9 +739,8 @@ class NewtonCoupledManager(NewtonManager):
     @staticmethod
     def _entry_uses_local_collision_pipeline(entry_cfg: CoupledSolverEntryCfg) -> bool:
         solver_cfg = entry_cfg.solver_cfg
-        return (
-            getattr(solver_cfg, "solver_type", None) == "mujoco_warp"
-            and not getattr(solver_cfg, "use_mujoco_contacts", True)
+        return getattr(solver_cfg, "solver_type", None) == "mujoco_warp" and not getattr(
+            solver_cfg, "use_mujoco_contacts", True
         )
 
     @classmethod
@@ -926,9 +921,7 @@ class NewtonCoupledManager(NewtonManager):
         cls._validate_proxy_mappings(entries, proxy_coupling.proxies)
 
     @classmethod
-    def _validate_proxy_mappings(
-        cls, entries: list[CoupledSolverEntryCfg], proxies: list[CoupledProxyCfg]
-    ) -> None:
+    def _validate_proxy_mappings(cls, entries: list[CoupledSolverEntryCfg], proxies: list[CoupledProxyCfg]) -> None:
         entry_names = {entry.name for entry in entries}
         for proxy in proxies:
             if proxy.source not in entry_names:
@@ -975,7 +968,6 @@ class NewtonCoupledManager(NewtonManager):
         if solver_cfg.use_collision_pipeline is not None:
             return solver_cfg.use_collision_pipeline
         return any(
-            solver_cfg_needs_external_contacts(entry.solver_cfg)
-            and not cls._entry_uses_local_collision_pipeline(entry)
+            solver_cfg_needs_external_contacts(entry.solver_cfg) and not cls._entry_uses_local_collision_pipeline(entry)
             for entry in solver_cfg.entries
         )

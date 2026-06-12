@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -25,10 +25,7 @@ from pathlib import Path
 from pxr import Usd, UsdGeom, UsdPhysics, Vt
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-OUT = (
-    REPO_ROOT
-    / "source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/fridge/socket_cylinder.usda"
-)
+OUT = REPO_ROOT / "source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/fridge/socket_cylinder.usda"
 
 
 def build_cup(bore_r, outer_r, depth, seg, floor=0.002, lead_in=0.0015, lead_depth=0.0025):
@@ -48,25 +45,31 @@ def build_cup(bore_r, outer_r, depth, seg, floor=0.002, lead_in=0.0015, lead_dep
             pts.append((r * math.cos(a), r * math.sin(a), z))
         return list(range(base, base + seg))
 
-    out0 = ring(outer_r, 0.0)                 # outer wall, mouth
-    out1 = ring(outer_r, depth)               # outer wall, bottom
-    inn0 = ring(bore_r + lead_in, 0.0)        # mouth opening (chamfer top, widened)
-    innA = ring(bore_r, lead_depth)           # chamfer bottom = start of straight bore
-    innB = ring(bore_r, bore_depth)           # bore wall, floor
-    ext_c = len(pts); pts.append((0.0, 0.0, depth))        # exterior bottom center
-    bore_c = len(pts); pts.append((0.0, 0.0, bore_depth))  # bore floor center
+    out0 = ring(outer_r, 0.0)  # outer wall, mouth
+    out1 = ring(outer_r, depth)  # outer wall, bottom
+    inn0 = ring(bore_r + lead_in, 0.0)  # mouth opening (chamfer top, widened)
+    innA = ring(bore_r, lead_depth)  # chamfer bottom = start of straight bore
+    innB = ring(bore_r, bore_depth)  # bore wall, floor
+    ext_c = len(pts)
+    pts.append((0.0, 0.0, depth))  # exterior bottom center
+    bore_c = len(pts)
+    pts.append((0.0, 0.0, bore_depth))  # bore floor center
 
     tris: list[tuple[int, int, int]] = []
     for i in range(seg):
         j = (i + 1) % seg
         # outer wall (outward normals)
-        tris.append((out0[i], out0[j], out1[j])); tris.append((out0[i], out1[j], out1[i]))
+        tris.append((out0[i], out0[j], out1[j]))
+        tris.append((out0[i], out1[j], out1[i]))
         # chamfer lead-in (inward) inn0 -> innA
-        tris.append((inn0[i], innA[i], innA[j])); tris.append((inn0[i], innA[j], inn0[j]))
+        tris.append((inn0[i], innA[i], innA[j]))
+        tris.append((inn0[i], innA[j], inn0[j]))
         # straight bore wall (inward) innA -> innB
-        tris.append((innA[i], innB[i], innB[j])); tris.append((innA[i], innB[j], innA[j]))
+        tris.append((innA[i], innB[i], innB[j]))
+        tris.append((innA[i], innB[j], innA[j]))
         # mouth rim annulus z=0 (faces -Z toward the approaching plug): out0 -> inn0
-        tris.append((out0[i], inn0[i], inn0[j])); tris.append((out0[i], inn0[j], out0[j]))
+        tris.append((out0[i], inn0[i], inn0[j]))
+        tris.append((out0[i], inn0[j], out0[j]))
         # exterior bottom disk z=depth (faces +Z)
         tris.append((out1[i], ext_c, out1[j]))
         # bore floor disk z=bore_depth (faces -Z, into the cavity)
@@ -104,8 +107,10 @@ def main():
     mca = UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim())
     mca.CreateApproximationAttr(UsdPhysics.Tokens.none)
     stage.GetRootLayer().Save()
-    print(f"wrote {a.out}  verts={len(pts)} tris={len(tris)} "
-          f"bore_r={a.bore_radius} outer_r={a.outer_radius} depth={a.depth}")
+    print(
+        f"wrote {a.out}  verts={len(pts)} tris={len(tris)} "
+        f"bore_r={a.bore_radius} outer_r={a.outer_radius} depth={a.depth}"
+    )
 
 
 if __name__ == "__main__":

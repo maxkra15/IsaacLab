@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -23,9 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import os
-import sys
 
 os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
 os.environ.setdefault("ISAACLAB_REPLACE_NEWTON_SHAPE_COLORS", "0")
@@ -55,11 +53,11 @@ simulation_app = app_launcher.app
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from isaaclab_newton.physics import NewtonManager  # noqa: E402
 
 import isaaclab_tasks  # noqa: F401, E402
 from isaaclab_tasks.contrib.waterhose.scripted_state_machine import WaterhoseDemoState  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg  # noqa: E402
-from isaaclab_newton.physics import NewtonManager  # noqa: E402
 
 
 # --------------------------------------------------------------------------------------
@@ -278,9 +276,9 @@ def exp_softer_plug_weld(env_cfg):
 
 def exp_heavier_plug(env_cfg):
     # 1g -> 50g plug; raises the lightest contact body's mass to damp stiff-contact accel.
-    env_cfg.scene.plug1.spawn.mass_props = __import__(
-        "isaaclab.sim", fromlist=["MassPropertiesCfg"]
-    ).MassPropertiesCfg(mass=0.05)
+    env_cfg.scene.plug1.spawn.mass_props = __import__("isaaclab.sim", fromlist=["MassPropertiesCfg"]).MassPropertiesCfg(
+        mass=0.05
+    )
 
 
 def exp_resample_cable(env_cfg):
@@ -383,7 +381,7 @@ def classify_bodies(model):
     return {k: np.asarray(v, dtype=np.int64) for k, v in groups.items()}, labels
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     # Kill all visualizers / video for a clean headless physics run.
     env_cfg.sim.visualizer_cfgs = []
@@ -392,17 +390,25 @@ def main() -> None:
     if patch is None:
         raise SystemExit(f"unknown --exp {args_cli.exp}; choices={list(EXPERIMENTS)}")
     patch(env_cfg)
-    print(f"[instr] exp={args_cli.exp} num_envs={args_cli.num_envs} dt={env_cfg.sim.dt} "
-          f"substeps={env_cfg.sim.physics.num_substeps}", flush=True)
+    print(
+        f"[instr] exp={args_cli.exp} num_envs={args_cli.num_envs} dt={env_cfg.sim.dt} "
+        f"substeps={env_cfg.sim.physics.num_substeps}",
+        flush=True,
+    )
 
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
     env.reset()
 
     model = NewtonManager._model
     groups, labels = classify_bodies(model)
-    body_world = np.asarray(model.body_world.numpy()) if hasattr(model.body_world, "numpy") else np.asarray(model.body_world)
+    body_world = (
+        np.asarray(model.body_world.numpy()) if hasattr(model.body_world, "numpy") else np.asarray(model.body_world)
+    )
     n_bodies = len(labels)
-    print(f"[instr] n_bodies={n_bodies} group_sizes={{ {', '.join(f'{k}:{len(v)}' for k,v in groups.items())} }}", flush=True)
+    print(
+        f"[instr] n_bodies={n_bodies} group_sizes={{ {', '.join(f'{k}:{len(v)}' for k, v in groups.items())} }}",
+        flush=True,
+    )
     # restrict to env 0 bodies (world 0 or -1) so multi-env doesn't pollute group stats
     env0_mask = (body_world == 0) | (body_world == -1)
 
@@ -440,11 +446,17 @@ def main() -> None:
         for token in ("base", "torso", "right_arm", "right_gripper_base"):
             bi = _find_idx(token)
             if bi >= 0:
-                print(f"[gt] body '{labels[bi]}' world_pos={np.round(bq[bi,:3],4).tolist()} "
-                      f"quat_xyzw={np.round(bq[bi,3:],4).tolist()}", flush=True)
+                print(
+                    f"[gt] body '{labels[bi]}' world_pos={np.round(bq[bi, :3], 4).tolist()} "
+                    f"quat_xyzw={np.round(bq[bi, 3:], 4).tolist()}",
+                    flush=True,
+                )
         if plug_idx >= 0:
-            print(f"[gt] PLUG world_pos={np.round(bq[plug_idx,:3],4).tolist()} "
-                  f"quat_xyzw={np.round(bq[plug_idx,3:],4).tolist()}", flush=True)
+            print(
+                f"[gt] PLUG world_pos={np.round(bq[plug_idx, :3], 4).tolist()} "
+                f"quat_xyzw={np.round(bq[plug_idx, 3:], 4).tolist()}",
+                flush=True,
+            )
         # static mesh shapes (shape_body == -1) — the socket/fridge colliders
         for s in range(len(sbody)):
             src = msrc[s] if msrc is not None else None
@@ -477,12 +489,19 @@ def main() -> None:
             axis = Wt[0]
             tag = ""
             if 120 <= V.shape[0] <= 320 and ext.max() < 0.018:
-                tag = (f"  <-- SOCKET? S={np.round(S[:3]/ max(S[0],1e-9),3).tolist()} "
-                       f"largest_axis={np.round(Wt[0],3).tolist()} bore_axis(smallest)={np.round(Wt[2],3).tolist()}")
-            print(f"[gt] static-shape s={s} body={b} nV={V.shape[0]} world_centroid={np.round(c,4).tolist()} "
-                  f"bbox_mm={np.round(ext*1000,1).tolist()} pca_axis={np.round(axis,3).tolist()}{tag}", flush=True)
-        print(f"[gt] SM hardcoded socket_pos_w=(-0.259345,0.344709,0.28698) "
-              f"socket bore axis(Rx20)=(0,-0.342,0.940)", flush=True)
+                tag = (
+                    f"  <-- SOCKET? S={np.round(S[:3] / max(S[0], 1e-9), 3).tolist()} "
+                    f"largest_axis={np.round(Wt[0], 3).tolist()} bore_axis(smallest)={np.round(Wt[2], 3).tolist()}"
+                )
+            print(
+                f"[gt] static-shape s={s} body={b} nV={V.shape[0]} world_centroid={np.round(c, 4).tolist()} "
+                f"bbox_mm={np.round(ext * 1000, 1).tolist()} pca_axis={np.round(axis, 3).tolist()}{tag}",
+                flush=True,
+            )
+        print(
+            "[gt] SM hardcoded socket_pos_w=(-0.259345,0.344709,0.28698) socket bore axis(Rx20)=(0,-0.342,0.940)",
+            flush=True,
+        )
 
     try:
         _dump_socket_and_base()
@@ -497,12 +516,12 @@ def main() -> None:
             sbody = m.shape_body.numpy()
             stype = m.shape_type.numpy() if hasattr(m.shape_type, "numpy") else np.asarray(m.shape_type)
             sxf = m.shape_transform.numpy()
-            sscale = m.shape_scale.numpy() if hasattr(m, "shape_scale") and m.shape_scale is not None else None
         except Exception as e:
             print(f"[geom] could not read shapes: {e}", flush=True)
             return
         # mesh source list (vertices) for mesh shapes
         msrc = getattr(m, "shape_source", None)
+
         def mesh_bounds(s):
             try:
                 src = msrc[int(s)] if msrc is not None else None
@@ -517,6 +536,7 @@ def main() -> None:
                 return V.min(0), V.max(0)
             except Exception:
                 return None
+
         for name, bidx in [("leftfinger", lf_idx), ("rightfinger", rf_idx), ("plug", plug_idx)]:
             sh = np.where(sbody == bidx)[0]
             print(f"[geom] {name} (body {bidx}): {len(sh)} shapes", flush=True)
@@ -525,17 +545,25 @@ def main() -> None:
                 mb = mesh_bounds(s)
                 if mb is not None:
                     lo, hi = mb
-                    print(f"[geom]   shape{int(s)} type={int(stype[s])} shapeT_pos={np.round(t[:3],4).tolist()} "
-                          f"mesh_min={np.round(lo,4).tolist()} mesh_max={np.round(hi,4).tolist()} "
-                          f"size_mm={np.round((hi-lo)*1000,1).tolist()}", flush=True)
+                    print(
+                        f"[geom]   shape{int(s)} type={int(stype[s])} shapeT_pos={np.round(t[:3], 4).tolist()} "
+                        f"mesh_min={np.round(lo, 4).tolist()} mesh_max={np.round(hi, 4).tolist()} "
+                        f"size_mm={np.round((hi - lo) * 1000, 1).tolist()}",
+                        flush=True,
+                    )
                 else:
-                    print(f"[geom]   shape{int(s)} type={int(stype[s])} shapeT_pos={np.round(t[:3],4).tolist()} (no mesh src)", flush=True)
+                    print(
+                        f"[geom]   shape{int(s)} type={int(stype[s])}"
+                        f" shapeT_pos={np.round(t[:3], 4).tolist()} (no mesh src)",
+                        flush=True,
+                    )
+
     _dump_geom()
 
     sm = WaterhoseDemoState(env.num_envs, env.step_dt, env.device, args_cli.settle_time, args_cli.debug_script)
     actions = sm.compute(env)
 
-    csv_f = open(args_cli.csv, "w") if args_cli.csv else None
+    csv_f = open(args_cli.csv, "w") if args_cli.csv else None  # noqa: SIM115
     if csv_f:
         cols = ["step", "phase", "grip"]
         for g in groups:
@@ -560,7 +588,7 @@ def main() -> None:
 
         state = NewtonManager._state_0
         body_qd = state.body_qd.numpy()  # [nbody, 6]
-        body_q = state.body_q.numpy()    # [nbody, 7]
+        body_q = state.body_q.numpy()  # [nbody, 7]
         speeds = np.linalg.norm(body_qd, axis=1)
         finite = np.isfinite(body_qd).all(axis=1) & np.isfinite(body_q).all(axis=1)
         nan_idx = np.where(~finite & env0_mask)[0]
@@ -618,8 +646,11 @@ def main() -> None:
             first_explode_step = step
             bad = int(np.nanargmax(np.where(np.isfinite(speeds), speeds, -1)))
             first_explode_group = worst_g
-            print(f"[EXPLODE] step={step} phase={row['phase']} global_vmax={global_vmax:.3g} "
-                  f"worst_body={labels[bad]} (idx={bad}, world={int(body_world[bad])}) grip={grip:.2f}", flush=True)
+            print(
+                f"[EXPLODE] step={step} phase={row['phase']} global_vmax={global_vmax:.3g} "
+                f"worst_body={labels[bad]} (idx={bad}, world={int(body_world[bad])}) grip={grip:.2f}",
+                flush=True,
+            )
             snap = " ".join(f"{g}={row[f'{g}_vmax']:.3g}" for g in groups)
             print(f"[EXPLODE] env0 vmax_by_group: {snap}", flush=True)
         if first_nan_step < 0 and len(nan_idx_all) > 0:
@@ -630,8 +661,11 @@ def main() -> None:
                 if inter.size:
                     bad_groups[g] = inter.size
             worlds = sorted(set(int(body_world[i]) for i in nan_idx_all))
-            print(f"[NAN] step={step} phase={row['phase']} n_nan={len(nan_idx_all)} worlds={worlds} groups={bad_groups} "
-                  f"first_labels={[labels[i] for i in nan_idx_all[:5]]}", flush=True)
+            print(
+                f"[NAN] step={step} phase={row['phase']} n_nan={len(nan_idx_all)} worlds={worlds} groups={bad_groups} "
+                f"first_labels={[labels[i] for i in nan_idx_all[:5]]}",
+                flush=True,
+            )
 
         if first_explode_step >= 0 or first_nan_step >= 0:
             steps_after_explode += 1

@@ -31,7 +31,7 @@ class WaterhoseSpaceMouseCfg(DeviceCfg):
     deadzone: float = 1.0e-3
     yaw_translation_lock: bool = False
     retargeters: None = None
-    class_type: type["WaterhoseSpaceMouse"] | str = "{DIR}.teleop:WaterhoseSpaceMouse"
+    class_type: type[WaterhoseSpaceMouse] | str = "{DIR}.teleop:WaterhoseSpaceMouse"
 
 
 class WaterhoseSpaceMouse(DeviceBase):

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from newton.solvers import SolverBase
 
     from isaaclab.scene import InteractiveSceneCfg
+
     from isaaclab_newton.physics import NewtonManager
 
 

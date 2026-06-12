@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -43,9 +43,7 @@ SOCKET_SNAP_ANCHOR_POS = (-0.258298, 0.345281, 0.276657)
 # target_local_pos — the anchor rot maps +Z onto the bore axis, so the local offset is +50 mm Z.
 _SNAP_ANCHOR_SETBACK = 0.05
 _BORE_AXIS = (0.0, -0.342020, 0.939693)  # SOCKET_ROT applied to +Z (20 deg about +X)
-SOCKET_SNAP_ANCHOR_BODY_POS = tuple(
-    p - _SNAP_ANCHOR_SETBACK * a for p, a in zip(SOCKET_SNAP_ANCHOR_POS, _BORE_AXIS)
-)
+SOCKET_SNAP_ANCHOR_BODY_POS = tuple(p - _SNAP_ANCHOR_SETBACK * a for p, a in zip(SOCKET_SNAP_ANCHOR_POS, _BORE_AXIS))
 SOCKET_SNAP_ANCHOR_LOCAL_OFFSET = (0.0, 0.0, _SNAP_ANCHOR_SETBACK)
 SOCKET_COLLISION_XFORM_SUFFIX = "/Cable008/SocketCollision"
 SOCKET_COLLISION_MESH_SUFFIX = f"{SOCKET_COLLISION_XFORM_SUFFIX}/Cable008_SocketCollision"

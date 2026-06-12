@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -11,14 +11,14 @@ from collections.abc import Sequence
 from dataclasses import MISSING
 
 import torch
+from isaaclab_newton.envs.mdp.actions.newton_ik_actions import NewtonInverseKinematicsAction
+from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKPoseObjectiveCfg
 
 import isaaclab.utils.math as math_utils
 import isaaclab.utils.string as string_utils
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.managers.manager_term_cfg import ActionTermCfg
 from isaaclab.utils.configclass import configclass
-from isaaclab_newton.envs.mdp.actions.newton_ik_actions import NewtonInverseKinematicsAction
-from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKPoseObjectiveCfg
 
 
 @configclass
@@ -110,12 +110,14 @@ class WaterhoseLocalFrameNewtonInverseKinematicsAction(NewtonInverseKinematicsAc
         super().__init__(cfg, env)
         pose_cfgs = [obj for obj in cfg.objectives if isinstance(obj, NewtonIKPoseObjectiveCfg)]
         if not pose_cfgs or cfg.objectives[0] is not pose_cfgs[0]:
-            raise ValueError("WaterhoseLocalFrameNewtonInverseKinematicsAction expects the primary pose objective first.")
+            raise ValueError(
+                "WaterhoseLocalFrameNewtonInverseKinematicsAction expects the primary pose objective first."
+            )
         primary = pose_cfgs[0]
         self._local_frame_active = primary.command_type == "pose" and primary.use_relative_mode
-        self._ee_offset_quat = torch.tensor(
-            primary.body_offset_rot, dtype=torch.float32, device=self.device
-        ).repeat(self.num_envs, 1)
+        self._ee_offset_quat = torch.tensor(primary.body_offset_rot, dtype=torch.float32, device=self.device).repeat(
+            self.num_envs, 1
+        )
         self._primary_body_idx = self._resolve_isaac_body_index(primary.body_name)
 
     def process_actions(self, actions: torch.Tensor) -> None:

@@ -11,10 +11,10 @@ from typing import TYPE_CHECKING
 
 import torch
 import warp as wp
+from isaaclab_newton.physics import NewtonManager
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import normalize, quat_apply
-from isaaclab_newton.physics import NewtonManager
 
 if TYPE_CHECKING:
     from isaaclab.assets import RigidObject

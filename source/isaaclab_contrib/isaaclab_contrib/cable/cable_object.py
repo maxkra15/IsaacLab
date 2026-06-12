@@ -668,8 +668,10 @@ def sync_registered_cable_curves_to_usd() -> None:
 
 def _active_solver_cfg_supports_cables() -> bool:
     """Return whether the active Newton solver cfg contains a VBD cable-owning solver."""
-    from isaaclab.physics import PhysicsManager
     from isaaclab_newton.physics import CoupledSolverCfg
+
+    from isaaclab.physics import PhysicsManager
+
     from isaaclab_contrib.deformable.newton_manager_cfg import (
         CoupledFeatherstoneVBDSolverCfg,
         CoupledMJWarpVBDSolverCfg,
@@ -814,9 +816,7 @@ class CableObject(Articulation):
 
         resample_segment_length = getattr(self.cfg, "resample_segment_length", None)
         if resample_segment_length:
-            node_positions, edges = _resample_open_polyline(
-                node_positions, edges, float(resample_segment_length)
-            )
+            node_positions, edges = _resample_open_polyline(node_positions, edges, float(resample_segment_length))
 
         # Material binding requires ``UsdPhysics.CollisionAPI`` on the curve;
         # without it the spawner's bind silently no-ops.

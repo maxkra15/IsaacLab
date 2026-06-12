@@ -19,7 +19,6 @@ import os
 
 from isaaclab.app import AppLauncher
 
-
 parser = argparse.ArgumentParser(description="Run a scripted IK demo for the RBY1 waterhose task.")
 parser.add_argument("--task", type=str, default="Isaac-Waterhose-Coupled-v0", help="Task name.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments.")

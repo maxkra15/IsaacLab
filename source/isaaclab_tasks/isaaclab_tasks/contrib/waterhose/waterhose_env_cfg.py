@@ -16,6 +16,9 @@ import logging
 import math
 import os
 
+from isaaclab_newton.envs.mdp.actions.newton_ik_actions_cfg import NewtonInverseKinematicsActionCfg
+from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKJointLimitObjectiveCfg, NewtonIKPoseObjectiveCfg
+from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.physics import (
     AdmmContactPairCfg,
     AdmmCouplingCfg,
@@ -26,13 +29,12 @@ from isaaclab_newton.physics import (
     NewtonCollisionPipelineCfg,
     ProxyCouplingCfg,
 )
-from isaaclab_newton.envs.mdp.actions.newton_ik_actions_cfg import NewtonInverseKinematicsActionCfg
-from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKJointLimitObjectiveCfg, NewtonIKPoseObjectiveCfg
-from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.sim.spawners.materials.physics_materials_cfg import NewtonCableMaterialCfg
+from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 from isaaclab_visualizers.kit.kit_visualizer_cfg import KitVisualizerCfg
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
 
+import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -41,7 +43,6 @@ from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.devices.device_base import DevicesCfg
 from isaaclab.devices.keyboard import Se3KeyboardCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-import isaaclab.envs.mdp as mdp
 from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -56,13 +57,13 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
 from isaaclab.sim.utils import clone
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
+
 from isaaclab_contrib.cable.cable_object_cfg import CableAttachmentCfg, CableObjectCfg
 from isaaclab_contrib.deformable.newton_manager_cfg import (
     CoupledNewtonCfg,
     NewtonModelCfg,
     VBDSolverCfg,
 )
-from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 
 from .geometry import (
     ANCHOR_POS,
@@ -136,6 +137,8 @@ _RIGHT_GRIPPER_JOINT_NAMES = [
     "right_gripper_left_finger_joint",
     "right_gripper_right_finger_joint",
 ]
+
+
 def _env_flag(name: str, default: bool) -> bool:
     raw_value = os.environ.get(name)
     if raw_value is None:
@@ -194,7 +197,9 @@ def spawn_fridge_with_socket_sdf(
             f"'{SOCKET_COLLISION_MESH_SUFFIX}' under {prim_path}; the socket would "
             "silently fall back to BVH mesh contacts."
         )
-    print(f"[waterhose] Applied Newton texture-SDF collision to {modified} socket prim(s) under {prim_path}.", flush=True)
+    print(
+        f"[waterhose] Applied Newton texture-SDF collision to {modified} socket prim(s) under {prim_path}.", flush=True
+    )
     return prim
 
 
@@ -237,9 +242,7 @@ def _disable_rby1df_gripper_mimic_constraints(_payload=None) -> None:
             disabled += 1
 
     if disabled == 0:
-        raise RuntimeError(
-            "No RBY1 gripper mimic constraints matched the expected right/left finger joint labels."
-        )
+        raise RuntimeError("No RBY1 gripper mimic constraints matched the expected right/left finger joint labels.")
 
     logging.debug("Disabled %d RBY1 gripper mimic constraints for explicit finger control.", disabled)
 
@@ -247,8 +250,9 @@ def _disable_rby1df_gripper_mimic_constraints(_payload=None) -> None:
 def _register_rby1df_gripper_mimic_override() -> None:
     """Match Newton's waterhose examples by using explicit gripper drives, not mimic equality."""
 
-    from isaaclab.physics import PhysicsEvent
     from isaaclab_newton.physics import NewtonManager
+
+    from isaaclab.physics import PhysicsEvent
 
     NewtonManager.register_callback(
         _disable_rby1df_gripper_mimic_constraints,

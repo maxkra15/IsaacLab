@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -21,7 +21,6 @@ os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
 os.environ.setdefault("ISAACLAB_REPLACE_NEWTON_SHAPE_COLORS", "0")
 
 from isaaclab.app import AppLauncher
-
 
 DEFAULT_TASK = "Isaac-Waterhose-Coupled-v0"
 DEFAULT_MAX_STEPS = 4500
@@ -146,9 +145,15 @@ parser = argparse.ArgumentParser(description="Run the scripted waterhose robot d
 parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--max_steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum manager steps to run.")
-parser.add_argument("--max_demo_steps", type=int, default=-1, help="Optional env-level termination bound; 0 disables it.")
-parser.add_argument("--settle_time", type=float, default=2.0, help="Initial settle time for scene-config scripted IK demos.")
-parser.add_argument("--debug_script", action="store_true", help="Print phase transitions for scene-config scripted IK demos.")
+parser.add_argument(
+    "--max_demo_steps", type=int, default=-1, help="Optional env-level termination bound; 0 disables it."
+)
+parser.add_argument(
+    "--settle_time", type=float, default=2.0, help="Initial settle time for scene-config scripted IK demos."
+)
+parser.add_argument(
+    "--debug_script", action="store_true", help="Print phase transitions for scene-config scripted IK demos."
+)
 parser.add_argument(
     "--asset_root",
     type=str,
@@ -196,8 +201,9 @@ def _configure_env_cfg(env_cfg) -> None:
 
 
 def _parse_configured_env_cfg():
-    import isaaclab_tasks  # noqa: F401, PLC0415
     from isaaclab.envs import ManagerBasedRLEnvCfg  # noqa: PLC0415
+
+    import isaaclab_tasks  # noqa: F401, PLC0415
     from isaaclab_tasks.utils import parse_env_cfg  # noqa: PLC0415
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=int(args_cli.num_envs))

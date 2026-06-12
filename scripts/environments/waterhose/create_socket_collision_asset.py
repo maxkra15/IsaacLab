@@ -1,3 +1,8 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Extract the Waterhose fridge socket colliders into one standalone USD mesh.
 
 Run this with Isaac Lab Python so Pixar USD bindings are available:
@@ -23,18 +28,8 @@ from pathlib import Path
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
-FRIDGE_DIR = (
-    REPO_ROOT
-    / "source"
-    / "isaaclab_tasks"
-    / "isaaclab_tasks"
-    / "contrib"
-    / "waterhose"
-    / "assets"
-    / "fridge"
-)
+FRIDGE_DIR = REPO_ROOT / "source" / "isaaclab_tasks" / "isaaclab_tasks" / "contrib" / "waterhose" / "assets" / "fridge"
 DEFAULT_FRIDGE_USD = FRIDGE_DIR / "fridge.usda"
 DEFAULT_OUTPUT_USD = FRIDGE_DIR / "socket_collision.usda"
 DEFAULT_INSPECTION_USD = FRIDGE_DIR / "fridge_socket_single_inspection.usda"
@@ -110,9 +105,7 @@ def apply_front_inset(points: list[Gf.Vec3f], *, axis: str, side: str, inset_m: 
     if side == "positive":
         limit = max(values) - inset_m
         return [
-            Gf.Vec3f(
-                *(limit if i == axis_index and float(point[i]) > limit else float(point[i]) for i in range(3))
-            )
+            Gf.Vec3f(*(limit if i == axis_index and float(point[i]) > limit else float(point[i]) for i in range(3)))
             for point in points
         ]
 

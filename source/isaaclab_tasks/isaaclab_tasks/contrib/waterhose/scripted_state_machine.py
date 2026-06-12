@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -33,7 +33,6 @@ from isaaclab.utils.math import (
 )
 
 from .geometry import (
-    CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z,
     CONNECTOR_TIP_LEN,
     PLUG_GRASP_OFFSET,
     RIGHT_GRIPPER_EE_FRAME_POS,
@@ -270,7 +269,6 @@ class WaterhoseDemoState:
         import re
 
         import numpy as np
-
         from isaaclab_newton.physics.coupled_manager import NewtonCoupledManager
         from isaaclab_newton.physics.newton_manager import NewtonManager
 
@@ -403,7 +401,6 @@ class WaterhoseDemoState:
     def compute(self, env) -> torch.Tensor:
         robot = env.scene["robot"]
         plug = env.scene["plug1"]
-        cable = env.scene["cable1"]
 
         if self._ee_body_id is None:
             self._ee_body_id = robot.find_bodies("right_gripper_base")[0][0]
@@ -432,7 +429,6 @@ class WaterhoseDemoState:
         self.phase_plug_pos_w[first_step] = plug_pos_w[first_step]
         self.phase_plug_quat_w[first_step] = plug_quat_w[first_step]
         connector_dir = quat_apply(plug_quat_w, self.connector_axis_local)
-        plug_tip_pos_w = plug_pos_w + connector_dir * self.connector_tip_len
         # --- Insertion snap-lock: pin while seated in HOLD_INSERTED, unpin for PULL_OUT. ---
         if not self._snap_ready:
             self._snap_init()

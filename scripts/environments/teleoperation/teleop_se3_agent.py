@@ -19,10 +19,8 @@ The script automatically detects which stack to use based on the environment con
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-from collections.abc import Callable
 import inspect
-import os
-import sys
+from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
 from isaaclab.utils.string import list_intersection, string_to_callable
@@ -42,7 +40,9 @@ parser.add_argument(
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
-parser.add_argument("--max_steps", type=int, default=0, help="Optional teleop loop bound. Set to 0 to run until closed.")
+parser.add_argument(
+    "--max_steps", type=int, default=0, help="Optional teleop loop bound. Set to 0 to run until closed."
+)
 parser.add_argument(
     "--debug_teleop",
     action="store_true",
@@ -143,12 +143,12 @@ import logging
 import gymnasium as gym
 import torch
 
+from isaaclab.app import launch_simulation
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.core.lift import mdp
-from isaaclab.app import launch_simulation
 from isaaclab_tasks.utils import parse_env_cfg
 
 logger = logging.getLogger(__name__)
@@ -215,7 +215,9 @@ def _create_configured_device(device_name: str, devices_cfg: dict, callbacks: di
     for retargeter_cfg in getattr(device_cfg, "retargeters", None) or []:
         retargeter_constructor = getattr(retargeter_cfg, "retargeter_type", None)
         if retargeter_constructor is None:
-            raise ValueError(f"Retargeter configuration {type(retargeter_cfg).__name__} does not declare retargeter_type.")
+            raise ValueError(
+                f"Retargeter configuration {type(retargeter_cfg).__name__} does not declare retargeter_type."
+            )
         retargeter_cls = _resolve_class_type(retargeter_constructor)
         if not issubclass(retargeter_cls, RetargeterBase):
             raise TypeError(
