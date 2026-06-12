@@ -27,7 +27,8 @@ from isaaclab_newton.physics import (
     ProxyCouplingCfg,
 )
 from isaaclab_newton.envs.mdp.actions.newton_ik_actions_cfg import NewtonInverseKinematicsActionCfg
-from isaaclab_newton.ik.newton_ik_manager_cfg import NewtonIKManagerCfg
+from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKJointLimitObjectiveCfg, NewtonIKPoseObjectiveCfg
+from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.sim.spawners.materials.physics_materials_cfg import NewtonCableMaterialCfg
 from isaaclab_visualizers.kit.kit_visualizer_cfg import KitVisualizerCfg
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
@@ -434,9 +435,11 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             ),
             # Dormant insertion snap-lock: cable head -> kinematic SocketAnchor1 at the
             # seated pose. The cable-side anchor point reuses the Plug1-weld offset, so the
-            # joint pins the PLUG ORIGIN onto SocketAnchor1. Created disabled; the scripted
-            # state machine enables it (k_lin=1e7) when the tip seats and releases it for
-            # PULL_OUT. add_to_articulation=False: seg 0 already has the Plug1 weld as its
+            # joint pins the PLUG ORIGIN onto SocketAnchor1. Created ENABLED so it is part
+            # of the solver's build-time joint structures (a joint enabled only at runtime
+            # exerts no force); dormancy comes from the scripted state machine zeroing its
+            # penalty gains at startup and writing them back when the tip seats.
+            # add_to_articulation=False: seg 0 already has the Plug1 weld as its
             # articulation parent, so this loop-closing latch must stay outside the tree.
             CableAttachmentCfg(
                 target_prim_path="/World/envs/env_.*/SocketAnchor1",
@@ -444,7 +447,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
                 cable_local_pos=(0.0, 0.0, CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z),
                 target_local_pos=SOCKET_SNAP_ANCHOR_LOCAL_OFFSET,
                 label_suffix="socket_snap",
-                enabled=False,
+                enabled=True,
                 add_to_articulation=False,
             ),
         ],
@@ -777,56 +780,76 @@ class WaterhoseIkEnvCfg(WaterhoseEnvCfg):
 
 @configclass
 class WaterhoseNewtonIkActionsCfg(WaterhoseIkActionsCfg):
-    """Newton-native absolute right end-effector pose plus normalized right-gripper action."""
+    """Newton-native absolute right end-effector pose plus normalized right-gripper action.
+
+    The IK is a multi-body objective solve: the command-driven right end-effector pose
+    objective is followed by two hold objectives (left gripper, torso hip) whose target
+    poses the scripted state machine writes into their action slices each step. The holds
+    replace the previous ``fixed_body_names`` mechanism and keep the shared torso joints
+    from swinging the uncommanded bodies while the right arm tracks its target. Action
+    layout: ``[right_ee pose(7), left_hold pose(7), torso_hold pose(7)]`` -- root-frame
+    positions plus ``(x, y, z, w)`` quaternions -- followed by the gripper action.
+    """
 
     arm_action = NewtonInverseKinematicsActionCfg(
         asset_name="robot",
         joint_names=["torso_joint_.*", "left_arm_joint_.*", "right_arm_joint_.*"],
-        body_name="right_gripper_base",
-        controller=NewtonIKManagerCfg(
-            command_type="pose",
-            use_relative_mode=False,
-            iterations=12,
-            lambda_initial=0.1,
-            jacobian_mode="analytic",
-            joint_limit_weight=10.0,
-            use_persistent_seed=True,
-        ),
-        ik_model_source="asset_usd",
-        fixed_body_names=["left_gripper_base", "torso_hip_yaw"],
-        fixed_body_weights=[1.0, 50.0],
-        body_offset=NewtonInverseKinematicsActionCfg.OffsetCfg(
-            pos=RIGHT_GRIPPER_EE_FRAME_POS,
-            rot=RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
-        ),
+        controller=NewtonIKSolverCfg(optimizer="lm", jacobian_mode="analytic", iterations=24),
+        objectives=[
+            NewtonIKPoseObjectiveCfg(
+                name="right_ee",
+                body_name="right_gripper_base",
+                body_offset_pos=RIGHT_GRIPPER_EE_FRAME_POS,
+                body_offset_rot=RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
+                command_type="pose",
+                use_relative_mode=False,
+            ),
+            NewtonIKPoseObjectiveCfg(
+                name="left_hold",
+                body_name="left_gripper_base",
+                command_type="pose",
+                use_relative_mode=False,
+                position_weight=1.0,
+                rotation_weight=1.0,
+            ),
+            NewtonIKPoseObjectiveCfg(
+                name="torso_hold",
+                body_name="torso_hip_yaw",
+                command_type="pose",
+                use_relative_mode=False,
+                position_weight=50.0,
+                rotation_weight=50.0,
+            ),
+            NewtonIKJointLimitObjectiveCfg(weight=0.1),
+        ],
     )
 
 
 @configclass
 class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
-    """Newton-native relative end-effector delta pose plus normalized right-gripper action."""
+    """Newton-native relative end-effector delta pose plus normalized right-gripper action.
+
+    Teleop variant: a single command-driven relative pose objective (deltas applied in the
+    end-effector frame via the task-local action subclass) plus the soft joint-limit
+    objective. No hold objectives -- the teleop operator owns the posture.
+    """
 
     arm_action = NewtonInverseKinematicsActionCfg(
         class_type="isaaclab_tasks.contrib.waterhose.mdp.actions:WaterhoseLocalFrameNewtonInverseKinematicsAction",
         asset_name="robot",
         joint_names=["torso_joint_.*", "left_arm_joint_.*", "right_arm_joint_.*"],
-        body_name="right_gripper_base",
-        controller=NewtonIKManagerCfg(
-            command_type="pose",
-            use_relative_mode=True,
-            iterations=12,
-            lambda_initial=0.1,
-            jacobian_mode="analytic",
-            joint_limit_weight=10.0,
-            use_persistent_seed=True,
-        ),
-        ik_model_source="asset_usd",
-        fixed_body_names=["left_gripper_base", "torso_hip_yaw"],
-        fixed_body_weights=[1.0, 50.0],
-        body_offset=NewtonInverseKinematicsActionCfg.OffsetCfg(
-            pos=RIGHT_GRIPPER_EE_FRAME_POS,
-            rot=RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
-        ),
+        controller=NewtonIKSolverCfg(optimizer="lm", jacobian_mode="analytic", iterations=24),
+        objectives=[
+            NewtonIKPoseObjectiveCfg(
+                name="right_ee",
+                body_name="right_gripper_base",
+                body_offset_pos=RIGHT_GRIPPER_EE_FRAME_POS,
+                body_offset_rot=RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
+                command_type="pose",
+                use_relative_mode=True,
+            ),
+            NewtonIKJointLimitObjectiveCfg(weight=0.1),
+        ],
     )
 
 
