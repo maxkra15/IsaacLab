@@ -33,6 +33,20 @@ CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z = 0.022
 SOCKET_MOUTH_POS = (-0.259345, 0.344709, 0.28698)
 SOCKET_ROT_QUAT_WXYZ = (0.984808, 0.173648, 0.0, 0.0)
 SOCKET_ROT_QUAT_XYZW = quat_xyzw_from_wxyz(SOCKET_ROT_QUAT_WXYZ)
+# Seated Plug1 origin, measured at HOLD_INSERTED (instrumented run, tip 4 mm into the bore).
+# This is the snap-lock PIN POINT: the dormant fixed joint pulls the plug origin here, so it
+# has ~zero linear violation at the moment it is activated.
+SOCKET_SNAP_ANCHOR_POS = (-0.258298, 0.345281, 0.276657)
+# The anchor BODY must not sit at the pin point: its (import-required) collider would block
+# the arriving plug. Park it 50 mm behind the mouth along the bore axis (inside the fridge,
+# which the VBD entry does not collide with) and map the pin point back via the attachment's
+# target_local_pos — the anchor rot maps +Z onto the bore axis, so the local offset is +50 mm Z.
+_SNAP_ANCHOR_SETBACK = 0.05
+_BORE_AXIS = (0.0, -0.342020, 0.939693)  # SOCKET_ROT applied to +Z (20 deg about +X)
+SOCKET_SNAP_ANCHOR_BODY_POS = tuple(
+    p - _SNAP_ANCHOR_SETBACK * a for p, a in zip(SOCKET_SNAP_ANCHOR_POS, _BORE_AXIS)
+)
+SOCKET_SNAP_ANCHOR_LOCAL_OFFSET = (0.0, 0.0, _SNAP_ANCHOR_SETBACK)
 SOCKET_COLLISION_XFORM_SUFFIX = "/Cable008/SocketCollision"
 SOCKET_COLLISION_MESH_SUFFIX = f"{SOCKET_COLLISION_XFORM_SUFFIX}/Cable008_SocketCollision"
 SOCKET_COLLISION_MESH_PATTERN = rf".*/Fridge{SOCKET_COLLISION_MESH_SUFFIX}.*"

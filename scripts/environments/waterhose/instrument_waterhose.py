@@ -84,6 +84,53 @@ def exp_baseline(env_cfg):
     pass
 
 
+def exp_no_success(env_cfg):
+    # Disable the success-termination reset so the scripted sequence runs through
+    # RELEASE/BACKOFF/REGRASP/PULL_OUT instead of resetting mid-INSERT (the coupled
+    # env reset currently explodes the sim, which poisons every later episode).
+    env_cfg.terminations.success = None
+
+
+def exp_reference_contacts(env_cfg):
+    # The standalone success-script contact recipe: soft honest contacts everywhere
+    # (gentle normal forces so the socket cannot hammer the 1 g plug during INSERT)
+    # plus the mega-friction grip weld. ke=1e3 matches example_waterhose_scene2 VBD_KE.
+    exp_no_success(env_cfg)
+    p = _proxy_cfg(env_cfg)
+    p.shape_material_ke = 1.0e3
+    p.shape_material_kd = 0.0
+    p.shape_material_mu = 1.0e6
+    p.shape_margin = 0.001
+    m = env_cfg.sim.physics.model_cfg
+    m.shape_material_ke = 1.0e3
+    m.shape_material_kd = 0.0
+
+
+def exp_forced_reset(env_cfg):
+    # Repro for the reset explosion: time-out reset at step 600 (mid-RETRACT, gripper
+    # holding the plug under cable load) so the post-reset transient is observable
+    # early. Success termination stays off so the reset timing is deterministic.
+    exp_no_success(env_cfg)
+    env_cfg.episode_length_s = 6.0
+
+
+def exp_demo_mirror(env_cfg):
+    # Match run_robot_demo's scripted-task configuration exactly: no success reset AND
+    # no time-out reset, so PULL_OUT runs to completion and the DONE phase is reached.
+    exp_no_success(env_cfg)
+    env_cfg.terminations.time_out = None
+
+
+def exp_physical_mu(env_cfg):
+    # With rigid_contact_history=True the contact normal forces are honest, so the
+    # mu=5e6 band-aid is no longer needed to hold the plug — and during INSERT its
+    # friction weld transmits socket-contact spikes into the cable. Drop to a high
+    # but bounded friction and the default friction smoothing.
+    exp_no_success(env_cfg)
+    _proxy_cfg(env_cfg).shape_material_mu = 100.0
+    _vbd_entry_cfg(env_cfg).friction_epsilon = 0.01
+
+
 def exp_no_coupling(env_cfg):
     # Remove the proxy entirely: gripper no longer present in the VBD solve.
     _solver_cfg(env_cfg).proxy_coupling.proxies = []
@@ -251,6 +298,11 @@ def exp_admm_combo(env_cfg):
 
 EXPERIMENTS = {
     "baseline": exp_baseline,
+    "no_success": exp_no_success,
+    "demo_mirror": exp_demo_mirror,
+    "forced_reset": exp_forced_reset,
+    "physical_mu": exp_physical_mu,
+    "reference_contacts": exp_reference_contacts,
     "no_coupling": exp_no_coupling,
     "more_substeps": exp_more_substeps,
     "soft_proxy": exp_soft_proxy,

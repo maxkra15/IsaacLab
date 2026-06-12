@@ -179,6 +179,17 @@ def _configure_env_cfg(env_cfg) -> None:
     env_cfg.scene.num_envs = int(args_cli.num_envs)
     if hasattr(env_cfg, "max_demo_steps"):
         env_cfg.max_demo_steps = int(args_cli.max_demo_steps)
+    if _task_id() in SCENE_CONFIG_SCRIPTED_TASKS:
+        # The scripted demo plays the full grasp -> insert -> release -> pull-out arc
+        # and stops itself once the state machine reaches DONE. Env-level resets must
+        # not fire mid-demo: the success termination triggers right at seating and the
+        # auto-reset teleports the robot home (looks like the arm "flips out"), and the
+        # 30 s time-out lands just before PULL_OUT finishes.
+        terminations = getattr(env_cfg, "terminations", None)
+        if terminations is not None and hasattr(terminations, "success"):
+            terminations.success = None
+        if terminations is not None and hasattr(terminations, "time_out"):
+            terminations.time_out = None
     physics_cfg = env_cfg.sim.physics
     if not isinstance(physics_cfg, NewtonCfg):
         raise TypeError(f"Expected a Newton-backed task config, got {type(physics_cfg).__name__}.")
@@ -212,6 +223,7 @@ def _run_env(env_cfg) -> None:
     start = time.perf_counter()
     rollout_start = start
     scripted_state = None
+    done_linger_steps = None
     try:
         _debug_runner("gym_make:start")
         env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
@@ -246,6 +258,16 @@ def _run_env(env_cfg) -> None:
             # already bounded by --max_steps).
             if not args_cli.profile and bool(torch.any(terminated | truncated).item()):
                 break
+            # Scripted demo: once every env reaches DONE, hold the final pose briefly,
+            # then stop the simulation and close.
+            if scripted_state is not None and not args_cli.profile and done_linger_steps is None:
+                if bool((scripted_state.phase == scripted_state.DONE).all().item()):
+                    done_linger_steps = max(1, int(round(1.0 / env.step_dt)))
+                    _debug_runner(f"scripted demo DONE at step={step}; closing after {done_linger_steps} linger steps")
+            if done_linger_steps is not None:
+                done_linger_steps -= 1
+                if done_linger_steps <= 0:
+                    break
             step += 1
         _debug_runner(f"loop:done steps={step} running={_simulation_is_running(env)}")
     except BaseException as exc:

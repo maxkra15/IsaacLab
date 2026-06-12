@@ -36,6 +36,7 @@ from .geometry import (
     PLUG_GRASP_OFFSET,
     RIGHT_GRIPPER_EE_FRAME_POS,
     RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
+    SOCKET_COLLISION_MESH_PATTERN,
     SOCKET_MOUTH_POS,
     SOCKET_ROT_QUAT_XYZW,
 )
@@ -43,6 +44,21 @@ from .geometry import (
 # Gripper command convention used by the IK action term: +1 fully open, -1 fully closed.
 _GRIPPER_OPEN = 1.0
 _GRIPPER_CLOSED = -1.0
+
+# Insertion snap-lock gains (standalone success-demo values): weld-grade linear hold so the
+# seated connector survives gripper RELEASE/BACKOFF, weak angular so the hanging cable can
+# still pivot. Written as k == k_min == k_max so neither the AVBD ramp/gamma decay nor the
+# rigid_joint ke ceiling can change the gains while pinned.
+_SNAP_LINEAR_K = 1.0e7
+_SNAP_ANGULAR_K = 1.0e1
+_SNAP_KD = 1.0e-1
+# Socket-only contact stiffness, written in place into the vbd entry view at snap init.
+# Build-time NewtonModelCfg.shape_material_ke fill_()s the whole model, so USD-authored
+# per-shape materials never reach the solver; the entry view arrays are what the captured
+# VBD kernels read. Pair stiffness mixes as the arithmetic mean with the cable/plug shapes
+# (ke=1e3), so 1e4 here gives ~5.5e3 for socket pairs (~5x less visible penetration)
+# without touching the gripper-grip pairs.
+_SOCKET_VIEW_CONTACT_KE = 1.0e4
 
 
 def _smoothstep(alpha: torch.Tensor) -> torch.Tensor:
@@ -188,9 +204,9 @@ class WaterhoseDemoState:
         # The socket bore axis points mostly upward, so this standoff also keeps the gripper lower
         # and away from the insertion mesh during the lift/align motion.
         self.preinsert_standoff = 0.018
-        # The authored socket mesh is a short shell around the mouth. Stop the connector tip just
-        # outside the mouth so the visible cable does not get driven through the socket asset.
-        self.insert_final_depth = -0.010
+        # The authored socket mesh is a short shell around the mouth. Seat the connector tip only
+        # shallowly into the bore so success is detected without driving the cable through the asset.
+        self.insert_final_depth = 0.004
         self.extract_clearance = 0.05
         self.gripper_backoff_distance = 0.10
         self.connector_tip_len = CONNECTOR_TIP_LEN
@@ -216,12 +232,94 @@ class WaterhoseDemoState:
         self._cable_grasp_body_id = 0
         self._cable_tip_body_id = 0
 
+        # Insertion snap-lock runtime state (lazily bound to the vbd entry on first compute).
+        self._snap_ready = False
+        self._snap_solver = None
+        self._snap_view = None
+        self._snap_joints = None  # np.ndarray [num_envs]: entry-local joint index per env
+        self._snap_c0 = None  # np.ndarray [num_envs]: first constraint slot (linear) per env
+        self._snap_active = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+
     def _vec(self, values) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.float32, device=self.device).repeat(self.num_envs, 1)
+
+    def _snap_init(self) -> None:
+        """Bind to the dormant ``socket_snap`` joints in the vbd entry and tune the socket shapes.
+
+        All writes are in-place into existing warp arrays (CUDA-graph safe; the captured
+        kernels re-read them every step). Never reallocate or reassign solver/view arrays.
+        """
+        import re
+
+        import numpy as np
+
+        from isaaclab_newton.physics.coupled_manager import NewtonCoupledManager
+
+        view = NewtonCoupledManager.get_entry_view("vbd")
+        solver = NewtonCoupledManager.get_entry_solver("vbd")
+        for attr in ("joint_penalty_k", "joint_penalty_k_min", "joint_penalty_k_max", "joint_penalty_kd"):
+            if not hasattr(solver, attr):
+                raise RuntimeError(f"vbd entry solver has no '{attr}' array; snap-lock needs the AVBD joint path.")
+
+        labels = [str(label) for label in view.joint_label]
+        joints = np.full(self.num_envs, -1, dtype=np.int64)
+        for env_index in range(self.num_envs):
+            token = f"socket_snap_w{env_index}"
+            matches = [j for j, label in enumerate(labels) if label.endswith(token)]
+            if len(matches) != 1:
+                raise RuntimeError(f"Expected exactly one '{token}' joint in the vbd entry, found {len(matches)}.")
+            joints[env_index] = matches[0]
+        self._snap_joints = joints
+        self._snap_c0 = solver.joint_constraint_start.numpy()[joints].astype(np.int64)
+        self._snap_solver = solver
+        self._snap_view = view
+
+        # Socket-only contact stiffness (see _SOCKET_VIEW_CONTACT_KE).
+        pattern = re.compile(SOCKET_COLLISION_MESH_PATTERN)
+        shape_ids = [i for i, label in enumerate(view.shape_label) if pattern.match(str(label))]
+        if shape_ids:
+            ke_host = view.shape_material_ke.numpy()
+            ke_host[shape_ids] = _SOCKET_VIEW_CONTACT_KE
+            view.shape_material_ke.assign(ke_host)
+
+        self._snap_ready = True
+
+    def _snap_write(self, env_mask: torch.Tensor, lin_k: float, ang_k: float, kd: float, enable: bool) -> None:
+        """Set the snap joints' penalty gains and enabled flag for the masked envs, in place."""
+        ids = torch.nonzero(env_mask, as_tuple=False).flatten().cpu().numpy()
+        if ids.size == 0:
+            return
+        solver = self._snap_solver
+        slots = self._snap_c0[ids]
+        for array, lin_value, ang_value in (
+            (solver.joint_penalty_k, lin_k, ang_k),
+            (solver.joint_penalty_k_min, lin_k, ang_k),
+            (solver.joint_penalty_k_max, lin_k, ang_k),
+            (solver.joint_penalty_kd, kd, kd),
+        ):
+            host = array.numpy()
+            host[slots] = lin_value
+            host[slots + 1] = ang_value
+            array.assign(host)
+        enabled_host = self._snap_view.joint_enabled.numpy()
+        enabled_host[self._snap_joints[ids]] = 1 if enable else 0
+        self._snap_view.joint_enabled.assign(enabled_host)
+        self._snap_active[torch.as_tensor(ids, device=self.device, dtype=torch.long)] = enable
+        if self.debug:
+            verb = "pinned" if enable else "released"
+            print(f"[waterhose_ik] snap-lock {verb} for envs {ids.tolist()}", flush=True)
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:
             env_ids = slice(None)
+        # Release any active snap-lock: a reset teleports the cable away from the anchor, and
+        # a stale 1e7 pin would yank it back across the scene on the next step.
+        if self._snap_ready and bool(self._snap_active.any()):
+            release = torch.zeros_like(self._snap_active)
+            release[env_ids] = True
+            release &= self._snap_active
+            if bool(release.any()):
+                self._snap_write(release, 0.0, 0.0, 0.0, enable=False)
         self.phase[env_ids] = self.REST
         self.elapsed[env_ids] = 0.0
         self.last_reported_phase[env_ids] = -1
@@ -266,6 +364,25 @@ class WaterhoseDemoState:
         plug_tip_pos_w = plug_pos_w + connector_dir * self.connector_tip_len
         cable_tip_quat_w = normalize(cable.data.body_quat_w.torch[:, self._cable_tip_body_id])
         cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self.connector_axis_local))
+
+        # --- Insertion snap-lock: pin while seated in HOLD_INSERTED, unpin for PULL_OUT. ---
+        if not self._snap_ready:
+            self._snap_init()
+        pin = (self.phase == self.HOLD_INSERTED) & ~self._snap_active
+        if bool(pin.any()):
+            # The measured seat oscillates ~1 mm below the commanded depth, so gate 2 mm
+            # under the target and keep checking through the whole hold phase.
+            tip_depth = torch.sum((plug_tip_pos_w - socket_pos_w) * insertion_dir_w, dim=-1)
+            pin &= tip_depth >= (self.insert_final_depth - 2.0e-3)
+            if bool(pin.any()):
+                self._snap_write(pin, _SNAP_LINEAR_K, _SNAP_ANGULAR_K, _SNAP_KD, enable=True)
+        if self.debug:
+            missed = first_step & (self.phase == self.RELEASE) & ~self._snap_active
+            if bool(missed.any()):
+                print("[waterhose_ik] WARNING: RELEASE entered without snap-lock pin (seat too shallow).", flush=True)
+        unpin = first_step & (self.phase == self.PULL_OUT) & self._snap_active
+        if bool(unpin.any()):
+            self._snap_write(unpin, 0.0, 0.0, 0.0, enable=False)
 
         start_pos_w = self.phase_start_pos_w
         start_quat_w = self.phase_start_quat_w
