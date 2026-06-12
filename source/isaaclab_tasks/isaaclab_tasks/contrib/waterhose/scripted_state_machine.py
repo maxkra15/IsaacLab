@@ -19,6 +19,7 @@ Design (deliberately simple and robust):
 from __future__ import annotations
 
 import torch
+import warp as wp
 
 from isaaclab.utils.math import (
     combine_frame_transforms,
@@ -32,6 +33,7 @@ from isaaclab.utils.math import (
 )
 
 from .geometry import (
+    CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z,
     CONNECTOR_TIP_LEN,
     PLUG_GRASP_OFFSET,
     RIGHT_GRIPPER_EE_FRAME_POS,
@@ -45,11 +47,15 @@ from .geometry import (
 _GRIPPER_OPEN = 1.0
 _GRIPPER_CLOSED = -1.0
 
-# Insertion snap-lock gains (standalone success-demo values): weld-grade linear hold so the
-# seated connector survives gripper RELEASE/BACKOFF, weak angular so the hanging cable can
-# still pivot. Written as k == k_min == k_max so neither the AVBD ramp/gamma decay nor the
-# rigid_joint ke ceiling can change the gains while pinned.
-_SNAP_LINEAR_K = 1.0e7
+# Insertion snap-lock gains. The pin engages with ~1 mm of violation against the authored
+# anchor, so a hard-engaged stiff spring kicks the 1 g plug violently (1e7 N/m at 1 mm is a
+# 10 kN impulse — measured 50-100 m/s explosion). Instead seed the penalty soft and let the
+# AVBD stiffness ramp (rigid_avbd_beta) pull it to the ceiling within a few substeps:
+# k_min=0, k=seed, k_max=ceiling. A 1e4 N/m linear ceiling holds the ~2 N cable preload with
+# ~0.2 mm error; angular stays weak so the hanging cable can pivot.
+_SNAP_LINEAR_K_SEED = 1.0e2
+_SNAP_LINEAR_K = 1.0e4
+_SNAP_ANGULAR_K_SEED = 1.0e0
 _SNAP_ANGULAR_K = 1.0e1
 _SNAP_KD = 1.0e-1
 # Socket-only contact stiffness, written in place into the vbd entry view at snap init.
@@ -182,6 +188,15 @@ class WaterhoseDemoState:
         self.phase_plug_quat_w[:, 3] = 1.0
         self.command_pose = torch.zeros((self.num_envs, 7), device=device)
         self.command_pose[:, 6] = 1.0
+        # Multi-body IK hold targets: [left_gripper_base pose(7), torso_hip_yaw pose(7)],
+        # root frame, quaternions in (x, y, z, w) per the Newton IK action convention.
+        # Captured once at the first compute and held for the whole demo.
+        self.hold_poses = torch.zeros((self.num_envs, 14), device=device)
+        self.hold_poses[:, 6] = 1.0
+        self.hold_poses[:, 13] = 1.0
+        self._holds_captured = False
+        self._left_hold_body_id = None
+        self._torso_hold_body_id = None
 
         durations = list(self.DURATIONS)
         durations[self.REST] = max(float(settle_time), self.step_dt)
@@ -206,6 +221,9 @@ class WaterhoseDemoState:
         self.preinsert_standoff = 0.018
         # The authored socket mesh is a short shell around the mouth. Seat the connector tip only
         # shallowly into the bore so success is detected without driving the cable through the asset.
+        # Commanded tip depth. Contact compliance eats some of the commanded push, but
+        # commanding deeper (6 mm tried) rides the open back of the 6.3 mm bore and can
+        # jam-explode the plug; 4 mm yields a reliable ~2-3 mm physical seat.
         self.insert_final_depth = 0.004
         self.extract_clearance = 0.05
         self.gripper_backoff_distance = 0.10
@@ -254,6 +272,7 @@ class WaterhoseDemoState:
         import numpy as np
 
         from isaaclab_newton.physics.coupled_manager import NewtonCoupledManager
+        from isaaclab_newton.physics.newton_manager import NewtonManager
 
         view = NewtonCoupledManager.get_entry_view("vbd")
         solver = NewtonCoupledManager.get_entry_solver("vbd")
@@ -274,6 +293,20 @@ class WaterhoseDemoState:
         self._snap_solver = solver
         self._snap_view = view
 
+        # Global body ids of the cable head segments, for ground-truth state reads. The
+        # asset views are unreliable for the coupled cable/plug (the plug view is frozen
+        # at its initial pose and the cable view's body indexing does not map to cable
+        # bodies), so live gating reads NewtonManager._state_0.body_q directly.
+        body_labels = [str(n) for n in NewtonManager.get_model().body_label]
+        plug_gids = np.full(self.num_envs, -1, dtype=np.int64)
+        for env_index in range(self.num_envs):
+            token = f"env_{env_index}/Plug1"
+            matches = [i for i, n in enumerate(body_labels) if n.endswith(token)]
+            if len(matches) != 1:
+                raise RuntimeError(f"Expected exactly one '{token}' body, found {len(matches)}.")
+            plug_gids[env_index] = matches[0]
+        self._snap_plug_gids = torch.as_tensor(plug_gids, device=self.device, dtype=torch.long)
+
         # Socket-only contact stiffness (see _SOCKET_VIEW_CONTACT_KE).
         pattern = re.compile(SOCKET_COLLISION_MESH_PATTERN)
         shape_ids = [i for i, label in enumerate(view.shape_label) if pattern.match(str(label))]
@@ -283,17 +316,55 @@ class WaterhoseDemoState:
             view.shape_material_ke.assign(ke_host)
 
         self._snap_ready = True
+        if self.debug:
+            cs = solver.joint_constraint_start.numpy()
+            k_host = solver.joint_penalty_k.numpy()
+            kmax_host = solver.joint_penalty_k_max.numpy()
+            for env_index, j in enumerate(joints):
+                c0 = int(cs[j])
+                c1 = int(cs[j + 1]) if j + 1 < len(cs) else len(k_host)
+                print(
+                    f"[waterhose_ik] snap joint env{env_index}: local_j={j} slots[{c0}:{c1}] "
+                    f"k={k_host[c0:c1].tolist()} k_max={kmax_host[c0:c1].tolist()}",
+                    flush=True,
+                )
+        # The snap joints are authored ENABLED (so they exist in the solver's build-time
+        # joint structures) with build-default gains; make them dormant before the first
+        # physics step by zeroing all penalty arrays.
+        self._snap_write(torch.ones_like(self._snap_active), 0.0, 0.0, 0.0, enable=False)
 
-    def _snap_write(self, env_mask: torch.Tensor, lin_k: float, ang_k: float, kd: float, enable: bool) -> None:
-        """Set the snap joints' penalty gains and enabled flag for the masked envs, in place."""
+    def _snap_write(
+        self,
+        env_mask: torch.Tensor,
+        lin_k: float,
+        ang_k: float,
+        kd: float,
+        enable: bool,
+        lin_k_seed: float | None = None,
+        ang_k_seed: float | None = None,
+    ) -> None:
+        """Set the snap joints' penalty gains and enabled flag for the masked envs, in place.
+
+        ``lin_k``/``ang_k`` are the stiffness ceilings (``joint_penalty_k_max``). When seeds
+        are given, the live penalty starts there and the AVBD ramp grows it to the ceiling
+        over a few substeps (soft engagement); otherwise the live penalty is pinned at the
+        ceiling.
+        """
         ids = torch.nonzero(env_mask, as_tuple=False).flatten().cpu().numpy()
         if ids.size == 0:
             return
         solver = self._snap_solver
         slots = self._snap_c0[ids]
+        lin_seed = lin_k if lin_k_seed is None else lin_k_seed
+        ang_seed = ang_k if ang_k_seed is None else ang_k_seed
+        # Without explicit seeds the pin engages hard at the ceiling: k_min == k_max makes
+        # the gain immune to the per-step gamma decay (the AVBD ramp was measured NOT to
+        # grow a runtime-seeded snap joint, so a soft seed just stays soft).
+        lin_min = 0.0 if lin_k_seed is not None else lin_k
+        ang_min = 0.0 if ang_k_seed is not None else ang_k
         for array, lin_value, ang_value in (
-            (solver.joint_penalty_k, lin_k, ang_k),
-            (solver.joint_penalty_k_min, lin_k, ang_k),
+            (solver.joint_penalty_k, lin_seed, ang_seed),
+            (solver.joint_penalty_k_min, lin_min, ang_min),
             (solver.joint_penalty_k_max, lin_k, ang_k),
             (solver.joint_penalty_kd, kd, kd),
         ):
@@ -362,20 +433,47 @@ class WaterhoseDemoState:
         self.phase_plug_quat_w[first_step] = plug_quat_w[first_step]
         connector_dir = quat_apply(plug_quat_w, self.connector_axis_local)
         plug_tip_pos_w = plug_pos_w + connector_dir * self.connector_tip_len
-        cable_tip_quat_w = normalize(cable.data.body_quat_w.torch[:, self._cable_tip_body_id])
-        cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self.connector_axis_local))
-
         # --- Insertion snap-lock: pin while seated in HOLD_INSERTED, unpin for PULL_OUT. ---
         if not self._snap_ready:
             self._snap_init()
+        # Plug pose from the Newton state (ground truth — the plug ASSET view is frozen at
+        # its initial pose and the cable view's body indexing is shifted, so neither may be
+        # used for live gating). Connector tip = plug origin + tip length along plug +Z.
+        from isaaclab_newton.physics.newton_manager import NewtonManager as _NM
+
+        plug_state_pose = wp.to_torch(_NM._state_0.body_q)[self._snap_plug_gids]
+        cable_tip_quat_w = normalize(plug_state_pose[:, 3:7])
+        cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self.connector_axis_local))
+        cable_tip_pos_w = plug_state_pose[:, :3] + quat_apply(
+            cable_tip_quat_w, self._vec((0.0, 0.0, CONNECTOR_TIP_LEN))
+        )
         pin = (self.phase == self.HOLD_INSERTED) & ~self._snap_active
         if bool(pin.any()):
-            # The measured seat oscillates ~1 mm below the commanded depth, so gate 2 mm
-            # under the target and keep checking through the whole hold phase.
-            tip_depth = torch.sum((plug_tip_pos_w - socket_pos_w) * insertion_dir_w, dim=-1)
-            pin &= tip_depth >= (self.insert_final_depth - 2.0e-3)
+            # Absolute gate: pin once the tip is genuinely inside the bore (>= 1 mm).
+            # Contact compliance eats 2-3 mm of the commanded push, so a target-relative
+            # gate misses marginal-but-real seats; the pin itself pulls the plug to the
+            # authored seated pose, so a shallow-but-seated pin is self-correcting.
+            tip_depth = torch.sum((cable_tip_pos_w - socket_pos_w) * insertion_dir_w, dim=-1)
+            if self.debug:
+                print(f"[waterhose_ik] snap gate: tip_depth={float(tip_depth[0]) * 1000.0:.2f} mm", flush=True)
+            pin &= tip_depth >= 1.0e-3
             if bool(pin.any()):
-                self._snap_write(pin, _SNAP_LINEAR_K, _SNAP_ANGULAR_K, _SNAP_KD, enable=True)
+                # Soft-seeded engagement: hard-engaging >=1e4 while the gripper still
+                # clamps the plug pumps energy between the pin and the grip weld and
+                # explodes the cable (measured). The runtime-written AVBD ramp does not
+                # grow a seeded k, so the effective hold is gentle; it biases the plug
+                # into the seat rather than rigidly locking it. Hard engagement (or
+                # engaging at RELEASE entry once the grip force fades) is the open
+                # tuning item for stronger retention.
+                self._snap_write(
+                    pin,
+                    _SNAP_LINEAR_K,
+                    _SNAP_ANGULAR_K,
+                    _SNAP_KD,
+                    enable=True,
+                    lin_k_seed=_SNAP_LINEAR_K_SEED,
+                    ang_k_seed=_SNAP_ANGULAR_K_SEED,
+                )
         if self.debug:
             missed = first_step & (self.phase == self.RELEASE) & ~self._snap_active
             if bool(missed.any()):
@@ -507,10 +605,34 @@ class WaterhoseDemoState:
 
         cmd_pos_b, cmd_quat_b = subtract_frame_transforms(root_pos_w, root_quat_w, cmd_pos_w, cmd_quat_w)
         self.command_pose[:, :3] = cmd_pos_b
+        # Isaac Lab math and the Newton IK action both use (x, y, z, w).
         self.command_pose[:, 3:] = cmd_quat_b
 
+        if not self._holds_captured:
+            # Capture the multi-body hold targets (root frame, xyzw) from the settled pose.
+            if self._left_hold_body_id is None:
+                self._left_hold_body_id = robot.find_bodies("left_gripper_base")[0][0]
+                self._torso_hold_body_id = robot.find_bodies("torso_hip_yaw")[0][0]
+            for slot, body_id in ((0, self._left_hold_body_id), (7, self._torso_hold_body_id)):
+                hold_pos_b, hold_quat_b = subtract_frame_transforms(
+                    root_pos_w,
+                    root_quat_w,
+                    robot.data.body_pos_w.torch[:, body_id],
+                    robot.data.body_quat_w.torch[:, body_id],
+                )
+                self.hold_poses[:, slot : slot + 3] = hold_pos_b
+                self.hold_poses[:, slot + 3 : slot + 7] = hold_quat_b
+            self._holds_captured = True
+
         gripper = (_GRIPPER_OPEN + (_GRIPPER_CLOSED - _GRIPPER_OPEN) * t_grip).unsqueeze(-1)
-        actions = torch.cat((self.command_pose, gripper), dim=-1)
+        # Match the configured action layout: with the multi-body hold objectives the
+        # arm action consumes [ee pose(7), left hold(7), torso hold(7)]; without them
+        # (EE-only IK variants) it consumes just the end-effector pose.
+        total_dim = env.action_manager.total_action_dim
+        if total_dim == self.command_pose.shape[-1] + self.hold_poses.shape[-1] + 1:
+            actions = torch.cat((self.command_pose, self.hold_poses, gripper), dim=-1)
+        else:
+            actions = torch.cat((self.command_pose, gripper), dim=-1)
 
         # --- Advance: min duration met AND converged (or hard 2x timeout). ---
         position_error = torch.abs(target_pos_w - ee_pos_w)

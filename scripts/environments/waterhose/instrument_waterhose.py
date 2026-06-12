@@ -121,6 +121,30 @@ def exp_demo_mirror(env_cfg):
     env_cfg.terminations.time_out = None
 
 
+def exp_demo_mirror_no_holds(env_cfg):
+    # IK tracking A/B: drop the left-gripper/torso hold objectives, keep the EE pose
+    # objective and the joint-limit objective only.
+    exp_demo_mirror(env_cfg)
+    objectives = env_cfg.actions.arm_action.objectives
+    env_cfg.actions.arm_action.objectives = [objectives[0], objectives[-1]]
+
+
+def exp_demo_mirror_eager_diffik(env_cfg):
+    # Discriminator for the prototype-finalize hypothesis: run the demo with the
+    # DifferentialIK action (no Newton IK, no prototype model finalize).
+    exp_demo_mirror_eager(env_cfg)
+    from isaaclab_tasks.contrib.waterhose.waterhose_env_cfg import WaterhoseIkActionsCfg
+
+    env_cfg.actions = WaterhoseIkActionsCfg()
+
+
+def exp_demo_mirror_eager(env_cfg):
+    # demo_mirror without CUDA graph capture: hangs/faults inside the captured step
+    # surface at their actual launch site instead of inside wp.capture_launch.
+    exp_demo_mirror(env_cfg)
+    env_cfg.sim.physics.use_cuda_graph = False
+
+
 def exp_physical_mu(env_cfg):
     # With rigid_contact_history=True the contact normal forces are honest, so the
     # mu=5e6 band-aid is no longer needed to hold the plug — and during INSERT its
@@ -300,6 +324,9 @@ EXPERIMENTS = {
     "baseline": exp_baseline,
     "no_success": exp_no_success,
     "demo_mirror": exp_demo_mirror,
+    "demo_mirror_eager": exp_demo_mirror_eager,
+    "demo_mirror_no_holds": exp_demo_mirror_no_holds,
+    "demo_mirror_eager_diffik": exp_demo_mirror_eager_diffik,
     "forced_reset": exp_forced_reset,
     "physical_mu": exp_physical_mu,
     "reference_contacts": exp_reference_contacts,
