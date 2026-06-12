@@ -1,0 +1,20 @@
+{
+  "voxel": 0.015,
+  "grid_type": "sparse",
+  "num_envs": 48,
+  "steps": 120,
+  "max_active_cells": -1,
+  "cuda_graph_requested": false,
+  "status": "ok",
+  "particles": 279216,
+  "particles_per_env": 5817,
+  "startup_s": 10.660797083051875,
+  "cuda_graph_active": false,
+  "cuda_used_after_warmup_gib": 2.58453369140625,
+  "cuda_total_gib": 31.35833740234375,
+  "cuda_used_after_run_gib": 2.74078369140625,
+  "step_ms": 96.79670183395501,
+  "env_steps_per_s": 495.88466435911386,
+  "finite": true,
+  "obs_finite": true
+}

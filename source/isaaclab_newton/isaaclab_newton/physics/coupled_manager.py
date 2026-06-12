@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -107,10 +108,20 @@ class NewtonCoupledManager(NewtonManager):
 
         cls._apply_entry_solver_overrides(solver_cfg.entries)
         cls._configure_fk_articulation_filter(model, solver_cfg.entries)
-        if hasattr(NewtonManager._solver, "prepare_graph_capture"):
-            NewtonManager._solver.prepare_graph_capture()
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = cls._needs_external_collision_pipeline(solver_cfg)
+
+    @classmethod
+    def _initialize_contacts(cls) -> None:
+        """Allocate contacts and preallocate entry-local filtered contact buffers.
+
+        Newton's coupled solver filters external contacts into per-entry
+        buffers during :meth:`step`; preallocating them here keeps the first
+        stepped frame capturable in a CUDA graph.
+        """
+        super()._initialize_contacts()
+        if cls._contacts is not None and hasattr(NewtonManager._solver, "prepare_contacts"):
+            NewtonManager._solver.prepare_contacts(cls._contacts)
 
     @classmethod
     def _resolve_solver_cfg(cls, model: Model, solver_cfg: CoupledSolverCfg) -> CoupledSolverCfg:
@@ -480,6 +491,7 @@ class NewtonCoupledManager(NewtonManager):
             configure_view=configure_view,
             substeps=entry_cfg.substeps,
             in_place=entry_cfg.in_place,
+            preserve_shape_ids=entry_cfg.preserve_shape_ids,
         )
 
         return SolverCoupled.Entry(**entry_kwargs)
@@ -509,6 +521,7 @@ class NewtonCoupledManager(NewtonManager):
             proxy_bodies=None if proxy_cfg.proxy_bodies is None else list(proxy_cfg.proxy_bodies),
             mass_scale=proxy_cfg.mass_scale,
             mode=cls._build_proxy_mode(proxy_cfg.mode),
+            proxy_relaxation=proxy_cfg.proxy_relaxation,
             particles=list(proxy_cfg.particles),
             proxy_particles=None if proxy_cfg.proxy_particles is None else list(proxy_cfg.proxy_particles),
             collision_pipeline=proxy_cfg.collision_pipeline_factory,
@@ -634,6 +647,8 @@ class NewtonCoupledManager(NewtonManager):
                 raise ValueError("CoupledProxyCfg proxy_particles must match particles length.")
             if proxy.mass_scale <= 0.0:
                 raise ValueError("CoupledProxyCfg mass_scale must be > 0.")
+            if not math.isfinite(proxy.proxy_relaxation) or proxy.proxy_relaxation < 0.0:
+                raise ValueError("CoupledProxyCfg proxy_relaxation must be finite and >= 0.")
             if proxy.collide_interval is not None and proxy.collide_interval < 1:
                 raise ValueError("CoupledProxyCfg collide_interval must be >= 1.")
             cls._build_proxy_mode(proxy.mode)

@@ -607,17 +607,27 @@ def test_coupled_entry_threads_generic_entry_options():
             particles=[0],
             configure_view=_configure_view,
             in_place=True,
+            preserve_shape_ids=False,
         )
     )
     assert entry.configure_view is _configure_view
     assert callable(entry.solver)
     assert entry.in_place is True
+    assert entry.preserve_shape_ids is False
 
 
 def test_coupled_proxy_int_mode_is_normalized():
     """Integer proxy modes are normalized before constructing Newton proxy configs."""
     proxy = NewtonCoupledManager._build_proxy(CoupledProxyCfg(source="src", destination="dst", particles=[0], mode=1))
     assert proxy.mode == "staggered"
+
+
+def test_coupled_proxy_threads_relaxation():
+    """Proxy relaxation is forwarded to Newton's proxy mapping config."""
+    proxy = NewtonCoupledManager._build_proxy(
+        CoupledProxyCfg(source="src", destination="dst", particles=[0], proxy_relaxation=0.5)
+    )
+    assert proxy.proxy_relaxation == 0.5
 
 
 def test_coupled_selectors_resolve_bodies_shapes_joints_particles():
@@ -754,6 +764,18 @@ def test_coupled_scene_entity_selectors_require_scene_cfg():
                 ),
             ),
             "Unsupported CoupledProxyCfg mode",
+        ),
+        (
+            CoupledSolverCfg(
+                entries=[
+                    CoupledSolverEntryCfg(name="a", solver_cfg=XPBDSolverCfg()),
+                    CoupledSolverEntryCfg(name="b", solver_cfg=XPBDSolverCfg()),
+                ],
+                proxy_coupling=ProxyCouplingCfg(
+                    proxies=[CoupledProxyCfg(source="a", destination="b", particles=[0], proxy_relaxation=-0.5)]
+                ),
+            ),
+            "proxy_relaxation must be finite",
         ),
         (
             CoupledSolverCfg(

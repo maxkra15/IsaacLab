@@ -1,0 +1,37 @@
+voxel_mm,grid_type,grid_padding,num_envs,particles_total,max_active_cells,status,step_ms,env_steps_per_s,steps_per_s_per_env,startup_s,steady_mem_gib,peak_mem_mib,peak_mem_gib,cuda_graph_active,timed_steps,warmup_steps,source,error
+20.0,fixed,8,1,2261,400000,ok,16.18,61.8,61.81,6.9,1.83,1871,1.83,True,120,20,main,
+20.0,fixed,8,8,18088,400000,ok,42.59,187.8,23.48,7.5,3.45,3535,3.45,True,120,20,main,
+20.0,fixed,8,32,72352,400000,ok,122.39,261.5,8.17,9.4,7.43,7605,7.43,True,120,20,main,
+20.0,fixed,8,128,289408,400000,ok,213.88,598.5,4.68,14.6,10.34,10587,10.34,True,120,20,main,
+20.0,fixed,8,398,899878,400000,ok,373.44,1065.8,2.68,41.9,15.29,15655,15.29,True,120,20,main,
+15.0,fixed,8,1,5817,400000,ok,17.25,58.0,57.96,7.1,1.89,1935,1.89,True,120,20,main,
+15.0,fixed,8,8,46536,400000,ok,55.11,145.2,18.15,8.1,4.39,4499,4.39,True,120,20,main,
+15.0,fixed,8,32,186144,400000,ok,139.14,230.0,7.19,10.9,8.91,9129,8.92,True,120,20,main,
+15.0,fixed,8,128,744576,400000,ok,191.83,667.2,5.21,17.6,12.44,12737,12.44,True,120,20,main,
+15.0,fixed,8,398,2315166,810308,ok,532.15,747.9,1.88,53.5,28.65,29333,28.65,True,120,20,main,
+10.0,fixed,8,1,21237,400000,ok,18.79,53.2,53.23,7.9,2.05,2097,2.05,True,120,20,main,
+10.0,fixed,8,8,169896,400000,ok,108.35,73.8,9.23,10.4,7.51,7687,7.51,True,120,20,main,
+10.0,fixed,8,32,679584,400000,ok,157.67,203.0,6.34,14.3,11.06,11996,11.71,True,120,20,main,
+10.0,fixed,8,128,2718336,951417,ok,452.5,282.9,2.21,33.9,28.62,29307,28.62,True,120,20,main,
+10.0,fixed,8,398,8452326,2958314,crashed,,,,,,31829,31.08,,120,20,main,"[ERROR] Command failed with code 1: ""/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_vo"
+20.0,fixed,8,128,289408,400000,ok,212.85,601.4,4.7,14.2,10.34,10587,10.34,True,120,20,redo,
+20.0,fixed,8,598,1352078,473227,ok,535.28,1117.2,1.87,80.1,20.8,21297,20.8,True,120,20,redo,
+20.0,fixed,8,800,1808800,633080,ok,742.19,1077.9,1.35,144.8,27.5,28163,27.5,True,120,20,redo,
+20.0,fixed,8,1024,2315264,810342,crashed,,,,,,32005,31.25,,120,20,redo,"[ERROR] Command failed with code 1: ""/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_vo"
+15.0,sparse,0,1,5817,-1,ok,83.76,11.9,11.94,8.2,1.79,1835,1.79,False,120,20,redo,
+15.0,sparse,0,8,46536,-1,ok,89.0,89.9,11.24,8.5,1.98,2033,1.99,False,120,20,redo,
+15.0,sparse,0,32,186144,-1,ok,92.72,345.1,10.78,9.9,2.51,2599,2.54,False,120,20,redo,
+15.0,sparse,0,128,744576,-1,ok,149.8,854.5,6.68,16.2,4.03,4639,4.53,False,120,20,redo,
+15.0,sparse,0,398,2315166,-1,ok,412.63,964.6,2.42,50.0,8.46,10195,9.96,False,120,20,redo,
+15.0,dense,0,1,5817,-1,crashed,,,,,,30923,30.2,,120,20,redo,"[ERROR] Command failed with code 1: ""/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_vo"
+15.0,sparse,8,48,279216,-1,crashed,,,,,,30135,29.43,,120,20,redo,"[ERROR] Command failed with code 1: ""/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_vo"
+15.0,sparse,0,48,279216,-1,ok,96.8,495.9,10.33,10.7,2.74,2871,2.8,False,120,20,redo,
+15.0,sparse,0,598,3478566,-1,ok,693.15,862.7,1.44,96.1,11.28,14051,13.72,False,120,20,redo2,
+15.0,sparse,0,800,4653600,-1,ok,1065.47,750.8,0.94,164.7,14.16,18273,17.84,False,120,20,redo2,
+15.0,sparse,0,1200,6980400,-1,ok,2012.37,596.3,0.5,390.4,20.39,26323,25.71,False,120,20,redo2,
+10.0,sparse,0,398,8452326,-1,ok,929.5,428.2,1.08,95.1,20.99,25399,24.8,False,120,20,redo2,
+10.0,sparse,0,1,21237,-1,ok,82.3,12.2,12.15,9.0,1.74,1783,1.74,False,120,20,redo3,
+10.0,sparse,0,8,169896,-1,ok,87.38,91.6,11.44,9.8,2.14,2223,2.17,False,120,20,redo3,
+10.0,sparse,0,32,679584,-1,ok,102.55,312.0,9.75,12.7,3.35,3593,3.51,False,120,20,redo3,
+10.0,sparse,0,128,2718336,-1,ok,249.04,514.0,4.02,28.8,7.97,9251,9.03,False,120,20,redo3,
+15.0,fixed,8,598,3478566,1217498,crashed,,,,,,30263,29.55,,120,20,redo4,"[ERROR] Command failed with code 1: ""/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_vo"

@@ -1,0 +1,15 @@
+[
+  {
+    "voxel": 0.015,
+    "grid_type": "fixed",
+    "num_envs": 598,
+    "expected_particles": 3478566,
+    "max_active_cells": 1217498,
+    "grid_padding": 8,
+    "status": "crashed",
+    "wall_s": 85.8,
+    "peak_mem_mib": 30263,
+    "baseline_mem_mib": 936,
+    "error": "[ERROR] Command failed with code 1: \"/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_voxel_grid_child.py --headless --voxel 0.015 --grid-type fixed --num-envs 598 --steps 120 --warmup 20 --max-active-cells 1217498 --grid-paddin"
+  }
+]

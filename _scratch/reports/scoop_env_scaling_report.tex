@@ -1,0 +1,522 @@
+% Franka Scoop MPM scaling report — single-file Overleaf template
+% Data: _scratch/reports/env_scaling/scoop_env_scaling_full_2026-06-11.csv (canonical merged table)
+\documentclass[a4paper,11pt]{article}
+
+\usepackage[margin=0.85in, top=1.3in, bottom=0.85in, headheight=18pt, headsep=14pt]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[scaled=0.95]{helvet}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{siunitx}
+\sisetup{
+  group-separator={,},
+  group-minimum-digits=4,
+  detect-weight=true,
+  detect-family=true,
+  table-number-alignment=center,
+}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{pgfplots}
+\usepackage{tikz}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+\renewcommand{\familydefault}{\sfdefault}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{calc}
+
+% NVIDIA / report palette (matches Isaac Lab ecosystem)
+\definecolor{NvidiaGreen}{HTML}{76B900}
+\definecolor{NvidiaGreenDark}{HTML}{558B00}
+\definecolor{ReportText}{HTML}{1A1A1A}
+\definecolor{ReportMuted}{HTML}{4D4D4D}
+\definecolor{SummaryGrey}{HTML}{F2F2F2}
+\definecolor{RuleGrey}{HTML}{D9D9D9}
+\definecolor{TabBlue}{HTML}{1F77B4}
+\definecolor{TabGreen}{HTML}{2CA02C}
+\definecolor{TabOrange}{HTML}{FF7F0E}
+\definecolor{TabRed}{HTML}{D62728}
+
+\color{ReportText}
+\hypersetup{colorlinks=true, linkcolor=NvidiaGreenDark, urlcolor=NvidiaGreenDark}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45em}
+\setlength{\headheight}{22pt}
+\setlength{\headsep}{18pt}
+
+% Full-width green banner (page 1)
+\newcommand{\NvidiaTopBanner}{%
+  \tikz[remember picture,overlay]{%
+    \fill[NvidiaGreen] (current page.north west) rectangle ([yshift=-1.05cm]current page.north east);
+    \node[anchor=west, text=white, font=\bfseries\small]
+      at ([xshift=0.85in, yshift=-0.55cm]current page.north west) {NVIDIA | ISAAC LAB};
+    \node[anchor=east, text=white, font=\small]
+      at ([xshift=-0.85in, yshift=-0.55cm]current page.north east) {Internal technical report};
+  }%
+}
+
+% Slim green banner for running pages
+\newcommand{\ReportRunHeader}{%
+  \begin{tcolorbox}[
+    enhanced,
+    colback=NvidiaGreen,
+    colframe=NvidiaGreen,
+    boxrule=0pt,
+    arc=0pt,
+    left=6pt,
+    right=6pt,
+    top=4pt,
+    bottom=4pt,
+    width=\headwidth,
+    halign=left,
+  ]
+  {\color{white}\footnotesize\textbf{NVIDIA | ISAAC LAB}\hfill
+   Scaling Report | Franka Scoop MPM}
+  \end{tcolorbox}%
+}
+
+\newcommand{\ReportRule}{{\color{RuleGrey}\rule{\linewidth}{0.5pt}}}
+
+\newcommand{\ReportCaption}[1]{{\small\color{ReportMuted} #1\par}}
+
+% Centered report tables with consistent spacing
+\newenvironment{reporttable}{%
+  \vspace{0.35em}%
+  \begin{center}%
+  \small
+  \renewcommand{\arraystretch}{1.3}%
+  \setlength{\tabcolsep}{11pt}%
+}{%
+  \end{center}%
+  \vspace{0.55em}%
+}
+
+\newcommand{\tableheading}[1]{{\color{ReportMuted}#1\par\vspace{0.35em}}}
+
+\newcommand{\ReportHeading}[1]{%
+  \vspace{0.6em}%
+  {\color{NvidiaGreen}\bfseries\large #1\par}%
+  \vspace{0.25em}\ReportRule
+  \vspace{0.45em}%
+}
+
+\newtcolorbox{executivesummarybox}{
+  enhanced,
+  breakable,
+  colback=SummaryGrey,
+  colframe=SummaryGrey,
+  boxrule=0pt,
+  borderline west={3.5pt}{0pt}{NvidiaGreen},
+  left=10pt,
+  right=10pt,
+  top=6pt,
+  bottom=6pt,
+  arc=0pt,
+  before skip=0.3em,
+  after skip=0.55em,
+}
+
+\titleformat{\section}
+  {\color{NvidiaGreen}\bfseries\large}
+  {\thesection\ }
+  {0pt}
+  {}
+  [\vspace{0.2em}\ReportRule\vspace{0.35em}]
+
+\titleformat{\subsection}
+  {\bfseries\normalsize\color{ReportText}}
+  {\thesubsection\ }
+  {0pt}
+  {}
+
+\titlespacing*{\section}{0pt}{0.9em}{0.5em}
+\titlespacing*{\subsection}{0pt}{0.65em}{0.3em}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{\ReportRunHeader}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0pt}
+
+\fancypagestyle{firstpage}{%
+  \fancyhf{}
+  \fancyfoot[C]{\small\thepage}
+  \renewcommand{\headrulewidth}{0pt}
+}
+
+\pgfplotsset{
+  reportplot/.style={
+    width=0.88\linewidth,
+    height=6.4cm,
+    tick label style={/pgf/number format/1000 sep={}},
+    label style={font=\small},
+    title style={font=\normalsize\bfseries},
+    grid=both,
+    grid style={gray!25},
+    major grid style={gray!25},
+    minor tick num=1,
+    minor grid style={gray!12},
+    legend style={font=\small, fill=white, draw=gray!40},
+    enlarge x limits=0.03,
+    enlarge y limits=0.06,
+  },
+  logx base2/.style={
+    xmode=log,
+    log basis x={2},
+    xtick pos=left,
+    xlabel style={font=\small},
+  },
+  scoop envaxis/.style={
+    logx base2,
+    xmin=0.8, xmax=1500,
+    xtick={1,32,128,398,1200},
+    xticklabels={1,32,128,398,1200},
+  },
+}
+
+
+% Bold a number inside an siunitx S column
+\newcommand{\B}{\bfseries}
+
+\begin{document}
+\thispagestyle{firstpage}
+\NvidiaTopBanner
+
+\vspace*{0.05cm}
+{\small\color{ReportMuted}%
+June 11, 2026 \quad|\quad Branch \texttt{max/newton-coupling-manager} (\texttt{add2551326})
+\quad|\quad Prepared by Maximilian Krause\par}
+
+\vspace{0.55em}
+{\fontsize{20}{24}\selectfont\bfseries MPM Environment Throughput Scaling\par}
+\vspace{0.2em}
+{\normalsize\color{ReportMuted} Isaac-Scoop-Franka-v0 --- grid type $\times$ voxel size $\times$ parallel environments\par}
+
+\vspace{0.4em}
+\ReportRule
+\vspace{0.45em}
+
+\ReportHeading{Executive summary}
+
+\begin{executivesummarybox}
+\begin{itemize}[leftmargin=1.25em, itemsep=0.15em, topsep=0pt, parsep=0pt]
+  \item \textbf{Use sparse at training scale.} At 15\,mm it reaches \textbf{965 env-steps/s @
+        398 envs} with 8.5\,GiB steady memory; the fixed grid reaches 748 env-steps/s at
+        28.6\,GiB.
+  \item \textbf{Keep fixed for few-env debugging and the 20\,mm reference.} Its CUDA-graph floor
+        wins at the small env counts measured, and 20\,mm fixed gives the highest raw rate measured
+        (1{,}117 env-steps/s @ 598 envs).
+  \item \textbf{Memory is the limiter.} Fixed-grid memory tracks particles at
+        $\approx$\,10\,GiB/M, versus $\approx$\,2.5\,GiB/M for sparse; on this RTX 5090 that moves
+        the practical ceiling from $\approx$\,2.7\,M particles to $\gtrsim$\,8.5\,M.
+\end{itemize}
+\end{executivesummarybox}
+
+\section{Methodology}
+
+Each point is one headless run on an idle NVIDIA GeForce RTX 5090 (32{,}607\,MiB VRAM, driver
+595.71.05), launched through \texttt{scoop\_run.sh} with 20 warm-up steps and 120 measured steps.
+The workload is the full zero-action RL environment step: four MPM substeps, MuJoCo arm solve,
+Newton IK tracking, and particle-count reward/observation code. The repeated point
+(20\,mm fixed @ 128 envs) reproduced within 0.5\%.
+
+\textbf{Fixed} uses \texttt{grid\_padding=8}, CUDA graph replay, and
+$\max(400\,\text{k},\, 0.35 \times \text{particles})$ active cells. \textbf{Sparse} runs eagerly
+with \texttt{grid\_padding=0}. Particle counts are tied to voxel size: 2{,}261/env at 20\,mm,
+5{,}817/env at 15\,mm, and 21{,}237/env at 10\,mm. Reported metrics are step time,
+env-steps/s, startup time, and GPU memory (fixed: peak; sparse: steady/peak).
+
+\newpage
+
+\section{Results at a glance}
+\label{sec:results}
+
+\tableheading{Throughput across the full matrix. Each cell: step time (ms) / env-steps per second.
+``OOM'' = out of memory at solver init (\texttt{Warp CUDA error 2}); ``---'' = not measured.}
+\begin{reporttable}
+\setlength{\tabcolsep}{5.5pt}%
+\footnotesize
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}r cc cc cc cc cc@{}}
+\toprule
+& \multicolumn{2}{c}{\textbf{20\,mm fixed}} & \multicolumn{2}{c}{\textbf{15\,mm fixed}}
+& \multicolumn{2}{c}{\textbf{10\,mm fixed}} & \multicolumn{2}{c}{\textbf{15\,mm sparse}}
+& \multicolumn{2}{c}{\textbf{10\,mm sparse}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+\textbf{envs} & {ms} & {sps} & {ms} & {sps} & {ms} & {sps} & {ms} & {sps} & {ms} & {sps} \\
+\midrule
+1    & 16.2  & 62   & 17.2  & 58  & 18.8  & 53  & 83.8   & 12  & 82.3  & 12  \\
+8    & 42.6  & 188  & 55.1  & 145 & 108.3 & 74  & 89.0   & 90  & 87.4  & 92  \\
+32   & 122.4 & 262  & 139.1 & 230 & 157.7 & 203 & 92.7   & 345 & 102.5 & 312 \\
+48   & ---   & ---  & ---   & --- & ---   & --- & 96.8   & 496 & ---   & --- \\
+128  & 213.9 & 598  & 191.8 & 667 & 452.5 & 283 & 149.8  & 854 & 249.0 & \textbf{514} \\
+398  & 373.4 & 1066 & 532.1 & 748 & \multicolumn{2}{c}{OOM} & 412.6 & \textbf{965} & 929.5 & 428 \\
+598  & 535.3 & \textbf{1117} & \multicolumn{2}{c}{OOM} & --- & --- & 693.1  & 863 & --- & --- \\
+800  & 742.2 & 1078 & ---   & --- & ---   & --- & 1065.5 & 751 & --- & --- \\
+1024 & \multicolumn{2}{c}{OOM} & --- & --- & --- & --- & ---  & --- & --- & --- \\
+1200 & ---   & ---  & ---   & --- & ---   & --- & 2012.4 & 596 & --- & --- \\
+\bottomrule
+\end{tabular}%
+}
+\end{reporttable}
+
+\tableheading{GPU memory (GiB) and startup time (s). Fixed-grid memory is the peak ($\approx$
+steady); sparse memory is steady\,/\,peak (the difference is the init transient, $\leq$\,27\%).}
+\begin{reporttable}
+\setlength{\tabcolsep}{5.5pt}%
+\footnotesize
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}r ccc cc ccc cc@{}}
+\toprule
+& \multicolumn{5}{c}{\textbf{Memory (GiB)}} & \multicolumn{5}{c}{\textbf{Startup (s)}} \\
+\cmidrule(lr){2-6}\cmidrule(lr){7-11}
+\textbf{envs} & {20\,f} & {15\,f} & {10\,f} & {15\,sp} & {10\,sp}
+              & {20\,f} & {15\,f} & {10\,f} & {15\,sp} & {10\,sp} \\
+\midrule
+1    & 1.8  & 1.9  & 2.0  & 1.8\,/\,1.8   & 1.7\,/\,1.7 & 7   & 7  & 8  & 8   & 9  \\
+8    & 3.5  & 4.4  & 7.5  & 2.0\,/\,2.0   & 2.1\,/\,2.2 & 8   & 8  & 10 & 8   & 10 \\
+32   & 7.4  & 8.9  & 11.7 & 2.5\,/\,2.5   & 3.4\,/\,3.5 & 9   & 11 & 14 & 10  & 13 \\
+48   & ---  & ---  & ---  & 2.7\,/\,2.8   & ---         & --- & --- & --- & 11 & --- \\
+128  & 10.3 & 12.4 & 28.6 & 4.0\,/\,4.5   & 8.0\,/\,9.0 & 15  & 18 & 34 & 16  & 29 \\
+398  & 15.3 & 28.6 & 31.1$^{\dagger}$ & 8.5\,/\,10.0 & 21.0\,/\,24.8 & 42 & 54 & --- & 50 & 95 \\
+598  & 20.8 & 29.6$^{\dagger}$ & --- & 11.3\,/\,13.7 & --- & 80  & --- & --- & 96  & --- \\
+800  & 27.5 & ---  & ---  & 14.2\,/\,17.8 & --- & 145 & --- & --- & 165 & --- \\
+1024 & 31.2$^{\dagger}$ & --- & --- & ---  & --- & --- & --- & --- & --- & --- \\
+1200 & ---  & ---  & ---  & 20.4\,/\,25.7 & --- & --- & --- & --- & 390 & --- \\
+\bottomrule
+\end{tabular}%
+}
+\end{reporttable}
+\ReportCaption{$^{\dagger}$\,peak reached by the failed allocation attempt of an OOM run; the GPU
+capacity is 31.8\,GiB. Columns: f $=$ fixed, sp $=$ sparse.}
+
+\section{Throughput and step time}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  reportplot,
+  scoop envaxis,
+  title={Total throughput},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Env-steps per second},
+  ymin=0, ymax=1300,
+  ytick={0,200,400,600,800,1000,1200},
+  legend pos=south east,
+  legend columns=2,
+]
+\addplot[TabGreen, thick, mark=*, mark size=1.8pt] coordinates {
+  (1,62) (32,262) (128,598) (398,1066) (598,1117) (800,1078)
+};
+\addlegendentry{20\,mm fixed}
+\addplot[TabBlue, thick, mark=square*, mark size=1.8pt] coordinates {
+  (1,58) (32,230) (128,667) (398,748)
+};
+\addlegendentry{15\,mm fixed}
+\addplot[TabOrange, thick, mark=triangle*, mark size=2.2pt] coordinates {
+  (1,53) (32,203) (128,283)
+};
+\addlegendentry{10\,mm fixed}
+\addplot[TabBlue, thick, dashed, mark=o, mark size=2.0pt] coordinates {
+  (1,12) (32,345) (128,854) (398,965) (598,863) (800,751) (1200,596)
+};
+\addlegendentry{15\,mm sparse}
+\addplot[TabOrange, thick, dashed, mark=triangle, mark size=2.4pt] coordinates {
+  (1,12) (32,312) (128,514) (398,428)
+};
+\addlegendentry{10\,mm sparse}
+\addplot[only marks, TabRed, mark=x, mark size=4pt, thick] coordinates {(398,330) (1024,1078)};
+\node[font=\scriptsize, color=TabRed, anchor=south east] at (axis cs:380,345) {10\,mm fixed OOM};
+\node[font=\scriptsize, color=TabRed, anchor=north east] at (axis cs:1024,1050) {20\,mm fixed OOM};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Throughput peaks: 20\,mm fixed at 1{,}117 env-steps/s, 15\,mm sparse at 965, and
+10\,mm sparse at 514. Sparse overtakes fixed at the same voxel by 32 envs; red $\times$ markers
+show OOM boundaries. The omitted 8- and 48-env points remain in Section~\ref{sec:results}.}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  reportplot,
+  scoop envaxis,
+  ymode=log, log basis y={10},
+  title={Env step time},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Env step time (ms, log scale)},
+  ymin=10, ymax=2500,
+  ytick={10,30,100,300,1000,2500},
+  yticklabels={10,30,100,300,1000,2500},
+  legend pos=south east,
+  legend columns=2,
+]
+\addplot[TabGreen, thick, mark=*, mark size=1.8pt] coordinates {
+  (1,16.2) (32,122.4) (128,213.9) (398,373.4) (598,535.3) (800,742.2)
+};
+\addlegendentry{20\,mm fixed}
+\addplot[TabBlue, thick, mark=square*, mark size=1.8pt] coordinates {
+  (1,17.2) (32,139.1) (128,191.8) (398,532.1)
+};
+\addlegendentry{15\,mm fixed}
+\addplot[TabOrange, thick, mark=triangle*, mark size=2.2pt] coordinates {
+  (1,18.8) (32,157.7) (128,452.5)
+};
+\addlegendentry{10\,mm fixed}
+\addplot[TabBlue, thick, dashed, mark=o, mark size=2.0pt] coordinates {
+  (1,83.8) (32,92.7) (128,149.8) (398,412.6) (598,693.1) (800,1065.5) (1200,2012.4)
+};
+\addlegendentry{15\,mm sparse}
+\addplot[TabOrange, thick, dashed, mark=triangle, mark size=2.4pt] coordinates {
+  (1,82.3) (32,102.5) (128,249.0) (398,929.5)
+};
+\addlegendentry{10\,mm sparse}
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Fixed has the lower one-env floor ($\sim$16--19\,ms) because it can replay a CUDA
+graph; sparse starts near $\sim$83\,ms but scales better once launch overhead is amortized.}
+\end{center}
+
+\section{Fixed vs.\ sparse}
+
+\tableheading{Head-to-head at the 15\,mm training voxel. Bold marks the better grid per env count.}
+\begin{reporttable}
+\setlength{\tabcolsep}{7pt}%
+\begin{tabular}{@{}r S[table-format=3.1] S[table-format=3.0] S[table-format=3.1] S[table-format=3.0] c@{}}
+\toprule
+& \multicolumn{2}{c}{\textbf{Fixed (CUDA graph)}} & \multicolumn{2}{c}{\textbf{Sparse (eager)}} & \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+\textbf{num\_envs} & {\textbf{Step (ms)}} & {\textbf{Steps/s}} & {\textbf{Step (ms)}} & {\textbf{Steps/s}} & \textbf{Memory (GiB, peak/steady)} \\
+\midrule
+1   & \B 17.2  & \B 58  & 83.8   & 12  & 1.9 vs.\ 1.8 \\
+8   & \B 55.1  & \B 145 & 89.0   & 90  & 4.4 vs.\ 2.0 \\
+32  & 139.1 & 230 & \B 92.7   & \B 345 & 8.9 vs.\ 2.5 \\
+128 & 191.8 & 667 & \B 149.8  & \B 854 & 12.4 vs.\ 4.0 \\
+398 & 532.1 & 748 & \B 412.6  & \B 965 & 28.6 vs.\ 8.5 \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+At 15\,mm, fixed wins only at 1--8 envs; from 32 envs upward sparse is faster and much lighter on
+memory. At 398 envs it is 29\% faster at $3.4\times$ less memory. The 10\,mm case is more severe:
+sparse is already ahead by 8 envs and can run the 398-env, 8.45\,M-particle case that fixed cannot
+initialize.
+
+\section{GPU memory}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  reportplot,
+  scoop envaxis,
+  title={GPU memory},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={GPU memory (GiB)},
+  ymin=0, ymax=35,
+  ytick={0,5,10,15,20,25,30,35},
+  legend style={at={(0.98,0.03)}, anchor=south east, font=\footnotesize,
+    fill opacity=0.85, text opacity=1},
+  legend columns=2,
+]
+\addplot[TabGreen, thick, mark=*, mark size=1.8pt] coordinates {
+  (1,1.8) (32,7.4) (128,10.3) (398,15.3) (598,20.8) (800,27.5)
+};
+\addlegendentry{20\,mm fixed}
+\addplot[TabBlue, thick, mark=square*, mark size=1.8pt] coordinates {
+  (1,1.9) (32,8.9) (128,12.4) (398,28.6)
+};
+\addlegendentry{15\,mm fixed}
+\addplot[TabOrange, thick, mark=triangle*, mark size=2.2pt] coordinates {
+  (1,2.0) (32,11.7) (128,28.6)
+};
+\addlegendentry{10\,mm fixed}
+\addplot[TabBlue, thick, dashed, mark=o, mark size=2.0pt] coordinates {
+  (1,1.8) (32,2.5) (128,4.0) (398,8.5) (598,11.3) (800,14.2) (1200,20.4)
+};
+\addlegendentry{15\,mm sparse}
+\addplot[TabOrange, thick, dashed, mark=triangle, mark size=2.4pt] coordinates {
+  (1,1.7) (32,3.4) (128,8.0) (398,21.0)
+};
+\addlegendentry{10\,mm sparse}
+\addplot[only marks, TabRed, mark=x, mark size=4pt, thick] coordinates {(398,31.1) (598,29.6) (1024,31.2)};
+\draw[dashed, TabRed] (axis cs:0.8,31.8) -- (axis cs:1500,31.8);
+\node[font=\scriptsize, color=TabRed, anchor=south east] at (axis cs:1450,32.2) {VRAM capacity (31.8\,GiB)};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Fixed-grid memory (solid; peak $\approx$ steady, includes the cell preallocation)
+tracks total particles at $\approx$\,10\,GiB per million (least-squares: 4.7\,GiB $+$
+10.4\,GiB/M); sparse steady memory (dashed) needs only $\approx$\,2.5\,GiB per million. Red
+$\times$: failed allocation attempts of the OOM runs against the capacity line.}
+\end{center}
+
+Fixed memory follows total particles, not env count: 15\,mm @ 398 envs and 10\,mm @ 128 envs both
+peak at 28.6\,GiB. Sparse pushes the same GPU beyond 8.5\,M particles and still leaves training
+headroom for PPO and logging.
+
+\section{Startup cost}
+
+Startup is mostly flat through 48 envs ($\leq$\,16\,s), then scales with env count: 29--34\,s at
+128 envs, 42--95\,s at 398, and 390\,s for sparse at 1{,}200. Even the largest case amortizes
+within $\sim$200 steady-state env steps.
+
+\section{Recommended operating points}
+
+\begin{reporttable}
+\begin{tabular}{@{}l c p{0.44\linewidth}@{}}
+\toprule
+\textbf{Goal} & \textbf{Config} & \textbf{Why} \\
+\midrule
+Training default        & 15\,mm sparse @ 398 envs & Fastest 15\,mm config: 965 env-steps/s at
+                                              8.5\,GiB steady. \\
+Balanced / shared GPU   & 15\,mm sparse @ 128 envs & 854 env-steps/s at 4.0\,GiB steady;
+                                              faster than the best 15\,mm fixed run with far less
+                                              memory. \\
+Fine media (physics)    & 10\,mm sparse @ 128 envs & 514 env-steps/s at 8.0\,GiB steady; use
+                                              398 envs only when particle count matters more than
+                                              sample rate. \\
+Few-env debugging       & 15\,mm fixed @ $\leq$8 envs & The CUDA-graph replay floor
+                                              beats sparse at these counts. \\
+Max raw sample rate     & 20\,mm fixed @ 598 envs & 1{,}117 env-steps/s --- the overall peak, but
+                                              coarse for real scooping. \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+\section{Caveats}
+\label{sec:caveats}
+
+\begin{itemize}[leftmargin=1.4em, itemsep=0.18em]
+  \item \textbf{Single measurement per point.} Each cell is one 120-step run. The repeated point
+        reproduced within 0.5\%; treat $\lesssim$\,5\% gaps cautiously.
+  \item \textbf{Zero-action workload.} The cup barely moves, so sparse sees near-best-case
+        allocation behavior. A trained policy should raise sparse step times somewhat, but the
+        scale ranking should hold.
+  \item \textbf{Physics validity differs across voxels.} The hemisphere ladle wall is 24\,mm: at
+        20\,mm it spans only 1.2 cells and will leak during real scooping. Treat 20\,mm as a
+        performance reference, not a training setting.
+  \item \textbf{Memory figures include the preallocation policy.} Fixed-grid
+        \texttt{max\_active\_cells} was auto-scaled as
+        $\max(400\text{k}, 0.35 \times \text{particles})$; a tighter cap saves memory but risks
+        active-cell overflow.
+\end{itemize}
+
+\vspace{0.8em}
+{\small\color{ReportMuted}%
+Raw data: \texttt{\_scratch/reports/env\_scaling/scoop\_env\_scaling\_full\_2026-06-11.csv};
+per-run JSON/stdout logs live beside it. Sweep drivers: \texttt{\_scratch/bench\_env\_scaling.py}
+and \texttt{\_scratch/bench\_redo.py}; fragments are regenerated by
+\texttt{\_scratch/reports/gen\_tex\_fragments.py}.}
+
+\end{document}

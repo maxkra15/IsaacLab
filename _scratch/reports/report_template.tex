@@ -1,0 +1,780 @@
+% Cable ADMM / Proxy scaling report — single-file Overleaf template
+% Rebuilt from reports/cable_admm_proxy_scaling_report.pdf
+\documentclass[a4paper,11pt]{article}
+
+\usepackage[margin=0.85in, top=1.45in, bottom=0.85in, headheight=18pt, headsep=14pt]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[scaled=0.95]{helvet}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{siunitx}
+\sisetup{
+  group-separator={,},
+  group-minimum-digits=4,
+  detect-weight=true,
+  detect-family=true,
+  table-number-alignment=center,
+}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{pgfplots}
+\usepackage{tikz}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+\renewcommand{\familydefault}{\sfdefault}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{calc}
+
+% NVIDIA / report palette (matches Isaac Lab ecosystem)
+\definecolor{NvidiaGreen}{HTML}{76B900}
+\definecolor{NvidiaGreenDark}{HTML}{558B00}
+\definecolor{ReportText}{HTML}{1A1A1A}
+\definecolor{ReportMuted}{HTML}{4D4D4D}
+\definecolor{SummaryGrey}{HTML}{F2F2F2}
+\definecolor{RuleGrey}{HTML}{D9D9D9}
+\definecolor{TabBlue}{HTML}{1F77B4}
+\definecolor{TabGreen}{HTML}{2CA02C}
+\definecolor{TabOrange}{HTML}{FF7F0E}
+\definecolor{TabRed}{HTML}{D62728}
+
+\color{ReportText}
+\hypersetup{colorlinks=true, linkcolor=NvidiaGreenDark, urlcolor=NvidiaGreenDark}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45em}
+\setlength{\headheight}{22pt}
+\setlength{\headsep}{18pt}
+
+% Full-width green banner (page 1)
+\newcommand{\NvidiaTopBanner}{%
+  \tikz[remember picture,overlay]{%
+    \fill[NvidiaGreen] (current page.north west) rectangle ([yshift=-1.05cm]current page.north east);
+    \node[anchor=west, text=white, font=\bfseries\small]
+      at ([xshift=0.85in, yshift=-0.55cm]current page.north west) {NVIDIA | ISAAC LAB};
+    \node[anchor=east, text=white, font=\small]
+      at ([xshift=-0.85in, yshift=-0.55cm]current page.north east) {Internal technical report};
+  }%
+}
+
+% Slim green banner for running pages (tcolorbox is more reliable in fancyhdr than tikz)
+\newcommand{\ReportRunHeader}{%
+  \begin{tcolorbox}[
+    enhanced,
+    colback=NvidiaGreen,
+    colframe=NvidiaGreen,
+    boxrule=0pt,
+    arc=0pt,
+    left=6pt,
+    right=6pt,
+    top=4pt,
+    bottom=4pt,
+    width=\headwidth,
+    halign=left,
+  ]
+  {\color{white}\footnotesize\textbf{NVIDIA | ISAAC LAB}\hfill
+   Scaling Report\,|\,Cable \& CablePlug}
+  \end{tcolorbox}%
+}
+
+\newcommand{\ReportRule}{{\color{RuleGrey}\rule{\linewidth}{0.5pt}}}
+
+\newcommand{\ReportCaption}[1]{{\small\color{ReportMuted} #1\par}}
+
+% Centered report tables with consistent spacing
+\newenvironment{reporttable}{%
+  \vspace{0.35em}%
+  \begin{center}%
+  \small
+  \renewcommand{\arraystretch}{1.3}%
+  \setlength{\tabcolsep}{11pt}%
+}{%
+  \end{center}%
+  \vspace{0.55em}%
+}
+
+\newcommand{\tableheading}[1]{{\color{ReportMuted}#1\par\vspace{0.35em}}}
+
+% Green section-style heading + rule (unnumbered blocks like Executive summary)
+\newcommand{\ReportHeading}[1]{%
+  \vspace{0.6em}%
+  {\color{NvidiaGreen}\bfseries\large #1\par}%
+  \vspace{0.25em}\ReportRule
+  \vspace{0.45em}%
+}
+
+% Executive summary callout box
+\newtcolorbox{executivesummarybox}{
+  enhanced,
+  breakable,
+  colback=SummaryGrey,
+  colframe=SummaryGrey,
+  boxrule=0pt,
+  borderline west={3.5pt}{0pt}{NvidiaGreen},
+  left=10pt,
+  right=10pt,
+  top=8pt,
+  bottom=8pt,
+  arc=0pt,
+  before skip=0.4em,
+  after skip=0.8em,
+}
+
+% Indented command snippet
+\newenvironment{reportcode}{%
+  \vspace{0.2em}%
+  \begin{quote}%
+  \ttfamily\small%
+}{%
+  \end{quote}%
+  \vspace{0.2em}%
+}
+
+% Section / subsection styling
+\titleformat{\section}
+  {\color{NvidiaGreen}\bfseries\large}
+  {\thesection\ }
+  {0pt}
+  {}
+  [\vspace{0.2em}\ReportRule\vspace{0.35em}]
+
+\titleformat{\subsection}
+  {\bfseries\normalsize\color{ReportText}}
+  {\thesubsection\ }
+  {0pt}
+  {}
+
+\titlespacing*{\section}{0pt}{0.9em}{0.5em}
+\titlespacing*{\subsection}{0pt}{0.65em}{0.3em}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{\ReportRunHeader}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0pt}
+
+\fancypagestyle{firstpage}{%
+  \fancyhf{}
+  \fancyfoot[C]{\small\thepage}
+  \renewcommand{\headrulewidth}{0pt}
+}
+
+\pgfplotsset{
+  reportplot/.style={
+    width=0.88\linewidth,
+    height=6.4cm,
+    tick label style={/pgf/number format/1000 sep={}},
+    label style={font=\small},
+    title style={font=\normalsize\bfseries},
+    grid=both,
+    grid style={gray!25},
+    major grid style={gray!25},
+    minor tick num=1,
+    minor grid style={gray!12},
+    legend style={font=\small, fill=white, draw=gray!40},
+    enlarge x limits=0.03,
+    enlarge y limits=0.06,
+  },
+  logx base2/.style={
+    xmode=log,
+    log basis x={2},
+    xtick pos=left,
+    xlabel style={font=\small},
+  },
+  cable throughput/.style={
+    reportplot,
+    logx base2,
+    ymin=0, ymax=26000,
+    ytick={0,5000,10000,15000,20000,25000},
+    yticklabels={0,5000,10000,15000,20000,25000},
+    /pgf/number format/1000 sep={,},
+  },
+  cable itertime/.style={
+    reportplot,
+    logx base2,
+    xmode=log, ymode=log, log basis y={10},
+    xmin=6, xmax=12000,
+    ymin=0.45, ymax=12,
+    ytickten={-1,0,1},
+    yticklabels={0.1,1,10},
+  },
+  compare loglog/.style={
+    reportplot,
+    xmode=log, ymode=log,
+    log basis x={2}, log basis y={10},
+    xmin=1.5, xmax=48,
+    xtick={2,4,8,16,32},
+    xticklabels={2,4,8,16,32},
+  },
+  cableplug throughput/.style={
+    reportplot,
+    logx base2,
+    xmin=3, xmax=90,
+    ymin=0, ymax=24,
+    xtick={4,8,16,32,64},
+    xticklabels={4,8,16,32,64},
+  },
+  cableplug itertime/.style={
+    reportplot,
+    logx base2,
+    xmode=log, ymode=log, log basis y={10},
+    xmin=3, xmax=90,
+    ymin=4, ymax=400,
+    xtick={4,8,16,32,64},
+    xticklabels={4,8,16,32,64},
+  },
+}
+
+\begin{document}
+\thispagestyle{firstpage}
+\NvidiaTopBanner
+
+\vspace*{0.15cm}
+{\small\color{ReportMuted}%
+June 11, 2026 \quad|\quad Branch \texttt{max/...} \quad|\quad Prepared by Maximilian Krause\par}
+
+\vspace{0.85em}
+{\fontsize{22}{26}\selectfont\bfseries RL Training Throughput Scaling\par}
+\vspace{0.3em}
+{\large\color{ReportMuted} Isaac-...-v0 \& Isaac-....-v0\par}
+
+\vspace{0.55em}
+\ReportRule
+\vspace{0.65em}
+
+\ReportHeading{Executive summary}
+
+\begin{executivesummarybox}
+\textbf{Cable env.}\ Total throughput scales with parallelism up to \textbf{4{,}096 envs}
+(23{,}917 steps/s), plateaus there, and \emph{regresses} above 4{,}096 envs --- 6{,}144 envs is the
+first operating point where adding more environments yields fewer samples per second. Below 4{,}096
+envs the GPU still has headroom; above it, iteration time grows linearly with \texttt{num\_envs}
+($\approx$\,1.03\,ms/env) but throughput no longer climbs.
+
+\textbf{CablePlug env.}\ Scales \emph{poorly}: total throughput peaks at only $\sim$20 steps/s near
+8--16 envs and then declines. Iteration time grows roughly $O(N^{1.6\text{--}2})$ in
+\texttt{num\_envs}; the simulator collection phase --- not the PPO update --- is responsible for
+${>}99\%$ of the cost.
+
+\textbf{Proxy vs.\ ADMM coupling (Cable env).}\ ADMM on the plain cable scene is $\sim$10$\times$
+slower per iter than proxy at 8 envs, growing to $\sim$53$\times$ at 32 envs; peak throughput stays
+$\leq$33 sps regardless of \texttt{num\_envs}. The ADMM scaling on the cable scene closely mirrors
+the CablePlug scaling, suggesting the ADMM solver itself is the dominant cost in CablePlug.
+\end{executivesummarybox}
+
+\section{Methodology}
+
+Each data point is one training run launched with
+\begin{reportcode}
+./isaaclab.sh train --rl\_library rsl\_rl --task <TASK>\\
+\phantom{./isaaclab.sh train }--num\_envs N --max\_iterations 20 --headless
+\end{reportcode}
+on a single NVIDIA RTX A6000 (49\,GiB VRAM) in headless mode. The PPO trainer (RSL-RL) uses
+\texttt{num\_steps\_per\_env = 24}; the simulator uses \texttt{decimation = 1},
+\texttt{sim.dt = 1/60}\,s. The first three iterations of every run are dropped as warm-up; reported
+numbers are the mean over the remaining iterations. ``Steps per second'' is the value RSL-RL prints
+to stdout, i.e.\ \texttt{num\_envs $\times$ num\_steps\_per\_env/collection\_time}.
+
+The metrics reported per run are:
+\begin{itemize}[leftmargin=1.4em, itemsep=0.2em]
+  \item \textbf{Iteration time (s)} --- wall-clock per RL iteration.
+  \item \textbf{Steps per second} --- environment steps produced per wall-clock second.
+  \item \textbf{Startup time (s)} --- time before the first training iteration starts producing samples.
+  \item \textbf{Peak GPU memory (MiB)} --- training memory delta over the system baseline.
+\end{itemize}
+
+\section{Isaac-Lift-Cable-Franka-v0}
+
+\subsection{Scaling table}
+
+\tableheading{Cable env training throughput vs.\ number of parallel environments.}
+\begin{reporttable}
+\begin{tabular}{@{}r S[table-format=2.2] S[table-format=5.0] S[table-format=2.1]@{}}
+\toprule
+\textbf{num\_envs} & {\textbf{Iter time (s)}} & {\textbf{Steps / s}} & {\textbf{Steps / s / env}} \\
+\midrule
+8      & 0.57  &   339 & 42.4 \\
+16     & 0.60  &   643 & 40.2 \\
+32     & 0.67  &  1162 & 36.3 \\
+64     & 0.69  &  2232 & 34.9 \\
+128    & 0.73  &  4199 & 32.8 \\
+256    & 0.81  &  7580 & 29.6 \\
+384    & 0.94  &  9839 & 25.6 \\
+512    & 1.03  & 11939 & 23.3 \\
+1024   & 1.39  & 17750 & 17.3 \\
+2048   & 2.23  & 22008 & 10.8 \\
+3072   & 3.24  & 22755 &  7.4 \\
+4096   & 4.11  & 23917 &  5.8 \\
+6144   & 6.33  & 23313 &  3.8 \\
+8192   & 8.54  & 23052 &  2.8 \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+\subsection{Throughput vs.\ number of envs}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  cable throughput,
+  title={Cable env},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Steps per second},
+  xtick={8,32,128,512,2048,8192},
+  xticklabels={8,32,128,512,2048,8192},
+]
+\addplot[TabBlue, thick, mark=*, mark size=1.8pt] coordinates {
+  (8,339) (16,643) (32,1162) (64,2232) (128,4199) (256,7580) (384,9839)
+  (512,11939) (1024,17750) (2048,22008) (3072,22755) (4096,23917) (6144,23313) (8192,23052)
+};
+\addplot[only marks, TabRed, mark=*, mark size=3pt] coordinates {(4096,23917)};
+\draw[dashed, gray!60] (axis cs:4096,0) -- (axis cs:4096,26000);
+\node[font=\scriptsize, anchor=south west] at (axis cs:700,20500)
+  {peak: 4{,}096 envs, 23{,}917 sps};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Total throughput rises monotonically up to 4{,}096 envs, plateaus, then declines.}
+\end{center}
+
+\subsection{Iteration time vs.\ number of envs}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  cable itertime,
+  title={Cable env},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Iteration time (s)},
+  xtick={8,32,128,512,2048,8192},
+  xticklabels={8,32,128,512,2048,8192},
+]
+\addplot[TabBlue, thick, mark=*, mark size=1.8pt] coordinates {
+  (8,0.57) (16,0.60) (32,0.67) (64,0.69) (128,0.73) (256,0.81) (384,0.94)
+  (512,1.03) (1024,1.39) (2048,2.23) (3072,3.24) (4096,4.11) (6144,6.33) (8192,8.54)
+};
+\draw[dashed, TabOrange, thick] (axis cs:512,0.45) -- (axis cs:512,12);
+\node[font=\scriptsize, anchor=north west, align=left] at (axis cs:20,2.2)
+  {flat $<$512 envs};
+\node[font=\scriptsize, anchor=south west, align=left] at (axis cs:1200,5.5)
+  {$\approx$1.03\,ms/env above 2k};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Iter time is nearly flat below 512 envs (kernel-launch dominated), then grows linearly above
+$\sim$2{,}048 envs ($\approx$1.03\,ms/env) --- the GPU-saturation signature.}
+\end{center}
+
+\subsection{When does adding more envs become a bad idea?}
+
+\begin{itemize}[leftmargin=1.4em, itemsep=0.25em]
+  \item \textbf{8 $\to$ 2{,}048 envs} --- strong scaling. Every doubling of \texttt{num\_envs} yields
+        $\geq$24\% more throughput.
+  \item \textbf{2{,}048 $\to$ 4{,}096 envs} --- diminishing returns. Each +1{,}024 envs adds only +3--5\%
+        throughput.
+  \item \textbf{4{,}096 envs} --- throughput peak (23{,}917 sps).
+  \item \textbf{$\geq$6{,}144 envs} --- net negative. Throughput is lower than at 4{,}096, iter time is
+        longer, per-env efficiency is worse. Do not operate here.
+\end{itemize}
+
+\section{Proxy vs.\ ADMM coupling on the Cable env}
+
+The Cable env above uses proxy coupling (\texttt{CoupledProxySolverCfg}): the articulated robots are
+simulated in MJWarp while cables are in VBD; the gripper fingers are exposed as virtual proxies so VBD
+detects them as contacts on the cable. The cable plug env, by contrast, uses ADMM coupling
+(\texttt{CoupledAdmmSolverCfg}), which solves coupled mujoco--vbd constraints via an iterative
+alternating-direction scheme. ADMM is more rigorous but more expensive per step.
+
+To compare the two on the same scene, the Cable env was re-instantiated with the ADMM solver and the
+ADMM recipe used by the cable plug env (\texttt{iterations = 5}, $\rho = 30$, $\gamma = 0.1$,
+\texttt{baumgarte = 0.005}, \texttt{contact distance = 0.003}, VBD $\beta = 10^3$,
+\texttt{num\_substeps = 10}, contact stiffness \texttt{ke = $10^5$}). Task registered as
+\texttt{Isaac-Lift-Cable-ADMM-Franka-v0}.
+
+\subsection{Side-by-side scaling}
+
+\tableheading{Cable env throughput with proxy vs.\ ADMM coupling.}
+\begin{reporttable}
+\begin{tabular}{@{}r S[table-format=2.2] S[table-format=4.0] S[table-format=2.2] S[table-format=2.1]@{}}
+\toprule
+& \multicolumn{2}{c}{\textbf{Proxy}} & \multicolumn{2}{c}{\textbf{ADMM}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+\textbf{num\_envs} & {\textbf{Iter (s)}} & {\textbf{Steps / s}} & {\textbf{Iter (s)}} & {\textbf{Steps / s}} \\
+\midrule
+2  & \multicolumn{1}{c}{---} & \multicolumn{1}{c}{---} & 3.36  & 13.9 \\
+4  & \multicolumn{1}{c}{---} & \multicolumn{1}{c}{---} & 4.01  & 23.6 \\
+8  & 0.57 & 339   & 5.76  & 32.7 \\
+16 & 0.60 & 643   & 11.82 & 32.3 \\
+32 & 0.67 & 1162  & 35.71 & 21.4 \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+\subsection{Throughput vs.\ number of envs}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  compare loglog,
+  title={Proxy vs.\ ADMM throughput},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Steps per second (log scale)},
+  ymin=10, ymax=2000,
+  ytickten={1,2,3},
+  yticklabels={10,100,1000},
+]
+\addplot[TabBlue, thick, mark=*, mark size=1.8pt] coordinates {(8,339) (16,643) (32,1162)};
+\addlegendentry{Proxy}
+\addplot[TabGreen, thick, mark=square*, mark size=1.8pt] coordinates {
+  (2,13.9) (4,23.6) (8,32.7) (16,32.3) (32,21.4)
+};
+\addlegendentry{ADMM}
+\node[font=\scriptsize, anchor=west] at (axis cs:9,900) {proxy scales with envs};
+\node[font=\scriptsize, anchor=west] at (axis cs:3,18) {ADMM plateaus $\leq$33 sps};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Proxy throughput grows linearly with \texttt{num\_envs}; ADMM throughput plateaus near 32 sps at
+8--16 envs and then degrades. At 32 envs the proxy variant produces $\sim$54$\times$ more samples per
+second.}
+\end{center}
+
+\subsection{Iteration time vs.\ number of envs}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  compare loglog,
+  title={Proxy vs.\ ADMM iteration time},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Iteration time (s, log scale)},
+  ymin=0.4, ymax=50,
+  ytickten={-1,0,1,2},
+  yticklabels={0.1,1,10,100},
+]
+\addplot[TabBlue, thick, mark=*, mark size=1.8pt] coordinates {(8,0.57) (16,0.60) (32,0.67)};
+\addlegendentry{Proxy}
+\addplot[TabGreen, thick, mark=square*, mark size=1.8pt] coordinates {
+  (2,3.36) (4,4.01) (8,5.76) (16,11.82) (32,35.71)
+};
+\addlegendentry{ADMM}
+\node[font=\scriptsize, anchor=west] at (axis cs:5,0.55) {proxy $\sim$0.6\,s};
+\node[font=\scriptsize, anchor=west] at (axis cs:10,28) {53$\times$ slower at 32 envs};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Proxy iter time is flat at $\sim$0.6\,s across this range; ADMM iter time grows roughly linearly
+above 8 envs and is already 53$\times$ proxy at 32 envs.}
+\end{center}
+
+\subsection{Interpretation}
+
+\begin{itemize}[leftmargin=1.4em, itemsep=0.25em]
+  \item \textbf{Per-iteration overhead.} At 8 envs, ADMM is $\sim$10$\times$ slower than proxy
+        (5.76\,s vs.\ 0.57\,s); at 32 envs the gap widens to $\sim$53$\times$ (35.71\,s vs.\ 0.67\,s).
+        Proxy iter time barely moves with \texttt{num\_envs} in this range, while ADMM iter time scales
+        super-linearly above 8 envs.
+  \item \textbf{Throughput.} Proxy throughput rises linearly with envs in this range (339 $\to$ 1{,}162
+        sps for 8 $\to$ 32 envs); ADMM peaks at $\sim$33 sps near 8--16 envs and drops to 21 sps at 32 envs.
+  \item \textbf{Why use ADMM at all?} ADMM is required by the cable plug env because the plug couples
+        back into the cable through rigid--soft attachments that proxy coupling cannot represent. For the
+        plain cable env where the gripper is the only rigid contact, proxy coupling is the correct choice:
+        same physical scene, $\geq$50$\times$ better throughput, no stability issues observed.
+  \item \textbf{Implication for the cable plug env.} The super-linear cost growth observed earlier in the
+        CablePlug env ($O(N^{1.6\text{--}2})$) is consistent with ADMM's scaling on the plain cable scene,
+        which suggests the ADMM solver itself --- not the plug geometry --- is the dominant source of cost
+        in the cable plug benchmarks.
+\end{itemize}
+
+\section{Isaac-Lift-CablePlug-Franka-v0}
+
+\subsection{Scaling table}
+
+\tableheading{CablePlug env training throughput vs.\ number of parallel environments.}
+\begin{reporttable}
+\begin{tabular}{@{}r S[table-format=3.2] S[table-format=2.1] S[table-format=1.2]@{}}
+\toprule
+\textbf{num\_envs} & {\textbf{Iter time (s)}} & {\textbf{Steps / s}} & {\textbf{Steps / s / env}} \\
+\midrule
+4  &  6.43  & 14.4 & 3.59 \\
+8  &  9.45  & 20.0 & 2.50 \\
+16 & 20.10  & 18.9 & 1.18 \\
+32 & 65.87  & 11.4 & 0.36 \\
+64 & 288.88 &  5.1 & 0.08 \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+\subsection{Throughput vs.\ number of envs}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  cableplug throughput,
+  title={CablePlug env},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Steps per second},
+]
+\addplot[TabOrange, thick, mark=*, mark size=1.8pt] coordinates {
+  (4,14.4) (8,20.0) (16,18.9) (32,11.4) (64,5.1)
+};
+\addplot[only marks, TabRed, mark=*, mark size=3pt] coordinates {(8,20.0)};
+\node[font=\scriptsize, anchor=south west] at (axis cs:10,17.5) {peak: 8 envs, 20 sps};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Throughput peaks near 8--16 envs and falls thereafter --- the opposite of healthy parallel scaling.}
+\end{center}
+
+\subsection{Iteration time vs.\ number of envs}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  cableplug itertime,
+  title={CablePlug env},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Iteration time (s)},
+  ytickten={0,1,2},
+  yticklabels={1,10,100},
+]
+\addplot[TabOrange, thick, mark=*, mark size=1.8pt] coordinates {
+  (4,6.43) (8,9.45) (16,20.10) (32,65.87) (64,288.88)
+};
+\node[font=\scriptsize, anchor=north west, align=left] at (axis cs:5,120)
+  {doubling envs $\Rightarrow$ 3--4$\times$ iter time};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Iter time grows roughly $O(N^{1.6\text{--}2})$ in \texttt{num\_envs}: doubling envs costs 3--4$\times$
+more time per iteration.}
+\end{center}
+
+\subsection{Implication}
+
+For CablePlug, more parallel envs is actively harmful past $\sim$16. The super-linear cost growth means the
+simulator does not parallelize the plug interactions efficiently; root-cause analysis of the collection
+phase is needed before this task can use more envs productively.
+
+\section{Head-to-head}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  reportplot,
+  height=7cm,
+  logx base2,
+  xmode=log, ymode=log, log basis y={10},
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Steps per second (log scale)},
+  xmin=3, xmax=12000, ymin=4, ymax=30000,
+  xtick={4,8,32,128,512,2048,8192},
+  xticklabels={4,8,32,128,512,2048,8192},
+  ytickten={1,2,3,4},
+  yticklabels={10,100,1000,10000},
+]
+\addplot[TabBlue, thick, mark=*, mark size=1.8pt] coordinates {
+  (8,339) (16,643) (32,1162) (64,2232) (128,4199) (256,7580) (384,9839)
+  (512,11939) (1024,17750) (2048,22008) (3072,22755) (4096,23917) (6144,23313) (8192,23052)
+};
+\addlegendentry{Cable}
+\addplot[TabOrange, thick, mark=square*, mark size=1.8pt] coordinates {
+  (4,14.4) (8,20.0) (16,18.9) (32,11.4) (64,5.1)
+};
+\addlegendentry{CablePlug}
+\draw[dashed, gray!60] (axis cs:16,4) -- (axis cs:16,30000);
+\node[font=\scriptsize, anchor=south] at (axis cs:16,25) {CablePlug regresses past 16};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Cable env achieves over 1{,}000$\times$ higher peak throughput than CablePlug env, and continues to
+scale well past 1{,}000 envs while CablePlug regresses past 16 envs.}
+\end{center}
+
+\section{Startup cost}
+
+In addition to steady-state iteration time, every training run incurs a one-time startup cost (Python
+imports, Isaac Sim app init, scene cloning, USD stage build, RSL-RL setup) before the first training
+iteration produces samples. At very large env counts this is no longer negligible.
+
+\subsection{Startup time vs.\ number of envs}
+
+\tableheading{Startup time per run, by task and number of parallel envs.}
+\begin{reporttable}
+\begin{tabular}{@{}r S[table-format=3.1] S[table-format=2.1]@{}}
+\toprule
+\textbf{num\_envs} & {\textbf{Cable startup (s)}} & {\textbf{CablePlug startup (s)}} \\
+\midrule
+4      & \multicolumn{1}{c}{---} & 13.4 \\
+8      & 11.3  & 13.3 \\
+16     & 11.3  & 13.6 \\
+32     & 11.8  & 14.9 \\
+64     & 12.4  & 15.3 \\
+128    & 13.7  & \multicolumn{1}{c}{---} \\
+256    & 16.6  & \multicolumn{1}{c}{---} \\
+384    & 19.3  & \multicolumn{1}{c}{---} \\
+512    & 22.2  & \multicolumn{1}{c}{---} \\
+1024   & 32.2  & \multicolumn{1}{c}{---} \\
+2048   & 53.7  & \multicolumn{1}{c}{---} \\
+3072   & 75.1  & \multicolumn{1}{c}{---} \\
+4096   & 96.2  & \multicolumn{1}{c}{---} \\
+6144   & 142.2 & \multicolumn{1}{c}{---} \\
+8192   & 188.6 & \multicolumn{1}{c}{---} \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+\vspace{0.5em}
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  reportplot,
+  logx base2,
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Startup time (s)},
+  ymin=0, ymax=210,
+  ytick={0,50,100,150,200},
+  xtick={4,8,32,128,512,2048,8192},
+  xticklabels={4,8,32,128,512,2048,8192},
+]
+\addplot[TabBlue, thick, mark=*, mark size=1.8pt] coordinates {
+  (8,11.3) (16,11.3) (32,11.8) (64,12.4) (128,13.7) (256,16.6) (384,19.3)
+  (512,22.2) (1024,32.2) (2048,53.7) (3072,75.1) (4096,96.2) (6144,142.2) (8192,188.6)
+};
+\addlegendentry{Cable}
+\addplot[TabOrange, thick, mark=square*, mark size=1.8pt] coordinates {
+  (4,13.4) (8,13.3) (16,13.6) (32,14.9) (64,15.3)
+};
+\addlegendentry{CablePlug}
+\draw[dashed, TabOrange, thick] (axis cs:512,0) -- (axis cs:512,210);
+\node[font=\scriptsize, anchor=south west] at (axis cs:600,170)
+  {Cable startup grows above 512 envs};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Cable env startup grows roughly linearly with \texttt{num\_envs} above $\sim$512 envs
+($\approx$22\,ms per added env). CablePlug startup is essentially flat (12--15\,s) regardless of size
+--- the cable plug's expense is at simulation time, not at scene-clone time.}
+\end{center}
+
+\subsection{Implication}
+
+For long training runs (many thousands of iterations) the startup cost is negligible. For shorter
+experiments at very large env counts it dominates:
+\begin{itemize}[leftmargin=1.4em, itemsep=0.2em]
+  \item Cable @ 8{,}192 envs: startup is 188.6\,s --- more time than the first 22 training iterations combined.
+  \item Cable @ 4{,}096 envs: startup of 96.2\,s is roughly equal to the cost of 23 steady-state iterations.
+  \item Cable @ 1{,}024 envs: startup of 32.2\,s is roughly equal to 23 iterations.
+  \item Cable @ $\leq$256 envs: startup is essentially fixed at 11--17\,s.
+\end{itemize}
+
+A useful rule of thumb on this branch and GPU: startup amortizes after roughly 20--25 steady-state
+iterations, regardless of \texttt{num\_envs}. Below that, smaller env counts have lower total wall-clock cost.
+
+\section{GPU memory usage}
+
+Peak GPU memory consumed by training, measured by polling \texttt{nvidia-smi --query-gpu=memory.used}
+at 0.5\,s intervals during a short run (\texttt{--max\_iterations 2}) and subtracting the pre-launch
+system baseline. The benchmark GPU is an NVIDIA RTX A6000 with 49{,}140\,MiB (48\,GiB) of VRAM.
+
+\subsection{Memory vs.\ number of envs}
+
+\tableheading{Peak training GPU memory by task and number of parallel envs.}
+\begin{reporttable}
+\begin{tabular}{@{}r S[table-format=1.2] S[table-format=1.2]@{}}
+\toprule
+\textbf{num\_envs} & {\textbf{Cable peak (GiB)}} & {\textbf{CablePlug peak (GiB)}} \\
+\midrule
+2      & \multicolumn{1}{c}{---} & 0.70 \\
+4      & \multicolumn{1}{c}{---} & 0.75 \\
+8      & 0.49 & 0.80 \\
+16     & 0.49 & 0.89 \\
+32     & 0.49 & 2.18 \\
+64     & 0.53 & \multicolumn{1}{c}{---} \\
+128    & 0.59 & \multicolumn{1}{c}{---} \\
+256    & 0.71 & \multicolumn{1}{c}{---} \\
+384    & 0.83 & \multicolumn{1}{c}{---} \\
+512    & 0.95 & \multicolumn{1}{c}{---} \\
+1024   & 1.45 & \multicolumn{1}{c}{---} \\
+2048   & 2.40 & \multicolumn{1}{c}{---} \\
+3072   & 3.38 & \multicolumn{1}{c}{---} \\
+4096   & 4.38 & \multicolumn{1}{c}{---} \\
+6144   & 6.30 & \multicolumn{1}{c}{---} \\
+8192   & 8.11 & \multicolumn{1}{c}{---} \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+\vspace{0.5em}
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  reportplot,
+  logx base2,
+  xlabel={Number of parallel envs (log scale)},
+  ylabel={Peak GPU memory (GiB)},
+  ymin=0, ymax=10,
+  ytick={0,2,4,6,8,10},
+  xtick={2,8,32,128,512,2048,8192},
+  xticklabels={2,8,32,128,512,2048,8192},
+]
+\addplot[TabBlue, thick, mark=*, mark size=1.8pt] coordinates {
+  (8,0.49) (16,0.49) (32,0.49) (64,0.53) (128,0.59) (256,0.71) (384,0.83)
+  (512,0.95) (1024,1.45) (2048,2.40) (3072,3.38) (4096,4.38) (6144,6.30) (8192,8.11)
+};
+\addlegendentry{Cable}
+\addplot[TabOrange, thick, mark=square*, mark size=1.8pt] coordinates {
+  (2,0.70) (4,0.75) (8,0.80) (16,0.89) (32,2.18)
+};
+\addlegendentry{CablePlug}
+\draw[dashed, TabOrange, thick] (axis cs:32,0) -- (axis cs:32,10);
+\node[font=\scriptsize, anchor=south west] at (axis cs:40,7.5)
+  {CablePlug jump at 32 envs};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Cable memory: fixed $\sim$0.5\,GiB baseline for $\leq$32 envs, then grows linearly at $\approx$1\,MiB
+per env. CablePlug memory: small ($\leq$1\,GiB) below 32 envs, then a sharp step to 2.2\,GiB at 32 envs.
+The 48\,GiB A6000 budget is far above either trace.}
+\end{center}
+
+\subsection{Implication}
+
+\begin{itemize}[leftmargin=1.4em, itemsep=0.25em]
+  \item Cable env memory is dominated by a fixed $\sim$0.5\,GiB baseline (network weights, sim app, kit
+        overhead) for env counts up to about 32, then grows linearly with \texttt{num\_envs}
+        ($\approx$1\,MiB per env) once cable storage dominates.
+  \item At 8{,}192 envs Cable uses only 8.1\,GiB --- about 17\% of A6000 VRAM. Memory is not the
+        bottleneck for Cable's throughput plateau at 4{,}096 envs; that plateau is computational.
+  \item CablePlug shows a sharp memory jump from 0.89\,GiB (16 envs) to 2.18\,GiB (32 envs). This is
+        consistent with a per-env workspace that only allocates above a small threshold; the workspace is
+        also the likely source of the super-linear iter-time growth in CablePlug.
+\end{itemize}
+
+\section{Recommended operating points}
+
+\begin{reporttable}
+\begin{tabular}{@{}l c p{0.52\linewidth}@{}}
+\toprule
+\textbf{Task} & \textbf{Recommended num\_envs} & \textbf{Why} \\
+\midrule
+Cable     & 4{,}096 (max throughput) & Throughput peak. \\
+Cable     & 2{,}048 (balanced)       & 92\% of peak at half the iter time. \\
+Cable     & $\leq$1{,}024 (sample efficient) & Per-env throughput $\geq$17 sps/env. \\
+CablePlug & 8--16                    & Throughput peak; above is regression. \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+\vspace{0.8em}
+{\small\color{ReportMuted}%
+All raw per-run JSON and stdout logs are kept under \texttt{/tmp/cable\_scaling/results/}.}
+
+\end{document}

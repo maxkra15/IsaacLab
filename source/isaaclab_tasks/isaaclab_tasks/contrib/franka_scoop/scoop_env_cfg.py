@@ -213,14 +213,14 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     # solver diverge. Target box is parked clear on the +y side (later-stage pour).
     source_center: tuple = (0.32, -0.23, 0.060)
     target_center: tuple = (0.32, 0.22, 0.060)
-    container_inner_half: tuple = (0.14, 0.14, 0.060)
+    container_inner_half: tuple = (0.2, 0.2, 0.060)
     # Wall thickness must stay >= ~1.5 MPM voxels or pile-edge particles seep through the
     # retaining box (the MPM grid cannot represent a sub-voxel solid wall).
     container_wall: float = 0.024
     media_fill_frac: float = 0.80
     # ---- granular pile (source) ----
     pile_box_wall_half: float = 0.015  # retaining-box wall half-height [m] -> 3 cm walls
-    pile_height: float = 0.2250  # natural pile (cone apex) height above the table [m]
+    pile_height: float = 0.50  # natural pile (cone apex) height above the table [m]
     pile_jitter: float = 0.004  # per-particle surface noise on the spawned pile [m]
     # Pile side slope = angle of repose; ~atan(media_material.friction) for dry cohesionless granular media.
 
@@ -258,7 +258,7 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     voxel_size: float = 0.015
     particles_per_cell: float = 2.0  # MPM particle samples per voxel per axis (media spacing = voxel_size / this)
     mpm_iterations: int = 24
-    mpm_grid_padding: int = 8
+    mpm_grid_padding: int = 32
     # On episode reset, restore the per-particle MPM state (elastic strain/transform -> identity, Jp -> 1,
     # APIC velocity gradient/stress -> 0) for the reset envs to its rest values, for a deterministic stress-free
     # fresh pile. NOTE: for the current granular rheology this is effectively a no-op (plastic flow keeps the

@@ -116,6 +116,14 @@ class CoupledSolverEntryCfg:
     in_place: bool = False
     """Step this entry in-place. Only valid for solvers that support it and when :attr:`substeps` is 1."""
 
+    preserve_shape_ids: bool = True
+    """Whether this entry's sub-solver sees shape ids in the parent-model namespace.
+
+    Newton keeps shape ids in the parent namespace by default so contact buffers
+    can be shared across entries. Set ``False`` to expose a compact entry-local
+    shape namespace instead, for sub-solvers that explicitly support it.
+    """
+
 
 @configclass
 class CoupledProxyCfg:
@@ -159,6 +167,16 @@ class CoupledProxyCfg:
 
     mode: Literal["lagged", "staggered"] | int = "lagged"
     """Proxy transfer mode passed to Newton's ``SolverCoupledProxy``."""
+
+    proxy_relaxation: float = 1.0
+    """Relaxation factor for the lagged proxy feedback update.
+
+    The harvested coupling force is blended as ``proxy_relaxation * new +
+    (1 - proxy_relaxation) * old``. Values below ``1`` under-relax the update,
+    which damps the lagged impulse exchange (useful when light free bodies sit
+    in the path of fast-flowing media); ``1`` keeps the harvested force
+    unchanged; values above ``1`` over-relax it.
+    """
 
     collision_pipeline_factory: Callable | None = None
     """Optional factory for a proxy-local collision pipeline.

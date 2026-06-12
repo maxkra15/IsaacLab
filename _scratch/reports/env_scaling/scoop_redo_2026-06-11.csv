@@ -1,0 +1,13 @@
+voxel_mm,grid_type,num_envs,grid_padding,max_active_cells,status,step_ms,env_steps_per_s,steps_per_s_per_env,startup_s,steady_mem_gib,peak_mem_mib,cuda_graph_active,particles_total,wall_s,error
+20.0,fixed,128,8,400000,ok,212.85,601.4,4.7,14.2,10.34,10587,True,289408,43.3,
+20.0,fixed,598,8,473227,ok,535.28,1117.2,1.87,80.1,20.8,21297,True,1352078,148.5,
+20.0,fixed,800,8,633080,ok,742.19,1077.9,1.35,144.8,27.5,28163,True,1808800,238.4,
+20.0,fixed,1024,8,810342,crashed,,,,,,32005,,2315264,229.5,"[ERROR] Command failed with code 1: ""/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_voxel_grid_child.py --headless --voxel 0.02 --grid-type fixed --num-envs 1024 --steps 120 --warmup 20 --max-active-cells 810342 --grid-padding"
+15.0,sparse,1,0,-1,ok,83.76,11.9,11.94,8.2,1.79,1835,False,5817,21.6,
+15.0,sparse,8,0,-1,ok,89.0,89.9,11.24,8.5,1.98,2033,False,46536,22.6,
+15.0,sparse,32,0,-1,ok,92.72,345.1,10.78,9.9,2.51,2599,False,186144,24.5,
+15.0,sparse,128,0,-1,ok,149.8,854.5,6.68,16.2,4.03,4639,False,744576,38.4,
+15.0,sparse,398,0,-1,ok,412.63,964.6,2.42,50.0,8.46,10195,False,2315166,103.9,
+15.0,dense,1,0,-1,crashed,,,,,,30923,,5817,13.7,"[ERROR] Command failed with code 1: ""/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_voxel_grid_child.py --headless --voxel 0.015 --grid-type dense --num-envs 1 --steps 120 --warmup 20 --max-active-cells -1 --grid-padding 0 --c"
+15.0,sparse,48,8,-1,crashed,,,,,,30135,,279216,27.2,"[ERROR] Command failed with code 1: ""/home/maximiliank/Work/IsaacLab-coupling/env_isaaclab/bin/python /home/maximiliank/Work/IsaacLab-coupling/_scratch/bench_voxel_grid_child.py --headless --voxel 0.015 --grid-type sparse --num-envs 48 --steps 120 --warmup 20 --max-active-cells -1 --grid-padding 8 -"
+15.0,sparse,48,0,-1,ok,96.8,495.9,10.33,10.7,2.74,2871,False,279216,25.8,
