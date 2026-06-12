@@ -41,6 +41,31 @@ gym.register(
 
 
 ##
+# Newton Inverse Kinematics - Relative Pose Control
+##
+
+gym.register(
+    id="Isaac-Reach-Franka-Newton-IK-Rel",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ik_newton_env_cfg:FrankaReachEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaReachNewtonIKPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Reach-Franka-Newton-IK-Rel-Play",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ik_newton_env_cfg:FrankaReachEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaReachNewtonIKPPORunnerCfg",
+    },
+)
+
+
+##
 # Operational Space Control
 ##
 

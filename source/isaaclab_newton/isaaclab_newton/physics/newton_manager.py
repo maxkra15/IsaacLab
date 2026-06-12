@@ -13,7 +13,6 @@ import inspect
 import logging
 from abc import abstractmethod
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -54,17 +53,6 @@ if TYPE_CHECKING:
     from .newton_collision_cfg import NewtonCollisionPipelineCfg
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class NewtonPrototypeModelInfo:
-    """Cached Newton prototype model built before physics replication."""
-
-    source_path: str
-    destination_path: str
-    builder: ModelBuilder
-    model: Model | None = None
-    model_device: object | None = None
 
 
 # Tagged union for entries in _cl_site_index_map.
@@ -203,7 +191,6 @@ class NewtonManager(PhysicsManager):
     # Newton model and state
     _builder: ModelBuilder = None
     _model: Model = None
-    _prototype_models: dict[str, NewtonPrototypeModelInfo] = {}
     _solver: SolverBase | None = None
     _use_single_state: bool | None = None
     """Use only one state for both input and output for solver stepping. Requires solver support."""
@@ -293,6 +280,12 @@ class NewtonManager(PhysicsManager):
     _SiteEntry = _GlobalSite | _LocalSite
     _cl_site_index_map: dict[str, _SiteEntry] = {}
     _world_xforms: list[wp.transform] | None = None
+
+    # Per-source prototype builders produced during replication, keyed by the
+    # clone-plan source path. Retained (not re-imported) so single-model
+    # consumers such as batched Newton IK can finalize a single-env model and
+    # resolve it via ``isaaclab.cloner.resolve_clone_plan_source``.
+    _cl_protos: dict[str, ModelBuilder] = {}
 
     @classmethod
     def initialize(cls, sim_context: SimulationContext) -> None:
@@ -729,7 +722,6 @@ class NewtonManager(PhysicsManager):
         NewtonManager._cubric_bound_fabric_id = None
         NewtonManager._builder = None
         NewtonManager._model = None
-        NewtonManager._prototype_models = {}
         NewtonManager._solver = None
         NewtonManager._use_single_state = None
         NewtonManager._state_0 = None
@@ -769,6 +761,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._up_axis = "Z"
         NewtonManager._scene_data = None
         NewtonManager._scene_data_mapping = None
+        NewtonManager._cl_protos = {}
         NewtonManager._model_changes = set()
         NewtonManager._scene_data_backend = None
         NewtonManager._cl_pending_sites = {}
@@ -783,78 +776,6 @@ class NewtonManager(PhysicsManager):
     def set_builder(cls, builder: ModelBuilder) -> None:
         """Set the Newton model builder."""
         NewtonManager._builder = builder
-
-    @classmethod
-    def register_prototype_builders(
-        cls,
-        sources: list[str] | tuple[str, ...],
-        destinations: list[str] | tuple[str, ...],
-        proto_builders: dict[str, ModelBuilder],
-    ) -> None:
-        """Register prototype builders created before Newton physics replication.
-
-        Prototype builders preserve the single-source model that is later added
-        into each replicated Newton world. Controllers that need a single-model
-        representation, such as batched Newton IK, should use this registry
-        instead of re-importing USD after the scene has already been built.
-        """
-        for index, source_path in enumerate(sources):
-            builder = proto_builders.get(source_path)
-            if builder is None:
-                continue
-            destination_path = destinations[index] if index < len(destinations) else destinations[-1]
-            NewtonManager._prototype_models[source_path] = NewtonPrototypeModelInfo(
-                source_path=source_path,
-                destination_path=destination_path,
-                builder=builder,
-            )
-
-    @staticmethod
-    def _to_first_env_path(path: str) -> str:
-        """Convert common Isaac Lab env regex/template paths to env_0 paths."""
-        return (
-            path.replace("env_.*", "env_0")
-            .replace("env_\\d+", "env_0")
-            .replace("env_*", "env_0")
-            .replace("env_{}", "env_0")
-        )
-
-    @classmethod
-    def get_prototype_model(cls, prim_path: str) -> NewtonPrototypeModelInfo:
-        """Return the prototype model that owns ``prim_path``."""
-        if not NewtonManager._prototype_models:
-            raise RuntimeError(
-                "No Newton prototype builders are registered. Prototype access is only available after "
-                "Newton physics replication has built the scene."
-            )
-
-        requested_path = cls._to_first_env_path(prim_path)
-        matches: list[NewtonPrototypeModelInfo] = []
-        for info in NewtonManager._prototype_models.values():
-            source_path = cls._to_first_env_path(info.source_path)
-            destination_path = cls._to_first_env_path(info.destination_path)
-            if requested_path in (source_path, destination_path) or requested_path.startswith(
-                (source_path + "/", destination_path + "/")
-            ):
-                matches.append(info)
-
-        if not matches:
-            available = ", ".join(sorted(NewtonManager._prototype_models))
-            raise KeyError(f"No Newton prototype model matches '{prim_path}'. Available prototypes: {available}")
-
-        matches.sort(key=lambda item: len(cls._to_first_env_path(item.source_path)), reverse=True)
-        if len(matches) > 1:
-            best_len = len(cls._to_first_env_path(matches[0].source_path))
-            if len(cls._to_first_env_path(matches[1].source_path)) == best_len:
-                paths = ", ".join(match.source_path for match in matches)
-                raise ValueError(f"Ambiguous Newton prototype model for '{prim_path}'. Matches: {paths}")
-
-        info = matches[0]
-        device = cls._model.device if cls._model is not None else None
-        if info.model is None or info.model_device != device:
-            info.model = info.builder.finalize(device=device)
-            info.model_device = device
-        return info
 
     @classmethod
     def create_builder(cls, up_axis: str | None = None, **kwargs) -> ModelBuilder:
@@ -1439,6 +1360,7 @@ class NewtonManager(PhysicsManager):
                 root_path=proto_path,
                 schema_resolvers=schema_resolvers,
             )
+            cls._cl_protos = {proto_path: proto}
 
             # Inject registered sites into the proto before replication
             global_sites, proto_sites, world_sites = cls._cl_inject_sites(builder, {proto_path: proto})

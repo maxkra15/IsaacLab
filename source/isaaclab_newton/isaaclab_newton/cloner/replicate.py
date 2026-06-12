@@ -415,9 +415,9 @@ class NewtonReplicateContext:
         if self.commit_to_manager:
             NewtonManager._cl_site_index_map = site_index_map
             NewtonManager._world_xforms = world_xforms
-            # Re-thread the branch's prototype registration onto develop's NewtonReplicateContext so
-            # NewtonManager.get_prototype_model (used by the Newton IK / scoop env) keeps working.
-            NewtonManager.register_prototype_builders(sources, destinations, protos)
+            # Retain the per-source prototype builders so single-model consumers
+            # (batched Newton IK) can finalize a single-env model later.
+            NewtonManager._cl_protos = protos
             NewtonManager.set_builder(builder)
             NewtonManager._num_envs = mapping.size(1)
         self._queue.clear()

@@ -40,3 +40,9 @@ class FrankaReachPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class FrankaReachNewtonIKPPORunnerCfg(FrankaReachPPORunnerCfg):
+    experiment_name = "reach_franka_newton_ik_rel"
+    clip_actions = 1.0
