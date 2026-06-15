@@ -3,14 +3,17 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""IsaacTeleop retargeting pipelines for the waterhose task.
+"""Preserved, known-working IsaacTeleop retargeting pipelines for the waterhose task.
 
-These follow the framework's idiomatic conventions (retargeters keyed by the
-device source constants ``ControllersSource.RIGHT`` / ``HandsSource.RIGHT``,
-matching the reference manipulation teleop tasks). The previous, known-working
-variants are preserved verbatim in :mod:`.teleop_pipelines_legacy`; if a change
-here ever regresses the live XR session, switch the imports in
-:mod:`.waterhose_env_cfg` back to that module to restore the old behavior.
+These are the exact pipeline builders that were validated to work on the XR/VR
+path before :mod:`.teleop_pipelines` was refactored toward the framework's
+idiomatic conventions (source-constant connection keys, etc.). They are kept
+verbatim as a fallback: if a future best-practices change regresses the live XR
+session, swap the imports in :mod:`.waterhose_env_cfg` from ``teleop_pipelines``
+to ``teleop_pipelines_legacy`` to restore this behavior exactly.
+
+Do not "clean up" this module -- its value is being a byte-for-byte snapshot of
+the working setup.
 """
 
 from __future__ import annotations
@@ -114,14 +117,9 @@ def build_waterhose_relative_teleop_pipeline():
             }
 
         def _compute_fn(self, inputs, outputs, context) -> None:
-            # Keep only the first rotation-vector component (the twist the operator uses to
-            # line the connector up with the bore) and zero the other two, so wrist wobble
-            # does not fight the insertion. The mask is applied to the retargeter's anchor-
-            # frame rotvec; the relative IK action then conjugates it into the end-effector
-            # frame (see WaterhoseLocalFrameNewtonInverseKinematicsAction). Translation
-            # (indices 0:3) passes through unchanged.
             delta = np.asarray(inputs["ee_delta"][0], dtype=np.float32).flatten()
             remapped = delta.copy()
+            remapped[3] = delta[3]
             remapped[4] = 0.0
             remapped[5] = 0.0
             outputs["ee_delta"][0] = remapped
@@ -149,12 +147,10 @@ def build_waterhose_relative_teleop_pipeline():
 
     gripper_cfg = GripperRetargeterConfig(hand_side="right")
     gripper = GripperRetargeter(gripper_cfg, name="gripper")
-    # Key the gripper inputs by the device source constants (idiomatic; matches the
-    # reference manipulation teleop tasks) rather than free-form alias strings.
     connected_gripper = gripper.connect(
         {
-            HandsSource.RIGHT: hands.output(HandsSource.RIGHT),
-            ControllersSource.RIGHT: controllers.output(ControllersSource.RIGHT),
+            "hand_right": hands.output(HandsSource.RIGHT),
+            "controller_right": controllers.output(ControllersSource.RIGHT),
         }
     )
 
