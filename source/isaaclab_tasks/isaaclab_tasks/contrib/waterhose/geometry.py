@@ -45,6 +45,17 @@ _SNAP_ANCHOR_SETBACK = 0.05
 _BORE_AXIS = (0.0, -0.342020, 0.939693)  # SOCKET_ROT applied to +Z (20 deg about +X)
 SOCKET_SNAP_ANCHOR_BODY_POS = tuple(p - _SNAP_ANCHOR_SETBACK * a for p, a in zip(SOCKET_SNAP_ANCHOR_POS, _BORE_AXIS))
 SOCKET_SNAP_ANCHOR_LOCAL_OFFSET = (0.0, 0.0, _SNAP_ANCHOR_SETBACK)
+# Orientation of the kinematic snap-lock anchor body (xyzw, fed to InitialStateCfg.rot).
+# This is deliberately the raw SOCKET_ROT_QUAT_WXYZ tuple, NOT SOCKET_ROT_QUAT_XYZW. It looks
+# like a wxyz/xyzw mistake, but it is the long-standing, most-tested value: the snap geometry
+# above (measured pin point, setback, local offset) was calibrated with the anchor at the
+# orientation this tuple produces when consumed as xyzw, and it has the most stable evidence.
+# Swapping to the nominal xyzw socket orientation showed no stability benefit in testing, so
+# leave it as-is. NOTE: the snap-lock *engagement* in HOLD_INSERTED is marginally unstable in
+# its own right under either orientation (the soft latch occasionally drifts the inserted plug
+# and the cable diverges ~mid-HOLD_INSERTED, run-dependent) -- that is a separate open tuning
+# item, unmasked once the ALIGN coaxial-axis fix let the demo reach insertion reliably.
+SOCKET_SNAP_ANCHOR_ROT = SOCKET_ROT_QUAT_WXYZ
 SOCKET_COLLISION_XFORM_SUFFIX = "/Cable008/SocketCollision"
 SOCKET_COLLISION_MESH_SUFFIX = f"{SOCKET_COLLISION_XFORM_SUFFIX}/Cable008_SocketCollision"
 SOCKET_COLLISION_MESH_PATTERN = rf".*/Fridge{SOCKET_COLLISION_MESH_SUFFIX}.*"

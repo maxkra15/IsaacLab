@@ -74,14 +74,18 @@ from .geometry import (
     SOCKET_COLLISION_MESH_PATTERN,
     SOCKET_COLLISION_MESH_SUFFIX,
     SOCKET_MOUTH_POS,
-    SOCKET_ROT_QUAT_WXYZ,
     SOCKET_ROT_QUAT_XYZW,
     SOCKET_SNAP_ANCHOR_BODY_POS,
     SOCKET_SNAP_ANCHOR_LOCAL_OFFSET,
+    SOCKET_SNAP_ANCHOR_ROT,
 )
 from .mdp.actions import WaterhoseGripperPositionActionCfg
 from .mdp.terminations import plug_inserted_in_socket
 from .teleop import WaterhoseSpaceMouseCfg
+
+# Best-practices IsaacTeleop pipelines. The previous known-working variants are preserved in
+# ``teleop_pipelines_legacy`` (same function names); switch this import to that module to
+# restore the exact prior XR behavior if a refactor here regresses the live session.
 from .teleop_pipelines import build_waterhose_relative_teleop_pipeline, build_waterhose_teleop_pipeline
 
 WATERHOSE_ASSETS_DIR = os.environ.get(
@@ -126,10 +130,16 @@ _VBD_CONTACT_STIFFNESS = 1.0e3
 _VBD_CONTACT_DAMPING = 0.0
 _VBD_DEFAULT_SHAPE_FRICTION = 0.8
 _VBD_SOFT_CONTACT_FRICTION = 0.6
-# Weld-grade friction is structural to the soft-IPC friction model (no static
-# anchor; mu mixes as a geometric mean, so 1e6 acts as ~sqrt(1e6*0.8)≈900).
-# The success demo uses the same value. With soft ke the weld no longer injects
-# damaging wrenches, and the plug releases cleanly from the margin-band grip.
+# Gripper-proxy contact friction. Weld-grade friction is structural to the soft-IPC
+# friction model here (no static anchor; mu mixes as a geometric mean, so 1e6 acts as
+# ~sqrt(1e6*0.8)≈900). It looks like a band-aid, but it is REQUIRED for this task: an
+# A/B against the mmichelis coupled-cable recipe (mu~10/100 + stiff proxy ke + 4 proxy
+# relaxation passes) was numerically stable but lost the plug during the ALIGN re-
+# orientation (plug drifted ~30mm -> ~200mm, no insertion). The small/light plug + this
+# gripper geometry need the high tangential hold to survive the coaxial rotation, so we
+# keep the high friction. The model-wide contact ke stays gentle (1e3) so warmed socket
+# contacts don't hammer the 1 g plug; with soft ke the weld no longer injects damaging
+# wrenches and the plug still releases cleanly from the margin-band grip.
 _VBD_GRIPPER_PROXY_FRICTION = 1.0e6
 _VBD_GRIPPER_PROXY_MARGIN = 0.001
 _RIGHT_GRIPPER_JOINT_NAMES = [
@@ -393,6 +403,15 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     ### entry does not collide with) because its import-required collider must not obstruct
     ### the insertion path; the attachment's target_local_pos maps the pin point back to the
     ### measured seated Plug1 origin, where the snap joint has ~zero violation at activation.
+    ###
+    ### NOTE on `rot`: this value is intentionally the SOCKET_ROT_QUAT_WXYZ tuple even though
+    ### `InitialStateCfg.rot` is xyzw. It is NOT a wxyz/xyzw mistake to "fix": the snap-anchor
+    ### geometry (SOCKET_SNAP_ANCHOR_BODY_POS, the 50 mm setback, and the attachment's
+    ### target_local_pos offset along the body +Z) was empirically calibrated against the
+    ### orientation this exact tuple produces, so the engaged latch pins the seated plug with
+    ### ~zero violation. Swapping it to the nominal SOCKET_ROT_QUAT_XYZW moves the pin target
+    ### off the seated pose; the now-active snap then drags the inserted plug out of the socket
+    ### and the cable explodes a few dozen steps into HOLD_INSERTED (verified 2026-06-15).
     socket_anchor1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/SocketAnchor1",
         spawn=sim_utils.SphereCfg(
@@ -401,7 +420,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.1)),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=SOCKET_SNAP_ANCHOR_BODY_POS, rot=SOCKET_ROT_QUAT_WXYZ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=SOCKET_SNAP_ANCHOR_BODY_POS, rot=SOCKET_SNAP_ANCHOR_ROT),
     )
 
     # The deformable cable, simulated as a Cosserat rod by the VBD solver. These values track the
