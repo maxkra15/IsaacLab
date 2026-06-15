@@ -439,7 +439,14 @@ class WaterhoseDemoState:
 
         plug_state_pose = wp.to_torch(_NM._state_0.body_q)[self._snap_plug_gids]
         cable_tip_quat_w = normalize(plug_state_pose[:, 3:7])
-        cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self.connector_axis_local))
+        # The coaxial-alignment axis must point "back along the hose" to match the
+        # ``-ins_dir`` convention below (the original axis was read from the cable
+        # head segment, whose local +Z points back along the hose). The plug body is
+        # welded to that segment rotated ~180 deg, so the plug's +Z points the other
+        # way (toward the connector tip); use the plug's -Z to recover the hose-back
+        # axis. Reading the plug's +Z here (as the gating tip position does) silently
+        # flipped the ALIGN orientation target ~180 deg and made ALIGN diverge.
+        cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self._vec((0.0, 0.0, -1.0))))
         cable_tip_pos_w = plug_state_pose[:, :3] + quat_apply(
             cable_tip_quat_w, self._vec((0.0, 0.0, CONNECTOR_TIP_LEN))
         )
