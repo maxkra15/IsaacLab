@@ -146,9 +146,6 @@ parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--max_steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum manager steps to run.")
 parser.add_argument(
-    "--max_demo_steps", type=int, default=-1, help="Optional env-level termination bound; 0 disables it."
-)
-parser.add_argument(
     "--settle_time", type=float, default=2.0, help="Initial settle time for scene-config scripted IK demos."
 )
 parser.add_argument(
@@ -182,8 +179,6 @@ def _configure_env_cfg(env_cfg) -> None:
     from isaaclab_newton.physics import NewtonCfg  # noqa: PLC0415
 
     env_cfg.scene.num_envs = int(args_cli.num_envs)
-    if hasattr(env_cfg, "max_demo_steps"):
-        env_cfg.max_demo_steps = int(args_cli.max_demo_steps)
     if _task_id() in SCENE_CONFIG_SCRIPTED_TASKS:
         # The scripted demo plays the full grasp -> insert -> release -> pull-out arc
         # and stops itself once the state machine reaches DONE. Env-level resets must

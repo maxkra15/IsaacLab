@@ -14,6 +14,10 @@
 **/*.usdc
 **/*.usdz
 
+# Exception: the waterhose demo ships its required USDs in-tree (LFS) so the customer
+# handoff is self-contained. Keep them tracked instead of relying on force-add.
+!source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/**/*.usda
+
 # Waterhose demo assets are distributed as an unpacked local bundle, not tracked in git.
 /source/isaaclab_assets/data/WaterhoseDemo/
 /source/isaaclab_assets/data/Props/Waterhose/
