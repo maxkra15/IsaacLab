@@ -157,6 +157,13 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     arm_home: tuple = (-0.3268, -0.3751, -0.2812, -2.8079, -0.3870, 1.9367, 0.4461)
     arm_stiffness: float = 600.0
     arm_damping: float = 50.0
+    # Reflected rotor inertia added to every arm joint. The coupled solver runs explicit Euler at
+    # the 1/120 s substep (implicitfast diverges the MPM coupling), so the PD damping must satisfy
+    # kd*dt/I < 2. At the stock armature 0.1 the low-inertia distal joints sat ABOVE that bound and
+    # the arm held a sustained ~1 rad/s limit-cycle jitter (the visible teleop "wobble") that
+    # sloshed the cup empty. 0.5 lifts I 5x -> kd*dt/I ~ 0.7 with margin, dropping the held-pose
+    # jitter ~28x without lowering the damping authority needed for tracking.
+    arm_armature: float = 0.5
     hide_robot_visual_shapes_in_newton: bool = False  # show the robot's visual meshes in the Newton viewer too.
 
     # ---- scoop-bowl EE (gripped cup; home orientation is exactly opening-up) ----
@@ -304,7 +311,14 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
     # constraint's knife edge, and parallel-sim floating-point noise then diverges the
     # (identical) envs macroscopically within a few steps.
     reset_ik_joint_limit_weight: float = 200.0
-    ik_backend: str = "newton"  # "newton" full-pose LM IK (single warm-started seed) or "diffik" single-step DLS
+    # Runtime control IK ONLY. The reset/initial pose always uses the Newton multi-seed solver
+    # (branch-finding for the loaded curriculum poses); ``ik_backend`` selects how the per-step
+    # bowl-pose command is tracked during the episode. Default "diffik": one damped-least-squares
+    # Jacobian step per control step (the standard IsaacLab teleop/RL controller, ~3x cheaper than
+    # the Newton LM solve and stateless-feeling). "newton" = full-pose LM (single warm-started seed),
+    # kept available for the highest orientation-tracking fidelity.
+    ik_backend: str = "diffik"
+    diffik_lambda: float = 0.05
     diffik_lambda: float = 0.05
     diffik_max_delta: float = 0.05  # per-step joint delta clamp for DiffIK runtime tracking [rad]
     max_ik_delta: float = 0.05  # full-IK runtime joint delta clamp [rad]; 0 disables it.
@@ -424,7 +438,7 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
         for actuator_name in ("panda_shoulder", "panda_forearm"):
             self.scene.robot.actuators[actuator_name].stiffness = self.arm_stiffness
             self.scene.robot.actuators[actuator_name].damping = self.arm_damping
-            self.scene.robot.actuators[actuator_name].armature = 0.1
+            self.scene.robot.actuators[actuator_name].armature = self.arm_armature
 
         self.sim.physics = NewtonCfg(
             solver_cfg=CoupledSolverCfg(
@@ -460,6 +474,7 @@ class FrankaScoopEnvCfg(ManagerBasedRLEnvCfg):
                             max_iterations=self.mpm_iterations,
                             collider_velocity_mode="backward",
                             solver="gauss-seidel",
+                            project_outside_colliders=True,
                         ),
                         all_particles=True,
                         body_label_patterns=[
@@ -502,15 +517,14 @@ class FrankaScoopEnvCfg_PLAY(FrankaScoopEnvCfg):
 
 @configclass
 class FrankaScoopEnvCfg_TELEOP(FrankaScoopEnvCfg_PLAY):
-    """Lift-style teleop feel: low-lag, stateless-feeling, accurately tracked.
+    """Lift-style teleop feel: low-lag, stateless-feeling DLS control.
 
-    Mirrors the Franka cube-lift ``ik_rel`` teleop interface as closely as the scoop action
-    allows: no action smoothing, a faster Cartesian rate, a looser per-step joint clamp, and
-    the commanded target is HELD through zero-action frames instead of snapping to the
-    achieved pose. The IK stays on the Newton full-pose solver: single-step DLS (the lift
-    teleop controller) cannot track the composed pitch+yaw orientation here (54 deg
-    steady-state error, sloshing the tilted cup empty), while the held Newton solve tracks
-    it and retains the cup load through yaw-and-pour maneuvers.
+    Mirrors the Franka cube-lift ``ik_rel`` teleop interface: the inherited ``diffik`` runtime
+    backend (single-step damped-least-squares, the same controller the lift teleop uses), no
+    action smoothing, a faster Cartesian rate, a looser per-step joint clamp, and the commanded
+    target HELD through zero-action frames so the arm keeps converging to the last command
+    instead of snapping to the achieved pose. The reset/initial pose still uses the Newton
+    multi-seed solver (branch-finding for the loaded curriculum start).
     """
 
     def __post_init__(self):
