@@ -1,6 +1,6 @@
 # Waterhose Robot Demo
 
-Last verified: 2026-06-10.
+Last verified: 2026-06-15.
 
 This customer-facing branch is `max/waterhose-coupled-experimental`. It supersedes the earlier
 `waterhose-demo` branch used for the first package handoff.
@@ -21,6 +21,7 @@ waterhose/
   scripted_state_machine.py
   teleop.py
   teleop_pipelines.py
+  teleop_pipelines_legacy.py
   waterhose_env_cfg.py
   assets/
   mdp/
@@ -29,15 +30,20 @@ waterhose/
       __init__.py
       coupled_env_cfg.py
       teleop_env_cfg.py
+      admm_env_cfg.py
       agents/
 ```
 
-The package exposes two public task variants:
+The package exposes two supported task variants:
 
 | Task ID | Purpose |
 | --- | --- |
 | `Isaac-Waterhose-Coupled-v0` | Client-facing RBY1DF waterhose demo using Newton proxy coupling and absolute Newton IK actions for scripted demo and XR. |
 | `Isaac-Waterhose-Coupled-Teleop-v0` | Same coupled scene with relative Newton IK actions and `env_cfg.teleop_devices` for native keyboard/SpaceMouse teleop. |
+
+A third task, `Isaac-Waterhose-Admm-v0` (`admm_env_cfg.py`), is also registered but is an
+**experimental** ADMM-coupling variant used for internal solver experiments; it is not part of
+the supported demo and may be unstable.
 
 The coupled task is the default and primary demo path. The previous local
 `Isaac-Waterhose-Kinematic-v0` workaround has been removed so the demo exercises the real two-way
@@ -80,9 +86,12 @@ cd waterhose-demo/IsaacLab-waterhose
 Isaac Sim, creates `.venv`, installs the full Isaac Lab workspace with `isaaclab.sh -i all`, unpacks
 the demo assets, and runs a short headless smoke check unless `--skip-smoke` is passed.
 
-Newton is pinned in the source tree to upstream Newton PR 2848 commit
-`97d745063ff5556032a09a7c7f5699032f2de053`, resolved on 2026-06-10. The setup does not depend on
-`/home/maximiliank/Work/newton-coupled` or any other local Newton edits.
+Newton is pinned in the source tree to upstream Newton PR 2848 (coupled-solver) commit
+`6409c9f454a8222ca5ab7119eb5102148aab0af5`, resolved on 2026-06-15. A fresh handoff install
+resolves this commit from GitHub via the pyproject pin and does not require any local Newton
+checkout. (A developer machine may additionally `pip install -e` a local Newton checkout that
+carries an extra, not-yet-upstreamed "immovable proxy" patch, but the waterhose demo does not
+use it, so the pinned commit alone is sufficient.)
 
 The setup script intentionally does not wrap runtime commands. Run demo, profile, and teleop commands
 directly from the `waterhose-demo/IsaacLab-waterhose` checkout so the task, device, CloudXR profile,
@@ -269,7 +278,6 @@ Required files:
 fridge/fridge.usda
 fridge/fridge_waterhose.usda
 fridge/cable/cable001.usda
-fridge/cable/cable002.usda
 fridge/cable/plug.usda
 rby1df/rby1df.usda
 rby1df/rby1df_waterhose.usda
