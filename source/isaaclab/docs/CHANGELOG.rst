@@ -1,6 +1,35 @@
 Changelog
 ---------
 
+7.0.1 (2026-06-14)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Updated the ``newton`` extra installation message to list the Newton GL
+  viewer's ``pyglet`` dependency.
+
+Fixed
+^^^^^
+
+* Fixed SimulationContext reset ordering so initial visualizers are created before the timeline play event pump can invalidate freshly created PhysX tensor views.
+* Fixed Pink IK USD-to-URDF conversion to use Isaac Sim's URDF exporter instead of the unavailable ``nvidia.srl`` package.
+
+
+7.0.0 (2026-06-13)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed the core ``warp-lang`` dependency pin for compatibility with latest Newton.
+* Fixed the core ``usd-core`` dependency pin to stay on the Isaac Sim compatible USD ABI.
+* Fixed the wheel-builder ``newton[sim]`` dependency pin to use Newton commit
+  ``811968bfb7cc7ff4e37b9260a2ba56930a3e605e``.
+* Prevented MARL adapter wrappers from raising destructor tracebacks when destroyed by setting their environment lifecycle state explicitly.
+
+
 6.8.0 (2026-06-12)
 ~~~~~~~~~~~~~~~~~~
 

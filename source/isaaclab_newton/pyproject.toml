@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "isaaclab_newton"
-version = "0.16.0"
+version = "1.0.1"
 description = "Extension providing IsaacLab with Newton specific abstractions."
 license = {text = "BSD-3-Clause"}
 authors = [{name = "Isaac Lab Project Developers"}]
@@ -26,11 +26,16 @@ Repository = "https://github.com/isaac-sim/IsaacLab"
 all = [
     "prettytable>=3.3.0",
     "PyOpenGL-accelerate>=3.1.0",
+    "pyglet>=2.1.6,<3",
     # RBY1DF's URDF still references a Collada visual mesh. This can be
     # removed once the demo robot is switched to a USD asset.
     "pycollada",
-    # Verified upstream Newton PR 2848 commit until the coupled-solver API lands in a release.
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@97d745063ff5556032a09a7c7f5699032f2de053",
+    # Newton PR 2848 (coupled-solver framework) head; supersedes develop's
+    # plain-main pin (811968bf is an ancestor of this commit). Required for the
+    # waterhose two-way coupling layer until the coupled-solver API lands in a
+    # release. The local newton-coupled checkout carries one additional, not-yet-
+    # upstreamed patch (immovable one-way proxy mode) not needed by this demo.
+    "newton[sim] @ git+https://github.com/newton-physics/newton.git@6409c9f454a8222ca5ab7119eb5102148aab0af5",
 ]
 
 [tool.setuptools]
