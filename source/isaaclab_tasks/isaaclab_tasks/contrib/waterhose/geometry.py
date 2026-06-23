@@ -33,32 +33,19 @@ CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z = 0.022
 SOCKET_MOUTH_POS = (-0.259345, 0.344709, 0.28698)
 SOCKET_ROT_QUAT_WXYZ = (0.984808, 0.173648, 0.0, 0.0)
 SOCKET_ROT_QUAT_XYZW = quat_xyzw_from_wxyz(SOCKET_ROT_QUAT_WXYZ)
-# Seated Plug1 origin, measured at HOLD_INSERTED (instrumented run, tip 4 mm into the bore).
-# This is the snap-lock PIN POINT: the dormant fixed joint pulls the plug origin here, so it
-# has ~zero linear violation at the moment it is activated.
-SOCKET_SNAP_ANCHOR_POS = (-0.258298, 0.345281, 0.276657)
-# The anchor BODY must not sit at the pin point: its (import-required) collider would block
-# the arriving plug. Park it 50 mm behind the mouth along the bore axis (inside the fridge,
-# which the VBD entry does not collide with) and map the pin point back via the attachment's
-# target_local_pos — the anchor rot maps +Z onto the bore axis, so the local offset is +50 mm Z.
-_SNAP_ANCHOR_SETBACK = 0.05
-_BORE_AXIS = (0.0, -0.342020, 0.939693)  # SOCKET_ROT applied to +Z (20 deg about +X)
-SOCKET_SNAP_ANCHOR_BODY_POS = tuple(p - _SNAP_ANCHOR_SETBACK * a for p, a in zip(SOCKET_SNAP_ANCHOR_POS, _BORE_AXIS))
-SOCKET_SNAP_ANCHOR_LOCAL_OFFSET = (0.0, 0.0, _SNAP_ANCHOR_SETBACK)
-# Orientation of the kinematic snap-lock anchor body (xyzw, fed to InitialStateCfg.rot).
-# This is deliberately the raw SOCKET_ROT_QUAT_WXYZ tuple, NOT SOCKET_ROT_QUAT_XYZW. It looks
-# like a wxyz/xyzw mistake, but it is the long-standing, most-tested value: the snap geometry
-# above (measured pin point, setback, local offset) was calibrated with the anchor at the
-# orientation this tuple produces when consumed as xyzw, and it has the most stable evidence.
-# Swapping to the nominal xyzw socket orientation showed no stability benefit in testing, so
-# leave it as-is. NOTE: the snap-lock *engagement* in HOLD_INSERTED is marginally unstable in
-# its own right under either orientation (the soft latch occasionally drifts the inserted plug
-# and the cable diverges ~mid-HOLD_INSERTED, run-dependent) -- that is a separate open tuning
-# item, unmasked once the ALIGN coaxial-axis fix let the demo reach insertion reliably.
-SOCKET_SNAP_ANCHOR_ROT = SOCKET_ROT_QUAT_WXYZ
 SOCKET_COLLISION_XFORM_SUFFIX = "/Cable008/SocketCollision"
 SOCKET_COLLISION_MESH_SUFFIX = f"{SOCKET_COLLISION_XFORM_SUFFIX}/Cable008_SocketCollision"
 SOCKET_COLLISION_MESH_PATTERN = rf".*/Fridge{SOCKET_COLLISION_MESH_SUFFIX}.*"
+
+# The connector-housing body collision is authored two ways under Fridge/Cable008. The robot
+# (MJWarp entry) collides with the per-fragment convex hulls under Collisions/Cable008_Collider* --
+# cheap, accurate convex collision in MuJoCo-Warp. The deformable hose (VBD entry) instead collides
+# with a single welded mesh under BodyCollision/Cable008_BodyCollision, so the per-substep
+# particle-vs-shape soft-contact pass runs over one shape rather than the full hull set (the cost
+# scales with the shape count). Both are world-static shapes (shape_body < 0); each entry selects
+# its own representation by label so the robot does not also pick up the (concave) welded mesh.
+FRIDGE_BODY_COLLISION_MESH_PATTERN = r".*/Fridge/Cable008/Collisions/Cable008_Collider\d+.*"
+FRIDGE_BODY_WELDED_MESH_PATTERN = r".*/Fridge/Cable008/BodyCollision/Cable008_BodyCollision.*"
 
 # Grasp point relative to the plug frame. The offset is biased toward the fridge/socket side of the
 # plug flange so the full finger pad, not just its trailing edge, carries the plug.

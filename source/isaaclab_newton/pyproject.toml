@@ -35,7 +35,7 @@ all = [
     # waterhose two-way coupling layer until the coupled-solver API lands in a
     # release. The local newton-coupled checkout carries one additional, not-yet-
     # upstreamed patch (immovable one-way proxy mode) not needed by this demo.
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@6409c9f454a8222ca5ab7119eb5102148aab0af5",
+    "newton[sim] @ git+https://github.com/newton-physics/newton.git@526b36396777c18b82af8f30c4693b7c8bb4d89d",
 ]
 
 [tool.setuptools]

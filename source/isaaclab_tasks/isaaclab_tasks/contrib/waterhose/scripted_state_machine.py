@@ -3,17 +3,17 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Scripted IK state machine for the RBY1 waterhose pick-insert-extract demo.
+"""Scripted IK state machine for the RBY1 waterhose grasp-and-insert demo.
 
-Phases: REST -> APPROACH -> ENGAGE -> GRASP -> HOLD_GRASP -> RETRACT -> SETTLE ->
-CARRY -> ALIGN -> INSERT -> HOLD_INSERTED -> RELEASE -> BACKOFF -> REAPPROACH ->
-REGRASP -> PULL_OUT -> DONE.
+Phases: ``REST -> APPROACH -> ENGAGE -> GRASP -> HOLD_GRASP -> RETRACT -> SETTLE ->
+CARRY -> ALIGN -> INSERT -> HOLD_INSERTED -> RELEASE -> BACKOFF -> DONE``.
 
-Design (deliberately simple and robust):
-
-* Each phase has a fixed *duration* and computes a single EE *target pose* from a
-  snapshot taken on phase entry, plus a fixed geometric offset; the commanded pose
-  is a smoothstep blend from the entry pose to the target.
+Each phase has a fixed minimum *duration* and a single end-effector *target pose* derived
+from a snapshot taken on phase entry plus a fixed geometric offset. The commanded pose is a
+smoothstep blend from the entry pose to the target, and a phase advances once its minimum
+duration has elapsed and the end effector has converged (or a hard timeout fires). The output
+is the action vector consumed by the task's IK action term: an absolute right end-effector
+pose ``[pos(3), quat_xyzw(4)]`` followed by the normalized gripper command.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ from .geometry import (
     PLUG_GRASP_OFFSET,
     RIGHT_GRIPPER_EE_FRAME_POS,
     RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
-    SOCKET_COLLISION_MESH_PATTERN,
     SOCKET_MOUTH_POS,
     SOCKET_ROT_QUAT_XYZW,
 )
@@ -45,25 +44,6 @@ from .geometry import (
 # Gripper command convention used by the IK action term: +1 fully open, -1 fully closed.
 _GRIPPER_OPEN = 1.0
 _GRIPPER_CLOSED = -1.0
-
-# Insertion snap-lock gains. The pin engages with ~1 mm of violation against the authored
-# anchor, so a hard-engaged stiff spring kicks the 1 g plug violently (1e7 N/m at 1 mm is a
-# 10 kN impulse — measured 50-100 m/s explosion). Instead seed the penalty soft and let the
-# AVBD stiffness ramp (rigid_avbd_beta) pull it to the ceiling within a few substeps:
-# k_min=0, k=seed, k_max=ceiling. A 1e4 N/m linear ceiling holds the ~2 N cable preload with
-# ~0.2 mm error; angular stays weak so the hanging cable can pivot.
-_SNAP_LINEAR_K_SEED = 1.0e2
-_SNAP_LINEAR_K = 1.0e4
-_SNAP_ANGULAR_K_SEED = 1.0e0
-_SNAP_ANGULAR_K = 1.0e1
-_SNAP_KD = 1.0e-1
-# Socket-only contact stiffness, written in place into the vbd entry view at snap init.
-# Build-time NewtonModelCfg.shape_material_ke fill_()s the whole model, so USD-authored
-# per-shape materials never reach the solver; the entry view arrays are what the captured
-# VBD kernels read. Pair stiffness mixes as the arithmetic mean with the cable/plug shapes
-# (ke=1e3), so 1e4 here gives ~5.5e3 for socket pairs (~5x less visible penetration)
-# without touching the gripper-grip pairs.
-_SOCKET_VIEW_CONTACT_KE = 1.0e4
 
 
 def _smoothstep(alpha: torch.Tensor) -> torch.Tensor:
@@ -107,7 +87,7 @@ def _quat_from_two_vectors(source: torch.Tensor, target: torch.Tensor) -> torch.
 
 
 class WaterhoseDemoState:
-    """Per-environment scripted pick-insert-extract state machine."""
+    """Per-environment scripted grasp-and-insert state machine."""
 
     REST = 0
     APPROACH = 1
@@ -122,10 +102,7 @@ class WaterhoseDemoState:
     HOLD_INSERTED = 10
     RELEASE = 11
     BACKOFF = 12
-    REAPPROACH = 13
-    REGRASP = 14
-    PULL_OUT = 15
-    DONE = 16
+    DONE = 13
 
     PHASE_NAMES = (
         "REST",
@@ -141,13 +118,11 @@ class WaterhoseDemoState:
         "HOLD_INSERTED",
         "RELEASE",
         "BACKOFF",
-        "REAPPROACH",
-        "REGRASP",
-        "PULL_OUT",
         "DONE",
     )
-    # Minimum time spent in each phase [s]; a phase advances once this elapsed AND the EE
-    # converged (or a 2x hard timeout). Insert/extract phases get generous time + tolerance.
+    # Minimum time spent in each phase [s]. A phase advances once this has elapsed AND the end
+    # effector has converged (or a 2x hard timeout fires). Insert/extract phases get generous
+    # time and tolerance; DONE is terminal.
     DURATIONS = (
         0.25,
         3.0,
@@ -162,9 +137,6 @@ class WaterhoseDemoState:
         1.0,
         0.8,
         1.5,
-        2.0,
-        0.7,
-        3.0,
         1.0e6,
     )
 
@@ -177,6 +149,9 @@ class WaterhoseDemoState:
         self.phase = torch.zeros(self.num_envs, dtype=torch.long, device=device)
         self.elapsed = torch.zeros(self.num_envs, device=device)
         self.last_reported_phase = torch.full((self.num_envs,), -1, dtype=torch.long, device=device)
+        # Terminal readout of the env-0 phase, printed once on every change.
+        self._last_printed_phase = -1
+        self._step_count = 0
 
         # Phase-entry snapshots (world frame) and the commanded pose (base frame).
         self.phase_start_pos_w = torch.zeros((self.num_envs, 3), device=device)
@@ -187,9 +162,11 @@ class WaterhoseDemoState:
         self.phase_plug_quat_w[:, 3] = 1.0
         self.command_pose = torch.zeros((self.num_envs, 7), device=device)
         self.command_pose[:, 6] = 1.0
-        # Multi-body IK hold targets: [left_gripper_base pose(7), torso_hip_yaw pose(7)],
-        # root frame, quaternions in (x, y, z, w) per the Newton IK action convention.
-        # Captured once at the first compute and held for the whole demo.
+        # Multi-body Newton-IK hold targets: [left_gripper_base pose(7), torso_hip_yaw pose(7)],
+        # root frame, quaternions in (x, y, z, w) per the Newton IK action convention. Captured once
+        # from the settled pose and held for the whole demo so the torso (and idle left arm) stay put
+        # while the right arm tracks the connector. Consumed only when the active action exposes the
+        # hold objectives; EE-only action variants ignore them.
         self.hold_poses = torch.zeros((self.num_envs, 14), device=device)
         self.hold_poses[:, 6] = 1.0
         self.hold_poses[:, 13] = 1.0
@@ -204,6 +181,11 @@ class WaterhoseDemoState:
         # Convergence tolerances (generous; combined with the min duration this gives smooth motion).
         self.pos_tolerance = torch.tensor([0.01, 0.01, 0.01], dtype=torch.float32, device=device)
         self.rot_tolerance = 15.0 * torch.pi / 180.0
+        # ALIGN also waits until the connector is actually coaxial with the bore (cos of the angle
+        # between the connector axis and the bore axis), not just until the EE reaches its commanded
+        # pose -- the gripped plug has compliance, so the connector axis lags the EE orientation.
+        # 0.9995 ~= 1.8 deg; the hard timeout (2x ALIGN duration) bounds the dwell.
+        self.coax_cos_tolerance = 0.9995
 
         # Fixed geometric offsets.
         self.plug_grasp_offset = self._vec(PLUG_GRASP_OFFSET)
@@ -213,22 +195,21 @@ class WaterhoseDemoState:
         self.connector_axis_local = self._vec((0.0, 0.0, 1.0))
 
         # Insertion geometry along the bore (= connector) axis, relative to the socket mouth.
-        # The scripted target is expressed by the cable connector tip, not the EE frame: CARRY stops
-        # with the tip outside the mouth, ALIGN dwells there, and INSERT seats the tip shallowly.
-        # The socket bore axis points mostly upward, so this standoff also keeps the gripper lower
-        # and away from the insertion mesh during the lift/align motion.
+        # The scripted target is expressed at the cable connector tip, not the end-effector frame:
+        # CARRY stops with the tip just outside the mouth, ALIGN dwells there, and INSERT seats the
+        # tip shallowly. The bore axis points mostly upward, so the standoff also keeps the gripper
+        # low and clear of the socket mesh during the lift/align motion.
         self.preinsert_standoff = 0.018
-        # The authored socket mesh is a short shell around the mouth. Seat the connector tip only
-        # shallowly into the bore so success is detected without driving the cable through the asset.
-        # Commanded tip depth. Contact compliance eats some of the commanded push, but
-        # commanding deeper (6 mm tried) rides the open back of the 6.3 mm bore and can
-        # jam-explode the plug; 4 mm yields a reliable ~2-3 mm physical seat.
-        self.insert_final_depth = 0.004
-        self.extract_clearance = 0.05
+        # Commanded connector-tip depth past the socket mouth: the forward-facing tip seats this far
+        # into the bore (~3 mm). Kept shallow so the connector seats near the mouth instead of being
+        # driven against the back of the bore, which buckles the hose and destabilizes the coupled
+        # solve -- especially now that the lower bore friction lets the plug slide in freely instead
+        # of being passively limited. Lower for a shallower seat, raise for a deeper one.
+        self.insert_final_depth = 0.003
         self.gripper_backoff_distance = 0.10
         self.connector_tip_len = CONNECTOR_TIP_LEN
 
-        # EE orientation that grasps the plug from the side: Rx(+90) * Rz(-90).
+        # End-effector orientation that grasps the plug from the side: Rx(+90) * Rz(-90).
         z_axis = self._vec((0.0, 0.0, 1.0))
         x_axis = self._vec((1.0, 0.0, 0.0))
         q_rz = quat_from_angle_axis(torch.full((self.num_envs,), -torch.pi / 2.0, device=device), z_axis)
@@ -238,6 +219,10 @@ class WaterhoseDemoState:
             quat_inv(self.grasp_orientation_offset),
             self.connector_axis_local * self.connector_tip_len - self.plug_grasp_offset,
         )
+        # Connector-tip offset in the end-effector frame. Initialized to the static estimate and
+        # overwritten per env at INSERT entry with the live grasp offset, so the insertion push
+        # targets the true connector tip on the bore centerline (see compute()).
+        self._tip_offset_frozen = self.connector_tip_pos_in_ee.clone()
 
         self.socket_pos_w = self._vec(SOCKET_MOUTH_POS)
         self.socket_quat_w = normalize(self._vec(SOCKET_ROT_QUAT_XYZW))
@@ -246,152 +231,37 @@ class WaterhoseDemoState:
         self.ee_offset_quat = self._vec(RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW)
 
         self._ee_body_id = None
-        self._cable_grasp_body_id = 0
-        self._cable_tip_body_id = 0
 
-        # Insertion snap-lock runtime state (lazily bound to the vbd entry on first compute).
-        self._snap_ready = False
-        self._snap_solver = None
-        self._snap_view = None
-        self._snap_joints = None  # np.ndarray [num_envs]: entry-local joint index per env
-        self._snap_c0 = None  # np.ndarray [num_envs]: first constraint slot (linear) per env
-        self._snap_active = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        # Newton body ids of the per-env plug bodies, resolved lazily on first compute. The plug
+        # is welded to the coupled cable, so its ground-truth pose is read from the Newton state
+        # rather than the asset view.
+        self._plug_body_ids = None
 
     def _vec(self, values) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.float32, device=self.device).repeat(self.num_envs, 1)
 
-    def _snap_init(self) -> None:
-        """Bind to the dormant ``socket_snap`` joints in the vbd entry and tune the socket shapes.
+    def _bind_plug_bodies(self) -> None:
+        """Resolve the per-env plug Newton body ids for ground-truth pose reads."""
 
-        All writes are in-place into existing warp arrays (CUDA-graph safe; the captured
-        kernels re-read them every step). Never reallocate or reassign solver/view arrays.
-        """
-        import re
-
-        import numpy as np
-        from isaaclab_newton.physics.coupled_manager import NewtonCoupledManager
         from isaaclab_newton.physics.newton_manager import NewtonManager
 
-        view = NewtonCoupledManager.get_entry_view("vbd")
-        solver = NewtonCoupledManager.get_entry_solver("vbd")
-        for attr in ("joint_penalty_k", "joint_penalty_k_min", "joint_penalty_k_max", "joint_penalty_kd"):
-            if not hasattr(solver, attr):
-                raise RuntimeError(f"vbd entry solver has no '{attr}' array; snap-lock needs the AVBD joint path.")
-
-        labels = [str(label) for label in view.joint_label]
-        joints = np.full(self.num_envs, -1, dtype=np.int64)
-        for env_index in range(self.num_envs):
-            token = f"socket_snap_w{env_index}"
-            matches = [j for j, label in enumerate(labels) if label.endswith(token)]
-            if len(matches) != 1:
-                raise RuntimeError(f"Expected exactly one '{token}' joint in the vbd entry, found {len(matches)}.")
-            joints[env_index] = matches[0]
-        self._snap_joints = joints
-        self._snap_c0 = solver.joint_constraint_start.numpy()[joints].astype(np.int64)
-        self._snap_solver = solver
-        self._snap_view = view
-
-        # Global body ids of the cable head segments, for ground-truth state reads. The
-        # asset views are unreliable for the coupled cable/plug (the plug view is frozen
-        # at its initial pose and the cable view's body indexing does not map to cable
-        # bodies), so live gating reads NewtonManager._state_0.body_q directly.
-        body_labels = [str(n) for n in NewtonManager.get_model().body_label]
-        plug_gids = np.full(self.num_envs, -1, dtype=np.int64)
+        body_labels = [str(label) for label in NewtonManager.get_model().body_label]
+        plug_ids = []
         for env_index in range(self.num_envs):
             token = f"env_{env_index}/Plug1"
-            matches = [i for i, n in enumerate(body_labels) if n.endswith(token)]
+            matches = [i for i, label in enumerate(body_labels) if label.endswith(token)]
             if len(matches) != 1:
                 raise RuntimeError(f"Expected exactly one '{token}' body, found {len(matches)}.")
-            plug_gids[env_index] = matches[0]
-        self._snap_plug_gids = torch.as_tensor(plug_gids, device=self.device, dtype=torch.long)
-
-        # Socket-only contact stiffness (see _SOCKET_VIEW_CONTACT_KE).
-        pattern = re.compile(SOCKET_COLLISION_MESH_PATTERN)
-        shape_ids = [i for i, label in enumerate(view.shape_label) if pattern.match(str(label))]
-        if shape_ids:
-            ke_host = view.shape_material_ke.numpy()
-            ke_host[shape_ids] = _SOCKET_VIEW_CONTACT_KE
-            view.shape_material_ke.assign(ke_host)
-
-        self._snap_ready = True
-        if self.debug:
-            cs = solver.joint_constraint_start.numpy()
-            k_host = solver.joint_penalty_k.numpy()
-            kmax_host = solver.joint_penalty_k_max.numpy()
-            for env_index, j in enumerate(joints):
-                c0 = int(cs[j])
-                c1 = int(cs[j + 1]) if j + 1 < len(cs) else len(k_host)
-                print(
-                    f"[waterhose_ik] snap joint env{env_index}: local_j={j} slots[{c0}:{c1}] "
-                    f"k={k_host[c0:c1].tolist()} k_max={kmax_host[c0:c1].tolist()}",
-                    flush=True,
-                )
-        # The snap joints are authored ENABLED with dormant=True, so CableObject already
-        # zeroed their gains at asset init (cable_object.py). Re-zero here anyway: the SM
-        # owns the latch from now on and this also resets joint_enabled bookkeeping.
-        self._snap_write(torch.ones_like(self._snap_active), 0.0, 0.0, 0.0, enable=False)
-
-    def _snap_write(
-        self,
-        env_mask: torch.Tensor,
-        lin_k: float,
-        ang_k: float,
-        kd: float,
-        enable: bool,
-        lin_k_seed: float | None = None,
-        ang_k_seed: float | None = None,
-    ) -> None:
-        """Set the snap joints' penalty gains and enabled flag for the masked envs, in place.
-
-        ``lin_k``/``ang_k`` are the stiffness ceilings (``joint_penalty_k_max``). When seeds
-        are given, the live penalty starts there and the AVBD ramp grows it to the ceiling
-        over a few substeps (soft engagement); otherwise the live penalty is pinned at the
-        ceiling.
-        """
-        ids = torch.nonzero(env_mask, as_tuple=False).flatten().cpu().numpy()
-        if ids.size == 0:
-            return
-        solver = self._snap_solver
-        slots = self._snap_c0[ids]
-        lin_seed = lin_k if lin_k_seed is None else lin_k_seed
-        ang_seed = ang_k if ang_k_seed is None else ang_k_seed
-        # Without explicit seeds the pin engages hard at the ceiling: k_min == k_max makes
-        # the gain immune to the per-step gamma decay (the AVBD ramp was measured NOT to
-        # grow a runtime-seeded snap joint, so a soft seed just stays soft).
-        lin_min = 0.0 if lin_k_seed is not None else lin_k
-        ang_min = 0.0 if ang_k_seed is not None else ang_k
-        for array, lin_value, ang_value in (
-            (solver.joint_penalty_k, lin_seed, ang_seed),
-            (solver.joint_penalty_k_min, lin_min, ang_min),
-            (solver.joint_penalty_k_max, lin_k, ang_k),
-            (solver.joint_penalty_kd, kd, kd),
-        ):
-            host = array.numpy()
-            host[slots] = lin_value
-            host[slots + 1] = ang_value
-            array.assign(host)
-        enabled_host = self._snap_view.joint_enabled.numpy()
-        enabled_host[self._snap_joints[ids]] = 1 if enable else 0
-        self._snap_view.joint_enabled.assign(enabled_host)
-        self._snap_active[torch.as_tensor(ids, device=self.device, dtype=torch.long)] = enable
-        if self.debug:
-            verb = "pinned" if enable else "released"
-            print(f"[waterhose_ik] snap-lock {verb} for envs {ids.tolist()}", flush=True)
+            plug_ids.append(matches[0])
+        self._plug_body_ids = torch.as_tensor(plug_ids, device=self.device, dtype=torch.long)
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:
             env_ids = slice(None)
-        # Release any active snap-lock: a reset teleports the cable away from the anchor, and
-        # a stale 1e7 pin would yank it back across the scene on the next step.
-        if self._snap_ready and bool(self._snap_active.any()):
-            release = torch.zeros_like(self._snap_active)
-            release[env_ids] = True
-            release &= self._snap_active
-            if bool(release.any()):
-                self._snap_write(release, 0.0, 0.0, 0.0, enable=False)
         self.phase[env_ids] = self.REST
         self.elapsed[env_ids] = 0.0
         self.last_reported_phase[env_ids] = -1
+        self._tip_offset_frozen[env_ids] = self.connector_tip_pos_in_ee[env_ids]
         self.phase_start_quat_w[env_ids] = 0.0
         self.phase_start_quat_w[env_ids, 3] = 1.0
         self.phase_plug_pos_w[env_ids] = 0.0
@@ -399,11 +269,24 @@ class WaterhoseDemoState:
         self.phase_plug_quat_w[env_ids, 3] = 1.0
 
     def compute(self, env) -> torch.Tensor:
+        from isaaclab_newton.physics.newton_manager import NewtonManager
+
+        # Terminal readout of the current phase (env 0), printed once on every change.
+        self._step_count += 1
+        current_phase = int(self.phase[0].item())
+        if current_phase != self._last_printed_phase:
+            print(
+                f"[waterhose SM] step {self._step_count}: phase = {self.PHASE_NAMES[current_phase]}",
+                flush=True,
+            )
+            self._last_printed_phase = current_phase
+
         robot = env.scene["robot"]
-        plug = env.scene["plug1"]
 
         if self._ee_body_id is None:
             self._ee_body_id = robot.find_bodies("right_gripper_base")[0][0]
+        if self._plug_body_ids is None:
+            self._bind_plug_bodies()
 
         root_pose_w = robot.data.root_link_pose_w.torch
         root_pos_w = root_pose_w[:, :3]
@@ -415,9 +298,14 @@ class WaterhoseDemoState:
             ee_base_pos_w, ee_base_quat_w, self.ee_offset_pos, self.ee_offset_quat
         )
 
-        plug_pose_w = plug.data.root_link_pose_w.torch
-        plug_pos_w = plug_pose_w[:, :3]
-        plug_quat_w = normalize(plug_pose_w[:, 3:])
+        # Live connector pose from the coupled-solver state (ground truth). The plug is welded to the
+        # deformable cable and its RigidObject asset view is stale/frozen for a coupled body, so the
+        # whole pick (approach/engage/grasp) reads the Newton body state to track where the hose
+        # actually hangs. This keeps the pick agnostic to the cable's resting pose: changing the cable
+        # stiffness (which lets it hang lower / at a different angle) needs no state-machine retuning.
+        plug_state_pose = wp.to_torch(NewtonManager.get_state_0().body_q)[self._plug_body_ids]
+        plug_pos_w = plug_state_pose[:, :3]
+        plug_quat_w = normalize(plug_state_pose[:, 3:7])
 
         socket_pos_w = self.socket_pos_w + env.scene.env_origins.to(device=self.device, dtype=self.socket_pos_w.dtype)
         insertion_dir_w = normalize(quat_apply(self.socket_quat_w, self._vec((0.0, 0.0, 1.0))))
@@ -429,61 +317,16 @@ class WaterhoseDemoState:
         self.phase_plug_pos_w[first_step] = plug_pos_w[first_step]
         self.phase_plug_quat_w[first_step] = plug_quat_w[first_step]
         connector_dir = quat_apply(plug_quat_w, self.connector_axis_local)
-        # --- Insertion snap-lock: pin while seated in HOLD_INSERTED, unpin for PULL_OUT. ---
-        if not self._snap_ready:
-            self._snap_init()
-        # Plug pose from the Newton state (ground truth — the plug ASSET view is frozen at
-        # its initial pose and the cable view's body indexing is shifted, so neither may be
-        # used for live gating). Connector tip = plug origin + tip length along plug +Z.
-        from isaaclab_newton.physics.newton_manager import NewtonManager as _NM
 
-        plug_state_pose = wp.to_torch(_NM._state_0.body_q)[self._snap_plug_gids]
+        # Connector tip from the same live plug state: the plug origin advanced by the tip length
+        # along the plug +Z axis. The coaxial-alignment axis points back along the hose (the plug is
+        # welded to the cable head rotated ~180 deg), so it is the plug -Z, which matches the
+        # ``-ins_dir`` convention used below.
         cable_tip_quat_w = normalize(plug_state_pose[:, 3:7])
-        # The coaxial-alignment axis must point "back along the hose" to match the
-        # ``-ins_dir`` convention below (the original axis was read from the cable
-        # head segment, whose local +Z points back along the hose). The plug body is
-        # welded to that segment rotated ~180 deg, so the plug's +Z points the other
-        # way (toward the connector tip); use the plug's -Z to recover the hose-back
-        # axis. Reading the plug's +Z here (as the gating tip position does) silently
-        # flipped the ALIGN orientation target ~180 deg and made ALIGN diverge.
         cable_tip_axis_w = normalize(quat_apply(cable_tip_quat_w, self._vec((0.0, 0.0, -1.0))))
         cable_tip_pos_w = plug_state_pose[:, :3] + quat_apply(
             cable_tip_quat_w, self._vec((0.0, 0.0, CONNECTOR_TIP_LEN))
         )
-        pin = (self.phase == self.HOLD_INSERTED) & ~self._snap_active
-        if bool(pin.any()):
-            # Absolute gate: pin once the tip is genuinely inside the bore (>= 1 mm).
-            # Contact compliance eats 2-3 mm of the commanded push, so a target-relative
-            # gate misses marginal-but-real seats; the pin itself pulls the plug to the
-            # authored seated pose, so a shallow-but-seated pin is self-correcting.
-            tip_depth = torch.sum((cable_tip_pos_w - socket_pos_w) * insertion_dir_w, dim=-1)
-            if self.debug:
-                print(f"[waterhose_ik] snap gate: tip_depth={float(tip_depth[0]) * 1000.0:.2f} mm", flush=True)
-            pin &= tip_depth >= 1.0e-3
-            if bool(pin.any()):
-                # Soft-seeded engagement: hard-engaging >=1e4 while the gripper still
-                # clamps the plug pumps energy between the pin and the grip weld and
-                # explodes the cable (measured). The runtime-written AVBD ramp does not
-                # grow a seeded k, so the effective hold is gentle; it biases the plug
-                # into the seat rather than rigidly locking it. Hard engagement (or
-                # engaging at RELEASE entry once the grip force fades) is the open
-                # tuning item for stronger retention.
-                self._snap_write(
-                    pin,
-                    _SNAP_LINEAR_K,
-                    _SNAP_ANGULAR_K,
-                    _SNAP_KD,
-                    enable=True,
-                    lin_k_seed=_SNAP_LINEAR_K_SEED,
-                    ang_k_seed=_SNAP_ANGULAR_K_SEED,
-                )
-        if self.debug:
-            missed = first_step & (self.phase == self.RELEASE) & ~self._snap_active
-            if bool(missed.any()):
-                print("[waterhose_ik] WARNING: RELEASE entered without snap-lock pin (seat too shallow).", flush=True)
-        unpin = first_step & (self.phase == self.PULL_OUT) & self._snap_active
-        if bool(unpin.any()):
-            self._snap_write(unpin, 0.0, 0.0, 0.0, enable=False)
 
         start_pos_w = self.phase_start_pos_w
         start_quat_w = self.phase_start_quat_w
@@ -527,33 +370,49 @@ class WaterhoseDemoState:
         settle = phase == self.SETTLE
         t_grip[settle] = 1.0
 
-        # --- Insert / extract ---
-        # Targets are computed from the connector tip pose.  The gripper frame is offset behind the
-        # tip, so aiming the EE itself at the socket mouth overshoots and drives the plug into the
-        # fridge.  CARRY moves to the standoff; ALIGN/INSERT then use the cable-tip capsule
-        # axis so the hose, not just the plug rigid body, becomes coaxial with the socket bore.
+        # --- Insert ---
+        # Targets are computed from the connector tip pose. The gripper frame is offset behind the
+        # tip, so aiming the EE itself at the socket mouth would overshoot and drive the plug into
+        # the fridge. CARRY moves to the standoff; ALIGN/INSERT use the cable-tip axis so the hose,
+        # not just the plug rigid body, becomes coaxial with the socket bore.
         ins_dir = insertion_dir_w  # bore axis into the socket = R(socket_quat) @ +Z
         socket_grasp_quat = normalize(quat_mul(self.socket_quat_w, self.grasp_orientation_offset))
-        # Cable segment local +Z points back along the hose, so -Z should point into the socket.
+        # Cable segment local +Z points back along the hose, so -Z points into the socket.
         coax_delta_quat = _quat_from_two_vectors(cable_tip_axis_w, -ins_dir)
         coaxial_grasp_quat = normalize(quat_mul(coax_delta_quat, ee_quat_w))
 
+        # Connector-tip offset in the EE frame for tip targeting. The static estimate assumes an
+        # idealized grasp; the plug settles a few mm off it laterally, which is fatal for a 6 mm
+        # connector in a 6.3 mm bore (it would ride the wall instead of entering coaxially). The
+        # live offset, derived from the current plug/EE poses, lands the real tip on the bore axis:
+        #   * CARRY/ALIGN: live offset to center the tip at the mouth (no bore contact yet).
+        #   * INSERT entry: freeze the centered offset and hold it through INSERT/HOLD_INSERTED so
+        #     the push commands a straight insertion instead of chasing bore-contact deflection.
+        #   * Otherwise (REST..SETTLE, RELEASE..DONE): the static estimate.
+        grasped_tip_offset_ee = quat_apply(quat_inv(ee_quat_w), cable_tip_pos_w - ee_pos_w)
+        insert_entry = (phase == self.INSERT) & first_step
+        if bool(insert_entry.any()):
+            self._tip_offset_frozen[insert_entry] = grasped_tip_offset_ee[insert_entry]
+        live_mask = (phase == self.CARRY) | (phase == self.ALIGN)
+        frozen_mask = (phase == self.INSERT) | (phase == self.HOLD_INSERTED)
+        tip_offset = self.connector_tip_pos_in_ee.clone()
+        tip_offset = torch.where(live_mask.unsqueeze(-1), grasped_tip_offset_ee, tip_offset)
+        tip_offset = torch.where(frozen_mask.unsqueeze(-1), self._tip_offset_frozen, tip_offset)
+
         def ee_pos_for_tip(target_tip_pos_w, target_ee_quat_w):
-            return target_tip_pos_w - quat_apply(target_ee_quat_w, self.connector_tip_pos_in_ee)
+            return target_tip_pos_w - quat_apply(target_ee_quat_w, tip_offset)
 
         preinsert_tip_pos = socket_pos_w - self.preinsert_standoff * ins_dir
         inserted_tip_pos = socket_pos_w + self.insert_final_depth * ins_dir
-        extracted_tip_pos = socket_pos_w - self.extract_clearance * ins_dir
         approach_pos = ee_pos_for_tip(preinsert_tip_pos, socket_grasp_quat)
         coax_approach_pos = ee_pos_for_tip(preinsert_tip_pos, coaxial_grasp_quat)
         coax_inserted_pos = ee_pos_for_tip(inserted_tip_pos, coaxial_grasp_quat)
-        coax_extracted_pos = ee_pos_for_tip(extracted_tip_pos, coaxial_grasp_quat)
 
         # CARRY: move up to the pre-insert standoff and rotate into socket alignment during the move.
         carry = phase == self.CARRY
         set_target(carry, approach_pos, socket_grasp_quat, 1.0)
 
-        # ALIGN: hold 1 cm outside the mouth while correcting the cable axis onto the bore.
+        # ALIGN: hold just outside the mouth while correcting the cable axis onto the bore.
         align = phase == self.ALIGN
         set_target(align, coax_approach_pos, coaxial_grasp_quat, 1.0)
 
@@ -561,50 +420,31 @@ class WaterhoseDemoState:
         insert = phase == self.INSERT
         set_target(insert, coax_inserted_pos, coaxial_grasp_quat, 1.0)
 
-        # HOLD_INSERTED: dwell at the seated pose before releasing the first grasp.
+        # HOLD_INSERTED: dwell at the seated pose before releasing the grasp.
         hold_ins = phase == self.HOLD_INSERTED
         set_target(hold_ins, coax_inserted_pos, coaxial_grasp_quat, 1.0)
 
-        # RELEASE: open the fingers while holding the inserted pose; do not pull the cable yet.
+        # RELEASE: open the fingers while holding the inserted pose; do not pull the cable.
         release = phase == self.RELEASE
         release_blend = _smoothstep(self.elapsed / torch.clamp(self.durations[self.RELEASE], min=1.0e-6))
         target_pos_w[release] = start_pos_w[release]
         target_quat_w[release] = start_quat_w[release]
         t_grip[release] = 1.0 - release_blend[release]
 
-        # BACKOFF: with the gripper open, move sideways away from the socket/cable.
+        # BACKOFF: with the gripper open, move sideways away from the socket and cable.
         withdraw_dir_w = quat_apply(self.socket_quat_w, self._vec((0.0, 1.0, 0.0)))
         backoff_pos = coax_inserted_pos + self.gripper_backoff_distance * withdraw_dir_w
         backoff = phase == self.BACKOFF
         set_target(backoff, backoff_pos, start_quat_w, 0.0)
 
-        # REAPPROACH: return open fingers to the inserted cable head.
-        reapproach = phase == self.REAPPROACH
-        set_target(reapproach, coax_inserted_pos, coaxial_grasp_quat, 0.0)
-
-        # REGRASP: close on the inserted cable head before extraction.
-        regrasp = phase == self.REGRASP
-        regrasp_blend = _smoothstep(self.elapsed / torch.clamp(self.durations[self.REGRASP], min=1.0e-6))
-        target_pos_w[regrasp] = start_pos_w[regrasp]
-        target_quat_w[regrasp] = start_quat_w[regrasp]
-        t_grip[regrasp] = regrasp_blend[regrasp]
-
-        # PULL_OUT: after the second grasp, remove the cable by pulling straight out of the socket.
-        pull_out = phase == self.PULL_OUT
-        set_target(pull_out, coax_extracted_pos, coaxial_grasp_quat, 1.0)
-
-        # DONE: keep holding the cable at the pulled-out pose.
+        # DONE: the gripper has backed away with the plug left inserted; keep the fingers open.
         done = phase == self.DONE
-        t_grip[done] = 1.0
+        t_grip[done] = 0.0
 
         # Smoothstep blend from the entry pose to the target pose (world frame).
         blend = _smoothstep(self.elapsed / self.durations[self.phase]).unsqueeze(-1)
         cmd_pos_w = start_pos_w * (1.0 - blend) + target_pos_w * blend
         cmd_quat_w = _blend_quat(start_quat_w, target_quat_w, blend)
-
-        # Debug-only plug diagnostics; targets remain phase-entry smoothstep poses.
-        plug_cos_val = torch.sum(connector_dir * ins_dir, dim=-1)
-        tip_cos_val = torch.sum(cable_tip_axis_w * ins_dir, dim=-1)
 
         cmd_pos_b, cmd_quat_b = subtract_frame_transforms(root_pos_w, root_quat_w, cmd_pos_w, cmd_quat_w)
         self.command_pose[:, :3] = cmd_pos_b
@@ -612,7 +452,7 @@ class WaterhoseDemoState:
         self.command_pose[:, 3:] = cmd_quat_b
 
         if not self._holds_captured:
-            # Capture the multi-body hold targets (root frame, xyzw) from the settled pose.
+            # Capture the multi-body hold targets (root frame, xyzw) once from the settled pose.
             if self._left_hold_body_id is None:
                 self._left_hold_body_id = robot.find_bodies("left_gripper_base")[0][0]
                 self._torso_hold_body_id = robot.find_bodies("torso_hip_yaw")[0][0]
@@ -628,9 +468,8 @@ class WaterhoseDemoState:
             self._holds_captured = True
 
         gripper = (_GRIPPER_OPEN + (_GRIPPER_CLOSED - _GRIPPER_OPEN) * t_grip).unsqueeze(-1)
-        # Match the configured action layout: with the multi-body hold objectives the
-        # arm action consumes [ee pose(7), left hold(7), torso hold(7)]; without them
-        # (EE-only IK variants) it consumes just the end-effector pose.
+        # Match the active action layout: the multi-body Newton IK action consumes
+        # [ee pose(7), left hold(7), torso hold(7)]; EE-only variants consume just the EE pose.
         total_dim = env.action_manager.total_action_dim
         if total_dim == self.command_pose.shape[-1] + self.hold_poses.shape[-1] + 1:
             actions = torch.cat((self.command_pose, self.hold_poses, gripper), dim=-1)
@@ -641,11 +480,18 @@ class WaterhoseDemoState:
         position_error = torch.abs(target_pos_w - ee_pos_w)
         rotation_error = quat_error_magnitude(target_quat_w, ee_quat_w)
         converged = torch.all(position_error < self.pos_tolerance, dim=-1) & (rotation_error < self.rot_tolerance)
-
-        target_tip_pos_w = target_pos_w + quat_apply(target_quat_w, self.connector_tip_pos_in_ee)
-        target_tip_depth = torch.sum((target_tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
+        # ALIGN additionally requires the live connector axis to be coaxial with the bore, so INSERT
+        # only begins once the gripped plug (not just the EE) is actually lined up. Other phases are
+        # unaffected. The hard timeout still bounds the dwell if it cannot fully converge.
+        coax_cos = torch.sum(connector_dir * ins_dir, dim=-1)
+        align_phase = self.phase == self.ALIGN
+        converged = converged & (~align_phase | (coax_cos > self.coax_cos_tolerance))
 
         if self.debug:
+            plug_cos_val = torch.sum(connector_dir * ins_dir, dim=-1)
+            tip_cos_val = torch.sum(cable_tip_axis_w * ins_dir, dim=-1)
+            target_tip_pos_w = target_pos_w + quat_apply(target_quat_w, self.connector_tip_pos_in_ee)
+            target_tip_depth = torch.sum((target_tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
             changed = self.phase != self.last_reported_phase
             if bool(changed[0].item()):
                 name = self.PHASE_NAMES[int(self.phase[0].item())]

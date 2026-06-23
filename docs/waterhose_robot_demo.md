@@ -1,6 +1,6 @@
 # Waterhose Robot Demo
 
-Last verified: 2026-06-15.
+Last verified: 2026-06-22.
 
 This customer-facing branch is `max/waterhose-coupled-experimental`. It supersedes the earlier
 `waterhose-demo` branch used for the first package handoff.
@@ -38,8 +38,8 @@ The package exposes two supported task variants:
 
 | Task ID | Purpose |
 | --- | --- |
-| `Isaac-Waterhose-Coupled-v0` | Client-facing RBY1DF waterhose demo using Newton proxy coupling and absolute Newton IK actions for scripted demo and XR. |
-| `Isaac-Waterhose-Coupled-Teleop-v0` | Same coupled scene with relative Newton IK actions and `env_cfg.teleop_devices` for native keyboard/SpaceMouse teleop. |
+| `Isaac-Waterhose-Coupled-v0` | Client-facing RBY1DF waterhose demo using Newton proxy coupling and absolute differential-IK end-effector actions for the scripted demo and XR. |
+| `Isaac-Waterhose-Coupled-Teleop-v0` | Same coupled scene with relative differential-IK actions and `env_cfg.teleop_devices` for native keyboard/SpaceMouse teleop. |
 
 A third task, `Isaac-Waterhose-Admm-v0` (`admm_env_cfg.py`), is also registered but is an
 **experimental** ADMM-coupling variant used for internal solver experiments; it is not part of
@@ -50,8 +50,8 @@ The coupled task is the default and primary demo path. The previous local
 Newton proxy coupling path. It uses normal IsaacLab scene configuration:
 
 - `ArticulationCfg` for the RBY1DF robot USD.
-- `RigidObjectCfg` for the plugs and kinematic cable anchors.
-- `CableObjectCfg` for the two USD cable curves.
+- `RigidObjectCfg` for the plug and the kinematic cable-tail anchor.
+- `CableObjectCfg` for the USD cable curve.
 - `AssetBaseCfg` for the fridge/static visual scene.
 - wrapper USD layers (`fridge_waterhose.usda`, `rby1df_waterhose.usda`) for task-specific collision
   overrides, including the socket SDF and right gripper finger SDF colliders.
@@ -86,12 +86,11 @@ cd waterhose-demo/IsaacLab-waterhose
 Isaac Sim, creates `.venv`, installs the full Isaac Lab workspace with `isaaclab.sh -i all`, unpacks
 the demo assets, and runs a short headless smoke check unless `--skip-smoke` is passed.
 
-Newton is pinned in the source tree to upstream Newton PR 2848 (coupled-solver) commit
-`6409c9f454a8222ca5ab7119eb5102148aab0af5`, resolved on 2026-06-15. A fresh handoff install
-resolves this commit from GitHub via the pyproject pin and does not require any local Newton
-checkout. (A developer machine may additionally `pip install -e` a local Newton checkout that
-carries an extra, not-yet-upstreamed "immovable proxy" patch, but the waterhose demo does not
-use it, so the pinned commit alone is sufficient.)
+Newton is pinned in the source tree to the upstream Newton PR 2848 (coupled-solver) head commit
+`526b36396777c18b82af8f30c4693b7c8bb4d89d`, resolved on 2026-06-22. Every Newton direct URL in
+`source/*/pyproject.toml` (and the wheel builder's package list) resolves to this one commit, so a
+fresh handoff install pulls a single, consistent Newton from GitHub and does not require any local
+Newton checkout. See `docs/newton_local_setup.md` for how to refresh the pin to a newer PR 2848 head.
 
 The setup script intentionally does not wrap runtime commands. Run demo, profile, and teleop commands
 directly from the `waterhose-demo/IsaacLab-waterhose` checkout so the task, device, CloudXR profile,
@@ -166,16 +165,20 @@ Keyboard desktop teleop uses the same relative-action task:
   --visualizer kit
 ```
 
-The scripted/XR task uses an absolute 8D Newton IK action space configured through `env_cfg.isaac_teleop`.
-The desktop teleop task uses a relative 7D action space configured through `env_cfg.teleop_devices`, matching
-IsaacLab's native keyboard and SpaceMouse devices.
+The scripted/XR task uses an absolute 8D differential-IK action space (right end-effector pose plus a
+normalized gripper command) configured through `env_cfg.isaac_teleop`. The desktop teleop task uses a
+relative 7D action space configured through `env_cfg.teleop_devices`, matching IsaacLab's native keyboard
+and SpaceMouse devices.
 
 The SpaceMouse entry uses a waterhose-specific mapping:
 
-- Cap translation moves the gripper in XYZ with the same signs as the original stable waterhose demo.
-- Cap twist rotates the gripper around the insertion/yaw axis.
-- Roll and pitch are suppressed to keep the plug aligned.
-- Translation suppresses accidental twist noise; use a pure twist motion for yaw.
+- Cap translation moves the gripper in XYZ.
+- Cap twist rolls the gripper about its own approach axis (the relative IK applies it in the
+  end-effector frame), spinning the held plug to line its keying up with the bore.
+- Wrist pitch and yaw are suppressed to keep the plug aligned.
+- Translation and twist are independent, so the operator can move and roll at the same time; a small
+  `twist_deadzone` rejects the twist cross-talk the cap reports during a translation push. Flip
+  `twist_sign` on `WaterhoseSpaceMouseCfg` if the roll direction feels inverted.
 
 ## Apple Vision Pro
 
@@ -256,13 +259,15 @@ sudo ufw allow 47998/udp
 
 ## Batching Status
 
-The task uses normal IsaacLab cloned scene setup (`replicate_physics=True`, regex prim paths, per-env
-cable anchors, and batched Torch actions/state). On 2026-06-10, the coupled task completed 100-step
-headless non-teleop profile runs with CUDA graph capture at `--num_envs 1`, `8`, and `128`. The wall-step
-rates on the local workstation were 25.7, 22.5, and 17.2 manager steps/s, which corresponds to about 25.7,
-180, and 2202 effective env-steps/s. The current Newton coupled solver path is functionally batched in
-play/demo mode; teleop should still be kept at one env because XR input and visualization are
-single-operator workflows.
+The task uses normal IsaacLab cloned-scene setup (`replicate_physics=True`, regex prim paths, per-env
+cable anchors, and batched Torch actions/state), so it runs headless at multiple environments with CUDA
+graph capture. With the default connector-housing collision enabled, a single-env headless profile runs
+at roughly 26 manager steps/s on the reference workstation. The deformable hose collides with the housing
+through a single welded body collider rather than the full per-fragment hull set, so the per-substep
+soft-contact cost stays low; setting `WATERHOSE_FRIDGE_BODY_COLLISION=0` (socket-only) leaves the rate
+essentially unchanged. The coupled VBD/proxy-contact workload is throughput-bound rather than scaling
+linearly with environment count, so profile before using large batches, and keep teleop and XR runs at one
+environment (XR input and visualization are single-operator workflows).
 
 ## Assets
 

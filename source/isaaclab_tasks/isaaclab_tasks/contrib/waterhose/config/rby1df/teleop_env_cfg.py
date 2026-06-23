@@ -12,4 +12,4 @@ from ...waterhose_env_cfg import WaterhoseProxyTeleopEnvCfg
 
 @configclass
 class WaterhoseTeleopEnvCfg(WaterhoseProxyTeleopEnvCfg):
-    """RBY1DF waterhose task with relative Newton IK for keyboard and SpaceMouse teleop."""
+    """RBY1DF waterhose task with relative differential IK for keyboard and SpaceMouse teleop."""

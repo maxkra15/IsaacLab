@@ -172,6 +172,15 @@ class CoupledProxyCfg:
     mode: Literal["lagged", "staggered"] | int = "lagged"
     """Proxy transfer mode passed to Newton's ``SolverCoupledProxy``."""
 
+    immovable: bool = False
+    """One-way (kinematic) coupling for this proxy mapping.
+
+    When ``True``, the destination proxy bodies are made immovable in the destination view and no
+    reaction wrench is harvested back to the source: the source (rigid) drives the destination
+    (deformable), but the deformable applies no force back on the rigid. Defaults to ``False``
+    (full two-way coupling).
+    """
+
     collision_pipeline_factory: Callable | None = None
     """Optional factory for a proxy-local collision pipeline.
 
@@ -211,19 +220,17 @@ class ProxyCouplingCfg:
 
 @configclass
 class AdmmContactPairCfg:
-    """Configuration for one Newton ADMM cross-solver contact pair."""
+    """Configuration for one Newton ADMM cross-solver contact pair.
+
+    Pair friction is read from the per-shape ``shape_material_mu`` and ``Model.particle_mu`` at
+    contact-fill time, not from the pair config.
+    """
 
     source: str = ""
     """Name of one solver entry."""
 
     destination: str = ""
     """Name of the other solver entry."""
-
-    contact_distance: float | None = None
-    """Optional minimum contact gap [m]. ``None`` uses Newton's pair default."""
-
-    detection_margin: float | None = None
-    """Optional contact detection margin [m]. ``None`` uses Newton's pair default."""
 
 
 @configclass
@@ -237,7 +244,7 @@ class AdmmCouplingCfg:
     """ADMM penalty parameter."""
 
     gamma: float = 0.0
-    """Proximal mass scaling parameter."""
+    """Proximal mass scaling parameter (scales the proximal penalty as ``gamma * rho``)."""
 
     baumgarte: float = 0.0
     """Position error correction fraction."""
@@ -254,17 +261,29 @@ class AdmmCouplingCfg:
     joint_angular_damping: float = 0.0
     """Quadratic damping for angular ADMM attachments from cross-solver fixed and revolute joints."""
 
+    rigid_contact_matching: str = "disabled"
+    """Frame-to-frame contact matching for collision-detected rigid contacts.
+
+    One of ``"disabled"``, ``"latest"`` (warm-start the ADMM dual from the previous refresh), or
+    ``"sticky"`` (also replay matched contact geometry).
+    """
+
+    contact_matching_pos_threshold: float | None = None
+    """World-space distance threshold [m] for matching a contact across refreshes. ``None`` uses
+    the collision pipeline default."""
+
+    contact_matching_normal_dot_threshold: float | None = None
+    """Minimum normal dot-product for matching a contact across refreshes. ``None`` uses the
+    collision pipeline default."""
+
+    contact_matching_force_scale: float = 0.9
+    """Multiplier applied to the rescaled previous-refresh ADMM dual when a contact matches."""
+
     contact_pairs: list[AdmmContactPairCfg] = field(default_factory=list)
     """Explicit cross-solver contact pairs to pass to Newton ADMM."""
 
     auto_contact_pairs: bool = False
     """Whether to ask Newton to generate a contact pair for each solver-entry combination."""
-
-    auto_contact_distance: float | None = None
-    """Optional minimum contact gap [m] for automatically generated contact pairs."""
-
-    auto_detection_margin: float | None = None
-    """Optional contact detection margin [m] for automatically generated contact pairs."""
 
 
 @configclass

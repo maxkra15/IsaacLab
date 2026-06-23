@@ -141,6 +141,36 @@ def _set_scene_config_visualizer_intent(args_cli: argparse.Namespace) -> None:
         args_cli.visualizer_intent = {"has_any_visualizers": True, "has_kit_visualizer": True}
 
 
+def _coupled_task_needs_kit(args_cli: argparse.Namespace) -> bool:
+    """Whether a scene-config coupled task must boot Omniverse Kit.
+
+    The coupled tasks run on ``CoupledNewtonCfg`` (a kitless Newton backend) with no Kit-renderer
+    camera, so they can run Kit-free under a kitless visualizer. Kit is required when:
+
+    * the Kit visualizer is explicitly requested (``--viz kit``), or
+    * livestreaming is enabled (it needs a Kit viewport to produce video), or
+    * no visualizer is requested on the command line. The task config installs both a Kit and a
+      Newton visualizer, so with no CLI override the Newton runtime resolves Kit rendering as active
+      and sets up Fabric/usdrt sync (Kit-only). Booting Kit keeps that default working; pass an
+      explicit kitless visualizer (``--viz newton``/``rerun``/``viser``/``none``) to skip Kit.
+
+    With an explicit kitless visualizer, the run goes through :func:`~isaaclab.app.launch_simulation`,
+    which skips Kit entirely for this Newton-backed, camera-free task.
+    """
+
+    livestream = getattr(args_cli, "livestream", -1)
+    livestream_mode = (
+        int(livestream) if livestream is not None and int(livestream) >= 0 else int(os.environ.get("LIVESTREAM", "0"))
+    )
+    if livestream_mode > 0:
+        return True
+
+    requested = _requested_visualizer_types(args_cli)
+    if not requested:
+        return True
+    return "kit" in requested
+
+
 parser = argparse.ArgumentParser(description="Run the scripted waterhose robot demo through IsaacLab.")
 parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task name.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
@@ -158,6 +188,12 @@ parser.add_argument(
     help="Optional WaterhoseDemo asset root. The packaged task assets are used when omitted.",
 )
 parser.add_argument("--profile", action="store_true", help="Print rollout timing after the run.")
+parser.add_argument(
+    "--one_way_coupling",
+    action="store_true",
+    help="Use one-way (kinematic) rigid->soft proxy coupling: the gripper drives the deformable grip, "
+    "but the plug/hose reaction is not fed back to the arm. Proxy-coupled task only (not ADMM).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 _install_faulthandler()
@@ -180,11 +216,11 @@ def _configure_env_cfg(env_cfg) -> None:
 
     env_cfg.scene.num_envs = int(args_cli.num_envs)
     if _task_id() in SCENE_CONFIG_SCRIPTED_TASKS:
-        # The scripted demo plays the full grasp -> insert -> release -> pull-out arc
+        # The scripted demo plays the full grasp -> insert -> release -> back-off arc
         # and stops itself once the state machine reaches DONE. Env-level resets must
         # not fire mid-demo: the success termination triggers right at seating and the
         # auto-reset teleports the robot home (looks like the arm "flips out"), and the
-        # 30 s time-out lands just before PULL_OUT finishes.
+        # 30 s time-out lands near the end of the arc.
         terminations = getattr(env_cfg, "terminations", None)
         if terminations is not None and hasattr(terminations, "success"):
             terminations.success = None
@@ -193,6 +229,27 @@ def _configure_env_cfg(env_cfg) -> None:
     physics_cfg = env_cfg.sim.physics
     if not isinstance(physics_cfg, NewtonCfg):
         raise TypeError(f"Expected a Newton-backed task config, got {type(physics_cfg).__name__}.")
+    if args_cli.one_way_coupling:
+        _enable_one_way_coupling(env_cfg)
+
+
+def _enable_one_way_coupling(env_cfg) -> None:
+    """Switch the rigid->soft proxy coupling to one-way (kinematic) mode.
+
+    Sets ``immovable=True`` on every proxy mapping so the rigid gripper kinematically drives the
+    deformable grip while the plug/hose reaction is not harvested back onto the arm. Only the
+    proxy-coupled task supports this; the ADMM variant uses a different coupling mechanism.
+    """
+    solver_cfg = getattr(env_cfg.sim.physics, "solver_cfg", None)
+    coupling_type = getattr(solver_cfg, "coupling_type", None)
+    proxy_coupling = getattr(solver_cfg, "proxy_coupling", None)
+    if coupling_type != "proxy" or proxy_coupling is None or not proxy_coupling.proxies:
+        raise ValueError(
+            "--one_way_coupling requires the proxy-coupled task (Isaac-Waterhose-Coupled-v0); "
+            f"the active config uses coupling_type={coupling_type!r} with no proxy mappings to make one-way."
+        )
+    for proxy in proxy_coupling.proxies:
+        proxy.immovable = True
 
 
 def _parse_configured_env_cfg():
@@ -297,10 +354,10 @@ def _run_env(env_cfg) -> None:
 
 
 def main() -> None:
-    if _uses_scene_config_coupled_task():
-        # The scene-config coupled tasks import Newton/USD builders while resolving
-        # the task. SimulationApp must own the USD Python bindings first; otherwise
-        # Kit extensions can see preloaded pxr modules from the venv and fail at startup.
+    if _uses_scene_config_coupled_task() and _coupled_task_needs_kit(args_cli):
+        # Kit path: the scene-config coupled tasks import Newton/USD builders while resolving
+        # the task. When Kit is needed, SimulationApp must own the USD Python bindings first;
+        # otherwise Kit extensions can see preloaded pxr modules from the venv and fail at startup.
         _set_scene_config_visualizer_intent(args_cli)
         app_launcher = AppLauncher(args_cli)
         try:
@@ -312,6 +369,10 @@ def main() -> None:
             app_launcher.app.close()
         return
 
+    # Kitless-capable path. Non-coupled tasks always use it; the coupled tasks join it whenever
+    # Kit is not required (e.g. ``--viz newton`` or headless). launch_simulation walks the config
+    # and skips Kit entirely for this Newton-backed, camera-free task, so the Newton viewer runs
+    # without Omniverse. The pxr-binding ordering constraint above does not apply when Kit never boots.
     env_cfg = _parse_configured_env_cfg()
     from isaaclab.app import launch_simulation  # noqa: PLC0415
 

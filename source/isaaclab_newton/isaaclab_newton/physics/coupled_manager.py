@@ -762,6 +762,7 @@ class NewtonCoupledManager(NewtonManager):
             proxy_particles=None if proxy_cfg.proxy_particles is None else list(proxy_cfg.proxy_particles),
             collision_pipeline=proxy_cfg.collision_pipeline_factory,
             collide_interval=proxy_cfg.collide_interval,
+            immovable=proxy_cfg.immovable,
         )
 
     @staticmethod
@@ -835,13 +836,7 @@ class NewtonCoupledManager(NewtonManager):
         if admm_cfg.auto_contact_pairs:
             if entries is None:
                 raise ValueError("AdmmCouplingCfg.auto_contact_pairs requires coupled solver entries.")
-            contact_pairs.extend(
-                SolverCoupledADMM.auto_detect_contact_pairs(
-                    entries,
-                    contact_distance=admm_cfg.auto_contact_distance,
-                    detection_margin=admm_cfg.auto_detection_margin,
-                )
-            )
+            contact_pairs.extend(SolverCoupledADMM.auto_detect_contact_pairs(entries))
 
         return SolverCoupledADMM.Config(
             iterations=admm_cfg.iterations,
@@ -852,6 +847,10 @@ class NewtonCoupledManager(NewtonManager):
             joint_damping=admm_cfg.joint_damping,
             joint_angular_stiffness=admm_cfg.joint_angular_stiffness,
             joint_angular_damping=admm_cfg.joint_angular_damping,
+            rigid_contact_matching=admm_cfg.rigid_contact_matching,
+            contact_matching_pos_threshold=admm_cfg.contact_matching_pos_threshold,
+            contact_matching_normal_dot_threshold=admm_cfg.contact_matching_normal_dot_threshold,
+            contact_matching_force_scale=admm_cfg.contact_matching_force_scale,
             contact_pairs=contact_pairs,
         )
 
@@ -861,8 +860,6 @@ class NewtonCoupledManager(NewtonManager):
         return SolverCoupledADMM.ContactPair(
             source=pair_cfg.source,
             destination=pair_cfg.destination,
-            contact_distance=pair_cfg.contact_distance,
-            detection_margin=pair_cfg.detection_margin,
         )
 
     @classmethod
@@ -950,17 +947,13 @@ class NewtonCoupledManager(NewtonManager):
             raise ValueError("AdmmCouplingCfg.rho must be > 0.")
         if admm_cfg.gamma < 0.0:
             raise ValueError("AdmmCouplingCfg.gamma must be >= 0.")
-        if admm_cfg.auto_contact_distance is not None and admm_cfg.auto_contact_distance < 0.0:
-            raise ValueError("AdmmCouplingCfg.auto_contact_distance must be >= 0.")
-        if admm_cfg.auto_detection_margin is not None and admm_cfg.auto_detection_margin < 0.0:
-            raise ValueError("AdmmCouplingCfg.auto_detection_margin must be >= 0.")
+        if admm_cfg.rigid_contact_matching not in ("disabled", "latest", "sticky"):
+            raise ValueError("AdmmCouplingCfg.rigid_contact_matching must be 'disabled', 'latest', or 'sticky'.")
+        if admm_cfg.contact_matching_force_scale < 0.0:
+            raise ValueError("AdmmCouplingCfg.contact_matching_force_scale must be >= 0.")
         for pair in admm_cfg.contact_pairs:
             if pair.source == pair.destination:
                 raise ValueError("AdmmContactPairCfg source and destination must be different.")
-            if pair.contact_distance is not None and pair.contact_distance < 0.0:
-                raise ValueError("AdmmContactPairCfg.contact_distance must be >= 0.")
-            if pair.detection_margin is not None and pair.detection_margin < 0.0:
-                raise ValueError("AdmmContactPairCfg.detection_margin must be >= 0.")
 
     @classmethod
     def _needs_external_collision_pipeline(cls, solver_cfg: CoupledSolverCfg) -> bool:

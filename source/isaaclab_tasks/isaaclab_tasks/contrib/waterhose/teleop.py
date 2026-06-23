@@ -27,9 +27,9 @@ class WaterhoseSpaceMouseCfg(DeviceCfg):
     pos_sensitivity: float = 0.05
     rot_sensitivity: float = 0.15
     translation_signs: tuple[float, float, float] = (-1.0, -1.0, 1.0)
-    yaw_sign: float = -1.0
+    twist_sign: float = -1.0
     deadzone: float = 1.0e-3
-    yaw_translation_lock: bool = False
+    twist_deadzone: float = 1.0e-2
     retargeters: None = None
     class_type: type[WaterhoseSpaceMouse] | str = "{DIR}.teleop:WaterhoseSpaceMouse"
 
@@ -37,8 +37,15 @@ class WaterhoseSpaceMouseCfg(DeviceCfg):
 class WaterhoseSpaceMouse(DeviceBase):
     """Waterhose-specific SpaceMouse wrapper.
 
-    The stock SpaceMouse device exposes full 6-DoF deltas. For this hose task the useful manual control is
-    translation plus twist around the gripper insertion axis; roll and pitch make the plug hard to keep aligned.
+    The stock SpaceMouse device exposes full 6-DoF deltas. For this hose task the useful manual control
+    is translation plus a cap twist that rolls the gripper about its own approach axis (spinning the
+    held plug to line its keying up with the bore); the wrist pitch and yaw make the plug hard to keep
+    aligned, so they are suppressed. Translation and twist are independent: a deliberate twist of the
+    cap always rolls the gripper, even while translating. ``twist_deadzone`` rejects the small twist
+    cross-talk the cap reports during a translation push. The relative IK action applies this twist in
+    the end-effector frame (see
+    :class:`~isaaclab_tasks.contrib.waterhose.mdp.actions.WaterhoseLocalFrameNewtonInverseKinematicsAction`),
+    so the roll is about the gripper's current approach axis.
     """
 
     def __init__(self, cfg: WaterhoseSpaceMouseCfg):
@@ -53,12 +60,12 @@ class WaterhoseSpaceMouse(DeviceBase):
             )
         )
         self._translation_signs = torch.tensor(cfg.translation_signs, dtype=torch.float32, device=cfg.sim_device)
-        self._yaw_sign = float(cfg.yaw_sign)
+        self._twist_sign = float(cfg.twist_sign)
         self._deadzone = max(0.0, float(cfg.deadzone))
-        self._yaw_translation_lock = bool(cfg.yaw_translation_lock)
+        self._twist_deadzone = max(0.0, float(cfg.twist_deadzone))
 
     def __str__(self) -> str:
-        return f"{self._device} (waterhose XYZ+yaw mapping)"
+        return f"{self._device} (waterhose XYZ + gripper-roll mapping)"
 
     def reset(self) -> None:
         self._device.reset()
@@ -68,20 +75,19 @@ class WaterhoseSpaceMouse(DeviceBase):
 
     def advance(self) -> torch.Tensor:
         command = self._device.advance().clone()
+        # Reject small per-axis noise.
         if self._deadzone > 0.0:
             command[torch.abs(command) < self._deadzone] = 0.0
 
+        # Translation: move the gripper in XYZ with the task's sign convention.
         command[:3] *= self._translation_signs
+
+        # Rotation: keep only the cap twist and map it to a gripper roll (the relative IK action
+        # applies this delta in the end-effector frame, about the gripper's approach axis). The wrist
+        # pitch and yaw are suppressed.
         command[3:5] = 0.0
-        command[5] *= self._yaw_sign
-
-        translation_norm = torch.linalg.vector_norm(command[:3])
-        yaw_abs = torch.abs(command[5])
-        translation_active = translation_norm > self._deadzone
-        yaw_active = yaw_abs > self._deadzone
-
-        # Translation wins over yaw unless explicitly locked. This avoids accidental wrist spin from cap noise.
-        command[5] = torch.where(translation_active, torch.zeros_like(command[5]), command[5])
-        zero_translation = yaw_active & (translation_active.logical_not() | bool(self._yaw_translation_lock))
-        command[:3] = torch.where(zero_translation, torch.zeros_like(command[:3]), command[:3])
+        twist = command[5] * self._twist_sign
+        # A deliberate twist passes through; the small twist cross-talk reported during a translation
+        # push is rejected, so the operator can translate and roll without one cancelling the other.
+        command[5] = torch.where(torch.abs(twist) > self._twist_deadzone, twist, torch.zeros_like(twist))
         return command

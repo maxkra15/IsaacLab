@@ -17,7 +17,14 @@ from __future__ import annotations
 
 
 def build_waterhose_teleop_pipeline():
-    """Build the IsaacTeleop pipeline for the absolute Waterhose IK action space."""
+    """Build the IsaacTeleop pipeline for the absolute Waterhose IK action space.
+
+    The end-effector pose is driven from the right HAND wrist so the pipeline works under Apple
+    Vision Pro (which streams hand tracking, not controllers). The gripper is wired to both the hand
+    and controller sources, so the same pipeline also works with Quest/Pico controllers: the
+    gripper retargeter prefers the controller trigger when present and falls back to the hand pinch.
+    This mirrors the framework's hand-tracking single-end-effector teleop pipelines.
+    """
 
     from isaacteleop.retargeters import (
         GripperRetargeter,
@@ -26,19 +33,23 @@ def build_waterhose_teleop_pipeline():
         Se3RetargeterConfig,
         TensorReorderer,
     )
-    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
+    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource, HandsSource
     from isaacteleop.retargeting_engine.interface import OutputCombiner, ValueInput
     from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
 
     controllers = ControllersSource(name="controllers")
+    hands = HandsSource(name="hands")
     transform_input = ValueInput("world_T_anchor", TransformMatrix())
-    transformed_controllers = controllers.transformed(transform_input.output(ValueInput.VALUE))
+    transformed_hands = hands.transformed(transform_input.output(ValueInput.VALUE))
 
+    # End-effector pose from the right hand wrist. ``use_wrist_position``/``use_wrist_rotation`` make
+    # the gripper follow the hand's position and orientation; the target offset keeps the gripper's
+    # side grip aligned. Tune ``zero_out_xy_rotation``/``target_offset_*`` for the desired feel.
     se3_cfg = Se3RetargeterConfig(
-        input_device=ControllersSource.RIGHT,
+        input_device=HandsSource.RIGHT,
         zero_out_xy_rotation=False,
-        use_wrist_rotation=False,
-        use_wrist_position=False,
+        use_wrist_rotation=True,
+        use_wrist_position=True,
         target_offset_roll=90.0,
         target_offset_pitch=0.0,
         target_offset_yaw=0.0,
@@ -46,7 +57,7 @@ def build_waterhose_teleop_pipeline():
     se3 = Se3AbsRetargeter(se3_cfg, name="ee_pose")
     connected_se3 = se3.connect(
         {
-            ControllersSource.RIGHT: transformed_controllers.output(ControllersSource.RIGHT),
+            HandsSource.RIGHT: transformed_hands.output(HandsSource.RIGHT),
         }
     )
 
@@ -54,7 +65,8 @@ def build_waterhose_teleop_pipeline():
     gripper = GripperRetargeter(gripper_cfg, name="gripper")
     connected_gripper = gripper.connect(
         {
-            ControllersSource.RIGHT: transformed_controllers.output(ControllersSource.RIGHT),
+            HandsSource.RIGHT: hands.output(HandsSource.RIGHT),
+            ControllersSource.RIGHT: controllers.output(ControllersSource.RIGHT),
         }
     )
 

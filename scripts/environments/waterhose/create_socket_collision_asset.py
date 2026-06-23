@@ -16,6 +16,12 @@ given SDF collision properties independently from the rest of the fridge.
 
 With ``--embed-in-fridge``, the same combined mesh is also written directly into
 ``fridge.usda`` at ``/root/Cable008/SocketCollision/Cable008_SocketCollision``.
+
+With ``--embed-body-collision``, the tool instead welds the connector-housing collider fragments
+(every ``Cable008_Collider*`` except the socket-bore set) into one mesh at
+``/root/Cable008/BodyCollision/Cable008_BodyCollision``. That single mesh is routed to the
+deformable-hose collision entry so the hose collides with the housing through one shape instead of
+all 245; the per-fragment convex hulls are left in place for the robot's collision path.
 """
 
 from __future__ import annotations
@@ -37,6 +43,11 @@ DEFAULT_REPORT_CSV = FRIDGE_DIR / "socket_collision_manifest.csv"
 DEFAULT_EMBED_PARENT = "/root/Cable008"
 DEFAULT_EMBED_XFORM = "/root/Cable008/SocketCollision"
 DEFAULT_EMBED_MESH = "/root/Cable008/SocketCollision/Cable008_SocketCollision"
+# Single welded body collider for the deformable hose path (see --embed-body-collision). The robot
+# keeps the original convex hulls; this one mesh replaces them only for the VBD/cable collision entry.
+DEFAULT_BODY_EMBED_XFORM = "/root/Cable008/BodyCollision"
+DEFAULT_BODY_EMBED_MESH = "/root/Cable008/BodyCollision/Cable008_BodyCollision"
+COLLISIONS_SCOPE = "/root/Cable008/Collisions"
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 HOLE_AXIS = (0.0, -math.sin(math.radians(20.0)), math.cos(math.radians(20.0)))
 
@@ -274,7 +285,8 @@ def write_embedded_socket_to_fridge(
     mesh.CreateDoubleSidedAttr(True)
     mesh.CreateExtentAttr(_extent(points))
     mesh.GetPrim().CreateAttribute("visibility", Sdf.ValueTypeNames.Token).Set("inherited")
-    mesh.GetPrim().CreateAttribute("purpose", Sdf.ValueTypeNames.Token).Set("default")
+    # Collision-only geometry: ``guide`` so renderers do not draw the socket collider over the fridge.
+    mesh.GetPrim().CreateAttribute("purpose", Sdf.ValueTypeNames.Token).Set("guide")
 
     primvars = UsdGeom.PrimvarsAPI(mesh)
     primvars.CreatePrimvar("displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.constant).Set(
@@ -292,6 +304,78 @@ def write_embedded_socket_to_fridge(
             if not source_prim:
                 raise ValueError(f"Missing source collider prim while setting active state: {name}")
             source_prim.SetActive(active)
+
+    stage.GetRootLayer().Save()
+
+
+def body_collider_names(fridge_usd: Path, exclude: list[str]) -> list[str]:
+    """Return the housing collider fragments to weld into the body collider.
+
+    Enumerates every ``Cable008_Collider*`` mesh under the Collisions scope and drops the
+    near-socket fragments in ``exclude`` (the ones that form the socket bore), so the welded body
+    mesh covers the connector housing without the bore hulls that would eject the seated plug.
+    """
+    stage = Usd.Stage.Open(str(fridge_usd))
+    if stage is None:
+        raise RuntimeError(f"Could not open fridge USD: {fridge_usd}")
+    scope = stage.GetPrimAtPath(COLLISIONS_SCOPE)
+    if not scope:
+        raise ValueError(f"Missing collisions scope: {COLLISIONS_SCOPE}")
+    excluded = set(exclude)
+    names = [
+        child.GetName()
+        for child in scope.GetChildren()
+        if child.GetName().startswith("Cable008_Collider") and UsdGeom.Mesh(child) and child.GetName() not in excluded
+    ]
+    names.sort(key=lambda name: int(name.removeprefix("Cable008_Collider")))
+    return names
+
+
+def write_embedded_body_to_fridge(
+    fridge_usd: Path,
+    collider_names: list[str],
+    points: list[Gf.Vec3f],
+    face_counts: list[int],
+    face_indices: list[int],
+    *,
+    xform_path: str = DEFAULT_BODY_EMBED_XFORM,
+    mesh_path: str = DEFAULT_BODY_EMBED_MESH,
+) -> None:
+    """Embed a single welded housing-body collision mesh into fridge.usda.
+
+    The original per-fragment convex hulls are left untouched (the robot still collides with them);
+    this single mesh is routed only to the deformable-hose collision entry.
+    """
+    stage = Usd.Stage.Open(str(fridge_usd))
+    if stage is None:
+        raise RuntimeError(f"Could not open fridge USD: {fridge_usd}")
+
+    xform = UsdGeom.Xform.Define(stage, xform_path)
+    _set_translate(xform, (0.0, 0.0, 0.0))
+    xform.GetPrim().CreateAttribute("body:sourceColliderNames", Sdf.ValueTypeNames.StringArray).Set(collider_names)
+    xform.GetPrim().CreateAttribute("body:description", Sdf.ValueTypeNames.String).Set(
+        "Single welded connector-housing collision mesh for the deformable-hose collision entry."
+    )
+
+    mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+    mesh.CreatePointsAttr(points)
+    mesh.CreateFaceVertexCountsAttr(face_counts)
+    mesh.CreateFaceVertexIndicesAttr(face_indices)
+    mesh.CreateSubdivisionSchemeAttr().Set("none")
+    mesh.CreateDoubleSidedAttr(True)
+    mesh.CreateExtentAttr(_extent(points))
+    # Collision-only geometry: tag it ``guide`` so renderers (Kit / the --video path) do not draw it,
+    # matching the per-fragment hulls. It still collides (CollisionAPI is independent of purpose).
+    mesh.CreatePurposeAttr().Set(UsdGeom.Tokens.guide)
+
+    primvars = UsdGeom.PrimvarsAPI(mesh)
+    primvars.CreatePrimvar("displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.constant).Set(
+        [Gf.Vec3f(1.0, 0.55, 0.1)]
+    )
+
+    UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+    mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim())
+    mesh_collision.CreateApproximationAttr().Set("none")
 
     stage.GetRootLayer().Save()
 
@@ -409,11 +493,33 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="Collider prim name to include. Repeat to override the default light-blue socket set.",
     )
+    parser.add_argument(
+        "--embed-body-collision",
+        action="store_true",
+        help=(
+            "Weld the connector-housing collider fragments (every Cable008_Collider* except the "
+            f"socket-bore set) into one mesh at {DEFAULT_BODY_EMBED_MESH} for the deformable-hose "
+            "collision entry, leaving the per-fragment hulls in place for the robot. Runs only this "
+            "bake and ignores the socket-asset options."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.embed_body_collision:
+        names = body_collider_names(args.fridge_usd, exclude=DEFAULT_SOCKET_COLLIDERS)
+        points, face_counts, face_indices, _ = extract_mesh_data(
+            args.fridge_usd, names, target_frame_path=DEFAULT_EMBED_PARENT
+        )
+        write_embedded_body_to_fridge(args.fridge_usd, names, points, face_counts, face_indices)
+        print(f"Welded {len(names)} housing colliders into one body mesh: {DEFAULT_BODY_EMBED_MESH}")
+        print(f"Embedded into fridge: {args.fridge_usd}")
+        print("The per-fragment hulls were left active for the robot collision path.")
+        return
+
     collider_names = args.colliders or DEFAULT_SOCKET_COLLIDERS
     front_inset_m = args.front_inset_mm * 0.001
     base_offset_m = tuple(value * 0.001 for value in args.offset_mm)

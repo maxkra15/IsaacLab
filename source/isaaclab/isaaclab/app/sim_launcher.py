@@ -32,8 +32,10 @@ from isaaclab.sensors.camera.camera_cfg import CameraCfg
 logger = logging.getLogger(__name__)
 
 # Class names of the kitless physics backends (Newton, OvPhysX). Matched by exact
-# name so subclasses with distinct names (e.g. ``DeformableNewtonCfg``) opt out.
-_KITLESS_PHYSICS_CFGS = ("NewtonCfg", "OvPhysxCfg")
+# name so subclasses opt in explicitly: a Newton subclass that genuinely needs Kit
+# is left off this list, while kitless-capable subclasses (e.g. the coupled
+# MJWarp+VBD ``CoupledNewtonCfg``) are named here so the kitless launch path applies.
+_KITLESS_PHYSICS_CFGS = ("NewtonCfg", "CoupledNewtonCfg", "OvPhysxCfg")
 
 
 def add_launcher_args(parser: argparse.ArgumentParser) -> None:

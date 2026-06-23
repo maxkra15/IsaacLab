@@ -46,6 +46,21 @@ run() {
     "$@"
 }
 
+# Clone a repo and check out a branch, tag, or commit SHA. `git clone --branch` only accepts a
+# branch or tag, so fall back to a plain clone followed by an explicit fetch + checkout for SHAs.
+clone_ref() {
+    local url="$1"
+    local dir="$2"
+    local ref="$3"
+    if run git clone --branch "$ref" "$url" "$dir" 2>/dev/null; then
+        return
+    fi
+    log "Ref '${ref}' is not a branch/tag; cloning and checking it out explicitly."
+    run git clone "$url" "$dir"
+    run git -C "$dir" fetch origin "$ref"
+    git -C "$dir" checkout "$ref" 2>/dev/null || run git -C "$dir" checkout FETCH_HEAD
+}
+
 source_without_nounset() {
     local script_path="$1"
     local had_nounset=0
@@ -87,13 +102,18 @@ Clean setup behavior:
   Isaac Sim build, venv, or IsaacLab checkout can create hard-to-debug issues.
   Use --resume-existing only when intentionally continuing a known partial setup.
 
+The default IsaacLab repo URL points at a development fork. For a supported handoff, set
+--repo-url / --repo-ref (or WATERHOSE_REPO_URL / WATERHOSE_REPO_REF) to the branch, tag, or
+commit your NVIDIA contact provided. --repo-ref and --isaacsim-ref accept a branch, tag, or
+commit SHA.
+
 Setup options:
   --workspace DIR            Workspace to create. Default: ./waterhose-demo
-  --repo-url URL             IsaacLab waterhose repo URL.
-  --repo-ref REF             IsaacLab waterhose branch/tag. Default: max/waterhose-coupled-experimental
+  --repo-url URL             IsaacLab waterhose repo URL (default is a development fork).
+  --repo-ref REF             IsaacLab waterhose branch/tag/commit. Default: max/waterhose-coupled-experimental
   --repo-dir-name NAME       Checkout dir inside workspace. Default: IsaacLab-waterhose
   --isaacsim-url URL         Isaac Sim repo URL.
-  --isaacsim-ref REF         Isaac Sim branch/tag. Default: develop
+  --isaacsim-ref REF         Isaac Sim branch/tag/commit. Default: develop
   --isaacsim-dir-name NAME   Isaac Sim dir inside workspace. Default: IsaacSim
   --venv DIR                 venv directory inside IsaacLab checkout. Default: .venv
   --assets-tar FILE          waterhose_demo_assets.tar.gz path.
@@ -276,7 +296,7 @@ clone_or_resume_repo() {
         return
     fi
 
-    run git clone --branch "$repo_ref" "$repo_url" "$repo_dir"
+    clone_ref "$repo_url" "$repo_dir" "$repo_ref"
 }
 
 clone_or_resume_isaacsim() {
@@ -300,7 +320,8 @@ clone_or_resume_isaacsim() {
             run git -C "$isaacsim_dir" checkout "$isaacsim_ref"
         fi
     else
-        run env GIT_LFS_SKIP_SMUDGE=1 git clone --branch "$isaacsim_ref" "$isaacsim_url" "$isaacsim_dir"
+        # Skip LFS smudge during the clone; LFS objects are pulled below unless --skip-lfs.
+        (export GIT_LFS_SKIP_SMUDGE=1 && clone_ref "$isaacsim_url" "$isaacsim_dir" "$isaacsim_ref")
     fi
 
     if [[ "$skip_lfs" != "1" ]]; then
@@ -430,13 +451,13 @@ run_setup_smoke_check() {
     [[ -x "$python_exe" ]] || die "Python executable not found: ${python_exe}"
 
     log "Running post-install smoke check. Use --skip-smoke to skip this step."
+    # Run through isaaclab.sh -- the same entry point documented for customers -- so the smoke
+    # check exercises the venv selection and Isaac Sim environment setup the wrapper performs.
     (
         cd "$repo_root"
         export VIRTUAL_ENV="$venv_dir"
         export PATH="${venv_dir}/bin:${PATH}"
-        export PYTHONPATH="${repo_root}/source/isaaclab:${PYTHONPATH:-}"
-        unset LD_LIBRARY_PATH
-        run "$python_exe" \
+        run "${repo_root}/isaaclab.sh" -p \
             scripts/environments/waterhose/run_robot_demo.py \
             --task "$DEFAULT_TASK" \
             --num_envs 1 \
@@ -536,6 +557,11 @@ cmd_setup() {
     local isaacsim_dir
     repo_root="$(repo_dir_for_workspace "$workspace" "$repo_dir_name")"
     isaacsim_dir="$(isaacsim_dir_for_workspace "$workspace" "$isaacsim_dir_name")"
+
+    if [[ "$repo_url" == "$DEFAULT_REPO_URL" ]]; then
+        warn "Using the default IsaacLab repo URL (${repo_url}), which is a development fork. For a"
+        warn "supported handoff, pass --repo-url / --repo-ref (or WATERHOSE_REPO_URL / WATERHOSE_REPO_REF)."
+    fi
 
     clone_or_resume_repo "$repo_root" "$repo_url" "$repo_ref" "$resume_existing"
     clone_or_resume_isaacsim "$isaacsim_dir" "$isaacsim_url" "$isaacsim_ref" "$resume_existing" "$skip_lfs"
