@@ -805,7 +805,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # small authored offsets, and a hard joint solve would inject a large startup
                         # impulse into the cable.
                         solver_cfg=VBDSolverCfg(
-                            iterations=10,
+                            iterations=20,
                             friction_epsilon=0.1,
                             rigid_contact_hard=True,
                             rigid_joint_hard=False,
@@ -821,8 +821,16 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             # The cable/gripper/socket contacts can exceed 1000 contacts on a single
                             # body, so size the per-body contact buffer well above the default.
                             rigid_body_contact_buffer_size=4096,
-                            rigid_joint_linear_ke=1.0e5,
-                            rigid_joint_angular_ke=1.0e5,
+                            # Weld (head->Plug1, tail->Anchor1) penalty stiffness. Matched to the cable
+                            # stretch stiffness (1e6) so the head->plug weld is not the weak link in the
+                            # head(gripped)<->tail(anchored) chain: at the previous 1e5 the weld -- 10x
+                            # softer than the cable -- stretched under the carry/insert drag, so the
+                            # plug pulled away from the cable head (the "plug dragged, cable lagging"
+                            # separation) and the stiffness discontinuity at the weld oscillated. The
+                            # ramp (k_start) stays low so the authored 22 mm weld offset does not inject
+                            # a startup impulse; the joints remain soft-mode (rigid_joint_hard=False).
+                            rigid_joint_linear_ke=1.0e6,
+                            rigid_joint_angular_ke=1.0e6,
                             rigid_joint_linear_k_start=1.0e4,
                             rigid_joint_angular_k_start=1.0e1,
                             rigid_joint_linear_kd=0.0,
