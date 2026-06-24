@@ -131,3 +131,65 @@ class WaterhoseLocalFrameNewtonInverseKinematicsAction(NewtonInverseKinematicsAc
             actions = actions.clone()
             actions[:, 3:6] = math_utils.quat_apply(ee_quat_b, actions[:, 3:6])
         super().process_actions(actions)
+
+
+class WaterhoseTeleopPinnedNewtonIkAction(WaterhoseLocalFrameNewtonInverseKinematicsAction):
+    """Teleop Newton IK that pins the torso and left gripper, like the scripted demo.
+
+    The operator drives only the primary (right end-effector) relative pose. The demo's ``left_hold``
+    and ``torso_hold`` pose objectives are kept, but their targets are captured once from the bodies'
+    settled poses and held fixed, so the torso and left gripper stay put while the right arm tracks the
+    teleop command -- the same multi-body hold IK the scripted demo uses, with the holds captured at
+    teleop start instead of written each step by the state machine.
+
+    The external action dimension is just the right-end-effector slice; the hold slices are filled
+    internally, so it matches what the teleop pipeline emits (the pipeline drives only the
+    end-effector). ``WaterhoseLocalFrameNewtonInverseKinematicsAction`` still rotates the primary
+    orientation delta into the end-effector frame before the base solve.
+    """
+
+    _HOLD_OBJECTIVE_NAMES = ("left_hold", "torso_hold")
+
+    def __init__(self, cfg, env) -> None:
+        super().__init__(cfg, env)
+        self._hold_drivers = [d for d in self._drivers if d.objective.name in self._HOLD_OBJECTIVE_NAMES]
+        if not self._hold_drivers:
+            raise ValueError(
+                "WaterhoseTeleopPinnedNewtonIkAction requires the 'left_hold' and 'torso_hold' pose objectives."
+            )
+        # The operator command covers only the primary (first) objective -- the right end-effector.
+        # The hold slices are auto-filled, so the externally-exposed action dim excludes them and
+        # matches what the teleop pipeline produces.
+        self._teleop_action_dim = int(self._drivers[0].objective.action_dim)
+        self._full_actions = torch.zeros(self.num_envs, self._action_dim, device=self.device)
+        self._hold_targets_b = torch.zeros(self.num_envs, len(self._hold_drivers), 7, device=self.device)
+        self._holds_captured = False
+
+    @property
+    def action_dim(self) -> int:
+        return self._teleop_action_dim
+
+    def _capture_hold_targets(self) -> None:
+        # Pin each hold body at its current pose, expressed in the root frame as (pos, xyzw) -- the
+        # absolute-pose convention the base IK expects for these objectives.
+        body_pos_w = self._asset.data.body_pos_w.torch
+        body_quat_w = self._asset.data.body_quat_w.torch
+        root_pos_w = self._asset.data.root_pos_w.torch
+        root_quat_w = self._asset.data.root_quat_w.torch
+        for index, driver in enumerate(self._hold_drivers):
+            pos_b, quat_b = math_utils.subtract_frame_transforms(
+                root_pos_w, root_quat_w, body_pos_w[:, driver.body_idx], body_quat_w[:, driver.body_idx]
+            )
+            self._hold_targets_b[:, index, :3] = pos_b
+            self._hold_targets_b[:, index, 3:] = quat_b
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        if not self._holds_captured:
+            self._capture_hold_targets()
+            self._holds_captured = True
+        self._full_actions.zero_()
+        self._full_actions[:, : self._teleop_action_dim] = actions[:, : self._teleop_action_dim]
+        for index, driver in enumerate(self._hold_drivers):
+            offset = driver.action_offset
+            self._full_actions[:, offset : offset + 7] = self._hold_targets_b[:, index]
+        super().process_actions(self._full_actions)

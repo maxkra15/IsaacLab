@@ -85,7 +85,7 @@ from .teleop import WaterhoseSpaceMouseCfg
 # Best-practices IsaacTeleop pipelines. The previous known-working variants are preserved in
 # ``teleop_pipelines_legacy`` (same function names); switch this import to that module to
 # restore the exact prior XR behavior if a refactor here regresses the live session.
-from .teleop_pipelines import build_waterhose_relative_teleop_pipeline, build_waterhose_teleop_pipeline
+from .teleop_pipelines import build_waterhose_relative_teleop_pipeline
 
 WATERHOSE_ASSETS_DIR = os.environ.get(
     "WATERHOSE_ASSETS_DIR",
@@ -137,7 +137,7 @@ _VBD_SOFT_CONTACT_FRICTION = 0.6
 # (~1e3) holds but, combined with the hard contacts, over-constrains the seated plug and oscillates
 # it at HOLD_INSERTED. This moderate value gives a firm grip with margin against both failure modes.
 # Tune up if the grip still slips during INSERT, down if the seated plug flips at HOLD_INSERTED.
-_VBD_GRIPPER_PROXY_FRICTION = 1.0e1
+_VBD_GRIPPER_PROXY_FRICTION = 2.0e1
 _VBD_GRIPPER_PROXY_MARGIN = 0.001
 _RIGHT_GRIPPER_JOINT_NAMES = [
     "right_gripper_finger_joint_1",
@@ -277,6 +277,11 @@ _RIGHT_GRIPPER_FINGER_BODY_TOKENS = ("right_gripper_leftfinger", "right_gripper_
 
 # Body-label suffix of the kinematic cable-tail anchor (a collision-free weld target).
 _ANCHOR_BODY_TOKEN = "Anchor1"
+# Body-label suffixes for merging the connector into the cable head: the plug donates its collision
+# shape to the cable's head-segment body so the connector is rigidly part of the rod (no separate
+# welded body, no soft weld to stretch). See ``_merge_plug_shape_into_cable_head``.
+_PLUG_BODY_TOKEN = "Plug1"
+_CABLE_HEAD_BODY_TOKEN = "Cable1/cable_edge_body_0"
 
 
 def _restrict_rby1df_collision_to_right_gripper(_payload=None) -> None:
@@ -349,11 +354,59 @@ def _disable_anchor_collision(_payload=None) -> None:
     logging.debug("Disabled cable-tail anchor collision (cleared %d shapes).", cleared)
 
 
+def _merge_plug_shape_into_cable_head(_payload=None) -> None:
+    """Re-parent the plug's collision shape onto the cable head-segment body before finalize.
+
+    The connector is then rigidly part of the rod's head segment -- one body, no separate ``Plug1``
+    body and no soft head->plug weld to stretch under the carry/insert drag. Each shape on the plug
+    body is moved to the matching per-env cable head body (``.../Cable1/cable_edge_body_0``) with its
+    world pose preserved (so the connector keeps its authored offset/orientation relative to the head
+    node). Runs at MODEL_INIT while the builder is still mutable, like the collision callbacks above.
+    """
+
+    import warp as wp
+
+    from isaaclab_newton.physics import NewtonManager
+
+    builder = getattr(NewtonManager, "_builder", None)
+    if builder is None:
+        raise RuntimeError("Newton builder is unavailable while merging the plug into the cable head.")
+
+    # Resolve per-env plug and cable-head bodies by their shared prim prefix.
+    plug_bodies: dict[str, int] = {}
+    head_bodies: dict[str, int] = {}
+    for body_id, label in enumerate(builder.body_label):
+        text = str(label)
+        if text.endswith(_PLUG_BODY_TOKEN):
+            plug_bodies[text[: -len(_PLUG_BODY_TOKEN)]] = body_id
+        elif text.endswith(_CABLE_HEAD_BODY_TOKEN):
+            head_bodies[text[: -len(_CABLE_HEAD_BODY_TOKEN)]] = body_id
+
+    merged = 0
+    for prefix, plug_body in plug_bodies.items():
+        head_body = head_bodies.get(prefix)
+        if head_body is None:
+            raise RuntimeError(f"No cable head body matching plug prefix {prefix!r} while merging connector.")
+        head_inv = wp.transform_inverse(builder.body_q[head_body])
+        plug_world = builder.body_q[plug_body]
+        for shape_id, body_id in enumerate(builder.shape_body):
+            if body_id != plug_body:
+                continue
+            shape_world = wp.transform_multiply(plug_world, builder.shape_transform[shape_id])
+            builder.shape_transform[shape_id] = wp.transform_multiply(head_inv, shape_world)
+            builder.shape_body[shape_id] = head_body
+            merged += 1
+
+    if merged == 0:
+        raise RuntimeError("No plug shapes matched to merge into the cable head; body labels changed.")
+    logging.debug("Merged %d plug shape(s) onto the cable head segment.", merged)
+
+
 def _register_rby1df_collision_restriction() -> None:
     """Limit active colliders to what the task needs before Newton finalizes the model.
 
-    Restrict the robot's colliders to the right gripper, and turn the cable-tail anchor into a
-    collision-free weld target.
+    Restrict the robot's colliders to the right gripper, turn the cable-tail anchor into a
+    collision-free weld target, and merge the connector shape onto the cable head segment.
     """
 
     from isaaclab_newton.physics import NewtonManager
@@ -372,6 +425,13 @@ def _register_rby1df_collision_restriction() -> None:
         PhysicsEvent.MODEL_INIT,
         order=10,
         name="waterhose_disable_anchor_collision",
+        wrap_weak_ref=False,
+    )
+    NewtonManager.register_callback(
+        _merge_plug_shape_into_cable_head,
+        PhysicsEvent.MODEL_INIT,
+        order=10,
+        name="waterhose_merge_plug_into_cable_head",
         wrap_weak_ref=False,
     )
 
@@ -829,8 +889,8 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             # separation) and the stiffness discontinuity at the weld oscillated. The
                             # ramp (k_start) stays low so the authored 22 mm weld offset does not inject
                             # a startup impulse; the joints remain soft-mode (rigid_joint_hard=False).
-                            rigid_joint_linear_ke=1.0e6,
-                            rigid_joint_angular_ke=1.0e6,
+                            rigid_joint_linear_ke=1.0e9,
+                            rigid_joint_angular_ke=1.0e9,
                             rigid_joint_linear_k_start=1.0e4,
                             rigid_joint_angular_k_start=1.0e1,
                             rigid_joint_linear_kd=0.0,
@@ -979,19 +1039,21 @@ class WaterhoseNewtonIkActionsCfg(WaterhoseIkActionsCfg):
 
 @configclass
 class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
-    """Newton-native relative end-effector delta pose plus normalized right-gripper action.
+    """Newton-native relative end-effector teleop with the torso + left gripper pinned.
 
-    Teleop variant (matches the original multi-body Newton-IK teleop): a single command-driven
-    relative pose objective (translation deltas applied in the root frame; orientation deltas applied
-    in the end-effector frame via :class:`WaterhoseLocalFrameNewtonInverseKinematicsAction`) plus the
-    soft joint-limit objective, with no hold objectives -- the teleop operator owns the posture. The
-    torso, left arm, and right arm all share the IK joint set so the end-effector cleanly tracks the
-    commanded direction (a right-arm-only set pushes the EE off-axis near the arm's reach limit); the
-    soft joint-limit objective keeps the redundant joints from drifting.
+    Same multi-body IK as the scripted demo (:class:`WaterhoseNewtonIkActionsCfg`) -- a right
+    end-effector objective plus ``left_hold``/``torso_hold`` objectives over the full upper-body joint
+    set -- so the torso and left gripper stay pinned while the right arm tracks the operator. The only
+    differences from the demo: the right end-effector is driven by *relative* deltas (the operator
+    streams pose deltas, applied in the end-effector frame) instead of absolute waypoints, and the
+    hold targets are captured once at teleop start instead of written each step by the state machine.
+    The action class (:class:`WaterhoseTeleopPinnedNewtonIkAction`) exposes only the right-ee slice as
+    the action dimension and fills the hold slices internally, so it matches what the teleop pipeline
+    emits.
     """
 
     arm_action = NewtonInverseKinematicsActionCfg(
-        class_type="isaaclab_tasks.contrib.waterhose.mdp.actions:WaterhoseLocalFrameNewtonInverseKinematicsAction",
+        class_type="isaaclab_tasks.contrib.waterhose.mdp.actions:WaterhoseTeleopPinnedNewtonIkAction",
         asset_name="robot",
         joint_names=["torso_joint_.*", "left_arm_joint_.*", "right_arm_joint_.*"],
         controller=NewtonIKSolverCfg(optimizer="lm", jacobian_mode="analytic", iterations=24),
@@ -1003,6 +1065,22 @@ class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
                 body_offset_rot=RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
                 command_type="pose",
                 use_relative_mode=True,
+            ),
+            NewtonIKPoseObjectiveCfg(
+                name="left_hold",
+                body_name="left_gripper_base",
+                command_type="pose",
+                use_relative_mode=False,
+                position_weight=1.0,
+                rotation_weight=1.0,
+            ),
+            NewtonIKPoseObjectiveCfg(
+                name="torso_hold",
+                body_name="torso_hip_yaw",
+                command_type="pose",
+                use_relative_mode=False,
+                position_weight=50.0,
+                rotation_weight=50.0,
             ),
             NewtonIKJointLimitObjectiveCfg(weight=0.1),
         ],
@@ -1036,20 +1114,10 @@ class WaterhoseProxyIkEnvCfg(WaterhoseEnvCfg):
         super().__post_init__()
         self.episode_length_s = 30.0
         self.scene.robot.init_state.joint_pos = _RBY1_IK_INITIAL_JOINT_POS
-        self.xr = XrCfg(
-            anchor_pos=(0.0, 0.9, -1),
-            # XrCfg quaternions are xyzw. Rotate the simulation 180 deg
-            # around world up so the headset initially faces the fridge.
-            anchor_rot=(0.0, 0.0, 1.0, 0.0),
-        )
-        self.isaac_teleop = IsaacTeleopCfg(
-            pipeline_builder=build_waterhose_teleop_pipeline,
-            sim_device=self.sim.device,
-            xr_cfg=self.xr,
-            target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
-            teleoperation_active_default=True,
-            control_channel_uuid=None,
-        )
+        # No teleop on this (scripted) env: it uses the multi-body IK action (right_ee + left/torso
+        # holds = 22 dims) that the scripted state machine fills. Teleop is the dedicated
+        # ``Isaac-Waterhose-Coupled-Teleop-v0`` task (``WaterhoseProxyTeleopEnvCfg``), whose
+        # right-ee-only action matches what the teleop pipelines emit.
 
 
 @configclass
@@ -1085,6 +1153,12 @@ class WaterhoseProxyTeleopEnvCfg(WaterhoseProxyIkEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.xr = XrCfg(
+            anchor_pos=(0.0, 0.9, -1),
+            # XrCfg quaternions are xyzw. Rotate the simulation 180 deg around world up so the
+            # headset initially faces the fridge.
+            anchor_rot=(0.0, 0.0, 1.0, 0.0),
+        )
         self.isaac_teleop = IsaacTeleopCfg(
             pipeline_builder=build_waterhose_relative_teleop_pipeline,
             sim_device=self.sim.device,

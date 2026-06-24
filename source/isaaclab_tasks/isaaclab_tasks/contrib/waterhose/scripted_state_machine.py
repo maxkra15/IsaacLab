@@ -205,7 +205,7 @@ class WaterhoseDemoState:
         # driven against the back of the bore, which buckles the hose and destabilizes the coupled
         # solve -- especially now that the lower bore friction lets the plug slide in freely instead
         # of being passively limited. Lower for a shallower seat, raise for a deeper one.
-        self.insert_final_depth = 0.003
+        self.insert_final_depth = 0.002
         self.gripper_backoff_distance = 0.10
         self.connector_tip_len = CONNECTOR_TIP_LEN
 
