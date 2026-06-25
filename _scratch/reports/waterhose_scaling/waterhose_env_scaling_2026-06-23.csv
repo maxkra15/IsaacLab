@@ -1,0 +1,37 @@
+solver,num_envs,status,step_ms,env_steps_per_s,steps_per_s_per_env,startup_s,peak_mem_mib,baseline_mem_mib,run_mem_gib,cuda_graph_active,timed_steps,warmup_steps,wall_s,error
+proxy,1,ok,44.29,22.6,22.58,5.5,1951,936,0.99,True,120,50,18.1,
+proxy,2,ok,46.4,43.1,21.55,6.3,1951,936,0.99,True,120,50,19.4,
+proxy,4,ok,51.85,77.1,19.29,5.7,1953,936,0.99,True,120,50,19.7,
+proxy,8,crashed,,,,,1985,936,1.02,,120,50,12.0,"AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_U"
+proxy,16,crashed,,,,,2017,936,1.06,,120,50,12.9,"AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_U"
+proxy,32,crashed,,,,,2081,936,1.12,,120,50,14.7,"AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_U"
+proxy,64,crashed,,,,,2209,936,1.24,,120,50,18.5,"AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_U"
+proxy,128,crashed,,,,,2465,936,1.49,,120,50,27.1,"AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_U"
+admm,1,ok,71.12,14.1,14.06,7.7,1991,936,1.03,True,120,50,25.0,
+admm,2,ok,71.23,28.1,14.04,6.4,1995,936,1.03,True,120,50,23.8,
+admm,4,ok,71.5,55.9,13.99,6.5,2001,936,1.04,True,120,50,24.0,
+admm,8,ok,74.52,107.4,13.42,6.8,2033,936,1.07,True,120,50,24.8,
+admm,16,ok,76.96,207.9,12.99,7.6,2065,936,1.1,True,120,50,26.0,
+admm,32,ok,81.37,393.3,12.29,9.0,2129,936,1.17,True,120,50,28.4,
+admm,64,ok,82.95,771.6,12.06,12.3,2257,936,1.29,True,120,50,32.3,
+admm,128,ok,86.75,1475.5,11.53,19.5,2545,936,1.57,True,120,50,40.6,

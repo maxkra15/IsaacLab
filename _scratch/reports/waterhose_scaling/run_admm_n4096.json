@@ -1,0 +1,14 @@
+{
+  "task": "Isaac-Waterhose-Admm-v0",
+  "num_envs": 4096,
+  "warmup_steps": 40,
+  "timed_steps": 80,
+  "status": "ok",
+  "step_ms": 229.75991709972732,
+  "steps_per_s_per_env": 4.352369258411379,
+  "env_steps_per_s": 17827.304482453008,
+  "startup_s": 1262.682298118947,
+  "measured_s": 18.380793367978185,
+  "torch_peak_gib": 0.024770736694335938,
+  "cuda_graph_active": true
+}

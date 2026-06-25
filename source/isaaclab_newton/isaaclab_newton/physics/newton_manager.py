@@ -372,23 +372,6 @@ class NewtonManager(PhysicsManager):
 
             cameras_enabled = bool(get_settings_manager().get("/isaaclab/cameras_enabled", False))
             cls._clone_physics_only = "kit" not in requested and not cameras_enabled
-            disable_graph_for_viewer = os.getenv("ISAACLAB_NEWTON_DISABLE_CUDA_GRAPH_WITH_VIEWER", "").lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-            if (
-                disable_graph_for_viewer
-                and "newton" in requested
-                and PhysicsManager._cfg is not None
-                and PhysicsManager._cfg.use_cuda_graph
-            ):
-                logger.info(
-                    "Disabling Newton CUDA graph capture while the standalone Newton visualizer is active. "
-                    "ViewerGL uses CUDA/OpenGL interop on the same context and must run against eager physics state."
-                )
-                PhysicsManager._cfg.use_cuda_graph = False
 
         cls._scene_data_backend = NewtonSceneDataBackend()
 

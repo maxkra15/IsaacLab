@@ -11,9 +11,14 @@ CARRY -> ALIGN -> INSERT -> HOLD_INSERTED -> RELEASE -> BACKOFF -> DONE``.
 Each phase has a fixed minimum *duration* and a single end-effector *target pose* derived
 from a snapshot taken on phase entry plus a fixed geometric offset. The commanded pose is a
 smoothstep blend from the entry pose to the target, and a phase advances once its minimum
-duration has elapsed and the end effector has converged (or a hard timeout fires). The output
-is the action vector consumed by the task's IK action term: an absolute right end-effector
-pose ``[pos(3), quat_xyzw(4)]`` followed by the normalized gripper command.
+duration has elapsed and the end effector has converged (or a hard timeout fires).
+
+The output is the action vector the task's IK action term consumes. For the registered multi-body
+Newton-IK tasks it is ``[right_ee pose(7), left_hold pose(7), torso_hold pose(7), gripper(1)]`` --
+root-frame positions with ``(x, y, z, w)`` quaternions, where the two hold blocks pin the torso and
+the idle left gripper. For an end-effector-only action variant it collapses to
+``[right_ee pose(7), gripper(1)]``. :meth:`WaterhoseDemoState.compute` selects the layout from the
+action manager's total action dimension.
 """
 
 from __future__ import annotations

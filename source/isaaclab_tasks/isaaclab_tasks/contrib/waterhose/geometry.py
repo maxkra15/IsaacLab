@@ -37,15 +37,14 @@ SOCKET_COLLISION_XFORM_SUFFIX = "/Cable008/SocketCollision"
 SOCKET_COLLISION_MESH_SUFFIX = f"{SOCKET_COLLISION_XFORM_SUFFIX}/Cable008_SocketCollision"
 SOCKET_COLLISION_MESH_PATTERN = rf".*/Fridge{SOCKET_COLLISION_MESH_SUFFIX}.*"
 
-# The connector-housing body collision is authored two ways under Fridge/Cable008. The robot
-# (MJWarp entry) collides with the per-fragment convex hulls under Collisions/Cable008_Collider* --
-# cheap, accurate convex collision in MuJoCo-Warp. The deformable hose (VBD entry) instead collides
-# with a single welded mesh under BodyCollision/Cable008_BodyCollision, so the per-substep
-# particle-vs-shape soft-contact pass runs over one shape rather than the full hull set (the cost
-# scales with the shape count). Both are world-static shapes (shape_body < 0); each entry selects
-# its own representation by label so the robot does not also pick up the (concave) welded mesh.
-FRIDGE_BODY_COLLISION_MESH_PATTERN = r".*/Fridge/Cable008/Collisions/Cable008_Collider\d+.*"
-FRIDGE_BODY_WELDED_MESH_PATTERN = r".*/Fridge/Cable008/BodyCollision/Cable008_BodyCollision.*"
+# Connector-housing collision: a single welded mesh under BodyCollision/Cable008_BodyCollision
+# (a world-static shape, shape_body < 0). The robot's right gripper collides it through the MJWarp
+# entry, which -- with use_mujoco_contacts=False -- runs Newton's collision pipeline directly against
+# this one concave mesh. No per-fragment convex-hull decomposition is needed (MuJoCo-Warp would have
+# convexified a single concave mesh, but its compiled geom is inert when Newton supplies the contacts),
+# so the collision-pair enumeration stays O(1 housing shape) instead of O(hundreds of hulls). The mesh
+# excludes the socket bore, leaving it open for plug insertion.
+FRIDGE_HOUSING_COLLISION_MESH_PATTERN = r".*/Fridge/Cable008/BodyCollision/Cable008_BodyCollision.*"
 
 # Grasp point relative to the plug frame. The offset is biased toward the fridge/socket side of the
 # plug flange so the full finger pad, not just its trailing edge, carries the plug.

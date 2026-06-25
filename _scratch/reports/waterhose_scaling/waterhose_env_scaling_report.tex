@@ -1,0 +1,279 @@
+% Waterhose coupled-env scaling report -- single-file Overleaf template.
+% Data: _scratch/reports/waterhose_scaling/waterhose_env_scaling_2026-06-24.csv (scaling sweep, all
+%       collisions on) + profile_components.py stdout (single-env per-step breakdown).
+% Styling adapted from _scratch/reports/scoop_env_scaling_report.tex (IsaacLab-coupling).
+\documentclass[a4paper,11pt]{article}
+
+\usepackage[margin=0.85in, top=1.3in, bottom=0.85in, headheight=18pt, headsep=14pt]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[scaled=0.95]{helvet}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{siunitx}
+\sisetup{
+  group-separator={,},
+  group-minimum-digits=4,
+  detect-weight=true,
+  detect-family=true,
+  table-number-alignment=center,
+}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{pgfplots}
+\usepackage{tikz}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+\renewcommand{\familydefault}{\sfdefault}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{calc}
+
+% NVIDIA / report palette (matches Isaac Lab ecosystem)
+\definecolor{NvidiaGreen}{HTML}{76B900}
+\definecolor{NvidiaGreenDark}{HTML}{558B00}
+\definecolor{ReportText}{HTML}{1A1A1A}
+\definecolor{ReportMuted}{HTML}{4D4D4D}
+\definecolor{SummaryGrey}{HTML}{F2F2F2}
+\definecolor{RuleGrey}{HTML}{D9D9D9}
+\definecolor{TabBlue}{HTML}{1F77B4}
+\definecolor{TabGreen}{HTML}{2CA02C}
+\definecolor{TabOrange}{HTML}{FF7F0E}
+
+\color{ReportText}
+\hypersetup{colorlinks=true, linkcolor=NvidiaGreenDark, urlcolor=NvidiaGreenDark}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45em}
+\setlength{\headheight}{22pt}
+\setlength{\headsep}{18pt}
+
+\newcommand{\NvidiaTopBanner}{%
+  \tikz[remember picture,overlay]{%
+    \fill[NvidiaGreen] (current page.north west) rectangle ([yshift=-1.05cm]current page.north east);
+    \node[anchor=west, text=white, font=\bfseries\small]
+      at ([xshift=0.85in, yshift=-0.55cm]current page.north west) {NVIDIA | ISAAC LAB};
+    \node[anchor=east, text=white, font=\small]
+      at ([xshift=-0.85in, yshift=-0.55cm]current page.north east) {Internal technical report};
+  }%
+}
+
+\newcommand{\ReportRunHeader}{%
+  \begin{tcolorbox}[
+    enhanced, colback=NvidiaGreen, colframe=NvidiaGreen, boxrule=0pt, arc=0pt,
+    left=6pt, right=6pt, top=4pt, bottom=4pt, width=\headwidth, halign=left,
+  ]
+  {\color{white}\footnotesize\textbf{NVIDIA | ISAAC LAB}\hfill
+   Scaling Report | Waterhose Coupled (RBY1DF)}
+  \end{tcolorbox}%
+}
+
+\newcommand{\ReportRule}{{\color{RuleGrey}\rule{\linewidth}{0.5pt}}}
+\newcommand{\ReportCaption}[1]{{\small\color{ReportMuted} #1\par}}
+
+\newenvironment{reporttable}{%
+  \vspace{0.35em}\begin{center}\small
+  \renewcommand{\arraystretch}{1.3}\setlength{\tabcolsep}{10pt}%
+}{%
+  \end{center}\vspace{0.55em}%
+}
+
+\newcommand{\ReportHeading}[1]{%
+  \vspace{0.6em}{\color{NvidiaGreen}\bfseries\large #1\par}\vspace{0.25em}\ReportRule\vspace{0.45em}%
+}
+
+\newtcolorbox{executivesummarybox}{
+  enhanced, breakable, colback=SummaryGrey, colframe=SummaryGrey, boxrule=0pt,
+  borderline west={3.5pt}{0pt}{NvidiaGreen}, left=10pt, right=10pt, top=6pt, bottom=6pt,
+  arc=0pt, before skip=0.3em, after skip=0.55em,
+}
+
+\titleformat{\section}
+  {\color{NvidiaGreen}\bfseries\large}{\thesection\ }{0pt}{}
+  [\vspace{0.2em}\ReportRule\vspace{0.35em}]
+\titlespacing*{\section}{0pt}{0.9em}{0.5em}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{\ReportRunHeader}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\fancypagestyle{firstpage}{\fancyhf{}\fancyfoot[C]{\small\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+\pgfplotsset{
+  reportplot/.style={
+    width=0.86\linewidth, height=6.2cm,
+    tick label style={/pgf/number format/1000 sep={}},
+    label style={font=\small}, title style={font=\normalsize\bfseries},
+    grid=both, grid style={gray!25}, major grid style={gray!25},
+    minor tick num=1, minor grid style={gray!12},
+    legend style={font=\small, fill=white, draw=gray!40},
+    enlarge x limits=0.03, enlarge y limits=0.06,
+  },
+  wh envaxis/.style={
+    xmode=log, log basis x={2}, xtick pos=left, xlabel style={font=\small},
+    xmin=0.85, xmax=2600, xtick={1,8,32,128,512,2048}, xticklabels={1,8,32,128,512,2048},
+  },
+}
+
+\newcommand{\B}{\bfseries}
+
+\begin{document}
+\thispagestyle{firstpage}
+\NvidiaTopBanner
+
+\vspace*{0.05cm}
+{\small\color{ReportMuted}%
+June 24, 2026 \quad|\quad Branch \texttt{max/waterhose-coupled-experimental}
+\quad|\quad Prepared by Maximilian Krause\par}
+
+\vspace{0.55em}
+{\fontsize{20}{24}\selectfont\bfseries Waterhose Coupled Environment Throughput Scaling\par}
+\vspace{0.2em}
+{\normalsize\color{ReportMuted} \texttt{Isaac-Waterhose-Coupled-v0} --- proxy vs.\ ADMM coupling,
+all collisions active, 1--2048 worlds\par}
+
+\vspace{0.4em}\ReportRule\vspace{0.45em}
+
+\ReportHeading{Executive summary}
+
+\begin{executivesummarybox}
+\begin{itemize}[leftmargin=1.25em, itemsep=0.15em, topsep=0pt, parsep=0pt]
+  \item \textbf{Throughput peaks at 2048 worlds} --- the optimal env count on a 32\,GiB RTX~5090:
+        \textbf{ADMM 13{,}053 env-steps/s}, proxy 11{,}032, all CUDA-graph captured. 4096/8192 did not
+        complete (build time + memory).
+  \item \textbf{Proxy is faster at low counts, ADMM at high.} Proxy wins up to $\approx$\,1024 envs
+        (cheaper coupling per env); ADMM's per-step scales better and overtakes it above that.
+  \item \textbf{Startup is the cost of scale, not memory.} The hose is a thin Cosserat rod (no particle
+        field), so memory stays low; but build/startup grows from $\approx$\,6\,s at 1 env to
+        $\approx$\,7\,min at 2048. Per step the VBD/AVBD cable+contact solve dominates (42\,\%); the
+        CUDA graph is essential ($\approx$\,6$\times$).
+\end{itemize}
+\end{executivesummarybox}
+
+\section{Methodology}
+
+Each point is one headless, kitless, CUDA-graph run on an idle NVIDIA GeForce RTX~5090, 40 warm-up + 80
+measured steps, driven by the scripted grasp-insert policy (ten coupled substeps per step: MuJoCo-Warp
+arm, VBD cable + hard AVBD contacts, coupling, plus the IK solve). The default collision config is
+active for both backends: robot$\leftrightarrow$housing convex hulls, hose$\leftrightarrow$fridge-body
+mesh, and plug$\leftrightarrow$socket. \textbf{Proxy} (\texttt{Isaac-Waterhose-Coupled-v0}) mirrors the
+gripper as proxy bodies; \textbf{ADMM} (\texttt{Isaac-Waterhose-Admm-v0}) couples through an ADMM
+contact constraint. 4096 and 8192 worlds did not complete within the run cap on this 32\,GiB GPU.
+
+\section{Scaling results}
+
+\tableheading{Throughput, step time, and startup vs.\ world count (all collisions on, CUDA graph on).
+Startup is scene build + first reset (similar for both backends).}
+\begin{reporttable}
+\setlength{\tabcolsep}{8pt}%
+\begin{tabular}{@{}r cc cc c@{}}
+\toprule
+& \multicolumn{2}{c}{\textbf{Proxy (default)}} & \multicolumn{2}{c}{\textbf{ADMM}} & \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+\textbf{worlds} & {ms} & {env-steps/s} & {ms} & {env-steps/s} & \textbf{startup (s)} \\
+\midrule
+1    & 37.9  & 26.4   & 70.7  & 14.1   & 6 \\
+8    & 42.2  & 189.4  & 74.1  & 107.9  & 6 \\
+32   & 48.5  & 659.2  & 81.3  & 393.7  & 8 \\
+64   & 55.9  & 1144.8 & 82.6  & 775.0  & 11 \\
+128  & 64.1  & 1995.8 & 85.9  & 1490.3 & 18 \\
+512  & 87.2  & 5869.8 & 100.3 & 5106.9 & 65 \\
+1024 & 115.3 & 8880.5 & 109.6 & 9342.6 & 160 \\
+2048 & 185.6 & 11032.0 & 156.9 & \B 13053.1 & 430 \\
+\midrule
+4096 & \multicolumn{4}{c}{\emph{did not complete (build time + 32\,GiB memory)}} & --- \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+\ReportCaption{Memory stays low (no particle field) and is not the limiter up to 2048; build/startup is
+($\approx$\,7\,min at 2048). The 256-world point is omitted (measurement outlier).}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  reportplot, wh envaxis,
+  title={Total throughput vs.\ world count (all collisions on)},
+  xlabel={Number of parallel worlds (log scale)}, ylabel={Env-steps per second},
+  ymin=0, ymax=13800, ytick={0,2000,4000,6000,8000,10000,12000}, legend pos=north west,
+]
+\addplot[TabBlue, thick, dashed, mark=o, mark size=2.0pt] coordinates {
+  (1,14.1) (2,28.2) (4,56.4) (8,107.9) (16,208.2) (32,393.7) (64,775.0) (128,1490.3)
+  (256,2785.1) (512,5106.9) (1024,9342.6) (2048,13053.1)
+};
+\addlegendentry{ADMM coupling}
+\addplot[TabGreen, thick, mark=*, mark size=1.8pt] coordinates {
+  (1,26.4) (2,51.7) (4,100.4) (8,189.4) (16,362.2) (32,659.2) (64,1144.8) (128,1995.8)
+  (512,5869.8) (1024,8880.5) (2048,11032.0)
+};
+\addlegendentry{Proxy (default)}
+\addplot[only marks, TabRed, mark=*, mark size=2.6pt] coordinates {(2048,13053.1)};
+\node[font=\scriptsize, color=TabRed, anchor=south east] at (axis cs:2000,12700) {optimum 2048};
+\end{axis}
+\end{tikzpicture}
+
+\ReportCaption{Throughput rises monotonically to a peak at 2048 worlds (the optimum); 4096+ exceeds the
+32\,GiB GPU. Proxy leads to $\approx$\,1024 worlds, ADMM above it.}
+\end{center}
+
+\section{Optimal world count}
+
+\textbf{2048 worlds is the throughput optimum} on this 32\,GiB RTX~5090: env-steps/s climbs the whole
+way (proxy 26$\to$11{,}032, ADMM 14$\to$13{,}053 from 1 to 2048), then 4096 and 8192 do not complete ---
+build time and memory run out. \textbf{ADMM is the faster backend at the optimum} (13{,}053 vs.\
+11{,}032), having overtaken proxy around 1024 worlds. If startup matters (it grows to $\approx$\,7\,min
+at 2048), \textbf{1024 worlds is the sweet spot}: 8.9--9.3\,k env-steps/s at $\approx$\,2.5\,min build.
+
+\section{Per-step cost (single env)}
+
+\tableheading{Where one env-step's GPU time goes, by component (CUDA graph disabled to time kernels by
+name; all collisions on). Total kernel time 39.3\,ms/step.}
+\begin{reporttable}
+\begin{tabular}{@{}l S[table-format=2.1] S[table-format=2.1]@{}}
+\toprule
+\textbf{Component} & {\textbf{ms/step}} & {\textbf{\% GPU}} \\
+\midrule
+VBD / AVBD solve (cable + hard contacts) & 16.7 & 42.4 \\
+MJWarp (rigid robot)                     &  9.8 & 25.0 \\
+Overhead (memset/memcpy)                 &  5.4 & 13.7 \\
+Collision (broad/narrow phase)           &  4.2 & 10.6 \\
+Newton IK                                &  2.9 &  7.4 \\
+Coupling (proxy)                         &  0.4 &  1.0 \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+\ReportCaption{With the CUDA graph enabled the per-env step drops to $\approx$\,38\,ms (close to the
+kernel sum); graph-disabled the wall step is $\approx$\,222\,ms, so the graph is worth $\approx$\,6$\times$
+by eliminating launch and host-sync latency (the overhead row above).}
+
+\section{Recommended operating points}
+
+\begin{reporttable}
+\begin{tabular}{@{}l c p{0.46\linewidth}@{}}
+\toprule
+\textbf{Goal} & \textbf{Config} & \textbf{Why} \\
+\midrule
+Max sample throughput  & ADMM @ 2048 worlds   & The optimum: 13{,}053 env-steps/s. Proxy @ 2048 is
+                                                11{,}032. \\
+Throughput + fast iter  & 1024 worlds          & 8.9--9.3\,k env-steps/s at $\approx$\,2.5\,min startup
+                                                (vs.\ $\approx$\,7\,min at 2048). \\
+Demo / teleop          & Proxy @ 1 env        & The tuned single-env grasp-insert path. \\
+Extra throughput        & \texttt{WATERHOSE\_HOSE\_BODY\_COLLISION=0} & Drops the $<$\,1\,mm
+                                                hose$\leftrightarrow$body graze for more env-steps/s. \\
+\bottomrule
+\end{tabular}
+\end{reporttable}
+
+\vspace{0.6em}
+{\small\color{ReportMuted}%
+Data: \texttt{\_scratch/reports/waterhose\_scaling/waterhose\_env\_scaling\_2026-06-24.csv}; drivers
+\texttt{bench\_sweep.py} / \texttt{bench\_child.py}; per-step profile \texttt{profile\_components.py}.}
+
+\end{document}

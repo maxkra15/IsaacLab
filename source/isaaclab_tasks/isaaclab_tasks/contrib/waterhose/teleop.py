@@ -24,12 +24,26 @@ class WaterhoseSpaceMouseCfg(DeviceCfg):
     """SpaceMouse mapping tuned for hose grasping and insertion."""
 
     gripper_term: bool = True
+    """Whether the device emits a trailing gripper command element."""
+
     pos_sensitivity: float = 0.05
+    """Translation scale, end-effector metres per unit puck deflection [m]."""
+
     rot_sensitivity: float = 0.15
+    """Rotation scale, end-effector radians per unit puck twist [rad]."""
+
     translation_signs: tuple[float, float, float] = (-1.0, -1.0, 1.0)
+    """Per-axis sign applied to the (x, y, z) translation deltas to match the task frame."""
+
     twist_sign: float = -1.0
+    """Sign applied to the retained cap-twist (gripper-roll) channel."""
+
     deadzone: float = 1.0e-3
+    """Per-axis magnitude below which a raw command component is zeroed [m or rad]."""
+
     twist_deadzone: float = 1.0e-2
+    """Twist magnitude below which cap-twist cross-talk during translation is rejected [rad]."""
+
     retargeters: None = None
     class_type: type[WaterhoseSpaceMouse] | str = "{DIR}.teleop:WaterhoseSpaceMouse"
 

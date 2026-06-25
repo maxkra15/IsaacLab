@@ -660,9 +660,50 @@ class NewtonCoupledManager(NewtonManager):
             if getattr(solver_class, "__name__", "") != "SolverVBD":
                 continue
             sub_solver = NewtonManager._solver.solver(entry_cfg.name)
-            joint_count = int(getattr(getattr(sub_solver, "model", None), "joint_count", 0))
-            for joint_index in range(joint_count):
-                sub_solver.set_joint_constraint_mode(joint_index, hard=False)
+            cls._set_all_vbd_joints_soft(sub_solver)
+
+    @staticmethod
+    def _set_all_vbd_joints_soft(sub_solver) -> None:
+        """Set every VBD structural joint slot to penalty-only (soft) in one pass.
+
+        Equivalent to calling :meth:`SolverVBD.set_joint_constraint_mode(j, hard=False)`
+        for every joint, but with a single host round-trip instead of one per joint.
+        The per-joint setter re-downloads and re-uploads the full joint arrays on each
+        call, so looping it over every joint in every world is O(num_joints**2) and
+        dominates startup at high env counts; this batched form is O(num_joints).
+        """
+        joint_count = int(getattr(getattr(sub_solver, "model", None), "joint_count", 0))
+        if joint_count == 0:
+            return
+        device = sub_solver.device
+        with wp.ScopedDevice("cpu"):
+            c_start = sub_solver._to_numpy(sub_solver.joint_constraint_start, dtype=np.int32)
+            c_dim = sub_solver._to_numpy(sub_solver.joint_constraint_dim, dtype=np.int32)
+            is_hard = sub_solver._to_numpy(sub_solver.joint_is_hard, dtype=np.int32)
+            lam_lin = sub_solver._to_numpy(sub_solver.joint_lambda_lin)
+            lam_ang = sub_solver._to_numpy(sub_solver.joint_lambda_ang)
+            c0_lin = sub_solver._to_numpy(sub_solver.joint_C0_lin)
+            c0_ang = sub_solver._to_numpy(sub_solver.joint_C0_ang)
+
+            # Structural slots are LINEAR (offset 0) and ANGULAR (offset 1); drive/limit
+            # slots (offset >= 2) are always soft and are left untouched.
+            structural = np.minimum(c_dim, 2)
+            is_hard[c_start[structural >= 1]] = 0
+            is_hard[c_start[structural >= 2] + 1] = 0
+
+            # Clear the augmented-Lagrangian dual (lambda) and C0 stabilization state for
+            # the softened slots: LINEAR for every joint, ANGULAR where the joint has one.
+            lam_lin[:] = 0.0
+            c0_lin[:] = 0.0
+            has_angular = c_dim > 1
+            lam_ang[has_angular] = 0.0
+            c0_ang[has_angular] = 0.0
+
+            sub_solver.joint_is_hard = wp.array(is_hard, dtype=wp.int32, device=device)
+            sub_solver.joint_lambda_lin = wp.array(lam_lin, dtype=wp.vec3, device=device)
+            sub_solver.joint_lambda_ang = wp.array(lam_ang, dtype=wp.vec3, device=device)
+            sub_solver.joint_C0_lin = wp.array(c0_lin, dtype=wp.vec3, device=device)
+            sub_solver.joint_C0_ang = wp.array(c0_ang, dtype=wp.vec3, device=device)
 
     @classmethod
     def _configure_fk_articulation_filter(cls, model: Model, entries: list[CoupledSolverEntryCfg]) -> None:

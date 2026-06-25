@@ -19,6 +19,11 @@ from __future__ import annotations
 def build_waterhose_teleop_pipeline():
     """Build the IsaacTeleop pipeline for the absolute Waterhose IK action space.
 
+    Currently unused: the registered teleop task drives the *relative* action space via
+    :func:`build_waterhose_relative_teleop_pipeline`. This absolute builder is retained for the
+    absolute Newton-IK action variant (:class:`WaterhoseNewtonIkActionsCfg`) should a teleop task
+    bind to it.
+
     The end-effector pose is driven from the right HAND wrist so the pipeline works under Apple
     Vision Pro (which streams hand tracking, not controllers). The gripper is wired to both the hand
     and controller sources, so the same pipeline also works with Quest/Pico controllers: the

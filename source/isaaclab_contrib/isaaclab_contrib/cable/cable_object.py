@@ -507,12 +507,17 @@ def apply_cable_attachments_to_builder(
         target_re = re.compile(target_path)
         body_label = builder.body_label
         body_world = builder.body_world
+        # Only this world's bodies (and Newton's ``-1`` global sentinel) can match.
+        # Filter on ``body_world`` first so the regex never runs against the other
+        # worlds' bodies already accumulated in the shared builder: this hook runs
+        # per world during replication, and scanning the full (growing) ``body_label``
+        # made attachment resolution O(num_worlds**2) and dominated startup at scale.
+        candidate_indices = np.flatnonzero((np.asarray(body_world) == world_idx) | (np.asarray(body_world) == -1))
         target_body_idx = -1
-        for body_idx in range(len(body_label)):
+        for body_idx in candidate_indices:
+            body_idx = int(body_idx)
             label = body_label[body_idx]
-            if label != expanded_target_path and not target_re.fullmatch(label):
-                continue
-            if body_world[body_idx] == world_idx or body_world[body_idx] == -1:
+            if label == expanded_target_path or target_re.fullmatch(label):
                 target_body_idx = body_idx
                 break
         # No matching Newton body: the target may be a USD-only static scene prim

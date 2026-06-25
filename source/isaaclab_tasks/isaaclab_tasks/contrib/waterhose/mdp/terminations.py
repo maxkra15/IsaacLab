@@ -39,8 +39,25 @@ def plug_inserted_in_socket(
     The socket pose is specified in each environment's local frame. Depth is measured along the
     socket's local +Z axis. When ``cable_cfg`` is provided, the predicate uses the cable registry's
     segment-0 Newton body as the hose head and treats cable local ``-Z`` as the connector insertion
-    axis. This matches the scripted insertion controller, where cable local ``+Z`` points back along
-    the hose.
+    axis (with ``cable_tip_offset`` the seated-tip offset); this matches the scripted insertion
+    controller, where cable local ``+Z`` points back along the hose. Otherwise it uses the rigid plug
+    asset and ``connector_tip_len`` along plug ``+Z``.
+
+    Args:
+        env: The RL environment instance.
+        plug_cfg: Rigid plug asset, used only when ``cable_cfg`` is None.
+        cable_cfg: Cable asset; when set, the cable head body is the connector reference.
+        socket_pos: Socket-mouth position in the environment frame [m].
+        socket_quat: Socket orientation as ``(x, y, z, w)``.
+        connector_tip_len: Tip offset along plug +Z for the rigid-plug path [m].
+        cable_tip_offset: Tip offset along cable -Z for the cable path [m].
+        radial_threshold: Max allowed tip distance from the bore axis [m].
+        min_depth: Min seated depth along the socket +Z axis [m].
+        max_depth: Max seated depth along the socket +Z axis [m].
+        alignment_threshold: Min cosine between the connector and socket axes (dimensionless).
+
+    Returns:
+        Boolean tensor of shape ``(num_envs,)``, true where the connector is seated and aligned.
     """
 
     if cable_cfg is not None:

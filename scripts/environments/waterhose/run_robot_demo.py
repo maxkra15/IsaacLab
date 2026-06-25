@@ -24,14 +24,18 @@ from isaaclab.app import AppLauncher
 
 DEFAULT_TASK = "Isaac-Waterhose-Coupled-v0"
 DEFAULT_MAX_STEPS = 4500
+# Coupled scene-config tasks: they build Newton/USD while resolving the config, so the launch
+# path must decide Kit vs. kitless before import (see ``main``). The teleop task
+# (``Isaac-Waterhose-Coupled-Teleop-v0``) is intentionally excluded -- it is human-driven, launched
+# through the teleop agent, not this runner.
 SCENE_CONFIG_COUPLED_TASKS = {
     "Isaac-Waterhose-Coupled-v0",
     "Isaac-Waterhose-Admm-v0",
 }
-SCENE_CONFIG_SCRIPTED_TASKS = {
-    "Isaac-Waterhose-Coupled-v0",
-    "Isaac-Waterhose-Admm-v0",
-}
+# Tasks this runner drives with the scripted state machine. Currently the scripted set equals the
+# coupled set (every coupled task this runner launches plays the scripted grasp-insert arc); kept
+# as a separate name so a future non-scripted coupled task can be added to one set only.
+SCENE_CONFIG_SCRIPTED_TASKS = set(SCENE_CONFIG_COUPLED_TASKS)
 
 
 def _debug_runner(message: str) -> None:

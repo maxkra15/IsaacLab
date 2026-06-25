@@ -1,0 +1,14 @@
+{
+  "task": "Isaac-Waterhose-Coupled-v0",
+  "num_envs": 128,
+  "warmup_steps": 15,
+  "timed_steps": 30,
+  "status": "ok",
+  "step_ms": 62.9821831981341,
+  "steps_per_s_per_env": 15.877506133030106,
+  "env_steps_per_s": 2032.3207850278536,
+  "startup_s": 17.675865788944066,
+  "measured_s": 1.8894654959440231,
+  "torch_peak_gib": 0.0007824897766113281,
+  "cuda_graph_active": true
+}

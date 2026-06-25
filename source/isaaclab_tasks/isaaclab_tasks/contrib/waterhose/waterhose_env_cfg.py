@@ -5,9 +5,10 @@
 
 """Waterhose manipulation environment.
 
-MDP config groups are copied from the Franka cable-plug task
-(:mod:`isaaclab_tasks.core.lift_franka_soft`), whose
-``mdp`` functions are reused by import.
+An RBY1DF robot grasps a hose connector and inserts it into a fridge socket under a Newton coupled
+solver (MuJoCo-Warp rigid robot + VBD deformable hose). The MDP uses standard
+:mod:`isaaclab.envs.mdp` terms plus the task-local action/termination terms in :mod:`.mdp`. See the
+package ``README.md`` for the task list, run commands, and the batchability/performance summary.
 """
 
 from __future__ import annotations
@@ -16,6 +17,9 @@ import logging
 import math
 import os
 
+from isaaclab_newton.envs.mdp.actions.newton_ik_actions_cfg import NewtonInverseKinematicsActionCfg
+from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKJointLimitObjectiveCfg, NewtonIKPoseObjectiveCfg
+from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.physics import (
     AdmmContactPairCfg,
     AdmmCouplingCfg,
@@ -26,9 +30,6 @@ from isaaclab_newton.physics import (
     NewtonCollisionPipelineCfg,
     ProxyCouplingCfg,
 )
-from isaaclab_newton.envs.mdp.actions.newton_ik_actions_cfg import NewtonInverseKinematicsActionCfg
-from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKJointLimitObjectiveCfg, NewtonIKPoseObjectiveCfg
-from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.sim.spawners.materials.physics_materials_cfg import NewtonCableMaterialCfg
 from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 from isaaclab_visualizers.kit.kit_visualizer_cfg import KitVisualizerCfg
@@ -68,8 +69,7 @@ from isaaclab_contrib.deformable.newton_manager_cfg import (
 from .geometry import (
     ANCHOR_POS,
     CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z,
-    FRIDGE_BODY_COLLISION_MESH_PATTERN,
-    FRIDGE_BODY_WELDED_MESH_PATTERN,
+    FRIDGE_HOUSING_COLLISION_MESH_PATTERN,
     FRIDGE_POS,
     RIGHT_GRIPPER_EE_FRAME_POS,
     RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
@@ -153,19 +153,22 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw_value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-# Connector-housing collision. The robot collides with the per-fragment convex housing hulls through
-# the MJWarp entry (cheap in MuJoCo-Warp), and when this flag is enabled the deformable hose collides
-# with the housing through a single welded body collider routed into the VBD/cable entry (one shape
-# keeps the per-substep particle-vs-shape soft-contact cost low). Set WATERHOSE_FRIDGE_BODY_COLLISION=0
-# to route no housing collision into the hose entry (socket-only; the hose is authored to sit flush
-# against the body).
-_FRIDGE_BODY_COLLISION = _env_flag("WATERHOSE_FRIDGE_BODY_COLLISION", True)
+# Connector-housing collision: the robot's right gripper collides with the single welded housing mesh
+# through the MJWarp entry (use_mujoco_contacts=False routes it to Newton's collision pipeline against
+# the one concave mesh -- no convex-hull decomposition to enumerate). Set WATERHOSE_FRIDGE_COLLISION=0
+# to drop it (the robot then collides with its own shapes only). The socket collision (plug insertion)
+# is independent of this flag.
+_FRIDGE_COLLISION = _env_flag("WATERHOSE_FRIDGE_COLLISION", True)
 
 
-# Texture-SDF collision for the fridge's embedded socket collider. An SDF gives the bore a smooth,
-# correctly-signed gradient field that guides the plug tip during insertion better than reduced
-# BVH mesh-mesh contacts. Resolution 128 resolves the thin (~3 mm) bore wall. Set
-# WATERHOSE_SOCKET_SDF=0 to fall back to the plain BVH mesh contact path.
+# Optional texture-SDF collision for the fridge's embedded socket collider. The socket is authored as
+# a plain triangle-mesh (BVH) collider; ``spawn_fridge_with_socket_sdf`` upgrades it to this texture-SDF
+# only when WATERHOSE_SOCKET_SDF is enabled (the flag is the single source of truth -- the SDF is no
+# longer baked into the USD). An SDF gives the bore a smooth, correctly-signed gradient field that
+# guides the plug tip during insertion, at the cost of a per-env SDF build at startup; the plain mesh is
+# faster to start and the scripted demo inserts on it (the state machine drives the pose, so it does not
+# rely on the SDF gradient). Resolution 128 resolves the thin (~3 mm) bore wall. Default OFF; set
+# WATERHOSE_SOCKET_SDF=1 for the smoother high-fidelity contact.
 _SOCKET_SDF_COLLISION = sim_utils.NewtonSDFCollisionPropertiesCfg(
     sdf_max_resolution=128,
     sdf_narrow_band_inner=0.004,
@@ -191,7 +194,7 @@ def spawn_fridge_with_socket_sdf(
     from pxr import Usd, UsdPhysics
 
     prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
-    if not _env_flag("WATERHOSE_SOCKET_SDF", True):
+    if not _env_flag("WATERHOSE_SOCKET_SDF", False):
         return prim
     stage = prim.GetStage()
     modified = 0
@@ -274,6 +277,12 @@ def _register_rby1df_gripper_mimic_override() -> None:
 # bodies). The two right-gripper fingers are the only robot bodies that need to collide.
 _RBY1_LINK_TOKENS = ("torso", "left_arm", "right_arm", "head", "left_gripper", "right_gripper")
 _RIGHT_GRIPPER_FINGER_BODY_TOKENS = ("right_gripper_leftfinger", "right_gripper_rightfinger")
+
+# Shape-label tokens of the fridge connector-housing COLLIDERS (welded body mesh, socket). Their
+# VISIBLE flag is cleared at model-init so the Newton viewer draws them only under its "Collisions"
+# toggle, not on top of the fridge visual mesh under "Visuals" (see ``_hide_fridge_collider_visuals``).
+# The fridge visual mesh (``Cable008/Visuals``) is not listed, so it stays under "Visuals".
+_FRIDGE_COLLIDER_SHAPE_TOKENS = ("Cable008_BodyCollision", "Cable008_SocketCollision")
 
 # Body-label suffix of the kinematic cable-tail anchor (a collision-free weld target).
 _ANCHOR_BODY_TOKEN = "Anchor1"
@@ -365,7 +374,6 @@ def _merge_plug_shape_into_cable_head(_payload=None) -> None:
     """
 
     import warp as wp
-
     from isaaclab_newton.physics import NewtonManager
 
     builder = getattr(NewtonManager, "_builder", None)
@@ -402,11 +410,46 @@ def _merge_plug_shape_into_cable_head(_payload=None) -> None:
     logging.debug("Merged %d plug shape(s) onto the cable head segment.", merged)
 
 
+def _hide_fridge_collider_visuals(_payload=None) -> None:
+    """Clear the ``VISIBLE`` flag on the fridge connector-housing collider shapes (render-only).
+
+    The fridge's housing colliders (convex hulls, welded body mesh, socket) are authored visible in the
+    USD, so the Newton viewer otherwise draws them on top of the fridge visual mesh and they clutter the
+    "Visuals" toggle. Clear their ``VISIBLE`` bit so they render only under the viewer's "Collisions"
+    toggle, like the robot's colliders already do -- leaving the fridge visual mesh as the sole "Visuals"
+    representation. Only ``ShapeFlags.VISIBLE`` is touched; ``COLLIDE_SHAPES``/``COLLIDE_PARTICLES`` are
+    left as-is, so collision behavior is unchanged. The cable/plug keep their visuals (they have no
+    separate render mesh -- the rod/plug geometry is what you watch being manipulated).
+    """
+
+    from isaaclab_newton.physics import NewtonManager
+    from newton import ShapeFlags
+
+    builder = getattr(NewtonManager, "_builder", None)
+    if builder is None:
+        raise RuntimeError("Newton builder is unavailable while hiding fridge collider visuals.")
+
+    visible = int(ShapeFlags.VISIBLE)
+    cleared = 0
+    for shape_id, label in enumerate(builder.shape_label):
+        if any(token in str(label) for token in _FRIDGE_COLLIDER_SHAPE_TOKENS) and (
+            builder.shape_flags[shape_id] & visible
+        ):
+            builder.shape_flags[shape_id] &= ~visible
+            cleared += 1
+
+    if cleared == 0:
+        raise RuntimeError("No fridge collider shapes matched to hide; the shape labels changed.")
+
+    logging.debug("Cleared the VISIBLE flag on %d fridge collider shape(s) (collision-only).", cleared)
+
+
 def _register_rby1df_collision_restriction() -> None:
     """Limit active colliders to what the task needs before Newton finalizes the model.
 
     Restrict the robot's colliders to the right gripper, turn the cable-tail anchor into a
-    collision-free weld target, and merge the connector shape onto the cable head segment.
+    collision-free weld target, merge the connector shape onto the cable head segment, and hide the
+    fridge collider shapes from the viewer's "Visuals" toggle (they stay under "Collisions").
     """
 
     from isaaclab_newton.physics import NewtonManager
@@ -434,6 +477,13 @@ def _register_rby1df_collision_restriction() -> None:
         name="waterhose_merge_plug_into_cable_head",
         wrap_weak_ref=False,
     )
+    NewtonManager.register_callback(
+        _hide_fridge_collider_visuals,
+        PhysicsEvent.MODEL_INIT,
+        order=10,
+        name="waterhose_hide_fridge_collider_visuals",
+        wrap_weak_ref=False,
+    )
 
 
 def _make_proxy_collision_pipeline(model):
@@ -442,8 +492,9 @@ def _make_proxy_collision_pipeline(model):
     Before building it, drop ``COLLIDE_PARTICLES`` on the gripper finger proxy shapes so the
     deformable hose (VBD particles) does NOT collide with -- and penetrate -- the fingers, while the
     plug grip is untouched. The two interactions ride independent contact paths gated by independent
-    shape-flag bits: the Plug1 grip is a RIGID-vs-rigid contact (``COLLIDE_SHAPES``, carrying the
-    weld-grade mu=1e6 tangential hold), and the hose-vs-finger penetration is a SOFT particle contact
+    shape-flag bits: the Plug1 grip is a RIGID-vs-rigid contact (``COLLIDE_SHAPES``, carrying the firm
+    tangential hold set by ``_VBD_GRIPPER_PROXY_FRICTION`` (mu~=20)), and the hose-vs-finger penetration
+    is a SOFT particle contact
     (``COLLIDE_PARTICLES``, generated over every particle x shape with no shape-pair filter, so a
     shape-pair filter cannot target it). Clearing only the particle bit removes the hose contacts and
     leaves the rigid grip byte-identical. ``model`` here is the VBD destination view; this runs once at
@@ -729,7 +780,11 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Reach-and-track reward shaping for the rigid plug."""
+    """Joint-regularization penalties only (velocity, torque, acceleration).
+
+    The demo is scripted/teleoperated, so no reach-or-insert reward is learned; these terms only keep
+    the motion smooth. A real training task would add task-progress rewards here.
+    """
 
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1e-2)
     joint_torque = RewTerm(func=mdp.joint_torques_l2, weight=-1e-4)
@@ -800,7 +855,11 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
             lookat=_NEWTON_CAMERA_LOOKAT,
             window_width=1600,
             window_height=1600,
-            show_static=True,
+            # show_static=False so static shapes (the fridge, ground) obey the viewer's Visuals/Collisions
+            # toggles via their VISIBLE/COLLIDE_SHAPES flags, instead of being force-drawn regardless. This
+            # lets the fridge visual be toggled off with the "Visuals" checkbox, and routes the fridge
+            # colliders (VISIBLE cleared by _hide_fridge_collider_visuals) to the "Collisions" checkbox.
+            show_static=False,
         )
         self.sim.visualizer_cfgs = [KitVisualizerCfg(**kit_view), NewtonVisualizerCfg(**newton_view)]
 
@@ -830,30 +889,29 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             cone="elliptic",
                             ls_iterations=20,
                             integrator="implicitfast",
+                            # use_mujoco_contacts=False routes the robot's contacts to Newton's
+                            # collision pipeline, so the static housing collider is the single concave
+                            # welded mesh (Newton collides it directly; MuJoCo-Warp's compiled convex
+                            # geom for it is inert). MuJoCo never sees the cavity-filling convex hull.
                             use_mujoco_contacts=False,
-                            # The fridge-housing colliders raise the robot's peak contact count to
-                            # ~126 (gripper/plug nestling into the socket region, which is densely
-                            # surrounded by convex housing pieces). The default nconmax (48) silently
-                            # DROPS the surplus, so size the contact + constraint buffers above the
-                            # peak with headroom. Buffers only cap capacity -- solver cost scales with
-                            # the actual contact count, so the spare capacity is cheap (1 env).
+                            # The gripper nestling into the socket region peaks at ~126 contacts. The
+                            # default nconmax (48) silently DROPS the surplus, so size the contact +
+                            # constraint buffers above the peak with headroom. Buffers only cap capacity
+                            # -- solver cost scales with the actual contact count, so the spare is cheap.
                             nconmax=4096,
                             njmax=1024,
                         ),
                         body_entities=[SceneEntityCfg("robot")],
-                        # The robot collides with the per-fragment housing convex hulls
-                        # (Cable008_Collider*), selected explicitly by label. ``include_body_shapes=True``
-                        # keeps the robot's own shapes in this entry's resolved shape list, which
-                        # suppresses the coupled solver's blanket world-static auto-include; the housing
-                        # hulls are then the only static shapes this entry owns. That keeps the single
-                        # welded body mesh (which the hose uses) out of the robot's view -- as a concave
-                        # mesh it would otherwise be convexified by MuJoCo-Warp and fill the socket
-                        # cavity. The socket collider is owned by the VBD entry (the plug inserts against
-                        # it); a world-static shape can only be owned by one entry, so it is not listed
-                        # here. With WATERHOSE_FRIDGE_BODY_COLLISION=0 the robot collides with its own
+                        # The robot collides with the single welded housing mesh (Cable008_BodyCollision),
+                        # selected explicitly by label. ``include_body_shapes=True`` keeps the robot's own
+                        # shapes in this entry's resolved shape list, which suppresses the coupled solver's
+                        # blanket world-static auto-include, so the housing mesh is the only static shape
+                        # this entry owns. The socket collider is owned by the VBD entry (the plug inserts
+                        # against it); a world-static shape can only be owned by one entry, so it is not
+                        # listed here. With WATERHOSE_FRIDGE_COLLISION=0 the robot collides with its own
                         # shapes only.
                         include_body_shapes=True,
-                        shape_label_patterns=([FRIDGE_BODY_COLLISION_MESH_PATTERN] if _FRIDGE_BODY_COLLISION else []),
+                        shape_label_patterns=([FRIDGE_HOUSING_COLLISION_MESH_PATTERN] if _FRIDGE_COLLISION else []),
                     ),
                     CoupledSolverEntryCfg(
                         name="vbd",
@@ -906,17 +964,10 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         ],
                         all_particles=True,
                         include_static_shapes=False,
-                        # Route the socket collider (texture-SDF bore, so the plug inserts against a
-                        # smooth field) and, when WATERHOSE_FRIDGE_BODY_COLLISION is enabled, the single
-                        # welded housing-body mesh into the VBD entry, so the cable and plug collide with
-                        # the fridge body. The deformable-hose soft-contact pass runs over every
-                        # particle x shape, so routing one welded mesh here instead of the full hull set
-                        # keeps that cost low. The robot uses the per-fragment hulls via the MJWarp entry.
-                        shape_label_patterns=(
-                            [SOCKET_COLLISION_MESH_PATTERN, FRIDGE_BODY_WELDED_MESH_PATTERN]
-                            if _FRIDGE_BODY_COLLISION
-                            else [SOCKET_COLLISION_MESH_PATTERN]
-                        ),
+                        # Route only the socket collider (the bore the plug inserts against). The
+                        # housing-body mesh is owned by the MJWarp entry for the robot contact; the hose
+                        # is authored to sit clear of the body, so it needs no separate housing collision.
+                        shape_label_patterns=[SOCKET_COLLISION_MESH_PATTERN],
                     ),
                 ],
                 proxy_coupling=ProxyCouplingCfg(
@@ -964,8 +1015,8 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
 class WaterhoseIkActionsCfg:
     """Absolute right end-effector pose plus normalized right-gripper action for scripted demos.
 
-    Base (DiffIK) action space, retained for the non-coupled :class:`WaterhoseIkEnvCfg` variant and
-    as the shared gripper-action parent for the Newton-IK subclasses below.
+    Base (DiffIK) action space, retained for the unregistered :class:`WaterhoseIkEnvCfg` reference
+    variant and as the shared gripper-action parent for the Newton-IK subclasses below.
     """
 
     arm_action = DifferentialInverseKinematicsActionCfg(
@@ -1089,7 +1140,12 @@ class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
 
 @configclass
 class WaterhoseIkEnvCfg(WaterhoseEnvCfg):
-    """Waterhose variant with an IK action space for the scripted RBY1 demo."""
+    """Coupled waterhose variant with the base DiffIK action space (unregistered reference).
+
+    Not gym-registered; kept as a reference for the differential-IK action variant. It still inherits
+    the full MJWarp+VBD coupled solver from :class:`WaterhoseEnvCfg`. The registered demo/teleop tasks
+    use the Newton-IK variants (:class:`WaterhoseProxyIkEnvCfg`, :class:`WaterhoseProxyTeleopEnvCfg`).
+    """
 
     actions: WaterhoseIkActionsCfg = WaterhoseIkActionsCfg()
 
