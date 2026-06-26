@@ -45,6 +45,7 @@ from isaaclab.devices.device_base import DevicesCfg
 from isaaclab.devices.keyboard import Se3KeyboardCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
+from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -68,6 +69,9 @@ from isaaclab_contrib.deformable.newton_manager_cfg import (
 from .geometry import (
     ANCHOR_POS,
     CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z,
+    FRIDGE_FLOOR_COLLISION_TOKEN,
+    FRIDGE_FLOOR_POS,
+    FRIDGE_FLOOR_SIZE,
     FRIDGE_HOUSING_COLLISION_MESH_PATTERN,
     FRIDGE_POS,
     RIGHT_GRIPPER_EE_FRAME_POS,
@@ -149,6 +153,11 @@ _RIGHT_GRIPPER_JOINT_NAMES = [
     "right_gripper_left_finger_joint",
     "right_gripper_right_finger_joint",
 ]
+# Teleop actions arrive as per-step relative commands. Bound them so high-gain IK targets stay finite
+# while still feeling responsive during free teleop.
+_TELEOP_MAX_EE_TRANSLATION_DELTA = 0.02
+_TELEOP_MAX_EE_ROTATION_DELTA = 0.08
+_TELEOP_MAX_GRIPPER_JOINT_DELTA = 0.0015
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -295,7 +304,7 @@ _RIGHT_GRIPPER_FINGER_BODY_TOKENS = ("right_gripper_leftfinger", "right_gripper_
 # VISIBLE flag is cleared at model-init so the Newton viewer draws them only under its "Collisions"
 # toggle, not on top of the fridge visual mesh under "Visuals" (see ``_hide_fridge_collider_visuals``).
 # The fridge visual mesh (``Cable008/Visuals``) is not listed, so it stays under "Visuals".
-_FRIDGE_COLLIDER_SHAPE_TOKENS = ("Cable008_BodyCollision", "Cable008_SocketCollision")
+_FRIDGE_COLLIDER_SHAPE_TOKENS = ("Cable008_BodyCollision", "Cable008_SocketCollision", FRIDGE_FLOOR_COLLISION_TOKEN)
 # Shape-label token of the connector-housing body mesh alone (NOT the socket). Used to gate the
 # housing contact off via ``WATERHOSE_FRIDGE_COLLISION`` while leaving the socket so the plug still
 # inserts (see ``_disable_fridge_body_collision``).
@@ -711,6 +720,28 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=ANCHOR_POS),
     )
 
+    # Below-socket collision wall (collider-only -- not a visual). A per-env kinematic SOLID box filling
+    # the fridge body below/behind the socket so the robot gripper cannot dip/tunnel into the concave
+    # connector housing while inserting the plug. Spawned as a ``GeoType.BOX`` primitive (analytic solid
+    # contact); it MUST stay thick in every dimension -- MuJoCo-Warp has no continuous collision, so a
+    # thin slab is stepped through by the stiff gripper even though the contact pair is generated (see the
+    # geometry-constant comment). It is added to the MJWarp robot entry below
+    # (``SceneEntityCfg("fridge_floor")``) so the gripper -- and only the gripper -- collides it; being a
+    # body shape (not world-static) it is invisible to the VBD entry, so it never touches the cable or
+    # plug. Cloned per-env by the replicator. Its VISIBLE flag is cleared at model-init
+    # (``_hide_fridge_collider_visuals``), so the Newton viewer draws it only under "Collisions". Tune the
+    # size/pose (``FRIDGE_FLOOR_SIZE`` / ``FRIDGE_FLOOR_POS`` in ``geometry.py``) live in the viewer.
+    fridge_floor = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/FridgeFloor",
+        spawn=sim_utils.CuboidCfg(
+            size=FRIDGE_FLOOR_SIZE,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.4, 0.8)),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=FRIDGE_FLOOR_POS),
+    )
+
     # The deformable cable, simulated as a Cosserat rod by the VBD solver. The stretch stiffness is
     # firm enough to hold the hose taut without making it behave like a rigid rod during plug motion.
     cable1 = CableObjectCfg(
@@ -963,7 +994,11 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             nconmax=4096,
                             njmax=1024,
                         ),
-                        body_entities=[SceneEntityCfg("robot")],
+                        # The robot plus the bottom-of-cavity collision floor: making the floor a body of
+                        # this entry gives it to the robot's MJWarp solver, so the gripper collides it
+                        # (box-vs-mesh). It is a kinematic body shape (not world-static), so it stays out
+                        # of the VBD entry's world-static auto-include and never touches the cable/plug.
+                        body_entities=[SceneEntityCfg("robot"), SceneEntityCfg("fridge_floor")],
                         # The robot collides the connector HOUSING but not the socket: the gripper should
                         # not fight the socket bore during insertion (only the plug seats into it). Listing
                         # the housing explicitly here scopes this entry to it -- a non-empty shape list also
@@ -1187,6 +1222,14 @@ class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
         asset_name="robot",
         joint_names=["torso_joint_.*", "left_arm_joint_.*", "right_arm_joint_.*"],
         controller=NewtonIKSolverCfg(optimizer="lm", jacobian_mode="analytic", iterations=24),
+        clip={
+            "right_ee/x": (-_TELEOP_MAX_EE_TRANSLATION_DELTA, _TELEOP_MAX_EE_TRANSLATION_DELTA),
+            "right_ee/y": (-_TELEOP_MAX_EE_TRANSLATION_DELTA, _TELEOP_MAX_EE_TRANSLATION_DELTA),
+            "right_ee/z": (-_TELEOP_MAX_EE_TRANSLATION_DELTA, _TELEOP_MAX_EE_TRANSLATION_DELTA),
+            "right_ee/roll": (-_TELEOP_MAX_EE_ROTATION_DELTA, _TELEOP_MAX_EE_ROTATION_DELTA),
+            "right_ee/pitch": (-_TELEOP_MAX_EE_ROTATION_DELTA, _TELEOP_MAX_EE_ROTATION_DELTA),
+            "right_ee/yaw": (-_TELEOP_MAX_EE_ROTATION_DELTA, _TELEOP_MAX_EE_ROTATION_DELTA),
+        },
         objectives=[
             NewtonIKPoseObjectiveCfg(
                 name="right_ee",
@@ -1214,6 +1257,13 @@ class WaterhoseNewtonRelativeIkActionsCfg(WaterhoseIkActionsCfg):
             ),
             NewtonIKJointLimitObjectiveCfg(weight=0.1),
         ],
+    )
+    gripper_action = WaterhoseGripperPositionActionCfg(
+        asset_name="robot",
+        joint_names=_RIGHT_GRIPPER_JOINT_NAMES,
+        open_command_expr=dict(_RIGHT_GRIPPER_OPEN_COMMAND),
+        close_command_expr=dict(_RIGHT_GRIPPER_CLOSE_COMMAND),
+        max_joint_delta_per_step=_TELEOP_MAX_GRIPPER_JOINT_DELTA,
     )
 
 
@@ -1317,3 +1367,48 @@ class WaterhoseProxyTeleopEnvCfg(WaterhoseProxyIkEnvCfg):
                 ),
             }
         )
+
+
+@configclass
+class WaterhoseMimicEnvCfg(WaterhoseProxyTeleopEnvCfg, MimicEnvCfg):
+    """Waterhose teleop task variant with Isaac Lab Mimic data-generation metadata."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.datagen_config.name = "waterhose_coupled_teleop_D0"
+        self.datagen_config.generation_guarantee = True
+        self.datagen_config.generation_keep_failed = False
+        self.datagen_config.generation_num_trials = 10
+        self.datagen_config.generation_select_src_per_subtask = False
+        self.datagen_config.generation_select_src_per_arm = False
+        self.datagen_config.generation_relative = True
+        self.datagen_config.generation_joint_pos = False
+        self.datagen_config.generation_transform_first_robot_pose = False
+        self.datagen_config.generation_interpolate_from_last_target_pose = True
+        self.datagen_config.max_num_failures = 25
+        self.datagen_config.seed = 1
+
+        self.subtask_configs = {
+            "right": [
+                SubTaskConfig(
+                    object_ref="socket",
+                    subtask_term_signal=None,
+                    subtask_term_offset_range=(0, 0),
+                    selection_strategy="nearest_neighbor_object",
+                    selection_strategy_kwargs={"nn_k": 3},
+                    action_noise=0.003,
+                    num_interpolation_steps=3,
+                    num_fixed_steps=0,
+                    apply_noise_during_interpolation=False,
+                    description="Insert the waterhose connector into the fridge socket",
+                )
+            ]
+        }
+
+    def make_recorder_manager_cfg(self):
+        """Return recorder terms that make teleop recordings usable by Isaac Lab Mimic."""
+
+        from .waterhose_mimic_env import WaterhoseMimicRecorderManagerCfg
+
+        return WaterhoseMimicRecorderManagerCfg()

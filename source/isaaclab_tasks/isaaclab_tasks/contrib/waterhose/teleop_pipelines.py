@@ -99,6 +99,8 @@ def build_waterhose_teleop_pipeline():
 def build_waterhose_relative_teleop_pipeline():
     """Build the IsaacTeleop pipeline for the relative Waterhose IK teleop action space."""
 
+    import os
+
     import numpy as np
     from isaacteleop.retargeters import (
         GripperRetargeter,
@@ -112,7 +114,9 @@ def build_waterhose_relative_teleop_pipeline():
     from isaacteleop.retargeting_engine.tensor_types import DLDataType, NDArrayType, TransformMatrix
 
     class WaterhoseDeltaFrameRemapper(BaseRetargeter):
-        """Adapt AVP wrist deltas to the waterhose relative IK action semantics."""
+        """Opt-in twist-only insertion aid (WATERHOSE_TELEOP_TWIST_ONLY): keep only the wrist roll/twist
+        and zero pitch/yaw so wrist wobble does not fight the bore during insertion. Off by default --
+        the full wrist orientation maps to the gripper for natural teleop."""
 
         def input_spec(self):
             return {
@@ -161,8 +165,14 @@ def build_waterhose_relative_teleop_pipeline():
     )
     se3 = Se3RelRetargeter(se3_cfg, name="ee_delta")
     connected_se3 = se3.connect({HandsSource.RIGHT: transformed_hands.output(HandsSource.RIGHT)})
-    delta_remapper = WaterhoseDeltaFrameRemapper(name="waterhose_delta_frame")
-    connected_delta = delta_remapper.connect({"ee_delta": connected_se3.output("ee_delta")})
+    # Default: the full wrist orientation drives the gripper (natural hand-to-tool mapping). The legacy
+    # "twist-only" insertion aid (zeroing wrist pitch/yaw, keeping only the roll twist) made the wrist
+    # feel broken during free teleop, so it is now opt-in via WATERHOSE_TELEOP_TWIST_ONLY=1.
+    if os.getenv("WATERHOSE_TELEOP_TWIST_ONLY", "").lower() in {"1", "true", "yes", "on"}:
+        delta_remapper = WaterhoseDeltaFrameRemapper(name="waterhose_delta_frame")
+        ee_delta_output = delta_remapper.connect({"ee_delta": connected_se3.output("ee_delta")}).output("ee_delta")
+    else:
+        ee_delta_output = connected_se3.output("ee_delta")
 
     gripper_cfg = GripperRetargeterConfig(hand_side="right")
     gripper = GripperRetargeter(gripper_cfg, name="gripper")
@@ -191,7 +201,7 @@ def build_waterhose_relative_teleop_pipeline():
     )
     connected_reorderer = reorderer.connect(
         {
-            "ee_delta": connected_delta.output("ee_delta"),
+            "ee_delta": ee_delta_output,
             "gripper": connected_gripper.output("gripper_command"),
         }
     )

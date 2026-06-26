@@ -38,8 +38,8 @@ The package exposes two supported task variants:
 
 | Task ID | Purpose |
 | --- | --- |
-| `Isaac-Waterhose-Coupled-v0` | Client-facing RBY1DF waterhose demo using Newton proxy coupling and absolute differential-IK end-effector actions for the scripted demo and XR. |
-| `Isaac-Waterhose-Coupled-Teleop-v0` | Same coupled scene with relative differential-IK actions and `env_cfg.teleop_devices` for native keyboard/SpaceMouse teleop. |
+| `Isaac-Waterhose-Coupled-v0` | Client-facing RBY1DF waterhose demo using Newton proxy coupling and absolute differential-IK end-effector actions for the scripted demo. |
+| `Isaac-Waterhose-Coupled-Teleop-v0` | Same coupled scene with relative differential-IK actions plus `env_cfg.isaac_teleop` and `env_cfg.teleop_devices` for XR, keyboard, and SpaceMouse teleop. |
 
 A third task, `Isaac-Waterhose-Admm-v0` (`admm_env_cfg.py`), is also registered as an ADMM-coupling
 variant for solver comparison. It shares the same scene and reaches the same grasp-insert result, but is
@@ -191,10 +191,10 @@ Keyboard desktop teleop uses the same relative-action task:
   --visualizer kit
 ```
 
-The scripted/XR task uses an absolute 8D differential-IK action space (right end-effector pose plus a
-normalized gripper command) configured through `env_cfg.isaac_teleop`. The desktop teleop task uses a
-relative 7D action space configured through `env_cfg.teleop_devices`, matching IsaacLab's native keyboard
-and SpaceMouse devices.
+The scripted task uses an absolute 8D differential-IK action space (right end-effector pose plus a
+normalized gripper command). The teleop task uses a relative 7D action space configured through
+`env_cfg.isaac_teleop` for XR and `env_cfg.teleop_devices` for IsaacLab's native keyboard and SpaceMouse
+devices.
 
 The SpaceMouse entry uses a waterhose-specific mapping:
 
@@ -206,6 +206,57 @@ The SpaceMouse entry uses a waterhose-specific mapping:
   `twist_deadzone` rejects the twist cross-talk the cap reports during a translation push. Flip
   `twist_sign` on `WaterhoseSpaceMouseCfg` if the roll direction feels inverted.
 
+## Isaac Lab Mimic
+
+The Mimic-compatible task is:
+
+```text
+Isaac-Waterhose-Coupled-Teleop-Mimic-v0
+```
+
+It keeps the same 7D relative teleop action space as `Isaac-Waterhose-Coupled-Teleop-v0`, so HDF5 demos
+recorded through the teleop pipeline can be replayed into the Mimic task for annotation/generation.
+Recording directly with the Mimic task also writes `obs/datagen_info` through the task's recorder config.
+
+Record a small source dataset:
+
+```bash
+./isaaclab.sh -p scripts/tools/record_demos.py \
+  --task Isaac-Waterhose-Coupled-Teleop-Mimic-v0 \
+  --num_envs 1 \
+  --teleop_device spacemouse \
+  --visualizer kit \
+  --dataset_file ./datasets/waterhose_dataset.hdf5 \
+  --num_demos 5
+```
+
+If the source dataset was recorded with `Isaac-Waterhose-Coupled-Teleop-v0`, annotate it through the Mimic
+task before generation:
+
+```bash
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
+  --task Isaac-Waterhose-Coupled-Teleop-Mimic-v0 \
+  --input_file ./datasets/waterhose_dataset.hdf5 \
+  --output_file ./datasets/waterhose_dataset_annotated.hdf5 \
+  --auto \
+  --headless
+```
+
+Then run a small generation pass:
+
+```bash
+./isaaclab.sh -p scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+  --task Isaac-Waterhose-Coupled-Teleop-Mimic-v0 \
+  --input_file ./datasets/waterhose_dataset_annotated.hdf5 \
+  --output_file ./datasets/waterhose_dataset_generated_small.hdf5 \
+  --num_envs 1 \
+  --generation_num_trials 1 \
+  --headless
+```
+
+The initial Mimic config uses one right-arm subtask referenced to the socket. This is intentionally minimal:
+it verifies compatibility with teleop recordings and leaves finer manual subtask boundaries for later tuning.
+
 ## Apple Vision Pro
 
 Apple Vision Pro XR teleoperation is verified on this branch with the IsaacTeleop/OpenXR path. Launch from
@@ -215,7 +266,7 @@ the Isaac Lab checkout:
 export DISPLAY=:1
 
 ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
-  --task Isaac-Waterhose-Coupled-v0 \
+  --task Isaac-Waterhose-Coupled-Teleop-v0 \
   --num_envs 1 \
   --visualizer kit \
   --xr \
@@ -263,7 +314,7 @@ Meta Quest and Pico use the CloudXR.js web profile:
 export DISPLAY=:1
 
 ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
-  --task Isaac-Waterhose-Coupled-v0 \
+  --task Isaac-Waterhose-Coupled-Teleop-v0 \
   --num_envs 1 \
   --visualizer kit \
   --xr \
@@ -418,7 +469,7 @@ release.
 - **`scripted_state_machine.py`** — the demo policy (REST→…→DONE). Reads the live plug pose from the
   Newton solver state (so the pick is agnostic to the cable's resting pose) and emits the multi-body IK
   action + gripper command.
-- **`mdp/actions.py`** — the gripper and Newton-IK action terms (scripted/XR absolute IK; teleop relative
+- **`mdp/actions.py`** — the gripper and Newton-IK action terms (scripted absolute IK; teleop/XR relative
   IK). **`mdp/terminations.py`** — the `plug_inserted_in_socket` success predicate.
 - **`geometry.py`** — shared poses, offsets, and collider label patterns. **All quaternions are
   `(x, y, z, w)`** (USD-authored `(w,x,y,z)` is converted here).
@@ -484,7 +535,7 @@ These notes address the initial customer feedback from the first RB-Y1 refrigera
    export DISPLAY=:1
 
    ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
-     --task Isaac-Waterhose-Coupled-v0 \
+     --task Isaac-Waterhose-Coupled-Teleop-v0 \
      --num_envs 1 \
      --visualizer kit \
      --xr \

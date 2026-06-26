@@ -36,6 +36,19 @@ class WaterhoseGripperPositionActionCfg(ActionTermCfg):
     close_command_expr: dict[str, float] = MISSING
     """Joint position targets for a normalized action of ``-1``."""
 
+    max_joint_delta_per_step: float | None = None
+    """Maximum per-step joint target change [m or rad, depending on joint type]."""
+
+
+def _rate_limit_joint_targets(
+    previous_targets: torch.Tensor, desired_targets: torch.Tensor, max_delta_per_step: float
+) -> torch.Tensor:
+    """Clamp desired joint targets to a per-step delta from previous targets."""
+
+    max_delta = max(0.0, float(max_delta_per_step))
+    delta = torch.clamp(desired_targets - previous_targets, min=-max_delta, max=max_delta)
+    return previous_targets + delta
+
 
 class WaterhoseGripperPositionAction(ActionTerm):
     """Interpolates one scalar into explicit right-gripper joint position targets."""
@@ -84,7 +97,15 @@ class WaterhoseGripperPositionAction(ActionTerm):
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
         close_alpha = torch.clamp((1.0 - actions) * 0.5, 0.0, 1.0)
-        self._processed_actions[:] = self._open_command + close_alpha * (self._close_command - self._open_command)
+        desired_actions = self._open_command + close_alpha * (self._close_command - self._open_command)
+        if self.cfg.max_joint_delta_per_step is None:
+            self._processed_actions[:] = desired_actions
+        else:
+            self._processed_actions[:] = _rate_limit_joint_targets(
+                self._processed_actions,
+                desired_actions,
+                self.cfg.max_joint_delta_per_step,
+            )
 
     def apply_actions(self) -> None:
         self._asset.set_joint_position_target_index(target=self._processed_actions, joint_ids=self._joint_ids)

@@ -2,7 +2,7 @@
   "task": "Isaac-Waterhose-Coupled-v0",
   "num_envs": 8192,
   "warmup_steps": 40,
-  "timed_steps": 80,
+  "timed_steps": 60,
   "status": "crashed",
   "error": "RuntimeError: Failed to allocate 6308233216 bytes on device 'cuda:0'"
 }

@@ -46,6 +46,30 @@ SOCKET_COLLISION_MESH_PATTERN = rf".*/Fridge{SOCKET_COLLISION_MESH_SUFFIX}.*"
 # excludes the socket bore, leaving it open for plug insertion.
 FRIDGE_HOUSING_COLLISION_MESH_PATTERN = r".*/Fridge/Cable008/BodyCollision/Cable008_BodyCollision.*"
 
+# Below-socket collision wall. A SOLID box occupying the fridge body directly below/behind the socket so
+# the robot gripper cannot dip/tunnel into the concave connector housing while inserting the plug. It is
+# a per-env kinematic body (a ``GeoType.BOX`` primitive -> analytic solid contact, so box-vs-mesh stays
+# robust unlike the hollow housing mesh), cloned by the replicator, and rendered only under the Newton
+# viewer's "Collisions" toggle (its VISIBLE flag is cleared at model-init -- see
+# ``_hide_fridge_collider_visuals``).
+#
+# CRITICAL: keep EVERY dimension thick (>= ~0.1 m). MuJoCo-Warp does no continuous collision detection,
+# so a thin slab (e.g. a 0.02 m wall) is stepped straight through by the stiff position-controlled
+# gripper between the once-per-step collision checks -- the contact pair IS generated and resolves as a
+# hard constraint, but a thin slab simply has no overlap at the sampled configuration. A thick solid
+# block keeps the gripper overlapping for several steps, so the contact is reliably caught. (This is also
+# why the 245 solid convex hulls held but the single concave housing *shell* mesh tunnels.)
+#
+# Placement (environment frame): the +y face sits at the socket plane (y~0.341) where the gripper
+# approaches from the robot side (+y); the box extends in -y into the fridge body (unused space), so the
+# thickness never intrudes on the grasp/insert corridor. The socket mouth is at z=0.28698; the box top
+# (z~0.215) stays below it so it clears the seated plug. Tune the size/pose live in the viewer, but do
+# not let any dimension go thin. The token must appear in the spawned collider's shape label so the hide
+# hook matches it.
+FRIDGE_FLOOR_SIZE = (0.5, 0.3, 0.5)
+FRIDGE_FLOOR_POS = (-0.259345, 0.191, -0.035)
+FRIDGE_FLOOR_COLLISION_TOKEN = "FridgeFloor"
+
 # Grasp point relative to the plug frame. The offset is biased toward the fridge/socket side of the
 # plug flange so the full finger pad, not just its trailing edge, carries the plug.
 CABLE_RADIUS = 0.003

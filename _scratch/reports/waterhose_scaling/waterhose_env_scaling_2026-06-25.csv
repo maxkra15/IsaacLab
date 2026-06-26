@@ -1,0 +1,7 @@
+solver,num_envs,status,step_ms,env_steps_per_s,steps_per_s_per_env,startup_s,peak_mem_mib,baseline_mem_mib,run_mem_gib,cuda_graph_active,timed_steps,warmup_steps,wall_s,error
+admm,512,ok,76.13,6725.5,13.14,30.7,6873,3842,2.96,True,60,40,47.6,
+admm,1024,ok,83.46,12269.5,11.98,65.4,8923,3842,4.96,True,60,40,87.2,
+admm,2048,ok,180.76,11330.1,5.53,149.4,15498,4699,10.55,True,60,40,210.6,
+proxy,512,ok,46.93,10909.6,21.31,24.4,6559,3756,2.74,True,60,40,36.6,
+proxy,1024,ok,57.12,17926.5,17.51,46.8,8385,3756,4.52,True,60,40,65.7,
+proxy,2048,ok,82.93,24695.3,12.06,107.1,12067,3756,8.12,True,60,40,151.1,

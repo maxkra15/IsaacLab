@@ -12,6 +12,7 @@
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage{array}
+\usepackage{tabularx}
 \usepackage{graphicx}
 \usepackage{siunitx}
 \sisetup{
@@ -46,6 +47,7 @@
 \definecolor{TabBlue}{HTML}{1F77B4}
 \definecolor{TabGreen}{HTML}{2CA02C}
 \definecolor{TabOrange}{HTML}{FF7F0E}
+\definecolor{TabRed}{HTML}{D62728}
 
 \color{ReportText}
 \hypersetup{colorlinks=true, linkcolor=NvidiaGreenDark, urlcolor=NvidiaGreenDark}
@@ -76,6 +78,7 @@
 }
 
 \newcommand{\ReportRule}{{\color{RuleGrey}\rule{\linewidth}{0.5pt}}}
+\newcommand{\tableheading}[1]{{\color{ReportMuted}#1\par\vspace{0.35em}}}
 \newcommand{\ReportCaption}[1]{{\small\color{ReportMuted} #1\par}}
 
 \newenvironment{reporttable}{%
@@ -119,7 +122,7 @@
   },
   wh envaxis/.style={
     xmode=log, log basis x={2}, xtick pos=left, xlabel style={font=\small},
-    xmin=0.85, xmax=2600, xtick={1,8,32,128,512,2048}, xticklabels={1,8,32,128,512,2048},
+    xmin=440, xmax=9400, xtick={512,1024,2048,4096,8192}, xticklabels={512,1024,2048,4096,8192},
   },
 }
 
@@ -138,7 +141,7 @@ June 24, 2026 \quad|\quad Branch \texttt{max/waterhose-coupled-experimental}
 {\fontsize{20}{24}\selectfont\bfseries Waterhose Coupled Environment Throughput Scaling\par}
 \vspace{0.2em}
 {\normalsize\color{ReportMuted} \texttt{Isaac-Waterhose-Coupled-v0} --- proxy vs.\ ADMM coupling,
-all collisions active, 1--2048 worlds\par}
+all collisions active, 512--8192 worlds\par}
 
 \vspace{0.4em}\ReportRule\vspace{0.45em}
 
@@ -146,55 +149,62 @@ all collisions active, 1--2048 worlds\par}
 
 \begin{executivesummarybox}
 \begin{itemize}[leftmargin=1.25em, itemsep=0.15em, topsep=0pt, parsep=0pt]
-  \item \textbf{Throughput peaks at 2048 worlds} --- the optimal env count on a 32\,GiB RTX~5090:
-        \textbf{ADMM 13{,}053 env-steps/s}, proxy 11{,}032, all CUDA-graph captured. 4096/8192 did not
-        complete (build time + memory).
-  \item \textbf{Proxy is faster at low counts, ADMM at high.} Proxy wins up to $\approx$\,1024 envs
-        (cheaper coupling per env); ADMM's per-step scales better and overtakes it above that.
-  \item \textbf{Startup is the cost of scale, not memory.} The hose is a thin Cosserat rod (no particle
-        field), so memory stays low; but build/startup grows from $\approx$\,6\,s at 1 env to
-        $\approx$\,7\,min at 2048. Per step the VBD/AVBD cable+contact solve dominates (42\,\%); the
-        CUDA graph is essential ($\approx$\,6$\times$).
+  \item \textbf{Proxy is the faster backend at every world count, and scales to 6144} ---
+        \textbf{32{,}544 env-steps/s at 6144 worlds} (the peak) on a 32\,GiB RTX~5090, all CUDA-graph
+        captured. Proxy climbs monotonically (10.9k$\to$17.9k$\to$24.7k$\to$29.2k$\to$31.2k$\to$32.5k
+        from 512 to 6144); 8192 crashes (NaN at $\approx$\,26\,GiB --- the deterministic-contact cap,
+        not OOM).
+  \item \textbf{ADMM peaks at 1024 ($\approx$\,12.3k env-steps/s) and is $\approx$\,2.6$\times$ slower
+        than proxy at scale.} Proxy resolves contacts through Newton's collision pipeline; ADMM disables
+        it (\texttt{use\_collision\_pipeline=False}). ADMM is also heavier --- 15.5\,GiB at 2048 vs
+        proxy's 12.2.
+  \item \textbf{Memory tops out near the card, startup is steep.} Proxy reaches 27.5\,GiB at 6144 (near
+        the 32\,GiB ceiling); the hose is a thin Cosserat rod so per-env memory is small, but
+        \emph{build/startup} grows super-linearly ($\approx$\,24\,s at 512 to $\approx$\,14\,min at 6144).
+        Per step the VBD/AVBD cable+contact solve dominates (40\,\%); the CUDA graph is essential
+        ($\approx$\,6$\times$).
 \end{itemize}
 \end{executivesummarybox}
 
 \section{Methodology}
 
-Each point is one headless, kitless, CUDA-graph run on an idle NVIDIA GeForce RTX~5090, 40 warm-up + 80
-measured steps, driven by the scripted grasp-insert policy (ten coupled substeps per step: MuJoCo-Warp
-arm, VBD cable + hard AVBD contacts, coupling, plus the IK solve). The default collision config is
-active for both backends: robot$\leftrightarrow$housing convex hulls, hose$\leftrightarrow$fridge-body
-mesh, and plug$\leftrightarrow$socket. \textbf{Proxy} (\texttt{Isaac-Waterhose-Coupled-v0}) mirrors the
-gripper as proxy bodies; \textbf{ADMM} (\texttt{Isaac-Waterhose-Admm-v0}) couples through an ADMM
-contact constraint. 4096 and 8192 worlds did not complete within the run cap on this 32\,GiB GPU.
+Each point is one headless, kitless, CUDA-graph run on an idle NVIDIA GeForce RTX~5090, 40 warm-up + 60
+measured steps, driven by the scripted grasp-insert policy (eight coupled substeps per step: MuJoCo-Warp
+arm, VBD cable + hard AVBD contacts, coupling, plus the IK solve). The collision config is active for
+both backends: robot$\leftrightarrow$housing (a single welded concave mesh, collided through Newton with
+\texttt{use\_mujoco\_contacts=False}), and plug$\leftrightarrow$socket. \textbf{Proxy}
+(\texttt{Isaac-Waterhose-Coupled-v0})
+mirrors the gripper as proxy bodies and resolves contacts through Newton's collision pipeline;
+\textbf{ADMM} (\texttt{Isaac-Waterhose-Admm-v0}) couples through an ADMM contact constraint with the
+pipeline disabled. ADMM was measured to 2048 here; proxy ran the full 512--8192 range. 8192 crashes for
+proxy (NaN, not memory).
 
 \section{Scaling results}
 
-\tableheading{Throughput, step time, and startup vs.\ world count (all collisions on, CUDA graph on).
-Startup is scene build + first reset (similar for both backends).}
+\tableheading{Throughput and peak GPU memory vs.\ world count (all collisions on, CUDA graph on).
+Startup is the scene build (\texttt{gym.make}); $\approx$ for $\ge$\,3072 (derived from wall time).}
 \begin{reporttable}
 \setlength{\tabcolsep}{8pt}%
 \begin{tabular}{@{}r cc cc c@{}}
 \toprule
 & \multicolumn{2}{c}{\textbf{Proxy (default)}} & \multicolumn{2}{c}{\textbf{ADMM}} & \\
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
-\textbf{worlds} & {ms} & {env-steps/s} & {ms} & {env-steps/s} & \textbf{startup (s)} \\
+\textbf{worlds} & {env-steps/s} & {peak GiB} & {env-steps/s} & {peak GiB} & \textbf{startup (s)} \\
 \midrule
-1    & 37.9  & 26.4   & 70.7  & 14.1   & 6 \\
-8    & 42.2  & 189.4  & 74.1  & 107.9  & 6 \\
-32   & 48.5  & 659.2  & 81.3  & 393.7  & 8 \\
-64   & 55.9  & 1144.8 & 82.6  & 775.0  & 11 \\
-128  & 64.1  & 1995.8 & 85.9  & 1490.3 & 18 \\
-512  & 87.2  & 5869.8 & 100.3 & 5106.9 & 65 \\
-1024 & 115.3 & 8880.5 & 109.6 & 9342.6 & 160 \\
-2048 & 185.6 & 11032.0 & 156.9 & \B 13053.1 & 430 \\
-\midrule
-4096 & \multicolumn{4}{c}{\emph{did not complete (build time + 32\,GiB memory)}} & --- \\
+512  & 10932  & 6.6  & 6726  & 6.9  & 24 \\
+1024 & 17706  & 8.5  & 12270 & 8.9  & 47 \\
+2048 & 24726  & 12.2 & 11330 & 15.5 & 107 \\
+3072 & 29226  & 15.8 & ---   & ---  & $\approx$250 \\
+4096 & 31163  & 20.6 & ---   & ---  & $\approx$415 \\
+6144 & \B 32544 & 27.5 & ---  & ---  & $\approx$835 \\
+8192 & \multicolumn{2}{c}{\emph{crash (NaN @ 26\,GiB)}} & --- & --- & --- \\
 \bottomrule
 \end{tabular}
 \end{reporttable}
-\ReportCaption{Memory stays low (no particle field) and is not the limiter up to 2048; build/startup is
-($\approx$\,7\,min at 2048). The 256-world point is omitted (measurement outlier).}
+\ReportCaption{Proxy peaks at 6144 worlds (32{,}544 env-steps/s, near the 32\,GiB ceiling); 8192 crashes
+with a NaN at $\approx$\,26\,GiB (deterministic-contact-matching cap, not OOM). ADMM peaks at 1024 and
+was measured only to 2048 (and is heavier --- 15.5\,GiB there). Build/startup grows super-linearly:
+$\approx$\,24\,s at 512 to $\approx$\,14\,min at 6144.}
 
 \begin{center}
 \begin{tikzpicture}
@@ -202,78 +212,77 @@ Startup is scene build + first reset (similar for both backends).}
   reportplot, wh envaxis,
   title={Total throughput vs.\ world count (all collisions on)},
   xlabel={Number of parallel worlds (log scale)}, ylabel={Env-steps per second},
-  ymin=0, ymax=13800, ytick={0,2000,4000,6000,8000,10000,12000}, legend pos=north west,
+  ymin=0, ymax=35000, ytick={0,5000,10000,15000,20000,25000,30000}, legend pos=north west,
 ]
 \addplot[TabBlue, thick, dashed, mark=o, mark size=2.0pt] coordinates {
-  (1,14.1) (2,28.2) (4,56.4) (8,107.9) (16,208.2) (32,393.7) (64,775.0) (128,1490.3)
-  (256,2785.1) (512,5106.9) (1024,9342.6) (2048,13053.1)
+  (512,6726) (1024,12270) (2048,11330)
 };
 \addlegendentry{ADMM coupling}
 \addplot[TabGreen, thick, mark=*, mark size=1.8pt] coordinates {
-  (1,26.4) (2,51.7) (4,100.4) (8,189.4) (16,362.2) (32,659.2) (64,1144.8) (128,1995.8)
-  (512,5869.8) (1024,8880.5) (2048,11032.0)
+  (512,10932) (1024,17706) (2048,24726) (3072,29226) (4096,31163) (6144,32544)
 };
 \addlegendentry{Proxy (default)}
-\addplot[only marks, TabRed, mark=*, mark size=2.6pt] coordinates {(2048,13053.1)};
-\node[font=\scriptsize, color=TabRed, anchor=south east] at (axis cs:2000,12700) {optimum 2048};
+\addplot[only marks, TabRed, mark=*, mark size=2.6pt] coordinates {(6144,32544)};
+\node[font=\scriptsize, color=TabRed, anchor=north east] at (axis cs:8000,31500) {proxy peak 6144};
 \end{axis}
 \end{tikzpicture}
 
-\ReportCaption{Throughput rises monotonically to a peak at 2048 worlds (the optimum); 4096+ exceeds the
-32\,GiB GPU. Proxy leads to $\approx$\,1024 worlds, ADMM above it.}
+\ReportCaption{Proxy rises monotonically and peaks at 6144 worlds (32{,}544 env-steps/s); 8192 crashes
+(NaN, not OOM). ADMM peaks at 1024 and was measured only to 2048 --- proxy is faster at every count.}
 \end{center}
 
 \section{Optimal world count}
 
-\textbf{2048 worlds is the throughput optimum} on this 32\,GiB RTX~5090: env-steps/s climbs the whole
-way (proxy 26$\to$11{,}032, ADMM 14$\to$13{,}053 from 1 to 2048), then 4096 and 8192 do not complete ---
-build time and memory run out. \textbf{ADMM is the faster backend at the optimum} (13{,}053 vs.\
-11{,}032), having overtaken proxy around 1024 worlds. If startup matters (it grows to $\approx$\,7\,min
-at 2048), \textbf{1024 worlds is the sweet spot}: 8.9--9.3\,k env-steps/s at $\approx$\,2.5\,min build.
+Proxy peaks at \textbf{6144 worlds}; 8192 is not viable (NaN below the memory ceiling). For day-to-day
+runs, \textbf{2048--4096} is the better trade-off: most of the peak throughput at a fraction of the build
+time (see scaling table above). Use ADMM only when proxy coupling is unavailable --- it is slower at
+every measured count.
 
 \section{Per-step cost (single env)}
 
-\tableheading{Where one env-step's GPU time goes, by component (CUDA graph disabled to time kernels by
-name; all collisions on). Total kernel time 39.3\,ms/step.}
+\tableheading{Where one env-step's GPU time goes, by component (single env, CUDA graph disabled to time
+kernels by name; 8 substeps $\times$ 16 VBD iters --- the tuned default). Total kernel time 24.5\,ms/step.}
 \begin{reporttable}
 \begin{tabular}{@{}l S[table-format=2.1] S[table-format=2.1]@{}}
 \toprule
 \textbf{Component} & {\textbf{ms/step}} & {\textbf{\% GPU}} \\
 \midrule
-VBD / AVBD solve (cable + hard contacts) & 16.7 & 42.4 \\
-MJWarp (rigid robot)                     &  9.8 & 25.0 \\
-Overhead (memset/memcpy)                 &  5.4 & 13.7 \\
-Collision (broad/narrow phase)           &  4.2 & 10.6 \\
-Newton IK                                &  2.9 &  7.4 \\
-Coupling (proxy)                         &  0.4 &  1.0 \\
+VBD / AVBD solve (cable + hard contacts) &  9.8 & 40.0 \\
+MJWarp (rigid robot)                     &  7.6 & 30.9 \\
+Overhead (memset/memcpy)                 &  2.9 & 12.0 \\
+Newton IK                                &  2.5 & 10.2 \\
+Collision (broad/narrow phase)           &  1.4 &  5.8 \\
+Coupling (proxy)                         &  0.3 &  1.1 \\
 \bottomrule
 \end{tabular}
 \end{reporttable}
-\ReportCaption{With the CUDA graph enabled the per-env step drops to $\approx$\,38\,ms (close to the
-kernel sum); graph-disabled the wall step is $\approx$\,222\,ms, so the graph is worth $\approx$\,6$\times$
-by eliminating launch and host-sync latency (the overhead row above).}
+\ReportCaption{VBD dominates. The MJWarp row is inflated by coupled-solver state-mapping copies and the
+Newton-contact path --- the bare articulation is only $\approx$\,0.29\,ms/substep (a standalone
+MuJoCo-Warp robot benchmark), so the rigid solve is not the bottleneck. With the CUDA graph enabled the
+per-env step is $\approx$\,27\,ms ($\approx$\,kernel sum); graph-disabled the wall step is
+$\approx$\,167\,ms, so the graph is worth $\approx$\,6$\times$.}
 
 \section{Recommended operating points}
 
 \begin{reporttable}
-\begin{tabular}{@{}l c p{0.46\linewidth}@{}}
+\setlength{\tabcolsep}{6pt}%
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.20\linewidth}
+  >{\raggedright\arraybackslash}p{0.30\linewidth} X@{}}
 \toprule
-\textbf{Goal} & \textbf{Config} & \textbf{Why} \\
+\textbf{Goal} & \textbf{Config} & \textbf{Notes} \\
 \midrule
-Max sample throughput  & ADMM @ 2048 worlds   & The optimum: 13{,}053 env-steps/s. Proxy @ 2048 is
-                                                11{,}032. \\
-Throughput + fast iter  & 1024 worlds          & 8.9--9.3\,k env-steps/s at $\approx$\,2.5\,min startup
-                                                (vs.\ $\approx$\,7\,min at 2048). \\
-Demo / teleop          & Proxy @ 1 env        & The tuned single-env grasp-insert path. \\
-Extra throughput        & \texttt{WATERHOSE\_HOSE\_BODY\_COLLISION=0} & Drops the $<$\,1\,mm
-                                                hose$\leftrightarrow$body graze for more env-steps/s. \\
+Max throughput   & Proxy @ 6144 worlds & Peak env-steps/s; long startup. \\
+Fast iteration   & Proxy @ 2048--4096  & Best throughput vs.\ build-time trade-off. \\
+Demo / teleop    & Proxy @ 1 env       & Tuned grasp-insert policy. \\
+Cheaper step     & \texttt{SUBSTEPS=6}, \texttt{VBD\_ITERS=12} & $\approx$1.44$\times$ per-step speedup vs.\ 8/16 default. \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{reporttable}
 
 \vspace{0.6em}
 {\small\color{ReportMuted}%
-Data: \texttt{\_scratch/reports/waterhose\_scaling/waterhose\_env\_scaling\_2026-06-24.csv}; drivers
-\texttt{bench\_sweep.py} / \texttt{bench\_child.py}; per-step profile \texttt{profile\_components.py}.}
+Data (2026-06-25, single welded-housing collider, 8/16 substeps): proxy 512--8192, ADMM 512--2048;
+drivers \texttt{bench\_sweep.py} / \texttt{bench\_child.py}; per-step profile
+\texttt{profile\_components.py}. ADMM $\ge$\,3072 not yet measured.}
 
 \end{document}
