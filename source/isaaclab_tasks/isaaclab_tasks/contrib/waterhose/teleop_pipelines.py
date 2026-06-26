@@ -99,8 +99,6 @@ def build_waterhose_teleop_pipeline():
 def build_waterhose_relative_teleop_pipeline():
     """Build the IsaacTeleop pipeline for the relative Waterhose IK teleop action space."""
 
-    import os
-
     import numpy as np
     from isaacteleop.retargeters import (
         GripperRetargeter,
@@ -110,42 +108,8 @@ def build_waterhose_relative_teleop_pipeline():
         TensorReorderer,
     )
     from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource, HandsSource
-    from isaacteleop.retargeting_engine.interface import BaseRetargeter, OutputCombiner, TensorGroupType, ValueInput
-    from isaacteleop.retargeting_engine.tensor_types import DLDataType, NDArrayType, TransformMatrix
-
-    class WaterhoseDeltaFrameRemapper(BaseRetargeter):
-        """Opt-in twist-only insertion aid (WATERHOSE_TELEOP_TWIST_ONLY): keep only the wrist roll/twist
-        and zero pitch/yaw so wrist wobble does not fight the bore during insertion. Off by default --
-        the full wrist orientation maps to the gripper for natural teleop."""
-
-        def input_spec(self):
-            return {
-                "ee_delta": TensorGroupType(
-                    "ee_delta",
-                    [NDArrayType("delta", shape=(6,), dtype=DLDataType.FLOAT, dtype_bits=32)],
-                )
-            }
-
-        def output_spec(self):
-            return {
-                "ee_delta": TensorGroupType(
-                    "ee_delta",
-                    [NDArrayType("delta", shape=(6,), dtype=DLDataType.FLOAT, dtype_bits=32)],
-                )
-            }
-
-        def _compute_fn(self, inputs, outputs, context) -> None:
-            # Keep only the first rotation-vector component (the twist the operator uses to
-            # line the connector up with the bore) and zero the other two, so wrist wobble
-            # does not fight the insertion. The mask is applied to the retargeter's anchor-
-            # frame rotvec; the relative IK action then conjugates it into the end-effector
-            # frame (see WaterhoseLocalFrameNewtonInverseKinematicsAction). Translation
-            # (indices 0:3) passes through unchanged.
-            delta = np.asarray(inputs["ee_delta"][0], dtype=np.float32).flatten()
-            remapped = delta.copy()
-            remapped[4] = 0.0
-            remapped[5] = 0.0
-            outputs["ee_delta"][0] = remapped
+    from isaacteleop.retargeting_engine.interface import OutputCombiner, ValueInput
+    from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
 
     controllers = ControllersSource(name="controllers")
     hands = HandsSource(name="hands")
@@ -159,20 +123,15 @@ def build_waterhose_relative_teleop_pipeline():
         use_wrist_rotation=True,
         use_wrist_position=True,
         delta_pos_scale_factor=15.0,
-        delta_rot_scale_factor=2.0,
+        # Match ``WaterhoseSpaceMouseCfg.rot_sensitivity`` so AVP roll gain feels like cap twist.
+        delta_rot_scale_factor=0.15,
         alpha_pos=0.5,
         alpha_rot=0.5,
     )
     se3 = Se3RelRetargeter(se3_cfg, name="ee_delta")
-    connected_se3 = se3.connect({HandsSource.RIGHT: transformed_hands.output(HandsSource.RIGHT)})
-    # Default: the full wrist orientation drives the gripper (natural hand-to-tool mapping). The legacy
-    # "twist-only" insertion aid (zeroing wrist pitch/yaw, keeping only the roll twist) made the wrist
-    # feel broken during free teleop, so it is now opt-in via WATERHOSE_TELEOP_TWIST_ONLY=1.
-    if os.getenv("WATERHOSE_TELEOP_TWIST_ONLY", "").lower() in {"1", "true", "yes", "on"}:
-        delta_remapper = WaterhoseDeltaFrameRemapper(name="waterhose_delta_frame")
-        ee_delta_output = delta_remapper.connect({"ee_delta": connected_se3.output("ee_delta")}).output("ee_delta")
-    else:
-        ee_delta_output = connected_se3.output("ee_delta")
+    ee_delta_output = se3.connect({HandsSource.RIGHT: transformed_hands.output(HandsSource.RIGHT)}).output(
+        "ee_delta"
+    )
 
     gripper_cfg = GripperRetargeterConfig(hand_side="right")
     gripper = GripperRetargeter(gripper_cfg, name="gripper")

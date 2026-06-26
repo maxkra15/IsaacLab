@@ -155,9 +155,9 @@ _RIGHT_GRIPPER_JOINT_NAMES = [
 ]
 # Teleop actions arrive as per-step relative commands. Bound them so high-gain IK targets stay finite
 # while still feeling responsive during free teleop.
-_TELEOP_MAX_EE_TRANSLATION_DELTA = 0.02
-_TELEOP_MAX_EE_ROTATION_DELTA = 0.08
-_TELEOP_MAX_GRIPPER_JOINT_DELTA = 0.0015
+_TELEOP_MAX_EE_TRANSLATION_DELTA = 0.07
+_TELEOP_MAX_EE_ROTATION_DELTA = 0.1
+_TELEOP_MAX_GRIPPER_JOINT_DELTA = 0.15
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -295,9 +295,7 @@ def _register_rby1df_gripper_mimic_override() -> None:
     )
 
 
-# RBY1 link-label tokens used to identify the robot's own collision shapes (vs. the cable/plug/anchor
-# bodies). The two right-gripper fingers are the only robot bodies that need to collide.
-_RBY1_LINK_TOKENS = ("torso", "left_arm", "right_arm", "head", "left_gripper", "right_gripper")
+# Right-gripper finger body-label suffixes (used by the VBD proxy collision pipeline).
 _RIGHT_GRIPPER_FINGER_BODY_TOKENS = ("right_gripper_leftfinger", "right_gripper_rightfinger")
 
 # Shape-label tokens of the fridge connector-housing COLLIDERS (welded body mesh, socket). Their
@@ -317,43 +315,6 @@ _ANCHOR_BODY_TOKEN = "Anchor1"
 # welded body, no soft weld to stretch). See ``_merge_plug_shape_into_cable_head``.
 _PLUG_BODY_TOKEN = "Plug1"
 _CABLE_HEAD_BODY_TOKEN = "Cable1/cable_edge_body_0"
-
-
-def _restrict_rby1df_collision_to_right_gripper(_payload=None) -> None:
-    """Keep collision only on the right-gripper fingers; clear it on the rest of the robot.
-
-    The task only needs the robot to collide where it grasps and inserts -- the right gripper. The
-    imported RBY1 USD authors a collider on every link, and the Newton importer keeps those colliders
-    active, so the whole arm/torso/head would otherwise collide against the fridge housing every step.
-    Clear both the ``COLLIDE_SHAPES`` (rigid) and ``COLLIDE_PARTICLES`` (deformable) flags on every
-    robot shape whose body is not a right-gripper finger, so no part of the robot except the gripper
-    generates rigid or hose-particle contacts. The cable, plug, and anchor colliders are left
-    untouched (they are not robot links).
-    """
-
-    from isaaclab_newton.physics import NewtonManager
-    from newton import ShapeFlags
-
-    builder = getattr(NewtonManager, "_builder", None)
-    if builder is None:
-        raise RuntimeError("Newton builder is unavailable while restricting RBY1 collision.")
-
-    collide_mask = int(ShapeFlags.COLLIDE_SHAPES) | int(ShapeFlags.COLLIDE_PARTICLES)
-    cleared = 0
-    for shape_id, body_id in enumerate(builder.shape_body):
-        if body_id < 0:
-            continue
-        label = str(builder.body_label[body_id])
-        is_robot_link = any(token in label for token in _RBY1_LINK_TOKENS)
-        is_right_finger = any(label.endswith(token) for token in _RIGHT_GRIPPER_FINGER_BODY_TOKENS)
-        if is_robot_link and not is_right_finger and (builder.shape_flags[shape_id] & collide_mask):
-            builder.shape_flags[shape_id] &= ~collide_mask
-            cleared += 1
-
-    if cleared == 0:
-        raise RuntimeError("No non-gripper RBY1 collision shapes matched; the robot link labels changed.")
-
-    logging.debug("Restricted RBY1 collision to the right gripper (cleared %d non-finger shapes).", cleared)
 
 
 def _disable_anchor_collision(_payload=None) -> None:
@@ -506,24 +467,17 @@ def _disable_fridge_body_collision(_payload=None) -> None:
 
 
 def _register_rby1df_collision_restriction() -> None:
-    """Limit active colliders to what the task needs before Newton finalizes the model.
+    """Register model-init callbacks before Newton finalizes the coupled scene.
 
-    Restrict the robot's colliders to the right gripper, turn the cable-tail anchor into a
-    collision-free weld target, merge the connector shape onto the cable head segment, and hide the
-    fridge collider shapes from the viewer's "Visuals" toggle (they stay under "Collisions").
+    Turn the cable-tail anchor into a collision-free weld target, merge the connector shape onto the
+    cable head segment, hide the fridge collider shapes from the viewer's "Visuals" toggle (they stay
+    under "Collisions"), and optionally drop the housing contact when ``WATERHOSE_FRIDGE_COLLISION=0``.
     """
 
     from isaaclab_newton.physics import NewtonManager
 
     from isaaclab.physics import PhysicsEvent
 
-    NewtonManager.register_callback(
-        _restrict_rby1df_collision_to_right_gripper,
-        PhysicsEvent.MODEL_INIT,
-        order=10,
-        name="waterhose_restrict_rby1df_collision",
-        wrap_weak_ref=False,
-    )
     NewtonManager.register_callback(
         _disable_anchor_collision,
         PhysicsEvent.MODEL_INIT,
@@ -557,16 +511,21 @@ def _register_rby1df_collision_restriction() -> None:
 def _make_proxy_collision_pipeline(model):
     """Build the destination-view collision pipeline used by Newton proxy coupling.
 
-    Before building it, drop ``COLLIDE_PARTICLES`` on the gripper finger proxy shapes so the
-    deformable hose (VBD particles) does NOT collide with -- and penetrate -- the fingers, while the
-    plug grip is untouched. The two interactions ride independent contact paths gated by independent
-    shape-flag bits: the Plug1 grip is a RIGID-vs-rigid contact (``COLLIDE_SHAPES``, carrying the firm
-    tangential hold set by ``_VBD_GRIPPER_PROXY_FRICTION`` (mu~=20)), and the hose-vs-finger penetration
-    is a SOFT particle contact
-    (``COLLIDE_PARTICLES``, generated over every particle x shape with no shape-pair filter, so a
-    shape-pair filter cannot target it). Clearing only the particle bit removes the hose contacts and
-    leaves the rigid grip byte-identical. ``model`` here is the VBD destination view; this runs once at
-    pipeline construction (after per-entry shape visibility is set), so it is CUDA-graph-safe.
+    The pipeline is scoped so the gripper finger proxies interact with the deformable connector ONLY,
+    along two independent contact paths:
+
+    * Soft (particle) path: ``COLLIDE_PARTICLES`` is cleared on the finger proxy shapes so the deformable
+      hose (VBD particles) does NOT collide with -- and penetrate -- the fingers. This bit is generated
+      over every particle x shape with no shape-pair filter, so only the flag can target it.
+    * Rigid path: an explicit ``shape_pairs_filtered`` list keeps every non-finger pair (cable<->housing,
+      plug<->socket, cable self-contacts, ...) but, for the fingers, keeps only finger<->connector. Without
+      this the destination view auto-includes the world-static housing and socket, so the finger proxies
+      would collide the fridge inside the VBD solve -- duplicating the robot<->housing contact the MJWarp
+      entry owns and fighting the socket bore. The connector grip carries the firm tangential hold set by
+      ``_VBD_GRIPPER_PROXY_FRICTION``.
+
+    ``model`` here is the VBD destination view; this runs once at pipeline construction (after per-entry
+    shape visibility is set), so it is CUDA-graph-safe.
     """
     import warp as wp
     from newton import CollisionPipeline, ShapeFlags
@@ -596,9 +555,57 @@ def _make_proxy_collision_pipeline(model):
     model.shape_flags = wp.array(flags, dtype=wp.int32, device=model.device)
     print(f"[waterhose] Disabled hose-vs-gripper particle collision on {dropped} finger proxy shape(s).", flush=True)
 
+    # Scope the finger proxies to the GRIP ONLY. This destination-view pipeline otherwise collides the
+    # finger proxies against every world-static collider auto-included into the VBD entry -- the welded
+    # housing mesh and the socket bore -- so the gripper fights the fridge inside the VBD solve. That
+    # duplicates the robot<->housing contact the MJWarp entry already owns and pushes the gripper off the
+    # bore during insertion. Robot<->housing belongs to MJWarp; the proxy is only the grip on the
+    # connector. Build an explicit pair list that keeps every non-finger pair (cable<->housing,
+    # plug<->socket, cable self-contacts, ...) but, for the fingers, keeps only finger<->connector. The
+    # connector collider is identified by SHAPE label: ``_merge_plug_shape_into_cable_head`` re-parents it
+    # onto the cable head BODY (so it reads as a cable body), but its shape label still names the plug.
+    import numpy as np
+
+    shape_label = [str(x) for x in model.shape_label] if getattr(model, "shape_label", None) is not None else None
+    if shape_label is None:
+        raise RuntimeError("waterhose proxy pipeline: model has no shape_label; cannot scope the finger grip pairs.")
+    base_pairs = getattr(model, "shape_contact_pairs", None)
+    if base_pairs is None:
+        raise RuntimeError(
+            "waterhose proxy pipeline: model.shape_contact_pairs is None; the explicit broad phase needs it."
+        )
+    finger_shapes = {shape_id for shape_id, body_id in enumerate(shape_body) if int(body_id) in finger_bodies}
+    grip_shapes = {shape_id for shape_id, label in enumerate(shape_label) if _PLUG_BODY_TOKEN.lower() in label.lower()}
+    if not grip_shapes:
+        raise RuntimeError(
+            f"waterhose proxy pipeline: no connector collider shape found by label ({_PLUG_BODY_TOKEN!r}); "
+            "the finger grip-pair filter cannot be built."
+        )
+    kept_pairs = []
+    dropped_finger_pairs = 0
+    for shape_a, shape_b in base_pairs.numpy().reshape(-1, 2):
+        shape_a, shape_b = int(shape_a), int(shape_b)
+        a_is_finger, b_is_finger = shape_a in finger_shapes, shape_b in finger_shapes
+        if a_is_finger or b_is_finger:
+            # Keep only a single-finger pair whose other shape is the connector grip target.
+            other, single_finger = (shape_b, not b_is_finger) if a_is_finger else (shape_a, not a_is_finger)
+            if not (single_finger and other in grip_shapes):
+                dropped_finger_pairs += 1
+                continue
+        kept_pairs.append((shape_a, shape_b))
+    shape_pairs_filtered = wp.array(
+        np.asarray(kept_pairs, dtype=np.int32).reshape(-1, 2), dtype=wp.vec2i, device=model.device
+    )
+    print(
+        f"[waterhose] Scoped gripper proxy to the connector grip: kept {len(kept_pairs)} contact pair(s), "
+        f"dropped {dropped_finger_pairs} finger-vs-non-connector pair(s).",
+        flush=True,
+    )
+
     return CollisionPipeline(
         model,
         broad_phase="explicit",
+        shape_pairs_filtered=shape_pairs_filtered,
         rigid_contact_max=30000,
         # "sticky" replays previous-frame contact geometry; that is useful for
         # hard-contact demos, but makes the hose feel glued to the fingers here.
@@ -731,16 +738,18 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     # plug. Cloned per-env by the replicator. Its VISIBLE flag is cleared at model-init
     # (``_hide_fridge_collider_visuals``), so the Newton viewer draws it only under "Collisions". Tune the
     # size/pose (``FRIDGE_FLOOR_SIZE`` / ``FRIDGE_FLOOR_POS`` in ``geometry.py``) live in the viewer.
-    fridge_floor = RigidObjectCfg(
-        prim_path="/World/envs/env_.*/FridgeFloor",
-        spawn=sim_utils.CuboidCfg(
-            size=FRIDGE_FLOOR_SIZE,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.4, 0.8)),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=FRIDGE_FLOOR_POS),
-    )
+    # TEMPORARILY DISABLED: the bottom-of-cavity collision box. Uncomment to restore it (and re-add
+    # ``SceneEntityCfg("fridge_floor")`` to the MJWarp entry's ``body_entities`` below).
+    # fridge_floor = RigidObjectCfg(
+    #     prim_path="/World/envs/env_.*/FridgeFloor",
+    #     spawn=sim_utils.CuboidCfg(
+    #         size=FRIDGE_FLOOR_SIZE,
+    #         rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+    #         collision_props=sim_utils.CollisionPropertiesCfg(),
+    #         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.4, 0.8)),
+    #     ),
+    #     init_state=RigidObjectCfg.InitialStateCfg(pos=FRIDGE_FLOOR_POS),
+    # )
 
     # The deformable cable, simulated as a Cosserat rod by the VBD solver. The stretch stiffness is
     # firm enough to hold the hose taut without making it behave like a rigid rod during plug motion.
@@ -994,11 +1003,10 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             nconmax=4096,
                             njmax=1024,
                         ),
-                        # The robot plus the bottom-of-cavity collision floor: making the floor a body of
-                        # this entry gives it to the robot's MJWarp solver, so the gripper collides it
-                        # (box-vs-mesh). It is a kinematic body shape (not world-static), so it stays out
-                        # of the VBD entry's world-static auto-include and never touches the cable/plug.
-                        body_entities=[SceneEntityCfg("robot"), SceneEntityCfg("fridge_floor")],
+                        # NOTE: the bottom-of-cavity collision box (``fridge_floor``) is temporarily
+                        # disabled (asset commented out below); re-add ``SceneEntityCfg("fridge_floor")``
+                        # here to restore it.
+                        body_entities=[SceneEntityCfg("robot")],
                         # The robot collides the connector HOUSING but not the socket: the gripper should
                         # not fight the socket bore during insertion (only the plug seats into it). Listing
                         # the housing explicitly here scopes this entry to it -- a non-empty shape list also
@@ -1009,12 +1017,12 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # shows every ``shape_body < 0`` shape to any entry with no owned shapes, and that is
                         # shared visibility, not ownership (the "owned by >1 entry" error only fires on
                         # explicit listings, and only this entry lists it). So robot↔housing runs in MJWarp
-                        # and cable↔housing in VBD, from one mesh. ``include_body_shapes=False`` keeps the
-                        # robot's own link shapes out of the resolved list (they stay visible via body
-                        # ownership); ``_restrict_rby1df_collision_to_right_gripper`` limits robot contacts
-                        # to the gripper. ``WATERHOSE_FRIDGE_COLLISION=0`` drops the housing contact for both
-                        # sides (``_disable_fridge_body_collision`` clears its collide flags).
-                        include_body_shapes=False,
+                        # and cable↔housing in VBD, from one mesh. ``include_body_shapes=True`` adds the
+                        # robot's (and fridge_floor's) colliders to this entry's resolved shape list so
+                        # the entry-local Newton collision pipeline (``use_mujoco_contacts=False``) actually
+                        # broad-phases robot↔housing pairs. Set ``WATERHOSE_FRIDGE_COLLISION=0`` to drop the
+                        # housing contact for both sides (``_disable_fridge_body_collision`` clears its collide flags).
+                        include_body_shapes=True,
                         shape_label_patterns=[FRIDGE_HOUSING_COLLISION_MESH_PATTERN],
                     ),
                     CoupledSolverEntryCfg(

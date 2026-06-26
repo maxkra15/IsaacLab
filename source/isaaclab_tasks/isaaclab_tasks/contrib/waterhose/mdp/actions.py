@@ -20,6 +20,11 @@ from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.managers.manager_term_cfg import ActionTermCfg
 from isaaclab.utils.configclass import configclass
 
+from . import contact_debug
+
+# Matches ``WaterhoseSpaceMouseCfg.twist_sign`` and the AVP pipeline convention.
+_TELEOP_TWIST_SIGN = -1.0
+
 
 @configclass
 class WaterhoseGripperPositionActionCfg(ActionTermCfg):
@@ -95,6 +100,9 @@ class WaterhoseGripperPositionAction(ActionTerm):
         return self._processed_actions
 
     def process_actions(self, actions: torch.Tensor) -> None:
+        # Optional per-step contact logging (WATERHOSE_DEBUG_CONTACTS); a no-op when unset. The gripper
+        # action runs every step in both the scripted demo and teleop, so this is the shared hook.
+        contact_debug.log_contacts_if_enabled()
         self._raw_actions[:] = actions
         close_alpha = torch.clamp((1.0 - actions) * 0.5, 0.0, 1.0)
         desired_actions = self._open_command + close_alpha * (self._close_command - self._open_command)
@@ -149,8 +157,29 @@ class WaterhoseLocalFrameNewtonInverseKinematicsAction(NewtonInverseKinematicsAc
             ee_quat_b = math_utils.quat_mul(
                 math_utils.quat_inv(root_quat_w), math_utils.quat_mul(body_quat_w, self._ee_offset_quat)
             )
+            ee_quat_w = math_utils.quat_mul(body_quat_w, self._ee_offset_quat)
+            z_axis = torch.zeros(self.num_envs, 3, device=self.device)
+            z_axis[:, 2] = 1.0
+            ee_z_w = math_utils.quat_apply(ee_quat_w, z_axis)
+
             actions = actions.clone()
-            actions[:, 3:6] = math_utils.quat_apply(ee_quat_b, actions[:, 3:6])
+            rotvec_in = actions[:, 3:6]
+            # SpaceMouse already emits EE-frame roll as [0, 0, twist] (see ``WaterhoseSpaceMouse``).
+            # AVP emits wrist rotation in the anchor/world frame via ``Se3RelRetargeter`` -- a different
+            # axis mix. Project both onto the EE approach axis so wrist/hand roll becomes the same
+            # single-axis gripper roll that SpaceMouse cap-twist produces through IK.
+            is_ee_frame_twist = (rotvec_in[:, 0].abs() < 1.0e-5) & (rotvec_in[:, 1].abs() < 1.0e-5)
+            rotvec_world = torch.where(
+                is_ee_frame_twist.unsqueeze(-1),
+                math_utils.quat_apply(ee_quat_w, rotvec_in),
+                rotvec_in,
+            )
+            twist = (rotvec_world * ee_z_w).sum(dim=-1)
+            # SpaceMouse already applies ``twist_sign`` in ``WaterhoseSpaceMouse``; AVP wrist data needs it here.
+            twist = torch.where(is_ee_frame_twist, twist, twist * _TELEOP_TWIST_SIGN)
+            rotvec_ee_roll = torch.zeros_like(rotvec_in)
+            rotvec_ee_roll[:, 2] = twist
+            actions[:, 3:6] = math_utils.quat_apply(ee_quat_b, rotvec_ee_roll)
         super().process_actions(actions)
 
 
@@ -165,8 +194,9 @@ class WaterhoseTeleopPinnedNewtonIkAction(WaterhoseLocalFrameNewtonInverseKinema
 
     The external action dimension is just the right-end-effector slice; the hold slices are filled
     internally, so it matches what the teleop pipeline emits (the pipeline drives only the
-    end-effector). ``WaterhoseLocalFrameNewtonInverseKinematicsAction`` still rotates the primary
-    orientation delta into the end-effector frame before the base solve.
+    end-effector). ``WaterhoseLocalFrameNewtonInverseKinematicsAction`` applies the primary
+    orientation delta in the end-effector frame before the base solve, matching
+    :class:`~isaaclab_tasks.contrib.waterhose.teleop.WaterhoseSpaceMouse`.
     """
 
     _HOLD_OBJECTIVE_NAMES = ("left_hold", "torso_hold")
