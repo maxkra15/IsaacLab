@@ -803,7 +803,6 @@ class NewtonCoupledManager(NewtonManager):
             proxy_particles=None if proxy_cfg.proxy_particles is None else list(proxy_cfg.proxy_particles),
             collision_pipeline=proxy_cfg.collision_pipeline_factory,
             collide_interval=proxy_cfg.collide_interval,
-            immovable=proxy_cfg.immovable,
         )
 
     @staticmethod

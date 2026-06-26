@@ -99,7 +99,6 @@ def build_waterhose_teleop_pipeline():
 def build_waterhose_relative_teleop_pipeline():
     """Build the IsaacTeleop pipeline for the relative Waterhose IK teleop action space."""
 
-    import numpy as np
     from isaacteleop.retargeters import (
         GripperRetargeter,
         GripperRetargeterConfig,
@@ -123,8 +122,9 @@ def build_waterhose_relative_teleop_pipeline():
         use_wrist_rotation=True,
         use_wrist_position=True,
         delta_pos_scale_factor=15.0,
-        # Match ``WaterhoseSpaceMouseCfg.rot_sensitivity`` so AVP roll gain feels like cap twist.
-        delta_rot_scale_factor=0.15,
+        # Wrist rotation is a per-frame delta angle, unlike SpaceMouse's normalized puck deflection.
+        # Keep enough gain for deliberate AVP wrist roll to visibly twist the gripper.
+        delta_rot_scale_factor=2.0,
         alpha_pos=0.5,
         alpha_rot=0.5,
     )

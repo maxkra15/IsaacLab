@@ -19,14 +19,14 @@ def test_waterhose_relative_ik_action_clips_teleop_deltas():
     actions_cfg = WaterhoseNewtonRelativeIkActionsCfg()
 
     assert actions_cfg.arm_action.clip == {
-        "right_ee/x": (-0.01, 0.01),
-        "right_ee/y": (-0.01, 0.01),
-        "right_ee/z": (-0.01, 0.01),
-        "right_ee/roll": (-0.08, 0.08),
-        "right_ee/pitch": (-0.08, 0.08),
-        "right_ee/yaw": (-0.08, 0.08),
+        "right_ee/x": (-0.07, 0.07),
+        "right_ee/y": (-0.07, 0.07),
+        "right_ee/z": (-0.07, 0.07),
+        "right_ee/roll": (-0.1, 0.1),
+        "right_ee/pitch": (-0.1, 0.1),
+        "right_ee/yaw": (-0.1, 0.1),
     }
-    assert actions_cfg.gripper_action.max_joint_delta_per_step == pytest.approx(0.0015)
+    assert actions_cfg.gripper_action.max_joint_delta_per_step == pytest.approx(0.15)
 
 
 def test_rate_limit_joint_targets_clamps_each_joint_delta():
@@ -42,3 +42,27 @@ def test_rate_limit_joint_targets_clamps_each_joint_delta():
 
     expected = torch.tensor([[0.002, 0.998], [0.999, -0.998]])
     assert torch.allclose(limited, expected)
+
+
+def test_avp_wrist_roll_maps_to_spacemouse_style_ee_twist():
+    """AVP wrist roll should drive the same local EE twist channel as SpaceMouse cap twist."""
+
+    actions_module = importlib.import_module("isaaclab_tasks.contrib.waterhose.mdp.actions")
+    assert hasattr(actions_module, "_remap_teleop_rotvec_to_local_ee_roll")
+
+    rotvec = torch.tensor(
+        [
+            [0.0, 0.0, 0.04],
+            [0.03, 0.02, -0.01],
+        ]
+    )
+
+    remapped = actions_module._remap_teleop_rotvec_to_local_ee_roll(rotvec)
+
+    expected = torch.tensor(
+        [
+            [0.0, 0.0, 0.04],
+            [0.0, 0.0, -0.03],
+        ]
+    )
+    assert torch.allclose(remapped, expected)

@@ -213,12 +213,6 @@ parser.add_argument(
     help="Optional WaterhoseDemo asset root. The packaged task assets are used when omitted.",
 )
 parser.add_argument("--profile", action="store_true", help="Print rollout timing after the run.")
-parser.add_argument(
-    "--one_way_coupling",
-    action="store_true",
-    help="Use one-way (kinematic) rigid->soft proxy coupling: the gripper drives the deformable grip, "
-    "but the plug/hose reaction is not fed back to the arm. Proxy-coupled task only (not ADMM).",
-)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 _install_faulthandler()
@@ -255,27 +249,6 @@ def _configure_env_cfg(env_cfg) -> None:
     physics_cfg = env_cfg.sim.physics
     if not isinstance(physics_cfg, NewtonCfg):
         raise TypeError(f"Expected a Newton-backed task config, got {type(physics_cfg).__name__}.")
-    if args_cli.one_way_coupling:
-        _enable_one_way_coupling(env_cfg)
-
-
-def _enable_one_way_coupling(env_cfg) -> None:
-    """Switch the rigid->soft proxy coupling to one-way (kinematic) mode.
-
-    Sets ``immovable=True`` on every proxy mapping so the rigid gripper kinematically drives the
-    deformable grip while the plug/hose reaction is not harvested back onto the arm. Only the
-    proxy-coupled task supports this; the ADMM variant uses a different coupling mechanism.
-    """
-    solver_cfg = getattr(env_cfg.sim.physics, "solver_cfg", None)
-    coupling_type = getattr(solver_cfg, "coupling_type", None)
-    proxy_coupling = getattr(solver_cfg, "proxy_coupling", None)
-    if coupling_type != "proxy" or proxy_coupling is None or not proxy_coupling.proxies:
-        raise ValueError(
-            "--one_way_coupling requires the proxy-coupled task (Isaac-Waterhose-Coupled-v0); "
-            f"the active config uses coupling_type={coupling_type!r} with no proxy mappings to make one-way."
-        )
-    for proxy in proxy_coupling.proxies:
-        proxy.immovable = True
 
 
 def _parse_configured_env_cfg():

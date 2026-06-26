@@ -89,10 +89,21 @@ from .teleop import WaterhoseSpaceMouseCfg
 # restore the exact prior XR behavior if a refactor here regresses the live session.
 from .teleop_pipelines import build_waterhose_relative_teleop_pipeline
 
-WATERHOSE_ASSETS_DIR = os.environ.get(
-    "WATERHOSE_ASSETS_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"),
-)
+def _resolve_waterhose_assets_dir(module_dir: str) -> str:
+    env_assets_dir = os.environ.get("WATERHOSE_ASSETS_DIR")
+    if env_assets_dir:
+        return env_assets_dir
+
+    setup_assets_dir = os.path.abspath(
+        os.path.join(module_dir, "..", "..", "..", "..", "isaaclab_assets", "data", "WaterhoseDemo")
+    )
+    if os.path.isdir(setup_assets_dir):
+        return setup_assets_dir
+
+    return os.path.join(module_dir, "assets")
+
+
+WATERHOSE_ASSETS_DIR = _resolve_waterhose_assets_dir(os.path.dirname(os.path.abspath(__file__)))
 
 _FRIDGE_USD = os.path.join(WATERHOSE_ASSETS_DIR, "fridge", "fridge_waterhose.usda")
 _RBY1_USD = os.path.join(WATERHOSE_ASSETS_DIR, "rby1df", "rby1df_waterhose.usda")

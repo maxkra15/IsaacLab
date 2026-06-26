@@ -172,15 +172,6 @@ class CoupledProxyCfg:
     mode: Literal["lagged", "staggered"] | int = "lagged"
     """Proxy transfer mode passed to Newton's ``SolverCoupledProxy``."""
 
-    immovable: bool = False
-    """One-way (kinematic) coupling for this proxy mapping.
-
-    When ``True``, the destination proxy bodies are made immovable in the destination view and no
-    reaction wrench is harvested back to the source: the source (rigid) drives the destination
-    (deformable), but the deformable applies no force back on the rigid. Defaults to ``False``
-    (full two-way coupling).
-    """
-
     collision_pipeline_factory: Callable | None = None
     """Optional factory for a proxy-local collision pipeline.
 

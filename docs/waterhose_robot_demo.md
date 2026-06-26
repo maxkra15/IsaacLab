@@ -110,7 +110,8 @@ cd waterhose-demo/IsaacLab-waterhose
 
 `init` is an alias for `setup`. The setup script only performs setup: it clones this branch, builds
 Isaac Sim, creates `.venv`, installs the full Isaac Lab workspace with `isaaclab.sh -i all`, unpacks
-the demo assets, and runs a short headless smoke check unless `--skip-smoke` is passed.
+the demo assets to `source/isaaclab_assets/data/WaterhoseDemo`, and runs a short headless smoke check
+unless `--skip-smoke` is passed.
 
 Newton is pinned in the source tree to the upstream Newton PR 2848 (coupled-solver) head commit
 `526b36396777c18b82af8f30c4693b7c8bb4d89d`, resolved on 2026-06-22. Every Newton direct URL in
@@ -383,7 +384,13 @@ Full numbers, plots, and the per-step breakdown: `_scratch/reports/waterhose_sca
 
 ## Assets
 
-By default the task uses packaged assets next to the waterhose package:
+When the standalone setup script is used, the task auto-detects the extracted asset bundle:
+
+```text
+source/isaaclab_assets/data/WaterhoseDemo/
+```
+
+Without that extracted bundle, the task falls back to packaged assets next to the waterhose package:
 
 ```text
 source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/
@@ -415,8 +422,8 @@ WATERHOSE_ASSETS_DIR=/path/to/waterhose/assets   # or: --asset_root /path/to/wat
 ```
 
 `waterhose_demo_assets.tar.gz` packages this exact tree under `WaterhoseDemo/` (untracked in git, copied
-alongside the setup script). On a site where git-LFS is blocked, unpack it and run with
-`--asset_root <unpacked>/WaterhoseDemo`.
+alongside the setup script). The setup script unpacks it automatically. If you unpack the archive
+manually somewhere else, run with `--asset_root <unpacked>/WaterhoseDemo`.
 
 ## Offline operation and firewall
 
@@ -439,8 +446,9 @@ What makes it offline (already done in this repo):
 **Build vs. runtime.** The above is *runtime*. The setup script (`waterhose-setup.sh`) builds Isaac Sim
 from source and runs `isaaclab.sh -i all`, which *does* need network. On a locked-down site, build on a
 connected machine and transfer the workspace, or allowlist the build endpoints for the install only. If
-git-LFS is blocked, the in-tree assets will not pull — use the asset tar
-(`--asset_root <unpacked>/WaterhoseDemo`), which carries the full runtime asset tree.
+git-LFS is blocked, use `waterhose_demo_assets.tar.gz`, which carries the full runtime asset tree. The
+standalone setup script unpacks it automatically; for a manual unpack, pass
+`--asset_root <unpacked>/WaterhoseDemo`.
 
 ### Firewall allowlist (backup)
 
@@ -491,8 +499,7 @@ release.
   `ShapeFlags`. `_hide_fridge_collider_visuals` clears `VISIBLE` on the fridge colliders so they show only
   under the viewer's *Collisions* toggle, and the Newton cfg sets `show_static=False` so the static
   fridge/ground obey the toggles.
-- **Newton pin:** PR-2848 head `526b3639` plus a local *immovable one-way kinematic proxy* commit on top
-  (see `docs/newton_local_setup.md` to refresh).
+- **Newton pin:** PR-2848 head `526b3639` (see `docs/newton_local_setup.md` to refresh).
 
 ## Customer Verification Notes
 
@@ -570,3 +577,12 @@ These notes address the initial customer feedback from the first RB-Y1 refrigera
    can appear during OpenXR device probing and are not by themselves fatal. A fatal dependency-resolution
    block is different: it ends with `Failed to resolve extension dependencies` and should be treated as an
    installation/cache/firewall issue.
+
+5. `Isaac Sim setup_conda_env.sh not found`: some public Isaac Sim source builds generate
+   `setup_python_env.sh` but no `setup_conda_env.sh`. The setup script creates a compatibility shim for
+   this case. If a previous setup stopped immediately after `BUILD (RELEASE) SUCCEEDED`, update
+   `waterhose-setup.sh` and resume from the same handoff directory:
+
+   ```bash
+   ./waterhose-setup.sh setup --accept-eula --assets-tar ./waterhose_demo_assets.tar.gz --jobs 8 --resume-existing
+   ```

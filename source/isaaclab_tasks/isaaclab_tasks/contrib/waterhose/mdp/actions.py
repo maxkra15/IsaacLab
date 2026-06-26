@@ -24,6 +24,7 @@ from . import contact_debug
 
 # Matches ``WaterhoseSpaceMouseCfg.twist_sign`` and the AVP pipeline convention.
 _TELEOP_TWIST_SIGN = -1.0
+_EE_FRAME_TWIST_TOL = 1.0e-5
 
 
 @configclass
@@ -53,6 +54,23 @@ def _rate_limit_joint_targets(
     max_delta = max(0.0, float(max_delta_per_step))
     delta = torch.clamp(desired_targets - previous_targets, min=-max_delta, max=max_delta)
     return previous_targets + delta
+
+
+def _remap_teleop_rotvec_to_local_ee_roll(rotvec: torch.Tensor) -> torch.Tensor:
+    """Map teleop rotation vectors to a single local EE roll channel.
+
+    SpaceMouse already emits the desired gripper twist as ``[0, 0, twist]``.
+    AVP wrist roll arrives from ``Se3RelRetargeter`` on the first rotation-vector
+    component, with wrist pitch/yaw mixed into the remaining components. The
+    waterhose teleop task only needs the gripper-roll component, so AVP roll is
+    converted into the same local z-axis twist command that SpaceMouse uses.
+    """
+
+    is_ee_frame_twist = (rotvec[:, 0].abs() < _EE_FRAME_TWIST_TOL) & (rotvec[:, 1].abs() < _EE_FRAME_TWIST_TOL)
+    twist = torch.where(is_ee_frame_twist, rotvec[:, 2], rotvec[:, 0] * _TELEOP_TWIST_SIGN)
+    remapped = torch.zeros_like(rotvec)
+    remapped[:, 2] = twist
+    return remapped
 
 
 class WaterhoseGripperPositionAction(ActionTerm):
@@ -157,29 +175,10 @@ class WaterhoseLocalFrameNewtonInverseKinematicsAction(NewtonInverseKinematicsAc
             ee_quat_b = math_utils.quat_mul(
                 math_utils.quat_inv(root_quat_w), math_utils.quat_mul(body_quat_w, self._ee_offset_quat)
             )
-            ee_quat_w = math_utils.quat_mul(body_quat_w, self._ee_offset_quat)
-            z_axis = torch.zeros(self.num_envs, 3, device=self.device)
-            z_axis[:, 2] = 1.0
-            ee_z_w = math_utils.quat_apply(ee_quat_w, z_axis)
 
             actions = actions.clone()
-            rotvec_in = actions[:, 3:6]
-            # SpaceMouse already emits EE-frame roll as [0, 0, twist] (see ``WaterhoseSpaceMouse``).
-            # AVP emits wrist rotation in the anchor/world frame via ``Se3RelRetargeter`` -- a different
-            # axis mix. Project both onto the EE approach axis so wrist/hand roll becomes the same
-            # single-axis gripper roll that SpaceMouse cap-twist produces through IK.
-            is_ee_frame_twist = (rotvec_in[:, 0].abs() < 1.0e-5) & (rotvec_in[:, 1].abs() < 1.0e-5)
-            rotvec_world = torch.where(
-                is_ee_frame_twist.unsqueeze(-1),
-                math_utils.quat_apply(ee_quat_w, rotvec_in),
-                rotvec_in,
-            )
-            twist = (rotvec_world * ee_z_w).sum(dim=-1)
-            # SpaceMouse already applies ``twist_sign`` in ``WaterhoseSpaceMouse``; AVP wrist data needs it here.
-            twist = torch.where(is_ee_frame_twist, twist, twist * _TELEOP_TWIST_SIGN)
-            rotvec_ee_roll = torch.zeros_like(rotvec_in)
-            rotvec_ee_roll[:, 2] = twist
-            actions[:, 3:6] = math_utils.quat_apply(ee_quat_b, rotvec_ee_roll)
+            local_ee_roll = _remap_teleop_rotvec_to_local_ee_roll(actions[:, 3:6])
+            actions[:, 3:6] = math_utils.quat_apply(ee_quat_b, local_ee_roll)
         super().process_actions(actions)
 
 

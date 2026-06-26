@@ -286,6 +286,7 @@ clone_or_resume_repo() {
 
     if [[ -d "${repo_dir}/.git" ]]; then
         [[ "$resume_existing" == "1" ]] || die "Repo checkout already exists: ${repo_dir}"
+        reset_newton_git_ref_patches "$repo_dir"
         ensure_clean_git_checkout "$repo_dir"
         run git -C "$repo_dir" fetch origin --tags --prune
         if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/${repo_ref}"; then
@@ -368,7 +369,8 @@ isaacsim_build_ready() {
     local isaacsim_dir="$1"
     local build_dir
     build_dir="$(isaacsim_build_dir "$isaacsim_dir")"
-    [[ -d "$build_dir" && -f "${build_dir}/python.sh" && -f "${build_dir}/setup_conda_env.sh" ]]
+    [[ -d "$build_dir" && -f "${build_dir}/python.sh" ]] || return 1
+    [[ -f "${build_dir}/setup_conda_env.sh" || -f "${build_dir}/setup_python_env.sh" ]]
 }
 
 build_isaacsim() {
@@ -383,6 +385,51 @@ build_isaacsim() {
     (cd "$isaacsim_dir" && run ./build.sh "${build_args[@]}")
 }
 
+isaacsim_has_wheeled_robots() {
+    local build_dir="$1"
+    [[ -f "${build_dir}/exts/isaacsim.robot.wheeled_robots/config/extension.toml" ]] && return 0
+    [[ -f "${build_dir}/exts/isaacsim.robot.experimental.wheeled_robots/config/extension.toml" ]] && return 0
+    [[ -f "${build_dir}/extsDeprecated/isaacsim.robot.wheeled_robots/config/extension.toml" ]] && return 0
+    return 1
+}
+
+ensure_isaacsim_setup_conda_env() {
+    local build_dir="$1"
+    local setup_conda_env="${build_dir}/setup_conda_env.sh"
+    local setup_python_env="${build_dir}/setup_python_env.sh"
+
+    if [[ -f "$setup_conda_env" ]]; then
+        return
+    fi
+    [[ -f "$setup_python_env" ]] || die "Isaac Sim setup_conda_env.sh and setup_python_env.sh not found in ${build_dir}"
+
+    log "Creating Isaac Sim setup_conda_env.sh compatibility shim in ${build_dir}"
+    cat > "$setup_conda_env" <<'EOF'
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${ZSH_VERSION:-}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
+MY_DIR="$(realpath -s "$SCRIPT_DIR")"
+
+export CARB_APP_PATH="$SCRIPT_DIR/kit"
+export EXP_PATH="$MY_DIR/apps"
+export ISAAC_PATH="$MY_DIR"
+
+_WATERHOSE_OLDPWD="$PWD"
+cd "$SCRIPT_DIR"
+. ./setup_python_env.sh
+cd "$_WATERHOSE_OLDPWD"
+unset _WATERHOSE_OLDPWD
+
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$(echo "$PYTHONPATH" | tr ':' '\n' | grep -v "$SCRIPT_DIR/kit/python/lib/python3.12" | tr '\n' ':' | sed 's/:$//')"
+fi
+EOF
+    chmod +x "$setup_conda_env"
+}
+
 link_isaacsim_build() {
     local repo_root="$1"
     local isaacsim_dir="$2"
@@ -391,11 +438,66 @@ link_isaacsim_build() {
 
     [[ -d "$build_dir" ]] || die "Expected Isaac Sim build directory does not exist: ${build_dir}"
     [[ -f "${build_dir}/python.sh" ]] || die "Isaac Sim python.sh not found in ${build_dir}"
+    ensure_isaacsim_setup_conda_env "$build_dir"
     [[ -f "${build_dir}/setup_conda_env.sh" ]] || die "Isaac Sim setup_conda_env.sh not found in ${build_dir}"
-    [[ -f "${build_dir}/exts/isaacsim.robot.wheeled_robots/config/extension.toml" ]] || die "Isaac Sim build is missing isaacsim.robot.wheeled_robots. Rebuild Isaac Sim or use a compatible --isaacsim-ref."
+    isaacsim_has_wheeled_robots "$build_dir" || die "Isaac Sim build is missing wheeled robot extensions (isaacsim.robot.wheeled_robots or isaacsim.robot.experimental.wheeled_robots). Rebuild Isaac Sim or use a compatible --isaacsim-ref."
 
     ln -sfn "$build_dir" "${repo_root}/_isaac_sim"
     log "Linked ${repo_root}/_isaac_sim -> ${build_dir}"
+}
+
+newton_git_ref_relpaths() {
+    printf '%s\n' \
+        "source/isaaclab_newton/pyproject.toml" \
+        "source/isaaclab_physx/pyproject.toml" \
+        "source/isaaclab_visualizers/pyproject.toml" \
+        "tools/wheel_builder/res/python_packages.toml"
+}
+
+reset_newton_git_ref_patches() {
+    local repo_root="$1"
+    local rel
+
+    [[ -d "${repo_root}/.git" ]] || return
+    while IFS= read -r rel; do
+        [[ -e "${repo_root}/${rel}" ]] || continue
+        git -C "$repo_root" checkout -- "$rel" 2>/dev/null || true
+    done < <(newton_git_ref_relpaths)
+}
+
+patch_isaaclab_kit_ext_folders() {
+    local repo_root="$1"
+    local kit_file="${repo_root}/apps/isaaclab.python.kit"
+    local marker='${exe-path}/../extsDeprecated'
+
+    [[ -f "$kit_file" ]] || return
+    if grep -qF "$marker" "$kit_file"; then
+        return
+    fi
+
+    sed -i '/\${exe-path}\/\.\.\/exts",  # isaac extensions/a\
+    "${exe-path}/../extsDeprecated",  # deprecated isaac extensions still referenced by Isaac Lab' "$kit_file"
+    log "Patched ${kit_file} to search extsDeprecated (needed for isaacsim.sensors.rtx on Isaac Sim develop)"
+}
+
+patch_newton_git_refs() {
+    local repo_root="$1"
+    local old_ref="526b36396777c18b82af8f30c4693b7c8bb4d89d"
+    local new_ref="refs/pull/2848/head"
+    local rel file patched=0
+
+    while IFS= read -r rel; do
+        file="${repo_root}/${rel}"
+        [[ -f "$file" ]] || continue
+        if grep -q "$old_ref" "$file"; then
+            sed -i "s|${old_ref}|${new_ref}|g" "$file"
+            patched=1
+        fi
+    done < <(newton_git_ref_relpaths)
+
+    if [[ "$patched" == "1" ]]; then
+        log "Patched Newton git refs to ${new_ref} (uv cannot fetch PR-only commits by SHA)"
+    fi
 }
 
 setup_uv_env_and_install_isaaclab() {
@@ -564,6 +666,8 @@ cmd_setup() {
     fi
 
     clone_or_resume_repo "$repo_root" "$repo_url" "$repo_ref" "$resume_existing"
+    patch_newton_git_refs "$repo_root"
+    patch_isaaclab_kit_ext_folders "$repo_root"
     clone_or_resume_isaacsim "$isaacsim_dir" "$isaacsim_url" "$isaacsim_ref" "$resume_existing" "$skip_lfs"
     accept_isaacsim_eula_if_requested "$isaacsim_dir" "$accept_eula"
 
@@ -602,4 +706,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${WATERHOSE_SETUP_SKIP_MAIN:-0}" != "1" ]]; then
+    main "$@"
+fi
