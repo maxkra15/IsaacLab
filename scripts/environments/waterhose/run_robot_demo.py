@@ -90,6 +90,27 @@ def _ensure_local_isaacsim_kit_args(args_cli: argparse.Namespace, selected_visua
         _debug_runner(f"kit_args={kit_args}")
 
 
+def _apply_offline_kit_args(args_cli: argparse.Namespace) -> None:
+    """Keep Kit fully offline at runtime: no extension-registry or telemetry connections.
+
+    Out of the box the demo's assets are local (see ``WATERHOSE_ASSETS_DIR``), so the only remaining
+    external calls Kit makes are (1) the extension registry on Azure
+    (``ovextensionsprod.blob.core.windows.net``) when ``app.extensions.registryEnabled`` is true -- a
+    source-built Isaac Sim already has every extension on disk, so this is only a startup resolve/refresh
+    -- and (2) anonymous NVIDIA telemetry. Disable both so a firewalled site needs zero clearance. Set
+    ``WATERHOSE_ALLOW_NETWORK=1`` to leave Kit's registry/telemetry network access enabled.
+    """
+    if os.getenv("WATERHOSE_ALLOW_NETWORK", "").lower() in {"1", "true", "yes", "on"}:
+        return
+
+    offline_args = (
+        "--/app/extensions/registryEnabled=0 --/telemetry/enableAnonymousData=0 --/telemetry/enableAnonymousAppName=0"
+    )
+    existing = getattr(args_cli, "kit_args", "") or ""
+    args_cli.kit_args = f"{existing} {offline_args}".strip()
+    _debug_runner(f"offline kit_args appended: {offline_args}")
+
+
 def _ensure_display_for_visible_visualizer(selected_visualizers: set[str]) -> None:
     """Use a local X display for visible visualizers when the shell did not export DISPLAY."""
 
@@ -213,6 +234,7 @@ if "kit" in startup_visualizers and os.getenv("WATERHOSE_KIT_MULTI_GPU", "").low
     args_cli.multi_gpu = False
 _ensure_display_for_visible_visualizer(startup_visualizers)
 _ensure_local_isaacsim_kit_args(args_cli, startup_visualizers)
+_apply_offline_kit_args(args_cli)
 
 
 def _configure_env_cfg(env_cfg) -> None:

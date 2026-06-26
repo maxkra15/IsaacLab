@@ -17,11 +17,12 @@ given SDF collision properties independently from the rest of the fridge.
 With ``--embed-in-fridge``, the same combined mesh is also written directly into
 ``fridge.usda`` at ``/root/Cable008/SocketCollision/Cable008_SocketCollision``.
 
-With ``--embed-body-collision``, the tool instead welds the connector-housing collider fragments
+With ``--embed-body-collision``, the tool welds the connector-housing collider fragments
 (every ``Cable008_Collider*`` except the socket-bore set) into one mesh at
-``/root/Cable008/BodyCollision/Cable008_BodyCollision``. That single mesh is routed to the
-deformable-hose collision entry so the hose collides with the housing through one shape instead of
-all 245; the per-fragment convex hulls are left in place for the robot's collision path.
+``/root/Cable008/BodyCollision/Cable008_BodyCollision``. That single welded mesh is the connector-housing
+collider for the robot (routed to the MJWarp entry and collided through Newton, so MuJoCo-Warp never
+needs the per-fragment decomposition); the ``Cable008_Collider*`` hulls it is built from are deactivated
+in ``fridge_waterhose.usda``.
 """
 
 from __future__ import annotations
@@ -43,8 +44,8 @@ DEFAULT_REPORT_CSV = FRIDGE_DIR / "socket_collision_manifest.csv"
 DEFAULT_EMBED_PARENT = "/root/Cable008"
 DEFAULT_EMBED_XFORM = "/root/Cable008/SocketCollision"
 DEFAULT_EMBED_MESH = "/root/Cable008/SocketCollision/Cable008_SocketCollision"
-# Single welded body collider for the deformable hose path (see --embed-body-collision). The robot
-# keeps the original convex hulls; this one mesh replaces them only for the VBD/cable collision entry.
+# Single welded connector-housing collider (see --embed-body-collision). It replaces the per-fragment
+# ``Cable008_Collider*`` hulls as the robot's housing collider (the hulls are deactivated in the wrapper).
 DEFAULT_BODY_EMBED_XFORM = "/root/Cable008/BodyCollision"
 DEFAULT_BODY_EMBED_MESH = "/root/Cable008/BodyCollision/Cable008_BodyCollision"
 COLLISIONS_SCOPE = "/root/Cable008/Collisions"
@@ -343,8 +344,8 @@ def write_embedded_body_to_fridge(
 ) -> None:
     """Embed a single welded housing-body collision mesh into fridge.usda.
 
-    The original per-fragment convex hulls are left untouched (the robot still collides with them);
-    this single mesh is routed only to the deformable-hose collision entry.
+    This single welded mesh is the robot's connector-housing collider; the per-fragment
+    ``Cable008_Collider*`` hulls it is welded from are deactivated in ``fridge_waterhose.usda``.
     """
     stage = Usd.Stage.Open(str(fridge_usd))
     if stage is None:
@@ -354,7 +355,7 @@ def write_embedded_body_to_fridge(
     _set_translate(xform, (0.0, 0.0, 0.0))
     xform.GetPrim().CreateAttribute("body:sourceColliderNames", Sdf.ValueTypeNames.StringArray).Set(collider_names)
     xform.GetPrim().CreateAttribute("body:description", Sdf.ValueTypeNames.String).Set(
-        "Single welded connector-housing collision mesh for the deformable-hose collision entry."
+        "Single welded connector-housing collision mesh; the robot's housing collider (MJWarp entry)."
     )
 
     mesh = UsdGeom.Mesh.Define(stage, mesh_path)
@@ -364,8 +365,8 @@ def write_embedded_body_to_fridge(
     mesh.CreateSubdivisionSchemeAttr().Set("none")
     mesh.CreateDoubleSidedAttr(True)
     mesh.CreateExtentAttr(_extent(points))
-    # Collision-only geometry: tag it ``guide`` so renderers (Kit / the --video path) do not draw it,
-    # matching the per-fragment hulls. It still collides (CollisionAPI is independent of purpose).
+    # Collision-only geometry: tag it ``guide`` so renderers (Kit / the --video path) do not draw it.
+    # It still collides (CollisionAPI is independent of purpose).
     mesh.CreatePurposeAttr().Set(UsdGeom.Tokens.guide)
 
     primvars = UsdGeom.PrimvarsAPI(mesh)
@@ -498,8 +499,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Weld the connector-housing collider fragments (every Cable008_Collider* except the "
-            f"socket-bore set) into one mesh at {DEFAULT_BODY_EMBED_MESH} for the deformable-hose "
-            "collision entry, leaving the per-fragment hulls in place for the robot. Runs only this "
+            f"socket-bore set) into one mesh at {DEFAULT_BODY_EMBED_MESH} -- the robot's housing "
+            "collider (the per-fragment hulls are deactivated in the wrapper). Runs only this "
             "bake and ignores the socket-asset options."
         ),
     )
@@ -517,7 +518,7 @@ def main() -> None:
         write_embedded_body_to_fridge(args.fridge_usd, names, points, face_counts, face_indices)
         print(f"Welded {len(names)} housing colliders into one body mesh: {DEFAULT_BODY_EMBED_MESH}")
         print(f"Embedded into fridge: {args.fridge_usd}")
-        print("The per-fragment hulls were left active for the robot collision path.")
+        print("This welded mesh is the robot's housing collider; deactivate the per-fragment hulls in the wrapper.")
         return
 
     collider_names = args.colliders or DEFAULT_SOCKET_COLLIDERS

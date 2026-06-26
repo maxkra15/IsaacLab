@@ -15,13 +15,16 @@
 **/*.usdz
 
 # Exception: the waterhose demo ships its required USDs in-tree (LFS) so the customer
-# handoff is self-contained. Keep them tracked instead of relying on force-add.
+# handoff is self-contained. Keep them tracked instead of relying on force-add. This also
+# covers the bundled offline cosmetic assets (the grid-ground ``.usd`` and the sky ``.hdr``),
+# so a clone runs with no external (S3/Nucleus) asset fetch.
 !source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/**/*.usda
+!source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/**/*.usd
 
 # Waterhose demo assets are distributed as an unpacked local bundle, not tracked in git.
 /source/isaaclab_assets/data/WaterhoseDemo/
 /source/isaaclab_assets/data/Props/Waterhose/
-/waterhose_demo_assets.tar.gz
+/waterhose_demo_assets*.tar.gz
 
 # Standalone bootstrap workspace when waterhose.sh is run from the repo root by accident.
 /waterhose-demo/

@@ -5,13 +5,12 @@
 
 """Decimate the welded ``Cable008_BodyCollision`` mesh in ``fridge.usda`` to a low-poly collider.
 
-The hose-vs-fridge-body contact (``WATERHOSE_HOSE_BODY_COLLISION``) routes this single concave mesh
-into the VBD/proxy collision pipeline, where the per-env mesh-triangle candidate count must stay small:
-deterministic contact matching hard-caps the global ``triangle_pairs`` buffer at ``2**20``, so the
-welded mesh's ~103k triangles overflow it past ~4 envs and the captured coupled graph faults with CUDA
-error 700. This rewrites that mesh in place as a coarse vertex-clustered shell (a few hundred triangles)
-so the contact batches to hundreds of envs. The robot's per-fragment convex hulls
-(``Cable008_Collider*``) and the socket collider are untouched -- only this one body mesh changes.
+This single welded mesh is the connector-housing collider for the robot (the MJWarp entry collides it
+through Newton's pipeline; see ``WATERHOSE_FRIDGE_COLLISION``). Keeping it low-poly keeps the per-env
+mesh-triangle candidate count small: deterministic contact matching hard-caps the global
+``triangle_pairs`` buffer at ``2**20``, so the welded mesh's ~103k triangles would overflow it at scale.
+This rewrites that mesh in place as a coarse vertex-clustered shell (a few hundred triangles) so the
+contact batches to thousands of envs. The socket collider is untouched -- only this one body mesh changes.
 
 Vertex clustering is used (no external decimation backend needed): snap every vertex to a coarse grid
 cell, replace it with the cell centroid, and drop the faces that collapse. It is robust to the welded
