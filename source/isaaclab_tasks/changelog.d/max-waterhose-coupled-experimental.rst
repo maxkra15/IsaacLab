@@ -11,8 +11,9 @@ Added
 Changed
 ^^^^^^^
 
-* Changed the coupled waterhose defaults to the validated 8 substeps and 16 VBD iterations, with
-  positive-integer overrides through ``WATERHOSE_SUBSTEPS`` and ``WATERHOSE_VBD_ITERS``.
+* Made coupled substeps and VBD iterations configurable through validated positive-integer
+  ``WATERHOSE_SUBSTEPS`` and ``WATERHOSE_VBD_ITERS`` overrides while retaining the high-fidelity
+  defaults of 10 and 20, respectively.
 
 Fixed
 ^^^^^

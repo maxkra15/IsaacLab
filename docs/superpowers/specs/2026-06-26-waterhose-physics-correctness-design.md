@@ -2,7 +2,7 @@
 
 ## Goal
 
-Apply a focused set of evidence-backed corrections to the waterhose task without redesigning its coupled-solver architecture. The result must preserve the existing MuJoCo/VBD staggered proxy coupling, feed each solver the contacts it owns, restore clean episode boundaries, and use the previously validated lower-cost defaults.
+Apply a focused set of evidence-backed corrections to the waterhose task without redesigning its coupled-solver architecture. The result must preserve the existing MuJoCo/VBD staggered proxy coupling, feed each solver the contacts it owns, restore clean episode boundaries, and expose validated lower-cost solver settings without reducing the high-fidelity defaults.
 
 ## Current behavior
 
@@ -18,7 +18,7 @@ Three defects are in scope:
 
 ### Validated performance settings
 
-Read `WATERHOSE_SUBSTEPS` and `WATERHOSE_VBD_ITERS` when constructing `WaterhoseEnvCfg`. Defaults are 8 substeps and 16 VBD iterations, matching the existing performance report. Values must be base-10 positive integers. Missing variables use defaults; malformed, zero, or negative values raise `ValueError` naming the offending variable.
+Read `WATERHOSE_SUBSTEPS` and `WATERHOSE_VBD_ITERS` when constructing `WaterhoseEnvCfg`. Defaults remain 10 substeps and 20 VBD iterations for high-fidelity operation. The existing performance report validates 8 substeps and 16 VBD iterations as an optional lower-cost mode. Values must be base-10 positive integers. Missing variables use defaults; malformed, zero, or negative values raise `ValueError` naming the offending variable.
 
 The values configure only `CoupledNewtonCfg.num_substeps` and the waterhose VBD entry's `VBDSolverCfg.iterations`. No timestep, decimation, graph-capture, contact-refresh, or coupling-mode behavior changes.
 
@@ -47,7 +47,7 @@ Regression tests will be added before implementation and observed failing agains
 - collision flags are cleared only for non-finger robot shapes;
 - the reset event uses full scene reset and resets joint targets.
 
-After implementation, run the focused regression file and existing waterhose contrib tests. Also run syntax/import checks and inspect the diff for unrelated changes. CUDA is unavailable in the current workspace, so GPU rollout and throughput validation cannot be performed locally; the performance expectation is based on the repository's existing 8/16 benchmark report and must be stated as such rather than claimed as newly measured.
+After implementation, run the focused regression file and existing waterhose contrib tests. Also run syntax/import checks and inspect the diff for unrelated changes. CUDA is unavailable in the current workspace, so GPU rollout and throughput validation cannot be performed locally; performance expectations for the optional 8/16 mode are based on the repository's existing benchmark report and must be stated as such rather than claimed as newly measured.
 
 ## Out of scope
 

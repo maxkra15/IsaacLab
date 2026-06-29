@@ -31,8 +31,8 @@ def _solver_tuning(monkeypatch, *, substeps: str | None = None, vbd_iters: str |
     return cfg.sim.physics.num_substeps, entries["vbd"].solver_cfg.iterations
 
 
-def test_waterhose_uses_validated_solver_tuning_defaults(monkeypatch):
-    assert _solver_tuning(monkeypatch) == (8, 16)
+def test_waterhose_uses_high_fidelity_solver_tuning_defaults(monkeypatch):
+    assert _solver_tuning(monkeypatch) == (10, 20)
 
 
 def test_waterhose_solver_tuning_accepts_environment_overrides(monkeypatch):

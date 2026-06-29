@@ -990,8 +990,8 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
 
     def __post_init__(self) -> None:
-        substeps = _env_positive_int("WATERHOSE_SUBSTEPS", 8)
-        vbd_iterations = _env_positive_int("WATERHOSE_VBD_ITERS", 16)
+        substeps = _env_positive_int("WATERHOSE_SUBSTEPS", 10)
+        vbd_iterations = _env_positive_int("WATERHOSE_VBD_ITERS", 20)
 
         _register_rby1df_gripper_mimic_override()
         _register_rby1df_collision_restriction()
@@ -1094,10 +1094,11 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # (rigid_joint_hard=False): the head->Plug1 and tail->Anchor1 fixed joints have
                         # small authored offsets, and a hard joint solve would inject a large startup
                         # impulse into the cable.
-                        # iterations x num_substeps (below) is the throughput knob: 16 x 8 is ~1.2x faster
-                        # than the original 20 x 10 with a byte-identical scripted-demo arc. 12 x 6 is
-                        # ~1.44x faster (good for training; the plug seats a little slower in the demo).
-                        # Override per-run via WATERHOSE_VBD_ITERS / WATERHOSE_SUBSTEPS.
+                        # iterations x num_substeps (below) is the throughput knob. The high-fidelity
+                        # default is 20 x 10; 16 x 8 is ~1.2x faster with a byte-identical scripted-demo
+                        # arc, while 12 x 6 is ~1.44x faster (good for training; the plug seats a little
+                        # slower in the demo). Select those lower-cost modes per run via
+                        # WATERHOSE_VBD_ITERS / WATERHOSE_SUBSTEPS.
                         solver_cfg=VBDSolverCfg(
                             iterations=vbd_iterations,
                             friction_epsilon=0.1,
