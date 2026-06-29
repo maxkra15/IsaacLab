@@ -19,4 +19,5 @@ Fixed
 ^^^^^
 
 * Restored right-gripper-only robot collision filtering and full-scene episode resets so unintended
-  robot contacts and state carried between episodes do not affect the task.
+  robot contacts and state carried between episodes do not affect the task. Cable resets now also
+  restore every VBD-owned hose segment pose and velocity before coupled-solver history is refreshed.

@@ -30,7 +30,9 @@ The existing proxy collision pair filter remains in place. The restored flag fil
 
 ### Full episodic reset
 
-Use Isaac Lab's standard `mdp.reset_scene_to_default` reset event instead of a robot-only joint reset. Reset joint targets along with physical state so stale commands do not immediately perturb the restored pose. This restores all scene assets for selected environment IDs through their normal asset write APIs and lets the coupled manager's existing teleport/reset handling synchronize solver state.
+Use Isaac Lab's standard `mdp.reset_scene_to_default` reset event instead of a robot-only joint reset. Reset joint targets along with physical state so stale commands do not immediately perturb the restored pose. Follow it with a cable-specific event because `CableObject` inherits the articulation API while VBD owns every cable segment pose directly: the standard root/joint writes cannot restore those maximal-coordinate segment transforms, and generic FK intentionally excludes them.
+
+The cable event copies the selected environments' segment transforms from immutable `model.body_q` into the parent `state.body_q`, zeros their `state.body_qd`, and invalidates only the selected cable articulations. It does not write compacted VBD buffers. The coupled manager's existing teleport protocol remains the single owner of distributing parent state, resetting sub-solvers, synchronizing proxies, and re-seeding previous-pose history before the next step.
 
 The gripper material reset remains unchanged because it is independent of transform/state reset and is already routed through the physics-manager notification path.
 
@@ -45,9 +47,10 @@ Regression tests will be added before implementation and observed failing agains
 - default and environment-overridden substep/iteration values;
 - clear rejection of malformed and non-positive tuning values;
 - collision flags are cleared only for non-finger robot shapes;
-- the reset event uses full scene reset and resets joint targets.
+- the reset event uses full scene reset, resets joint targets, and then restores every selected cable segment;
+- unselected cable environments remain untouched while selected segment poses and velocities return to defaults.
 
-After implementation, run the focused regression file and existing waterhose contrib tests. Also run syntax/import checks and inspect the diff for unrelated changes. CUDA is unavailable in the current workspace, so GPU rollout and throughput validation cannot be performed locally; performance expectations for the optional 8/16 mode are based on the repository's existing benchmark report and must be stated as such rather than claimed as newly measured.
+After implementation, run the focused regression file and existing waterhose contrib tests. Also run syntax/import checks, a short CUDA construction/reset/step smoke when a GPU is available, and inspect the diff for unrelated changes. A smoke run is not a throughput benchmark; performance expectations for the optional 8/16 mode remain based on the repository's existing benchmark report and must be stated as such rather than claimed as newly measured.
 
 ## Out of scope
 

@@ -9,9 +9,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
+import warp as wp
 from isaaclab_newton.physics import NewtonManager
 from newton import ShapeFlags
+
+from isaaclab.managers import SceneEntityCfg
 
 from isaaclab_tasks.contrib.waterhose import waterhose_env_cfg
 
@@ -99,3 +104,84 @@ def test_waterhose_reset_restores_the_full_scene_and_joint_targets():
     assert events.reset_scene.func is waterhose_env_cfg.mdp.reset_scene_to_default
     assert events.reset_scene.params == {"reset_joint_targets": True}
     assert not hasattr(events, "reset_robot_joints")
+
+
+def test_waterhose_cable_reset_event_runs_after_full_scene_reset():
+    events = waterhose_env_cfg.EventCfg()
+    reset_cable_to_default = getattr(waterhose_env_cfg, "reset_cable_to_default", None)
+
+    assert reset_cable_to_default is not None
+    assert events.reset_cable.func is reset_cable_to_default
+    assert events.reset_cable.params == {"asset_cfg": SceneEntityCfg("cable1")}
+    term_names = list(events.__dict__)
+    assert term_names.index("reset_scene") < term_names.index("reset_cable")
+    assert term_names.index("reset_cable") < term_names.index("gripper_finger_material")
+
+
+@pytest.mark.parametrize(
+    ("selected_env_ids", "expected_env_ids"),
+    [
+        (torch.tensor([1], dtype=torch.int64), [1]),
+        ([1], [1]),
+        (slice(None), [0, 1]),
+    ],
+    ids=["tensor", "sequence", "full-reset-slice"],
+)
+def test_waterhose_cable_reset_restores_selected_segment_state(monkeypatch, selected_env_ids, expected_env_ids):
+    reset_cable_to_default = getattr(waterhose_env_cfg, "reset_cable_to_default", None)
+    assert reset_cable_to_default is not None
+
+    default_body_q = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    disturbed_body_q = default_body_q.copy()
+    disturbed_body_q[:, 1] += 0.5
+    disturbed_body_q[:, 3:7] = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    disturbed_body_qd = np.full((4, 6), 3.0, dtype=np.float32)
+    model = SimpleNamespace(body_q=wp.array(default_body_q, dtype=wp.transformf, device="cpu"))
+    state = SimpleNamespace(
+        body_q=wp.array(disturbed_body_q, dtype=wp.transformf, device="cpu"),
+        body_qd=wp.array(disturbed_body_qd, dtype=wp.spatial_vectorf, device="cpu"),
+    )
+    articulation_ids = object()
+    cable = SimpleNamespace(
+        _registry_entry=SimpleNamespace(segment_body_indices=[[0, 1], [2, 3]]),
+        _root_view=SimpleNamespace(articulation_ids=articulation_ids),
+    )
+    env = SimpleNamespace(scene={"cable1": cable}, num_envs=2, device="cpu")
+    asset_cfg = SceneEntityCfg("cable1")
+    cfg = waterhose_env_cfg.EventTerm(
+        func=reset_cable_to_default,
+        mode="reset",
+        params={"asset_cfg": asset_cfg},
+    )
+    invalidations = []
+    monkeypatch.setattr(NewtonManager, "get_model", classmethod(lambda cls: model))
+    monkeypatch.setattr(NewtonManager, "get_state_0", classmethod(lambda cls: state))
+    monkeypatch.setattr(
+        NewtonManager,
+        "invalidate_fk",
+        classmethod(lambda cls, **kwargs: invalidations.append(kwargs)),
+    )
+
+    term = reset_cable_to_default(cfg, env)
+    term(env, selected_env_ids, asset_cfg=asset_cfg)
+
+    body_q_after = state.body_q.numpy()
+    body_qd_after = state.body_qd.numpy()
+    expected_body_q = disturbed_body_q.copy()
+    expected_body_qd = disturbed_body_qd.copy()
+    expected_body_ids = np.array([[0, 1], [2, 3]], dtype=np.int64)[expected_env_ids].reshape(-1)
+    expected_body_q[expected_body_ids] = default_body_q[expected_body_ids]
+    expected_body_qd[expected_body_ids] = 0.0
+    np.testing.assert_array_equal(body_q_after, expected_body_q)
+    np.testing.assert_array_equal(body_qd_after, expected_body_qd)
+    assert len(invalidations) == 1
+    np.testing.assert_array_equal(invalidations[0]["env_ids"].numpy(), np.array(expected_env_ids, dtype=np.int32))
+    assert invalidations[0]["articulation_ids"] is articulation_ids

@@ -70,8 +70,9 @@ from .geometry import (
     ANCHOR_POS,
     CABLE_HEAD_TO_PLUG_ORIGIN_LOCAL_Z,
     FRIDGE_FLOOR_COLLISION_TOKEN,
-    FRIDGE_FLOOR_POS,
-    FRIDGE_FLOOR_SIZE,
+    # Retained for the intentionally disabled collision box below.
+    FRIDGE_FLOOR_POS,  # noqa: F401
+    FRIDGE_FLOOR_SIZE,  # noqa: F401
     FRIDGE_HOUSING_COLLISION_MESH_PATTERN,
     FRIDGE_POS,
     RIGHT_GRIPPER_EE_FRAME_POS,
@@ -81,6 +82,7 @@ from .geometry import (
     SOCKET_ROT_QUAT_XYZW,
 )
 from .mdp.actions import WaterhoseGripperPositionActionCfg
+from .mdp.events import reset_cable_to_default
 from .mdp.terminations import plug_inserted_in_socket
 from .teleop import WaterhoseSpaceMouseCfg
 
@@ -88,6 +90,7 @@ from .teleop import WaterhoseSpaceMouseCfg
 # ``teleop_pipelines_legacy`` (same function names); switch this import to that module to
 # restore the exact prior XR behavior if a refactor here regresses the live session.
 from .teleop_pipelines import build_waterhose_relative_teleop_pipeline
+
 
 def _resolve_waterhose_assets_dir(module_dir: str) -> str:
     env_assets_dir = os.environ.get("WATERHOSE_ASSETS_DIR")
@@ -919,6 +922,11 @@ class EventCfg:
         func=mdp.reset_scene_to_default,
         mode="reset",
         params={"reset_joint_targets": True},
+    )
+    reset_cable = EventTerm(
+        func=reset_cable_to_default,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("cable1")},
     )
     gripper_finger_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
