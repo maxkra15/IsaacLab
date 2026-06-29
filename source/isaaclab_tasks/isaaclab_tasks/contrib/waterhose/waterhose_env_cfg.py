@@ -314,7 +314,9 @@ def _register_rby1df_gripper_mimic_override() -> None:
     )
 
 
-# Right-gripper finger body-label suffixes (used by the VBD proxy collision pipeline).
+# RBY1 link-label tokens used to identify the robot's own collision shapes (vs. the cable/plug/anchor
+# bodies). The two right-gripper fingers are the only robot bodies that need to collide.
+_RBY1_LINK_TOKENS = ("torso", "left_arm", "right_arm", "head", "left_gripper", "right_gripper")
 _RIGHT_GRIPPER_FINGER_BODY_TOKENS = ("right_gripper_leftfinger", "right_gripper_rightfinger")
 
 # Shape-label tokens of the fridge connector-housing COLLIDERS (welded body mesh, socket). Their
@@ -334,6 +336,34 @@ _ANCHOR_BODY_TOKEN = "Anchor1"
 # welded body, no soft weld to stretch). See ``_merge_plug_shape_into_cable_head``.
 _PLUG_BODY_TOKEN = "Plug1"
 _CABLE_HEAD_BODY_TOKEN = "Cable1/cable_edge_body_0"
+
+
+def _restrict_rby1df_collision_to_right_gripper(_payload=None) -> None:
+    """Keep collision only on the right-gripper fingers; clear it on the rest of the robot."""
+
+    from isaaclab_newton.physics import NewtonManager
+    from newton import ShapeFlags
+
+    builder = getattr(NewtonManager, "_builder", None)
+    if builder is None:
+        raise RuntimeError("Newton builder is unavailable while restricting RBY1 collision.")
+
+    collide_mask = int(ShapeFlags.COLLIDE_SHAPES) | int(ShapeFlags.COLLIDE_PARTICLES)
+    cleared = 0
+    for shape_id, body_id in enumerate(builder.shape_body):
+        if body_id < 0:
+            continue
+        label = str(builder.body_label[body_id])
+        is_robot_link = any(token in label for token in _RBY1_LINK_TOKENS)
+        is_right_finger = any(label.endswith(token) for token in _RIGHT_GRIPPER_FINGER_BODY_TOKENS)
+        if is_robot_link and not is_right_finger and (builder.shape_flags[shape_id] & collide_mask):
+            builder.shape_flags[shape_id] &= ~collide_mask
+            cleared += 1
+
+    if cleared == 0:
+        raise RuntimeError("No non-gripper RBY1 collision shapes matched; the robot link labels changed.")
+
+    logging.debug("Restricted RBY1 collision to the right gripper (cleared %d non-finger shapes).", cleared)
 
 
 def _disable_anchor_collision(_payload=None) -> None:
@@ -486,17 +516,25 @@ def _disable_fridge_body_collision(_payload=None) -> None:
 
 
 def _register_rby1df_collision_restriction() -> None:
-    """Register model-init callbacks before Newton finalizes the coupled scene.
+    """Limit active colliders to what the task needs before Newton finalizes the model.
 
-    Turn the cable-tail anchor into a collision-free weld target, merge the connector shape onto the
-    cable head segment, hide the fridge collider shapes from the viewer's "Visuals" toggle (they stay
-    under "Collisions"), and optionally drop the housing contact when ``WATERHOSE_FRIDGE_COLLISION=0``.
+    Restrict the robot's colliders to the right gripper, turn the cable-tail anchor into a
+    collision-free weld target, merge the connector shape onto the cable head segment, hide the
+    fridge collider shapes from the viewer's "Visuals" toggle (they stay under "Collisions"), and
+    optionally drop the housing contact when ``WATERHOSE_FRIDGE_COLLISION=0``.
     """
 
     from isaaclab_newton.physics import NewtonManager
 
     from isaaclab.physics import PhysicsEvent
 
+    NewtonManager.register_callback(
+        _restrict_rby1df_collision_to_right_gripper,
+        PhysicsEvent.MODEL_INIT,
+        order=10,
+        name="waterhose_restrict_rby1df_collision",
+        wrap_weak_ref=False,
+    )
     NewtonManager.register_callback(
         _disable_anchor_collision,
         PhysicsEvent.MODEL_INIT,

@@ -7,7 +7,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+from isaaclab_newton.physics import NewtonManager
+from newton import ShapeFlags
 
 from isaaclab_tasks.contrib.waterhose import waterhose_env_cfg
 
@@ -50,3 +54,40 @@ def test_waterhose_solver_tuning_rejects_invalid_values(monkeypatch, name, value
 
     with pytest.raises(ValueError, match=rf"{name} must be a positive integer"):
         waterhose_env_cfg.WaterhoseEnvCfg()
+
+
+def test_robot_collision_filter_preserves_only_right_fingers(monkeypatch):
+    collide_mask = int(ShapeFlags.COLLIDE_SHAPES) | int(ShapeFlags.COLLIDE_PARTICLES)
+    visible = int(ShapeFlags.VISIBLE)
+    builder = SimpleNamespace(
+        body_label=[
+            "/World/envs/env_0/Robot/right_arm_link_1",
+            "/World/envs/env_0/Robot/right_gripper_leftfinger",
+            "/World/envs/env_0/Cable1/cable_edge_body_0",
+        ],
+        shape_body=[0, 1, 2, -1],
+        shape_flags=[collide_mask | visible] * 4,
+    )
+    monkeypatch.setattr(NewtonManager, "_builder", builder, raising=False)
+
+    waterhose_env_cfg._restrict_rby1df_collision_to_right_gripper()
+
+    assert builder.shape_flags[0] & collide_mask == 0
+    assert builder.shape_flags[0] & visible
+    assert builder.shape_flags[1] & collide_mask == collide_mask
+    assert builder.shape_flags[2] & collide_mask == collide_mask
+    assert builder.shape_flags[3] & collide_mask == collide_mask
+
+
+def test_robot_collision_filter_is_registered(monkeypatch):
+    registrations = []
+
+    def record(callback, event, **kwargs):
+        registrations.append((callback, event, kwargs))
+
+    monkeypatch.setattr(NewtonManager, "register_callback", record)
+    waterhose_env_cfg._register_rby1df_collision_restriction()
+
+    matches = [item for item in registrations if item[2]["name"] == "waterhose_restrict_rby1df_collision"]
+    assert len(matches) == 1
+    assert matches[0][0] is waterhose_env_cfg._restrict_rby1df_collision_to_right_gripper
