@@ -178,9 +178,17 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw_value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_positive_int(name: str, default: int) -> int:
     raw_value = os.environ.get(name)
-    return int(raw_value) if raw_value is not None else default
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value, 10)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer; got {raw_value!r}.") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer; got {raw_value!r}.")
+    return value
 
 
 # Connector-housing collision: the welded housing mesh is a world-static collider SHARED by both coupled
@@ -944,6 +952,9 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
 
     def __post_init__(self) -> None:
+        substeps = _env_positive_int("WATERHOSE_SUBSTEPS", 8)
+        vbd_iterations = _env_positive_int("WATERHOSE_VBD_ITERS", 16)
+
         _register_rby1df_gripper_mimic_override()
         _register_rby1df_collision_restriction()
 
@@ -1050,7 +1061,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # ~1.44x faster (good for training; the plug seats a little slower in the demo).
                         # Override per-run via WATERHOSE_VBD_ITERS / WATERHOSE_SUBSTEPS.
                         solver_cfg=VBDSolverCfg(
-                            iterations=20,
+                            iterations=vbd_iterations,
                             friction_epsilon=0.1,
                             rigid_contact_hard=True,
                             rigid_joint_hard=False,
@@ -1133,7 +1144,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                     iterations=1,
                 ),
             ),
-            num_substeps=10,
+            num_substeps=substeps,
             collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
             model_cfg=NewtonModelCfg(
                 shape_material_ke=_VBD_CONTACT_STIFFNESS,
