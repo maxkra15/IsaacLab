@@ -91,3 +91,11 @@ def test_robot_collision_filter_is_registered(monkeypatch):
     matches = [item for item in registrations if item[2]["name"] == "waterhose_restrict_rby1df_collision"]
     assert len(matches) == 1
     assert matches[0][0] is waterhose_env_cfg._restrict_rby1df_collision_to_right_gripper
+
+
+def test_waterhose_reset_restores_the_full_scene_and_joint_targets():
+    events = waterhose_env_cfg.EventCfg()
+
+    assert events.reset_scene.func is waterhose_env_cfg.mdp.reset_scene_to_default
+    assert events.reset_scene.params == {"reset_joint_targets": True}
+    assert not hasattr(events, "reset_robot_joints")

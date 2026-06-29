@@ -915,10 +915,10 @@ class ObservationsCfg:
 class EventCfg:
     """Reset events for the cable plug task."""
 
-    reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_scale,
+    reset_scene = EventTerm(
+        func=mdp.reset_scene_to_default,
         mode="reset",
-        params={"position_range": (1.0, 1.0), "velocity_range": (0.0, 0.0)},
+        params={"reset_joint_targets": True},
     )
     gripper_finger_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
