@@ -31,3 +31,4 @@ Fixed
   input state without exposing solver internals.
 * Fixed CUDA graph allocation warmup to restore solver-private state before recording the first
   real step and reject sparse-capacity failures before advancing simulation time.
+* Fixed Newton teardown to discard MPM object registrations before constructing another scene.

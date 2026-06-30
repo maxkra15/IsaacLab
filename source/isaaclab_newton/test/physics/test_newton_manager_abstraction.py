@@ -216,6 +216,15 @@ SOLVER_MATRIX = [
 # ---------------------------------------------------------------------------
 
 
+def test_newton_manager_clear_discards_mpm_object_registrations():
+    """Closed simulations must not re-emit particle assets from a prior scene."""
+    NewtonManager._mpm_object_registry = [object()]
+
+    NewtonManager.clear()
+
+    assert NewtonManager._mpm_object_registry == []
+
+
 @pytest.mark.parametrize(
     "solver_cfg_factory, expected_manager, _solver_cls, _single_state, _pipeline",
     SOLVER_MATRIX,

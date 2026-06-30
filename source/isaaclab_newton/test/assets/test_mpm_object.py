@@ -54,6 +54,22 @@ def test_mpm_object_exposes_particle_offsets_without_private_access():
     assert MPMObject.particle_offsets.fget(SimpleNamespace(_particle_offsets=offsets)) is offsets
 
 
+def test_mpm_registry_entries_are_scoped_by_asset_identity():
+    """A delayed old-asset finalizer must not match a new scene's registration."""
+    cfg = MPMObjectCfg(
+        prim_path="/World/envs/env_.*/Sand",
+        spawn=MPMGridCfg(lower=(0.0, 0.0, 0.0), upper=(0.1, 0.1, 0.1), voxel_size=0.1),
+    )
+    old_scene_entry = MPMObjectRegistryEntry(cfg)
+    new_scene_entry = MPMObjectRegistryEntry(cfg)
+    current_registry = [new_scene_entry]
+
+    if old_scene_entry in current_registry:
+        current_registry.remove(old_scene_entry)
+
+    assert current_registry == [new_scene_entry]
+
+
 def test_mpm_grid_emission_records_constant_offsets_per_env():
     builder = newton.ModelBuilder()
     NewtonMPMManager._register_builder_attributes(builder)

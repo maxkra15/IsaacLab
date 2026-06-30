@@ -774,6 +774,10 @@ class NewtonManager(PhysicsManager):
         NewtonManager._scene_data = None
         NewtonManager._scene_data_mapping = None
         NewtonManager._cl_protos = {}
+        # MPM assets register particle emitters before model finalization. Asset instances may
+        # outlive a closed environment through task-owned references, so simulation teardown—not
+        # Python garbage collection—must delimit this scene-local registry.
+        NewtonManager._mpm_object_registry = []
         NewtonManager._model_changes = set()
         NewtonManager._scene_data_backend = None
         NewtonManager._cl_pending_sites = {}

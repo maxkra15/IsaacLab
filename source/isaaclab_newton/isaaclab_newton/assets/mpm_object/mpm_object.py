@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(eq=False)
 class MPMObjectRegistryEntry:
     """Particle object registration consumed by Newton builder replication."""
 
