@@ -87,10 +87,13 @@ clearing solver-private state after selected environments are reset.
 
 ## Initial pose and cameras
 
-The Franka reset joint pose must place the DiffIK TCP at a documented pre-grasp offset from the
-source-cup grasp point. A runtime invariant will bound this distance and prevent comments/config from
-drifting apart again. The pose will be calibrated against the actual Newton articulation rather than
-copied from an unverified trajectory.
+The existing Franka reset joint pose places the DiffIK TCP within a few millimeters of the source-cup
+grasp point when it reaches the Newton state. The observed 0.89 m error came from calling solver reset
+with `flags=None` after writing the arm, which reset `JOINT_Q` and `JOINT_QD` to model defaults. Task
+reset will retain the measured joint tuple and call solver reset with
+`StateFlags.BODY | StateFlags.PARTICLE`, clearing solver-private/body/particle history without
+overwriting the desired joint state. A runtime invariant will verify the arm joints, gripper width,
+and TCP-to-grasp distance immediately after reset and after one step.
 
 Kit's legacy viewer camera will use environment-relative framing for environment zero. Native
 visualizers continue to use their own explicit `VisualizerCfg`; no viewer-side world spacing is

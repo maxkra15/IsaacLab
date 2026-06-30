@@ -356,22 +356,25 @@ Run file-scoped pre-commit, stage the modified files, and commit:
 git commit -m "refactor: Reset Pour cups through asset APIs"
 ```
 
-### Task 5: Correct and lock down the pre-grasp reset pose
+### Task 5: Preserve and lock down the pre-grasp reset pose
 
 **Files:**
 - Modify: `source/isaaclab_tasks/isaaclab_tasks/contrib/franka_pour/pour_env_cfg.py`
 - Modify: `source/isaaclab_tasks/test/contrib/test_franka_pour_multiworld_runtime.py`
-- Create or modify diagnostic: `_scratch/calibrate_franka_pour_pregrasp.py`
 
 - [ ] **Step 1: Write a failing pose invariant**
 
-After reset, compute the actual DiffIK TCP and cup grasp point and require:
+After reset, require the public robot state to contain the configured arm and gripper values, then
+compute the actual DiffIK TCP and cup grasp point:
 
 ```python
+assert torch.allclose(arm_q, torch.as_tensor(env.cfg.arm_home).expand_as(arm_q), atol=1.0e-5)
+assert torch.allclose(env.gripper_width(), torch.full((env.num_envs,), 0.08), atol=1.0e-5)
 distance = torch.linalg.vector_norm(env.tcp_pos_e() - env.cup_grasp_point_e(), dim=-1)
-assert torch.all(distance < 0.08)
-assert torch.all(env.tcp_pos_e()[:, 2] > env.cup_grasp_point_e()[:, 2])
+assert torch.all(distance < 0.005)
 ```
+
+Repeat the same assertions after one simulation step.
 
 - [ ] **Step 2: Run the invariant to verify RED**
 
@@ -383,22 +386,34 @@ Run:
   -k pregrasp -q
 ```
 
-Expected: the current pose fails at approximately 0.89 m.
+Expected: the current reset fails with zero arm joints, a closed gripper, and approximately 0.89 m
+TCP error because solver reset overwrites the state written by the task.
 
-- [ ] **Step 3: Calibrate against the live Newton articulation**
+- [ ] **Step 3: Preserve task-authored joints during solver reset**
 
-Use a one-environment no-MPM diagnostic that drives the existing DiffIK action from a collision-free Franka seed to the desired TCP pose immediately above the grasp point, records the converged seven arm joints, resets from those joints, and remeasures the invariant. Keep the chosen pose within Panda joint limits and verify the target receiver has positive clearance from both fingers.
+Keep the existing `arm_home` tuple. Call the public reset boundary with:
 
-- [ ] **Step 4: Update the reset config and rerun GREEN**
+```python
+NewtonManager.reset_solver_state(
+    world_mask=world_mask,
+    flags=newton.StateFlags.BODY | newton.StateFlags.PARTICLE,
+)
+```
 
-Replace `arm_home` with the measured seven-joint tuple and update its comment with the measured TCP-to-grasp distance. Run the pre-grasp invariant twice from a fresh process and require both runs to pass.
+Do not include `JOINT_Q` or `JOINT_QD`; MuJoCo private buffers are still cleared while task-authored
+joint state survives.
+
+- [ ] **Step 4: Rerun the reset invariant GREEN**
+
+Run the pre-grasp invariant twice from a fresh process and require both immediate and post-step
+assertions to pass.
 
 - [ ] **Step 5: Commit the pose correction**
 
 Run file-scoped pre-commit, stage the config/test and any retained diagnostic, and commit:
 
 ```bash
-git commit -m "fix: Start Franka Pour at the cup pre-grasp"
+git commit -m "fix: Preserve Franka Pour pre-grasp reset"
 ```
 
 ### Task 6: Add Kit and Newton multi-environment visualization regressions
@@ -525,7 +540,7 @@ Run with the compatible source checkouts:
 
 ```bash
 export NEWTON_SOURCE_DIR=/home/maximiliank/Work/newton-worktrees/implicit-mpm-coupled-sparse
-export WARP_SOURCE_DIR=/home/maximiliank/Work/warp-max
+export WARP_SOURCE_DIR=/home/maximiliank/Work/warp-worktrees/sparse-rebuildable
 ./isaaclab.sh -p scripts/environments/zero_agent.py \
   --task Isaac-Pour-Franka-v0 --num_envs 2 --viz kit
 ```
