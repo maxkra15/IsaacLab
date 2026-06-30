@@ -17,6 +17,8 @@ def test_launcher_does_not_implicitly_select_adjacent_physics_checkouts():
     assert "$ISAACLAB_PATH/../newton-coupled" not in launcher
     assert "NEWTON_SOURCE_DIR" in launcher
     assert "WARP_SOURCE_DIR" in launcher
+    assert '"$warp_source_dir/warp/bin"' in launcher
+    assert "LD_LIBRARY_PATH" in launcher
 
 
 def test_local_physics_setup_document_is_location_independent():

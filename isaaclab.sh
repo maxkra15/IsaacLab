@@ -55,6 +55,9 @@ if [ -n "$warp_source_dir" ]; then
         exit 1
     fi
     source_roots="$warp_source_dir:$source_roots"
+    if [ -d "$warp_source_dir/warp/bin" ]; then
+        export LD_LIBRARY_PATH="$warp_source_dir/warp/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
 fi
 export PYTHONPATH="$source_roots:${PYTHONPATH:-}"
 

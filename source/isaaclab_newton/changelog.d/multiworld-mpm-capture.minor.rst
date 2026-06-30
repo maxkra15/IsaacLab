@@ -32,3 +32,4 @@ Fixed
 * Fixed CUDA graph allocation warmup to restore solver-private state before recording the first
   real step and reject sparse-capacity failures before advancing simulation time.
 * Fixed Newton teardown to discard MPM object registrations before constructing another scene.
+* Fixed local Warp source overrides to expose checkout-built native libraries to the dynamic loader.

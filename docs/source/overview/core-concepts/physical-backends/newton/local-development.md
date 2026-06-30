@@ -5,8 +5,8 @@ Use explicit source overrides when testing unpublished Newton and Warp changes.
 
 The reviewed feature pair is:
 
-- Newton: `46b44f9cc420210b0ef9efd171dd7c6a0ed31069`
-- Warp: `18782a34b545d2e7e3b874864087849f529ade75`
+- Newton: `2c08bfec9fc01710a203ded7e185334ded3f1ca0`
+- Warp: `87370fac45bfb90701ee5f390cb7f26fbfab86ef`
 
 Set checkout paths without committing workstation-specific locations:
 
@@ -20,8 +20,8 @@ the imported Python packages and Warp native library:
 
 ```bash
 ./isaaclab.sh -p tools/validate_newton_sources.py \
-  --newton_revision 46b44f9cc420210b0ef9efd171dd7c6a0ed31069 \
-  --warp_revision 18782a34b545d2e7e3b874864087849f529ade75
+  --newton_revision 2c08bfec9fc01710a203ded7e185334ded3f1ca0 \
+  --warp_revision 87370fac45bfb90701ee5f390cb7f26fbfab86ef
 ```
 
 These overrides are only a local-development mechanism. A reproducible clean
