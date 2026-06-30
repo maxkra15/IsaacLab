@@ -101,8 +101,9 @@ class NewtonMPMManager(NewtonManager):
         public capability contract (for example, a capacity-bounded rebuildable
         sparse solver). Dense grids remain eager.
         """
+        advertised_support = bool(getattr(cls._solver, "supports_cuda_graph_capture", False))
         if cls._solver.grid_type == "fixed":
-            return True
+            return advertised_support
         if cls._solver.grid_type != "sparse":
             return False
 
@@ -111,7 +112,7 @@ class NewtonMPMManager(NewtonManager):
         explicitly_advertised = (
             "supports_cuda_graph_capture" in solver_vars or "supports_cuda_graph_capture" in type_vars
         )
-        return explicitly_advertised and bool(cls._solver.supports_cuda_graph_capture)
+        return explicitly_advertised and advertised_support
 
     @classmethod
     def _step_solver(

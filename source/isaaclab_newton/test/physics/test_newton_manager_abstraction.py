@@ -715,10 +715,28 @@ def test_newton_cuda_graph_capture_capability_is_owned_by_solver(monkeypatch, su
     assert NewtonManager._supports_cuda_graph_capture() is supported
 
 
+def test_legacy_solver_without_cuda_graph_contract_stays_eager(monkeypatch):
+    """Pinned Newton solvers without a capability contract never enter graph capture."""
+    from isaaclab.physics import PhysicsManager
+
+    monkeypatch.setattr(PhysicsManager, "_cfg", SimpleNamespace(use_cuda_graph=True), raising=False)
+    monkeypatch.setattr(PhysicsManager, "_device", "cuda:0", raising=False)
+    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace(), raising=False)
+    monkeypatch.setattr(NewtonManager, "_graph", object(), raising=False)
+    monkeypatch.setattr(NewtonManager, "_graph_capture_pending", True, raising=False)
+
+    NewtonManager._capture_or_defer_graph()
+
+    assert NewtonManager._supports_cuda_graph_capture() is False
+    assert NewtonManager._graph is None
+    assert NewtonManager._graph_capture_pending is False
+
+
 @pytest.mark.parametrize(
     "grid_type, advertised, expected",
     [
-        ("fixed", False, True),
+        ("fixed", False, False),
+        ("fixed", True, True),
         ("sparse", False, False),
         ("sparse", True, True),
         ("dense", True, False),
@@ -736,6 +754,14 @@ def test_mpm_cuda_graph_capture_preserves_fixed_policy_and_accepts_sparse_opt_in
     )
 
     assert NewtonMPMManager._supports_cuda_graph_capture() is expected
+
+
+@pytest.mark.parametrize("grid_type", ["fixed", "sparse"])
+def test_legacy_mpm_solver_without_cuda_graph_contract_stays_eager(monkeypatch, grid_type):
+    """Pinned fixed and sparse MPM solvers do not inherit an implicit graph capability."""
+    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace(grid_type=grid_type), raising=False)
+
+    assert NewtonMPMManager._supports_cuda_graph_capture() is False
 
 
 @pytest.mark.parametrize("graph, expected", [(None, False), (object(), True)])
@@ -792,6 +818,19 @@ def test_manager_checks_solver_status_after_eager_or_captured_tick(monkeypatch, 
     NewtonManager.step()
 
     assert events == ["replay" if use_graph else "eager", "status", "debug"]
+
+
+@pytest.mark.parametrize(
+    "solver", [SimpleNamespace(), SimpleNamespace(check_status=None)], ids=["missing", "non-callable"]
+)
+def test_legacy_solver_without_callable_status_hook_is_safe_after_eager_tick(monkeypatch, solver):
+    """The eager host boundary is a no-op when the pinned solver has no callable status hook."""
+    events = _configure_manager_step_test(monkeypatch)
+    monkeypatch.setattr(NewtonManager, "_solver", solver, raising=False)
+
+    NewtonManager.step()
+
+    assert events == ["eager", "debug"]
 
 
 def test_manager_does_not_publish_time_when_solver_status_fails(monkeypatch):
@@ -899,6 +938,26 @@ def test_prepare_cuda_graph_capture_keeps_graph_ownership_external(monkeypatch):
     assert events == [("prepare", contacts), ("prewarm", None), ("status", None)]
     assert NewtonManager.is_cuda_graph_active() is False
     assert NewtonManager._graph_capture_pending is False
+
+
+@pytest.mark.parametrize(
+    "solver",
+    [
+        SimpleNamespace(supports_cuda_graph_capture=True),
+        SimpleNamespace(supports_cuda_graph_capture=True, prepare_cuda_graph_capture=None),
+    ],
+    ids=["missing", "non-callable"],
+)
+def test_prepare_cuda_graph_capture_rejects_missing_solver_prepare_hook(monkeypatch, solver):
+    """A solver cannot advertise capture without providing a callable preparation hook."""
+    from isaaclab.physics import PhysicsManager
+
+    monkeypatch.setattr(PhysicsManager, "_device", "cuda:0", raising=False)
+    monkeypatch.setattr(NewtonManager, "_solver", solver, raising=False)
+    monkeypatch.setattr(NewtonManager, "_is_outer_cuda_graph_capture_active", classmethod(lambda cls: False))
+
+    with pytest.raises(RuntimeError, match="prepare_cuda_graph_capture"):
+        NewtonManager._prepare_cuda_graph_capture_resources()
 
 
 def test_prepare_cuda_graph_capture_rejects_an_active_trajectory(monkeypatch):
@@ -1077,6 +1136,132 @@ def test_cuda_graph_warmup_restores_parent_when_solver_reset_fails(monkeypatch):
 
     assert state_0.value == "input"
     assert state_1.value == "output"
+
+
+def _configure_capture_state_preservation_test(monkeypatch):
+    """Install minimal manager state whose public and private values can be tracked."""
+
+    class FakeState:
+        def __init__(self, value=None):
+            self.value = value
+
+        def assign(self, other):
+            self.value = other.value
+
+    class FakeSolver:
+        supports_cuda_graph_capture = True
+
+        def __init__(self):
+            self.private_state = "input"
+            self.scratch_allocations = []
+
+        def reset(self, state, *, world_mask, flags):
+            assert world_mask is None and flags is None
+            self.private_state = state.value
+            state.value = "solver-default"
+
+        def check_status(self):
+            pass
+
+    state_0 = FakeState("input")
+    state_1 = FakeState("output")
+    solver = FakeSolver()
+    monkeypatch.setattr(NewtonManager, "_model", SimpleNamespace(state=FakeState), raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_0", state_0, raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_1", state_1, raising=False)
+    monkeypatch.setattr(NewtonManager, "_solver", solver, raising=False)
+    monkeypatch.setattr(wp, "synchronize_device", lambda: None)
+    return state_0, state_1, solver, FakeSolver
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_relaxed_capture_warmup_preserves_state(monkeypatch, fails):
+    """Relaxed-capture allocation warmup restores state after success or failure."""
+    import isaaclab_newton.physics.newton_manager as newton_manager_module
+
+    state_0, state_1, solver, _ = _configure_capture_state_preservation_test(monkeypatch)
+    scratch_allocations = solver.scratch_allocations
+
+    def warmup(cls):
+        solver.scratch_allocations.append(object())
+        cls._state_0.value = "future-input"
+        cls._state_1.value = "future-output"
+        cls._state_0, cls._state_1 = cls._state_1, cls._state_0
+        solver.private_state = "future-private"
+        if fails:
+            raise RuntimeError("warmup failed")
+
+    fake_cudart = SimpleNamespace(cudaStreamCreateWithFlags=lambda *_args: 1)
+    monkeypatch.setattr(newton_manager_module, "_cudart", fake_cudart)
+    monkeypatch.setattr(NewtonManager, "_is_all_graphable", classmethod(lambda cls: False))
+    monkeypatch.setattr(NewtonManager, "_simulate_physics_only", classmethod(warmup))
+    monkeypatch.setattr(wp, "get_stream", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(wp, "synchronize_stream", lambda *_args, **_kwargs: None)
+
+    if fails:
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            NewtonManager._capture_relaxed_graph("cpu")
+    else:
+        assert NewtonManager._capture_relaxed_graph("cpu") is None
+
+    assert NewtonManager._state_0 is state_0
+    assert NewtonManager._state_1 is state_1
+    assert state_0.value == "input"
+    assert state_1.value == "output"
+    assert solver.private_state == "input"
+    assert solver.scratch_allocations is scratch_allocations
+    assert len(scratch_allocations) == 1
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_kamino_post_capture_replay_preserves_state(monkeypatch, fails):
+    """Kamino's allocation-pinning replay restores state after success or failure."""
+    import isaaclab_newton.physics.newton_manager as newton_manager_module
+
+    from isaaclab.physics import PhysicsManager
+
+    state_0, state_1, solver, fake_solver_type = _configure_capture_state_preservation_test(monkeypatch)
+    graph = object()
+    scratch_allocations = solver.scratch_allocations
+
+    class FakeCapture:
+        def __enter__(self):
+            self.graph = graph
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def replay(_graph):
+        solver.scratch_allocations.append(object())
+        NewtonManager._state_0.value = "future-input"
+        NewtonManager._state_1.value = "future-output"
+        NewtonManager._state_0, NewtonManager._state_1 = NewtonManager._state_1, NewtonManager._state_0
+        solver.private_state = "future-private"
+        if fails:
+            raise RuntimeError("replay failed")
+
+    monkeypatch.setattr(newton_manager_module, "SolverKamino", fake_solver_type)
+    monkeypatch.setattr(PhysicsManager, "_cfg", SimpleNamespace(use_cuda_graph=True), raising=False)
+    monkeypatch.setattr(PhysicsManager, "_device", "cuda:0", raising=False)
+    monkeypatch.setattr(NewtonManager, "_usdrt_stage", None, raising=False)
+    monkeypatch.setattr(NewtonManager, "_graph", None, raising=False)
+    monkeypatch.setattr(NewtonManager, "_graph_capture_pending", False, raising=False)
+    monkeypatch.setattr(NewtonManager, "_is_all_graphable", classmethod(lambda cls: False))
+    monkeypatch.setattr(NewtonManager, "_simulate_physics_only", classmethod(lambda cls: None))
+    monkeypatch.setattr(wp, "ScopedCapture", FakeCapture)
+    monkeypatch.setattr(wp, "capture_launch", replay)
+
+    NewtonManager._capture_or_defer_graph()
+
+    assert NewtonManager._graph is (None if fails else graph)
+    assert NewtonManager._state_0 is state_0
+    assert NewtonManager._state_1 is state_1
+    assert state_0.value == "input"
+    assert state_1.value == "output"
+    assert solver.private_state == "input"
+    assert solver.scratch_allocations is scratch_allocations
+    assert len(scratch_allocations) == 1
 
 
 def test_reset_solver_state_forwards_public_reset_contract(monkeypatch):

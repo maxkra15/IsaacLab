@@ -1586,10 +1586,13 @@ class NewtonManager(PhysicsManager):
         cls._simulate_once_for_cuda_graph_warmup()
 
     @classmethod
-    def _simulate_once_for_cuda_graph_warmup(cls) -> None:
-        """Run one eager step to force lazy allocations, then restore public and private state."""
+    def _simulate_once_for_cuda_graph_warmup(cls, warmup: Callable[[], None] | None = None) -> None:
+        """Run an eager allocation warmup, then restore public and private state."""
         if cls._model is None or cls._state_0 is None or cls._state_1 is None:
             return
+
+        if warmup is None:
+            warmup = cls._simulate_physics_only
 
         state_0_ref = cls._state_0
         state_1_ref = cls._state_1
@@ -1599,7 +1602,7 @@ class NewtonManager(PhysicsManager):
         state_1_snapshot.assign(state_1_ref)
 
         try:
-            cls._simulate_physics_only()
+            warmup()
             wp.synchronize_device()
             cls.check_solver_status()
         finally:
@@ -1926,7 +1929,7 @@ class NewtonManager(PhysicsManager):
                         # Kamino lazily allocates state during its first step.
                         # Replay once before any eager reset can move those buffers.
                         if isinstance(cls._solver, SolverKamino):
-                            wp.capture_launch(cls._graph)
+                            cls._simulate_once_for_cuda_graph_warmup(lambda: wp.capture_launch(cls._graph))
                     except Exception as exc:
                         NewtonManager._graph = None
                         logger.warning("Newton CUDA graph capture failed; using eager execution: %s", exc)
@@ -1945,7 +1948,7 @@ class NewtonManager(PhysicsManager):
     @classmethod
     def _supports_cuda_graph_capture(cls) -> bool:
         """Return whether the active solver configuration supports CUDA graph capture."""
-        return bool(getattr(cls._solver, "supports_cuda_graph_capture", True))
+        return bool(getattr(cls._solver, "supports_cuda_graph_capture", False))
 
     @classmethod
     def _is_outer_cuda_graph_capture_active(cls) -> bool:
@@ -2002,7 +2005,7 @@ class NewtonManager(PhysicsManager):
         # no new cudaMalloc calls (which are forbidden inside graph capture).
         simulate = cls._simulate_full if cls._is_all_graphable() else cls._simulate_physics_only
         with wp.ScopedDevice(device):
-            simulate()
+            cls._simulate_once_for_cuda_graph_warmup(simulate)
         wp.synchronize_stream(wp.get_stream(device))
 
         # Create a non-blocking stream (cudaStreamNonBlocking = 0x01).
@@ -2216,7 +2219,13 @@ class NewtonManager(PhysicsManager):
         if not cls._supports_cuda_graph_capture():
             raise RuntimeError("The active Newton solver configuration does not support CUDA graph capture.")
 
-        cls._solver.prepare_cuda_graph_capture(cls._contacts)
+        prepare = getattr(cls._solver, "prepare_cuda_graph_capture", None)
+        if not callable(prepare):
+            raise RuntimeError(
+                "The active Newton solver advertises CUDA graph support but does not implement "
+                "a callable prepare_cuda_graph_capture hook."
+            )
+        prepare(cls._contacts)
         cls._prewarm_cuda_graph_allocations()
         cls.check_solver_status()
 
@@ -2225,7 +2234,9 @@ class NewtonManager(PhysicsManager):
         """Raise any sticky solver failure at an application-owned host boundary."""
         if cls._solver is None:
             raise RuntimeError("Newton solver is not initialized; cannot check solver status.")
-        cls._solver.check_status()
+        check_status = getattr(cls._solver, "check_status", None)
+        if callable(check_status):
+            check_status()
 
     @classmethod
     def reset_solver_state(
