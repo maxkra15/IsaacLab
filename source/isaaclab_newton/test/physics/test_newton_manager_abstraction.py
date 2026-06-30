@@ -772,6 +772,31 @@ def test_cuda_graph_active_reports_recorded_manager_graph(monkeypatch, graph, ex
     assert NewtonManager.is_cuda_graph_active() is expected
 
 
+def test_forward_pending_evaluates_and_consumes_only_filtered_dirty_articulations(monkeypatch):
+    """Selective asset writes must not turn an RL reset into full-scene FK."""
+    import isaaclab_newton.physics.newton_manager as newton_manager_module
+
+    filtered_mask = object()
+    reset_events = []
+    fk_calls = []
+    reset_mask = SimpleNamespace(zero_=lambda: reset_events.append("zero"))
+
+    monkeypatch.setattr(NewtonManager, "_model", "model", raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_0", SimpleNamespace(joint_q="q", joint_qd="qd"), raising=False)
+    monkeypatch.setattr(NewtonManager, "_fk_reset_mask", reset_mask, raising=False)
+    monkeypatch.setattr(
+        NewtonManager,
+        "_filtered_fk_reset_mask",
+        classmethod(lambda cls: filtered_mask),
+    )
+    monkeypatch.setattr(newton_manager_module, "eval_fk", lambda *args: fk_calls.append(args))
+
+    NewtonManager.forward_pending()
+
+    assert fk_calls == [("model", "q", "qd", NewtonManager._state_0, filtered_mask)]
+    assert reset_events == ["zero"]
+
+
 def _configure_manager_step_test(monkeypatch, *, use_graph=False, externally_capturing=False, status_error=None):
     from isaaclab.physics import PhysicsManager
 

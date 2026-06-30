@@ -390,6 +390,30 @@ class NewtonManager(PhysicsManager):
         eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, cls._fk_articulation_filter)
 
     @classmethod
+    def forward_pending(cls) -> None:
+        """Update kinematics only for articulations dirtied by public asset writes.
+
+        Asset write APIs accumulate articulation IDs in :attr:`_fk_reset_mask`.
+        This method applies the manager's optional articulation allow-mask, runs
+        Newton forward kinematics for only those pending articulations, and then
+        consumes the FK mask.  The per-world reset mask is intentionally left
+        intact for solver-specific reset handling on the next physics step.
+
+        Unlike :meth:`forward`, this path scales with the number of reset
+        environments and is suitable for selective vectorized-environment
+        resets, including CUDA-graph capture.
+        """
+        eval_fk(
+            cls._model,
+            cls._state_0.joint_q,
+            cls._state_0.joint_qd,
+            cls._state_0,
+            cls._filtered_fk_reset_mask(),
+        )
+        if cls._fk_reset_mask is not None:
+            NewtonManager._fk_reset_mask.zero_()
+
+    @classmethod
     def pre_render(cls) -> None:
         """Flush deferred Fabric writes before cameras/visualizers read the scene."""
         cls.sync_transforms_to_usd()

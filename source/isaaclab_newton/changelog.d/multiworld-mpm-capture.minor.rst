@@ -8,6 +8,9 @@ Added
   :meth:`~isaaclab_newton.physics.NewtonManager.is_cuda_graph_active` as public lifecycle seams.
 * Added :meth:`~isaaclab_newton.physics.NewtonManager.check_solver_status` for application-owned
   outer graphs to inspect sticky device failures after replay.
+* Added :meth:`~isaaclab_newton.physics.NewtonManager.forward_pending` to consume the masked
+  forward-kinematics work accumulated by selective public asset writes without recomputing every
+  articulation.
 * Added :meth:`~isaaclab_newton.physics.NewtonManager.register_builder_world_hook` and
   :meth:`~isaaclab_newton.physics.NewtonManager.unregister_builder_world_hook` so tasks can extend
   replicated Newton worlds without mutating manager internals.
@@ -19,6 +22,10 @@ Changed
   contracts, including recursive coupled-solver preparation.
 * Changed Newton environment reset masks to boolean arrays and updated the Kamino manager to use
   Newton's public solver reset contract.
+* Changed Newton articulation and rigid-object pose getters to refresh only pending forward
+  kinematics, preserving per-environment reset scaling. No migration is required; callers may
+  remove redundant full :meth:`~isaaclab_newton.physics.NewtonManager.forward` calls before
+  reading these public pose views.
 
 Fixed
 ^^^^^
