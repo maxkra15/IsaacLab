@@ -21,7 +21,9 @@ def test_launcher_does_not_implicitly_select_adjacent_physics_checkouts():
 
 def test_local_physics_setup_document_is_location_independent():
     """The source-validation recipe must not embed a developer's workstation path."""
-    setup = (_REPOSITORY_ROOT / "docs/newton_local_setup.md").read_text(encoding="utf-8")
+    setup = (
+        _REPOSITORY_ROOT / "docs/source/overview/core-concepts/physical-backends/newton/local-development.md"
+    ).read_text(encoding="utf-8")
 
     assert "/home/" not in setup
     assert "file://" in setup
