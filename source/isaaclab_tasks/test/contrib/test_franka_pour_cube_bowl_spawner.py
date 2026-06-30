@@ -5,6 +5,10 @@
 
 """Stage-authoring tests for the Franka pour cube-bowl spawner."""
 
+import subprocess
+import sys
+import textwrap
+
 from isaaclab.app import AppLauncher
 
 # Launch Omniverse before importing simulator or USD modules.
@@ -55,6 +59,44 @@ def _quat_xyzw(prim) -> tuple[float, float, float, float]:
     quat = prim.GetAttribute("xformOp:orient").Get()
     imaginary = quat.GetImaginary()
     return (float(imaginary[0]), float(imaginary[1]), float(imaginary[2]), float(quat.GetReal()))
+
+
+def test_config_import_and_instantiation_do_not_require_physx():
+    """The task-local config remains importable when the optional PhysX package is absent."""
+    code = textwrap.dedent(
+        """
+        import builtins
+        import sys
+
+        class _PhysxBlocker:
+            def find_spec(self, name, path=None, target=None):
+                if name == "isaaclab_physx" or name.startswith("isaaclab_physx."):
+                    raise ImportError(f"blocked optional PhysX import: {name}")
+                return None
+
+        sys.meta_path.insert(0, _PhysxBlocker())
+        builtins._isaaclab_tasks_registered = True
+
+        from isaaclab.sim.spawners.materials import RigidBodyMaterialBaseCfg
+        from isaaclab_tasks.contrib.franka_pour.cube_bowl_spawner_cfg import CubeBowlSpawnerCfg
+
+        cfg = CubeBowlSpawnerCfg(
+            inner_width=0.037,
+            inner_depth=0.039,
+            cavity_depth=0.045,
+            wall_thickness=0.009,
+            bottom_thickness=0.008,
+            physics_material=RigidBodyMaterialBaseCfg(static_friction=0.6, dynamic_friction=0.5),
+        )
+        assert isinstance(cfg.physics_material, RigidBodyMaterialBaseCfg)
+        assert cfg.physics_material.static_friction == 0.6
+        assert "isaaclab_physx" not in sys.modules
+        """
+    )
+
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_dynamic_source_authors_visual_mesh_grasp_proxy_and_material(sim):

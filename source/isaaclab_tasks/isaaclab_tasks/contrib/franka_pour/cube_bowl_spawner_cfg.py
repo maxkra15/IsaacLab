@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import MISSING
 
-from isaaclab.sim.spawners.materials import RigidBodyMaterialCfg
+from isaaclab.sim.spawners.materials import RigidBodyMaterialBaseCfg
 from isaaclab.sim.spawners.spawner_cfg import RigidObjectSpawnerCfg
 from isaaclab.utils.configclass import configclass
 
@@ -48,5 +48,5 @@ class CubeBowlSpawnerCfg(RigidObjectSpawnerCfg):
     A relative path is resolved below the bowl's ``geometry`` prim.
     """
 
-    physics_material: RigidBodyMaterialCfg | None = None
+    physics_material: RigidBodyMaterialBaseCfg | None = None
     """Optional rigid-body physics material for contact metadata."""
