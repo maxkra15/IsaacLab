@@ -12,14 +12,21 @@ from types import SimpleNamespace
 import gymnasium as gym
 import pytest
 import torch
+from isaaclab_newton.assets import MPMObjectCfg
 from isaaclab_newton.physics import NewtonCoupledManager
+from isaaclab_newton.sim.schemas import MujocoJointCfg
+
+from isaaclab.assets import RigidObjectCfg
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.sim.schemas import MassCfg, UsdPhysicsCollisionCfg, UsdPhysicsRigidBodyCfg
+from isaaclab.sim.spawners.materials import RigidBodyMaterialBaseCfg
 
 import isaaclab_tasks.contrib.franka_pour as franka_pour
 import isaaclab_tasks.contrib.franka_pour.config.franka  # noqa: F401
+import isaaclab_tasks.contrib.franka_pour.pour_env_cfg as pour_env_cfg
 from isaaclab_tasks.contrib.franka_pour.config.franka.agents.rsl_rl_ppo_cfg import FrankaPourPPORunnerCfg
+from isaaclab_tasks.contrib.franka_pour.cube_bowl_spawner_cfg import CubeBowlSpawnerCfg
 from isaaclab_tasks.contrib.franka_pour.pour_env_cfg import (
-    CUP_LABEL_PATTERN,
-    TARGET_CUP_LABEL_PATTERN,
     TARGET_CUP_RIGID_LABEL_PATTERN,
     FrankaPourEnvCfg,
     FrankaPourEnvCfg_PLAY,
@@ -40,8 +47,106 @@ def test_boolean_selection_mask_preserves_device_shape_and_dtype():
     assert mask.tolist() == [False, True, False, True, True, False]
 
 
+def test_finalize_builds_scene_assets_without_mutating_the_caller():
+    original = FrankaPourEnvCfg()
+    original.scene.num_envs = 8
+
+    resolved = original.finalize()
+
+    assert original.scene.source_cup is None
+    assert original.scene.target_cup is None
+    assert original.scene.media is None
+    assert isinstance(resolved.scene.source_cup, RigidObjectCfg)
+    assert isinstance(resolved.scene.target_cup, RigidObjectCfg)
+    assert isinstance(resolved.scene.media, MPMObjectCfg)
+    assert resolved is not original
+    assert resolved.scene is not original.scene
+    assert resolved.sim.physics.solver_cfg.scene_cfg is resolved.scene
+    assert _media_capacity(resolved) == 8 * max(resolved.mpm_min_cells_per_env, resolved.mpm_cells_per_env)
+
+
+def test_finalize_propagates_final_cup_overrides_to_fresh_assets():
+    original = FrankaPourEnvCfg()
+    original.source_cup_inner_width = 0.041
+    original.target_cup_inner_depth = 0.153
+    original.cup_grasp_box_half = (0.021, 0.022, 0.043)
+    original.cup_grasp_box_friction = 2.4
+    original.target_cup_friction = 1.3
+    original.cup_mass = 0.071
+    original.cup_reset_pos = (0.43, 0.02, 0.01)
+    original.target_cup_reset_pos = (0.47, -0.21, 0.02)
+
+    first = original.finalize()
+    first_source = first.scene.source_cup
+    first_target = first.scene.target_cup
+    assert isinstance(first_source.spawn, CubeBowlSpawnerCfg)
+    assert isinstance(first_target.spawn, CubeBowlSpawnerCfg)
+    assert first_source.spawn.inner_width == pytest.approx(0.041)
+    assert first_target.spawn.inner_depth == pytest.approx(0.153)
+    assert first_source.spawn.grasp_proxy_half_extents == pytest.approx((0.021, 0.022, 0.043))
+    assert first_source.spawn.physics_material.static_friction == pytest.approx(2.4)
+    assert first_source.spawn.physics_material.dynamic_friction == pytest.approx(2.4)
+    assert first_target.spawn.physics_material.static_friction == pytest.approx(1.3)
+    assert first_target.spawn.physics_material.dynamic_friction == pytest.approx(1.3)
+    assert first_source.spawn.mass_props.mass == pytest.approx(0.071)
+    assert first_source.init_state.pos == pytest.approx((0.43, 0.02, 0.01))
+    assert first_source.init_state.rot == (0.0, 0.0, 0.0, 1.0)
+    assert first_target.init_state.pos == pytest.approx((0.47, -0.21, 0.02))
+    assert first_target.init_state.rot == (0.0, 0.0, 0.0, 1.0)
+
+    first.source_cup_inner_width = 0.049
+    second = first.finalize()
+
+    assert second.scene.source_cup is not first.scene.source_cup
+    assert second.scene.target_cup is not first.scene.target_cup
+    assert second.scene.media is not first.scene.media
+    assert first.scene.source_cup.spawn.inner_width == pytest.approx(0.041)
+    assert second.scene.source_cup.spawn.inner_width == pytest.approx(0.049)
+
+
+def test_resolved_cups_have_backend_neutral_rigid_properties():
+    resolved = FrankaPourEnvCfg().finalize()
+    source = resolved.scene.source_cup
+    target = resolved.scene.target_cup
+
+    assert source.prim_path == "{ENV_REGEX_NS}/SourceCup"
+    assert isinstance(source.spawn.rigid_props, UsdPhysicsRigidBodyCfg)
+    assert source.spawn.rigid_props.rigid_body_enabled is True
+    assert source.spawn.rigid_props.kinematic_enabled is False
+    assert isinstance(source.spawn.collision_props, UsdPhysicsCollisionCfg)
+    assert source.spawn.collision_props.collision_enabled is True
+    assert isinstance(source.spawn.mass_props, MassCfg)
+    assert isinstance(source.spawn.physics_material, RigidBodyMaterialBaseCfg)
+    assert source.spawn.grasp_proxy_half_extents == resolved.cup_grasp_box_half
+
+    assert target.prim_path == "{ENV_REGEX_NS}/TargetCup"
+    assert isinstance(target.spawn.rigid_props, UsdPhysicsRigidBodyCfg)
+    assert target.spawn.rigid_props.rigid_body_enabled is True
+    assert target.spawn.rigid_props.kinematic_enabled is True
+    assert target.spawn.grasp_proxy_half_extents is None
+    assert isinstance(target.spawn.physics_material, RigidBodyMaterialBaseCfg)
+
+
+def test_robot_authors_mujoco_gravity_compensation_with_joint_fragment():
+    fragments = FrankaPourEnvCfg().scene.robot.spawn.joint_drive_props
+
+    assert isinstance(fragments, list)
+    assert any(isinstance(fragment, MujocoJointCfg) and fragment.actuatorgravcomp is True for fragment in fragments)
+
+
+def test_public_fixed_size_tuple_annotations_are_specific():
+    expected = {
+        "arm_home": "tuple[float, float, float, float, float, float, float]",
+        "cup_grasp_box_half": "tuple[float, float, float]",
+        "cup_reset_pos": "tuple[float, float, float]",
+        "target_cup_reset_pos": "tuple[float, float, float]",
+    }
+
+    assert {name: FrankaPourEnvCfg.__annotations__[name] for name in expected} == expected
+
+
 def test_cfg_routes_each_body_to_exactly_one_solver():
-    cfg = FrankaPourEnvCfg()
+    cfg = FrankaPourEnvCfg().finalize()
     solver = cfg.sim.physics.solver_cfg
     entries = {entry.name: entry for entry in solver.entries}
     assert set(entries) == {"arm", "media"}
@@ -55,11 +160,11 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert cfg.sim.physics.collision_cfg.soft_contact_max == 0
     assert arm.preserve_shape_ids is True
     assert arm.include_static_shapes is True
-    assert CUP_LABEL_PATTERN in arm.body_label_patterns
-    assert TARGET_CUP_RIGID_LABEL_PATTERN in arm.body_label_patterns
+    assert arm.body_entities == [SceneEntityCfg("robot"), SceneEntityCfg("source_cup")]
+    assert arm.body_label_patterns == [TARGET_CUP_RIGID_LABEL_PATTERN]
     assert media.all_particles is True
-    assert TARGET_CUP_LABEL_PATTERN in media.body_label_patterns
-    assert r".*/SpillFloor$" in media.body_label_patterns
+    assert media.body_entities == [SceneEntityCfg("target_cup")]
+    assert media.body_label_patterns == [r".*/SpillFloor$"]
     assert media.include_static_shapes is False
     assert media.in_place is True
     assert media.solver_cfg.separate_worlds is True
@@ -72,7 +177,10 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     proxies = solver.proxy_coupling.proxies
     assert len(proxies) == 1
     assert proxies[0].source == "arm" and proxies[0].destination == "media"
-    assert proxies[0].body_label_patterns == [CUP_LABEL_PATTERN]
+    assert proxies[0].body_entities == [SceneEntityCfg("source_cup")]
+    assert proxies[0].body_label_patterns == []
+    assert not hasattr(pour_env_cfg, "CUP_LABEL_PATTERN")
+    assert all("Cup$" not in pattern for entry in solver.entries for pattern in entry.body_label_patterns)
 
 
 def test_visible_source_geometry_matches_grasp_proxy_and_fits_gripper():
@@ -188,7 +296,7 @@ def test_capacity_resolver_reads_fixed_grid_type_from_media_entry_without_mutati
 
 
 def test_media_selector_includes_spill_floor_without_unrelated_shapes():
-    cfg = FrankaPourEnvCfg()
+    cfg = FrankaPourEnvCfg().finalize()
     media = _media_entry(cfg)
     model = SimpleNamespace(
         body_label=[

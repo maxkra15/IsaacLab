@@ -23,6 +23,8 @@ proxy bridges to MPM. Arm control is relative DiffIK plus a binary gripper open/
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from isaaclab_newton.assets import MPMObjectCfg
 from isaaclab_newton.physics import (
     CoupledProxyCfg,
@@ -34,10 +36,11 @@ from isaaclab_newton.physics import (
     NewtonCollisionPipelineCfg,
     ProxyCouplingCfg,
 )
+from isaaclab_newton.sim.schemas import MujocoJointCfg
 from isaaclab_newton.sim.spawners.mpm import MPMParticleMaterialCfg
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -47,18 +50,20 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim.schemas import MassCfg, UsdPhysicsCollisionCfg, UsdPhysicsRigidBodyCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
+from isaaclab.sim.spawners.materials import RigidBodyMaterialBaseCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 
 from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 
 from . import mdp
+from .cube_bowl_spawner_cfg import CubeBowlSpawnerCfg
+from .cup_media import build_media_object_cfg
 
 RIGID_ENTRY = "arm"
 MPM_ENTRY = "media"
-CUP_LABEL_PATTERN = r".*/Cup$"
-TARGET_CUP_LABEL_PATTERN = r".*/TargetCup$"
 TARGET_CUP_RIGID_LABEL_PATTERN = r".*/TargetCupRigid$"
 SPILL_FLOOR_LABEL_PATTERN = r".*/SpillFloor$"
 
@@ -101,7 +106,7 @@ def _resolve_mpm_cell_cap(cfg: FrankaPourEnvCfg) -> int:
 
 @configclass
 class PourSceneCfg(InteractiveSceneCfg):
-    """Lift-task scene assets (Franka + SeattleLab table) plus the declarative MPM media entity."""
+    """Lift-task scene assets plus resolved cups and MPM media."""
 
     # SeattleLab table (top at env z=0), exactly as the Isaac-Lift-Cube-Franka scene.
     table = AssetBaseCfg(
@@ -118,7 +123,10 @@ class PourSceneCfg(InteractiveSceneCfg):
         prim_path="/World/light", spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0)
     )
     robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-    # Built at environment-construction time so spawn points fill the resting cup cavity.
+    robot.spawn.joint_drive_props = [MujocoJointCfg(actuatorgravcomp=True)]
+    # Built by :meth:`FrankaPourEnvCfg.finalize` from the final override values.
+    source_cup: RigidObjectCfg | None = None
+    target_cup: RigidObjectCfg | None = None
     media: MPMObjectCfg | None = None
 
 
@@ -247,7 +255,15 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     # was measured from the same DiffIK trajectory used by ``pour_grasp_smoke.py``; the policy must
     # still close on the physical contacts, lift, carry, and pour, but does not spend the first
     # hundreds of low-throughput MPM iterations discovering a 30 cm free-space approach.
-    arm_home: tuple = (0.00144, 0.56318, -0.00085, -2.59404, 0.00120, 3.69399, 0.74187)
+    arm_home: tuple[float, float, float, float, float, float, float] = (
+        0.00144,
+        0.56318,
+        -0.00085,
+        -2.59404,
+        0.00120,
+        3.69399,
+        0.74187,
+    )
     # Coupled-pipeline arm tuning: heavy PD damping + reflected rotor inertia keep the distal joints
     # from limit-cycling under the coupled solver.
     arm_stiffness: float = 600.0
@@ -276,7 +292,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     # The x/y faces coincide with the visible 55 mm cup. The taller 80 mm rigid grip band prevents
     # the media-loaded cup from rolling between flat fingers at >90 deg; a 54 mm near-square proxy
     # could rotate corner-through-contact once the hand reached the pour pose.
-    cup_grasp_box_half: tuple = (0.0275, 0.0275, 0.040)
+    cup_grasp_box_half: tuple[float, float, float] = (0.0275, 0.0275, 0.040)
     cup_grasp_height: float = 0.032
     # A/B grasp testing: mu=1 let the media-loaded cup roll out during the carry, while mu=2 kept
     # bilateral contact through the full carry/tilt path without raising tangential stiffness.
@@ -291,7 +307,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     grasp_contact_kf: float = 1.0e3
     # Cup reset pose, in the env frame. The cup rests on the table (top z=0) directly under the home
     # gripper, opening up. z is the cup base height (the body local origin sits at the outer base).
-    cup_reset_pos: tuple = (0.5, 0.0, 0.0)
+    cup_reset_pos: tuple[float, float, float] = (0.5, 0.0, 0.0)
 
     # ---- receiving cup (fixed, represented once per solver to keep ownership disjoint) ----
     # The receiver is wider than the source during the initial learning curriculum. It remains a
@@ -304,7 +320,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     target_cup_friction: float = 0.8
     # Keep enough initial clearance for the Panda finger collision meshes. Moving this wide receiver
     # to y=-0.12 made its rigid rim touch the pre-grasp hand and explosively eject media at step 0.
-    target_cup_reset_pos: tuple = (0.5, -0.18, 0.0)
+    target_cup_reset_pos: tuple[float, float, float] = (0.5, -0.18, 0.0)
     collider_margin: float = 0.002
 
     # First-stage curriculum threshold: the deterministic physical reference pour reaches ~41%.
@@ -376,8 +392,8 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         solver_cfg=MJWarpSolverCfg(
                             use_mujoco_contacts=False, integrator="implicitfast", njmax=510, nconmax=400
                         ),
-                        body_entities=[SceneEntityCfg("robot")],
-                        body_label_patterns=[CUP_LABEL_PATTERN, TARGET_CUP_RIGID_LABEL_PATTERN],
+                        body_entities=[SceneEntityCfg("robot"), SceneEntityCfg("source_cup")],
+                        body_label_patterns=[TARGET_CUP_RIGID_LABEL_PATTERN],
                         include_static_shapes=True,
                         substeps=self.num_substeps,
                     ),
@@ -401,9 +417,10 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                             project_outside_colliders=True,
                         ),
                         all_particles=True,
-                        # The source cup is proxied from the rigid solver. The separate particle-only
-                        # target body is owned here; its co-located rigid copy belongs to the arm entry.
-                        body_label_patterns=[TARGET_CUP_LABEL_PATTERN, SPILL_FLOOR_LABEL_PATTERN],
+                        # The source cup is proxied from the rigid solver. The visible target belongs
+                        # here; its hidden rigid-only copy belongs to the arm entry.
+                        body_entities=[SceneEntityCfg("target_cup")],
+                        body_label_patterns=[SPILL_FLOOR_LABEL_PATTERN],
                         include_static_shapes=False,
                         include_child_joints=False,
                         in_place=True,
@@ -414,7 +431,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         CoupledProxyCfg(
                             source=RIGID_ENTRY,
                             destination=MPM_ENTRY,
-                            body_label_patterns=[CUP_LABEL_PATTERN],
+                            body_entities=[SceneEntityCfg("source_cup")],
                             mass_scale=self.proxy_mass_scale,
                             mode="lagged",
                         )
@@ -429,6 +446,62 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
             num_substeps=self.num_substeps,
             use_cuda_graph=self.use_cuda_graph,
         )
+
+    def finalize(self) -> FrankaPourEnvCfg:
+        """Return an independent config with all derived scene assets resolved."""
+        resolved = deepcopy(self)
+        resolved.scene.source_cup = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/SourceCup",
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=resolved.cup_reset_pos,
+                rot=(0.0, 0.0, 0.0, 1.0),
+            ),
+            spawn=CubeBowlSpawnerCfg(
+                inner_width=resolved.source_cup_inner_width,
+                inner_depth=resolved.source_cup_inner_depth,
+                cavity_depth=resolved.source_cup_cavity_depth,
+                wall_thickness=resolved.source_cup_wall_thickness,
+                bottom_thickness=resolved.source_cup_bottom_thickness,
+                display_color=(0.95, 0.82, 0.16),
+                grasp_proxy_half_extents=resolved.cup_grasp_box_half,
+                mass_props=MassCfg(mass=resolved.cup_mass),
+                rigid_props=UsdPhysicsRigidBodyCfg(rigid_body_enabled=True, kinematic_enabled=False),
+                collision_props=UsdPhysicsCollisionCfg(collision_enabled=True),
+                physics_material=RigidBodyMaterialBaseCfg(
+                    static_friction=resolved.cup_grasp_box_friction,
+                    dynamic_friction=resolved.cup_grasp_box_friction,
+                ),
+            ),
+        )
+        resolved.scene.target_cup = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/TargetCup",
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=resolved.target_cup_reset_pos,
+                rot=(0.0, 0.0, 0.0, 1.0),
+            ),
+            spawn=CubeBowlSpawnerCfg(
+                inner_width=resolved.target_cup_inner_width,
+                inner_depth=resolved.target_cup_inner_depth,
+                cavity_depth=resolved.target_cup_cavity_depth,
+                wall_thickness=resolved.target_cup_wall_thickness,
+                bottom_thickness=resolved.target_cup_bottom_thickness,
+                display_color=(0.20, 0.55, 0.90),
+                grasp_proxy_half_extents=None,
+                rigid_props=UsdPhysicsRigidBodyCfg(rigid_body_enabled=True, kinematic_enabled=True),
+                physics_material=RigidBodyMaterialBaseCfg(
+                    static_friction=resolved.target_cup_friction,
+                    dynamic_friction=resolved.target_cup_friction,
+                ),
+            ),
+        )
+        resolved.scene.media = build_media_object_cfg(
+            resolved,
+            resolved.cup_reset_pos,
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        _mpm_solver_cfg(resolved).max_active_cell_count = _resolve_mpm_cell_cap(resolved)
+        resolved.sim.physics.solver_cfg.scene_cfg = resolved.scene
+        return resolved
 
 
 @configclass
