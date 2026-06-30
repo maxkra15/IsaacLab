@@ -1264,6 +1264,98 @@ def test_kamino_post_capture_replay_preserves_state(monkeypatch, fails):
     assert len(scratch_allocations) == 1
 
 
+def _configure_kamino_deferred_step_test(monkeypatch, *, replay_fails):
+    """Install a deferred Kamino step whose graph replay exposes state advances."""
+    from isaaclab.physics import PhysicsManager
+
+    state_0, state_1, solver, _ = _configure_capture_state_preservation_test(monkeypatch)
+    state_0.value = 0
+    state_1.value = 10
+    solver.private_state = 0
+    scratch_allocations = solver.scratch_allocations
+    graph = object()
+    launches = []
+
+    def replay(captured_graph):
+        assert captured_graph is graph
+        launches.append(captured_graph)
+        if not solver.scratch_allocations:
+            solver.scratch_allocations.append(object())
+        NewtonManager._state_0.value += 1
+        NewtonManager._state_1.value += 1
+        solver.private_state += 1
+        if replay_fails:
+            raise RuntimeError("allocation replay failed")
+
+    monkeypatch.setattr(PhysicsManager, "_sim", SimpleNamespace(is_playing=lambda: True), raising=False)
+    monkeypatch.setattr(PhysicsManager, "_cfg", SimpleNamespace(use_cuda_graph=True), raising=False)
+    monkeypatch.setattr(PhysicsManager, "_device", "cuda:0", raising=False)
+    monkeypatch.setattr(PhysicsManager, "_sim_time", 0.0, raising=False)
+    monkeypatch.setattr(NewtonManager, "_model_changes", set(), raising=False)
+    monkeypatch.setattr(NewtonManager, "_graph_capture_pending", True, raising=False)
+    monkeypatch.setattr(NewtonManager, "_graph", None, raising=False)
+    monkeypatch.setattr(NewtonManager, "_needs_collision_pipeline", False, raising=False)
+    monkeypatch.setattr(NewtonManager, "_world_reset_mask", SimpleNamespace(zero_=lambda: None), raising=False)
+    monkeypatch.setattr(NewtonManager, "_fk_reset_mask", SimpleNamespace(zero_=lambda: None), raising=False)
+    monkeypatch.setattr(NewtonManager, "_solver_dt", 0.25, raising=False)
+    monkeypatch.setattr(NewtonManager, "_num_substeps", 2, raising=False)
+    monkeypatch.setattr(NewtonManager, "_usdrt_stage", object(), raising=False)
+    monkeypatch.setattr(NewtonKaminoManager, "_forward_kamino", classmethod(lambda cls, world_mask=None: None))
+    monkeypatch.setattr(
+        NewtonKaminoManager,
+        "_capture_relaxed_graph",
+        classmethod(lambda cls, device: graph),
+    )
+    monkeypatch.setattr(NewtonKaminoManager, "_mark_transforms_dirty", classmethod(lambda cls: None))
+    monkeypatch.setattr(NewtonKaminoManager, "_log_solver_debug", classmethod(lambda cls: None))
+    monkeypatch.setattr(wp, "capture_launch", replay)
+
+    return state_0, state_1, solver, scratch_allocations, graph, launches
+
+
+def test_kamino_deferred_capture_replay_does_not_double_advance(monkeypatch):
+    """Kamino's deferred allocation replay is invisible to the first real step."""
+    from isaaclab.physics import PhysicsManager
+
+    state_0, state_1, solver, scratch_allocations, graph, launches = _configure_kamino_deferred_step_test(
+        monkeypatch, replay_fails=False
+    )
+
+    NewtonKaminoManager.step()
+
+    assert launches == [graph, graph]
+    assert NewtonManager._state_0 is state_0
+    assert NewtonManager._state_1 is state_1
+    assert state_0.value == 1
+    assert state_1.value == 11
+    assert solver.private_state == 1
+    assert solver.scratch_allocations is scratch_allocations
+    assert len(scratch_allocations) == 1
+    assert PhysicsManager._sim_time == 0.5
+
+
+def test_kamino_deferred_capture_replay_failure_restores_state(monkeypatch):
+    """A failed Kamino allocation replay cannot publish a phantom advance."""
+    from isaaclab.physics import PhysicsManager
+
+    state_0, state_1, solver, scratch_allocations, graph, launches = _configure_kamino_deferred_step_test(
+        monkeypatch, replay_fails=True
+    )
+
+    with pytest.raises(RuntimeError, match="allocation replay failed"):
+        NewtonKaminoManager.step()
+
+    assert launches == [graph]
+    assert NewtonManager._state_0 is state_0
+    assert NewtonManager._state_1 is state_1
+    assert state_0.value == 0
+    assert state_1.value == 10
+    assert solver.private_state == 0
+    assert solver.scratch_allocations is scratch_allocations
+    assert len(scratch_allocations) == 1
+    assert PhysicsManager._sim_time == 0.0
+
+
 def test_reset_solver_state_forwards_public_reset_contract(monkeypatch):
     """Default reset finishes from the authoritative input buffer; explicit reset stays singular."""
     calls = []
