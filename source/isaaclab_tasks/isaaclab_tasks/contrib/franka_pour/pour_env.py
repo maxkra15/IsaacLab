@@ -3,29 +3,23 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Manager-based RL env: Franka grasping a dynamic cup of MPM media and pouring it.
+"""Manager-based RL environment for a Franka pouring MPM media between two cups.
 
-A single rigid **dynamic** cup body rests on the table; the Franka grasps it with its fingers
-through Newton-generated friction contacts resolved by MJWarp and pours the granular MPM media by
-tilting. A Newton :class:`CoupledSolverCfg` with **proxy coupling** advances the robot + cup (MJWarp
-``arm`` entry) and the media (implicit ``media`` entry) together in ``sim.step()``.
+The visible dynamic source cup and kinematic receiving cup are scene-owned rigid objects. Their
+USD bowl meshes are visual-only, while the source also owns an invisible rigid grasp proxy for
+Newton-generated finger contacts. A narrow per-world Newton hook attaches cached hollow
+particle-only colliders to both scene bodies and adds only two hidden solver objects: a rigid-only
+receiving-cup copy and a particle-only spill floor.
 
-The cup carries two co-located shapes on one body (see :meth:`FrankaPourEnv._add_cup_body`):
-
-* a SOLID grasp box (``COLLIDE_SHAPES``, owned by the ``arm`` entry) the fingers actually grip --
-  thin cup walls slip the jaws, so the box gives them something to clamp; and
-* a hollow cavity mesh (``COLLIDE_PARTICLES`` only, from
-  :func:`.cube_bowl_mesh.make_cube_bowl_mesh`) that retains the media.
-
-The cup body lives only in the ``arm`` entry; a proxy mapping (source ``arm``, destination
-``media``) exposes its ``COLLIDE_PARTICLES`` mesh to the MPM solver as an auto-pose-synced collider
-(a body cannot be owned by two coupled entries). The cup pose comes from the solver -- no weld
-kernel drives it. Arm control is relative DiffIK plus a binary gripper open/close action.
+A Newton :class:`CoupledSolverCfg` advances the robot and source cup in the ``arm`` MJWarp entry and
+the particles, receiving cup, and spill floor in the implicit ``media`` entry. Proxy coupling makes
+the source cup's particle collider available to MPM without assigning one body to two entries. Arm
+control is relative DiffIK with a binary gripper action; all observable and reset state flows through
+the scene assets' public APIs.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import newton
@@ -38,9 +32,8 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.utils import math as math_utils
 
 from .cube_bowl_mesh import cube_bowl_inner_bounds, make_cube_bowl_mesh
-from .cup_media import build_media_object_cfg, cup_cavity_lattice
+from .cup_media import cup_cavity_lattice
 from .mdp.terminations import _state_finite
-from .pour_env_cfg import _mpm_solver_cfg, _resolve_mpm_cell_cap
 from .reset_utils import boolean_selection_mask
 
 if TYPE_CHECKING:
@@ -58,28 +51,25 @@ class FrankaPourEnv(ManagerBasedRLEnv):
     cfg: FrankaPourEnvCfg
 
     def __init__(self, cfg: FrankaPourEnvCfg, render_mode: str | None = None, **kwargs):
-        self._prepare_newton_extras(cfg)
+        resolved_cfg = cfg.finalize()
+        self._prepare_newton_extras(resolved_cfg)
         self._install_newton_builder_hook()
         try:
-            super().__init__(cfg, render_mode, **kwargs)
+            super().__init__(resolved_cfg, render_mode, **kwargs)
         finally:
             self._remove_newton_builder_hook()
 
     def load_managers(self) -> None:
         self._setup_after_physics()
-        NewtonManager.set_decimation(self.cfg.decimation)
         super().load_managers()
 
     # ------------------------------------------------------------------ build
     def _prepare_newton_extras(self, cfg: FrankaPourEnvCfg) -> None:
-        """Bake the cup geometry and build the declarative cup-media scene asset.
+        """Bake task-local Newton collision geometry from the resolved scene config.
 
-        Runs before ``super().__init__`` so media spawn points see the final
-        layout and material values and the per-world builder hook has the cup
-        geometry available.
+        Runs before ``super().__init__`` so the per-world builder hook has the
+        geometry and contact values available while the scene is imported.
         """
-        _mpm_solver_cfg(cfg).max_active_cell_count = _resolve_mpm_cell_cap(cfg)
-
         # Watertight cube-cup collision meshes. The source's outer extents exactly match the solid
         # grasp box, so its visible walls and the rigid finger contacts no longer disagree.
         self._cup_vertices, self._cup_indices = make_cube_bowl_mesh(
@@ -95,6 +85,18 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             wall_thickness=float(cfg.target_cup_wall_thickness),
             cavity_depth=float(cfg.target_cup_cavity_depth),
             bottom_thickness=float(cfg.target_cup_bottom_thickness),
+        )
+        self._source_collider_mesh = newton.Mesh(
+            self._cup_vertices,
+            self._cup_indices,
+            compute_inertia=False,
+            is_solid=False,
+        )
+        self._target_collider_mesh = newton.Mesh(
+            self._target_vertices,
+            self._target_indices,
+            compute_inertia=False,
+            is_solid=False,
         )
         self._source_inner_lo, self._source_inner_hi = cube_bowl_inner_bounds(
             cfg.source_cup_inner_width,
@@ -122,197 +124,10 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         self._grasp_contact_kf = float(cfg.grasp_contact_kf)
         self._grasp_contact_mu = float(cfg.cup_grasp_box_friction)
 
-        # Declared media spawn snapshot at the cup reset pose (re-sampled exactly every reset).
-        if cfg.scene.media is None:
-            cfg.scene.media = build_media_object_cfg(cfg, self._cup_reset_pos, self._cup_reset_quat)
-
-        self._custom_proto, self._custom_meta = self._build_custom_proto(cfg)
-        self._hand_ids_l: list[int] = []
-        self._cup_body_ids_l: list[int] = []
-        self._target_body_ids_l: list[int] = []
-        self._cup_joint_ids_l: list[int] = []
-        self._cup_joint_q_l: list[int] = []
-        self._cup_joint_qd_l: list[int] = []
-        self._arm_joint_ids_l: list[list[int]] = []
-        self._arm_q_l: list[list[int]] = []
-        self._arm_qd_l: list[list[int]] = []
+        self._source_cup_friction = float(cfg.source_cup_friction)
+        self._target_cup_friction = float(cfg.target_cup_friction)
+        self._collider_margin = float(cfg.collider_margin)
         self._builder_hook = None
-
-    # --------------------------------------------------------------- proto
-    def _build_custom_proto(self, cfg: FrankaPourEnvCfg):
-        """Per-env prototype: the single dynamic cup body (+ free joint) and a ground plane.
-
-        The cup is ONE rigid dynamic body with a free joint to the world, carrying two co-located
-        shapes: a solid grasp box (``COLLIDE_SHAPES``) and the hollow cavity mesh
-        (``COLLIDE_PARTICLES``). The media particles are a scene-level :class:`MPMObject`
-        (``cfg.scene.media``), not in this prototype.
-        """
-        proto = NewtonManager.create_builder()
-        proto.default_shape_cfg.mu = 0.8
-        cup_body, cup_joint = self._add_cup_body(proto, cfg)
-        target_body, _ = self._add_target_cup_bodies(proto, cfg)
-        # A body-attached, per-world particle plane keeps spilled media at table height. Selecting
-        # this body explicitly avoids exposing every unrelated global static shape to the MPM view.
-        spill_floor = proto.add_body(
-            xform=wp.transform_identity(),
-            mass=0.0,
-            inertia=wp.mat33(),
-            is_kinematic=True,
-            lock_inertia=True,
-            label="/World/SpillFloor",
-        )
-        spill_floor_shape = proto.add_shape_plane(
-            body=spill_floor,
-            xform=wp.transform_identity(),
-            width=0.0,
-            length=0.0,
-            cfg=newton.ModelBuilder.ShapeConfig(
-                mu=0.8,
-                margin=cfg.collider_margin,
-                has_shape_collision=False,
-                has_particle_collision=True,
-            ),
-            color=(0.3, 0.3, 0.3),
-            label="/World/SpillFloor/Collision",
-        )
-        proto.shape_flags[spill_floor_shape] &= ~int(newton.ShapeFlags.COLLIDE_SHAPES)
-        proto.shape_flags[spill_floor_shape] |= int(newton.ShapeFlags.COLLIDE_PARTICLES)
-        proto.shape_flags[spill_floor_shape] &= ~int(newton.ShapeFlags.VISIBLE)
-        return proto, {
-            "cup_body": cup_body,
-            "cup_joint": cup_joint,
-            "target_body": target_body,
-        }
-
-    def _add_cup_body(self, proto, cfg: FrankaPourEnvCfg) -> tuple[int, int]:
-        """Add the single rigid dynamic cup body ``/World/Cup`` (grasp box + cavity mesh) + free joint."""
-        box_half = np.asarray(cfg.cup_grasp_box_half, dtype=np.float64)
-        # Solid-box inertia for the cup mass (the box is the cup's mass proxy).
-        ixx = cfg.cup_mass / 3.0 * (box_half[1] ** 2 + box_half[2] ** 2)
-        iyy = cfg.cup_mass / 3.0 * (box_half[0] ** 2 + box_half[2] ** 2)
-        izz = cfg.cup_mass / 3.0 * (box_half[0] ** 2 + box_half[1] ** 2)
-        inertia = wp.mat33(float(ixx), 0.0, 0.0, 0.0, float(iyy), 0.0, 0.0, 0.0, float(izz))
-
-        cup_pos = self._cup_reset_pos
-        cup_quat = self._cup_reset_quat
-        cup_body = proto.add_link(
-            xform=wp.transform(wp.vec3(*cup_pos.tolist()), wp.quat(*cup_quat.tolist())),
-            mass=float(cfg.cup_mass),
-            inertia=inertia,
-            lock_inertia=True,
-            label="/World/Cup",
-        )
-        # Free joint so MJWarp treats the cup as a movable dynamic body (grasped/pushed by contacts);
-        # the joint coords mirror body_q (xyzw quat) and are how a reset rewrites the cup pose.
-        cup_joint = proto.add_joint_free(child=cup_body, label="/World/Cup/FreeJoint")
-        proto.add_articulation([cup_joint], label="/World/Cup")
-
-        # Grasp box: SOLID, COLLIDE_SHAPES only (arm-entry contacts with the fingers; never MPM). Its
-        # base sits at the cup base (z=0) so it spans the cup body the fingers close around.
-        box_center_z = float(box_half[2])
-        box_cfg = newton.ModelBuilder.ShapeConfig(
-            mu=float(cfg.cup_grasp_box_friction),
-            density=0.0,
-            ke=float(cfg.grasp_contact_ke),
-            kd=float(cfg.grasp_contact_kd),
-            kf=float(cfg.grasp_contact_kf),
-            margin=cfg.collider_margin,
-        )
-        box_sid = proto.add_shape_box(
-            cup_body,
-            xform=wp.transform(wp.vec3(0.0, 0.0, box_center_z), wp.quat_identity()),
-            hx=float(box_half[0]),
-            hy=float(box_half[1]),
-            hz=float(box_half[2]),
-            cfg=box_cfg,
-            color=(0.85, 0.55, 0.20),
-        )
-        proto.shape_flags[box_sid] |= int(newton.ShapeFlags.COLLIDE_SHAPES)
-        proto.shape_flags[box_sid] &= ~int(newton.ShapeFlags.COLLIDE_PARTICLES)
-        proto.shape_flags[box_sid] &= ~int(newton.ShapeFlags.VISIBLE)
-        proto.shape_margin[box_sid] = cfg.collider_margin
-
-        # Cavity mesh: hollow, COLLIDE_PARTICLES only (visible). The proxy bridges this to MPM.
-        mesh = newton.Mesh(self._cup_vertices, self._cup_indices, compute_inertia=False, is_solid=False)
-        mesh_cfg = newton.ModelBuilder.ShapeConfig(
-            mu=float(cfg.source_cup_friction), density=0.0, margin=cfg.collider_margin, has_particle_collision=True
-        )
-        mesh_sid = proto.add_shape_mesh(
-            cup_body,
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-            mesh=mesh,
-            cfg=mesh_cfg,
-            color=(0.95, 0.82, 0.16),
-            label="/World/Cup/Collision",
-        )
-        proto.shape_flags[mesh_sid] |= int(newton.ShapeFlags.COLLIDE_PARTICLES) | int(newton.ShapeFlags.VISIBLE)
-        proto.shape_flags[mesh_sid] &= ~int(newton.ShapeFlags.COLLIDE_SHAPES)
-        proto.shape_margin[mesh_sid] = cfg.collider_margin
-        proto.shape_material_mu[mesh_sid] = float(cfg.source_cup_friction)
-        if proto.shape_source[mesh_sid] is not None:
-            proto.shape_source[mesh_sid].indices = proto.shape_source[mesh_sid].indices.reshape(-1)
-        return cup_body, cup_joint
-
-    def _add_target_cup_bodies(self, proto, cfg: FrankaPourEnvCfg) -> tuple[int, int]:
-        """Add disjoint MPM-only and rigid-only copies of the fixed receiving cup.
-
-        Coupled entries cannot own one body twice. The visible ``TargetCup`` is therefore selected
-        only by the media entry and retains particles, while an invisible ``TargetCupRigid`` copy is
-        selected only by the arm entry and prevents robot/source-cup tunnelling through the receiver.
-        """
-
-        pos = self._target_reset_pos
-        quat = self._target_reset_quat
-
-        def add_body(label: str, *, particle_collision: bool, visible: bool) -> int:
-            body = proto.add_body(
-                xform=wp.transform(wp.vec3(*pos.tolist()), wp.quat(*quat.tolist())),
-                mass=0.0,
-                is_kinematic=True,
-                lock_inertia=True,
-                label=f"/World/{label}",
-            )
-            mesh = newton.Mesh(self._target_vertices, self._target_indices, compute_inertia=False, is_solid=False)
-            shape_cfg = newton.ModelBuilder.ShapeConfig(
-                mu=float(cfg.target_cup_friction),
-                density=0.0,
-                ke=float(cfg.grasp_contact_ke),
-                kd=float(cfg.grasp_contact_kd),
-                margin=cfg.collider_margin,
-                has_particle_collision=particle_collision,
-            )
-            sid = proto.add_shape_mesh(
-                body,
-                xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-                mesh=mesh,
-                cfg=shape_cfg,
-                color=(0.20, 0.55, 0.90),
-                label=f"/World/{label}/Collision",
-            )
-            if particle_collision:
-                proto.shape_flags[sid] |= int(newton.ShapeFlags.COLLIDE_PARTICLES)
-                proto.shape_flags[sid] &= ~int(newton.ShapeFlags.COLLIDE_SHAPES)
-            else:
-                proto.shape_flags[sid] |= int(newton.ShapeFlags.COLLIDE_SHAPES)
-                proto.shape_flags[sid] &= ~int(newton.ShapeFlags.COLLIDE_PARTICLES)
-            if visible:
-                proto.shape_flags[sid] |= int(newton.ShapeFlags.VISIBLE)
-            else:
-                proto.shape_flags[sid] &= ~int(newton.ShapeFlags.VISIBLE)
-            proto.shape_margin[sid] = cfg.collider_margin
-            proto.shape_material_mu[sid] = float(cfg.target_cup_friction)
-            if proto.shape_source[sid] is not None:
-                proto.shape_source[sid].indices = proto.shape_source[sid].indices.reshape(-1)
-            proto.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
-            proto.body_mass[body] = 0.0
-            proto.body_inv_mass[body] = 0.0
-            proto.body_inertia[body] = wp.mat33()
-            proto.body_inv_inertia[body] = wp.mat33()
-            return body
-
-        target = add_body("TargetCup", particle_collision=True, visible=True)
-        target_rigid = add_body("TargetCupRigid", particle_collision=False, visible=False)
-        return target, target_rigid
 
     # --------------------------------------------------------------- hook
     def _install_newton_builder_hook(self) -> None:
@@ -327,107 +142,260 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         self._builder_hook = None
 
     def _add_pour_world_to_builder(self, builder, env_id: int, position, quaternion) -> None:
+        """Add only solver-specific collision representations to one imported scene world."""
         env_root = f"/World/envs/env_{env_id}"
-        self._disable_robot_particle_collision(builder, env_id)
-        self._enable_robot_gravcomp(builder, env_id)
-        self._configure_finger_contact_material(builder, env_id)
+        body_ids = self._current_world_range(builder, "body", env_id)
+        shape_ids = self._current_world_range(builder, "shape", env_id)
+        self._disable_robot_particle_collision(builder, body_ids, shape_ids)
+        self._configure_finger_contact_material(builder, body_ids, shape_ids)
 
-        hand = self._find_world_body(builder, env_id, "panda_hand")
-        arm_q, arm_qd, arm_joints = self._find_world_joint_coords(builder, env_id, ARM_JOINTS)
-
-        b_off = builder.body_count
-        j_off = builder.joint_count
-        label_starts = self._builder_label_starts(builder)
-        builder.add_builder(
-            self._custom_proto,
-            xform=wp.transform(wp.vec3(*[float(v) for v in position]), wp.quat(*[float(v) for v in quaternion])),
+        source_body = self._find_world_body(builder, body_ids, env_id, "SourceCup")
+        target_body = self._find_world_body(builder, body_ids, env_id, "TargetCup")
+        self._add_kinematic_rigid_object_articulation(builder, target_body)
+        grasp_proxy = self._find_world_shape(
+            builder,
+            shape_ids,
+            env_id,
+            "/SourceCup/geometry/grasp_proxy",
+            body_id=source_body,
         )
-        self._rewrite_builder_labels(builder, label_starts, env_root)
+        self._configure_grasp_proxy(builder, grasp_proxy)
 
-        cup_joint = j_off + self._custom_meta["cup_joint"]
-        self._hand_ids_l.append(hand)
-        self._cup_body_ids_l.append(b_off + self._custom_meta["cup_body"])
-        self._target_body_ids_l.append(b_off + self._custom_meta["target_body"])
-        self._cup_joint_ids_l.append(cup_joint)
-        self._cup_joint_q_l.append(int(builder.joint_q_start[cup_joint]))
-        self._cup_joint_qd_l.append(int(builder.joint_qd_start[cup_joint]))
-        self._arm_joint_ids_l.append(arm_joints)
-        self._arm_q_l.append(arm_q)
-        self._arm_qd_l.append(arm_qd)
+        self._add_particle_collider(
+            builder,
+            body_id=source_body,
+            mesh=self._source_collider_mesh,
+            friction=self._source_cup_friction,
+            label=f"{env_root}/SourceCup/ParticleCollider",
+        )
+        self._add_particle_collider(
+            builder,
+            body_id=target_body,
+            mesh=self._target_collider_mesh,
+            friction=self._target_cup_friction,
+            label=f"{env_root}/TargetCup/ParticleCollider",
+        )
+
+        world_xform = wp.transform(
+            wp.vec3(*[float(value) for value in position]),
+            wp.quat(*[float(value) for value in quaternion]),
+        )
+        target_local_xform = wp.transform(
+            wp.vec3(*self._target_reset_pos.tolist()),
+            wp.quat(*self._target_reset_quat.tolist()),
+        )
+        target_rigid = builder.add_body(
+            xform=wp.transform_multiply(world_xform, target_local_xform),
+            mass=0.0,
+            is_kinematic=True,
+            lock_inertia=True,
+            label=f"{env_root}/TargetCupRigid",
+        )
+        self._add_rigid_collider(
+            builder,
+            body_id=target_rigid,
+            mesh=self._target_collider_mesh,
+            friction=self._target_cup_friction,
+            label=f"{env_root}/TargetCupRigid/Collision",
+        )
+
+        spill_floor = builder.add_body(
+            xform=world_xform,
+            mass=0.0,
+            inertia=wp.mat33(),
+            is_kinematic=True,
+            lock_inertia=True,
+            label=f"{env_root}/SpillFloor",
+        )
+        spill_shape = builder.add_shape_plane(
+            body=spill_floor,
+            xform=wp.transform_identity(),
+            width=0.0,
+            length=0.0,
+            cfg=newton.ModelBuilder.ShapeConfig(
+                mu=0.8,
+                margin=self._collider_margin,
+                has_shape_collision=False,
+                has_particle_collision=True,
+            ),
+            color=(0.3, 0.3, 0.3),
+            label=f"{env_root}/SpillFloor/Collision",
+        )
+        self._set_shape_roles(builder, spill_shape, rigid=False, particles=True, visible=False)
 
     @staticmethod
-    def _label_world(builder, prefix: str, index: int) -> int:
+    def _current_world_range(builder, prefix: str, env_id: int) -> range:
+        """Return the contiguous tail added for the currently open Newton world."""
         worlds = getattr(builder, f"{prefix}_world", None)
         if worlds is None:
-            return -1
-        return int(worlds[index])
+            raise RuntimeError(f"Newton builder does not expose {prefix}_world assignments.")
+        stop = len(worlds)
+        start = stop
+        while start > 0 and int(worlds[start - 1]) == env_id:
+            start -= 1
+        if start == stop:
+            raise RuntimeError(f"Newton builder contains no {prefix} entries for open world {env_id}.")
+        return range(start, stop)
 
-    def _find_world_body(self, builder, env_id: int, body_name: str) -> int:
-        matches = [
-            body_id
-            for body_id, label in enumerate(builder.body_label)
-            if self._label_world(builder, "body", body_id) == env_id and str(label).rsplit("/", 1)[-1] == body_name
-        ]
+    def _find_world_body(self, builder, body_ids: range, env_id: int, body_name: str) -> int:
+        """Resolve exactly one imported body by Newton world and exact final path component."""
+        matches = [body_id for body_id in body_ids if str(builder.body_label[body_id]).rsplit("/", 1)[-1] == body_name]
         if len(matches) != 1:
-            raise RuntimeError(f"Expected one {body_name!r} body in Newton world {env_id}, found {matches}.")
+            labels = [str(builder.body_label[index]) for index in matches]
+            raise RuntimeError(
+                f"Expected exactly one {body_name!r} body in Newton world {env_id}, "
+                f"found ids={matches}, labels={labels}."
+            )
         return matches[0]
 
-    def _find_world_joint_coords(
-        self, builder, env_id: int, joint_names: Sequence[str]
-    ) -> tuple[list[int], list[int], list[int]]:
-        joint_labels = [str(label) for label in builder.joint_label]
-        joint_q, joint_qd, joint_ids = [], [], []
-        for joint_name in joint_names:
-            matches = [
-                joint_id
-                for joint_id, label in enumerate(joint_labels)
-                if self._label_world(builder, "joint", joint_id) == env_id and label.rsplit("/", 1)[-1] == joint_name
-            ]
-            if len(matches) != 1:
-                raise RuntimeError(f"Expected one {joint_name!r} joint in Newton world {env_id}, found {matches}.")
-            joint_id = matches[0]
-            joint_ids.append(joint_id)
-            joint_q.append(int(builder.joint_q_start[joint_id]))
-            joint_qd.append(int(builder.joint_qd_start[joint_id]))
-        return joint_q, joint_qd, joint_ids
+    @staticmethod
+    def _add_kinematic_rigid_object_articulation(builder, body_id: int) -> None:
+        """Expose an imported kinematic body through Newton's articulation-based rigid view."""
+        body_label = str(builder.body_label[body_id])
+        child_joints = [joint_id for _, joint_id in builder.joint_parents.get(body_id, ())]
+        if not child_joints:
+            joint_id = builder.add_joint_free(child=body_id, label=f"{body_label}/FreeJoint")
+            builder.add_articulation([joint_id], label=body_label)
+        elif len(child_joints) == 1:
+            joint_id = child_joints[0]
+            articulation_id = int(builder.joint_articulation[joint_id])
+            if articulation_id < 0 or str(builder.articulation_label[articulation_id]) != body_label:
+                raise RuntimeError(
+                    f"Kinematic rigid body {body_label!r} has an unexpected joint/articulation association."
+                )
+        else:
+            raise RuntimeError(
+                f"Kinematic rigid body {body_label!r} must have at most one root joint, found {child_joints}."
+            )
 
-    def _enable_robot_gravcomp(self, builder, env_id: int) -> None:
-        """MuJoCo gravity compensation on robot links. The MJWarp solver does not honor the PhysX
-        ``disable_gravity`` flag, and relative DiffIK re-anchors to the current pose every step, so
-        without this the arm continuously sags under gravity."""
-        try:
-            attr = builder.custom_attributes["mujoco:gravcomp"]
-        except (KeyError, TypeError, AttributeError):
-            return
-        if attr.values is None:
-            attr.values = {}
-        for body_id in range(builder.body_count):
-            if self._label_world(builder, "body", body_id) != env_id:
-                continue
-            if "/panda" in str(builder.body_label[body_id]):
-                attr.values[int(body_id)] = 1.0
+        builder.body_flags[body_id] = int(newton.BodyFlags.KINEMATIC)
+        builder.body_mass[body_id] = 0.0
+        builder.body_inv_mass[body_id] = 0.0
+        builder.body_inertia[body_id] = wp.mat33()
+        builder.body_inv_inertia[body_id] = wp.mat33()
 
-    def _disable_robot_particle_collision(self, builder, env_id: int) -> None:
+    def _find_world_shape(self, builder, shape_ids: range, env_id: int, label_suffix: str, *, body_id: int) -> int:
+        """Resolve exactly one imported shape by owning body and exact scene-relative path."""
+        matches = [
+            shape_id
+            for shape_id in shape_ids
+            if int(builder.shape_body[shape_id]) == body_id
+            and str(builder.shape_label[shape_id]).endswith(label_suffix)
+        ]
+        if len(matches) != 1:
+            labels = [str(builder.shape_label[index]) for index in matches]
+            raise RuntimeError(
+                f"Expected exactly one shape ending in {label_suffix!r} on body {body_id} "
+                f"in Newton world {env_id}, found ids={matches}, labels={labels}."
+            )
+        return matches[0]
+
+    def _configure_grasp_proxy(self, builder, shape_id: int) -> None:
+        """Keep the imported grasp proxy rigid-only, invisible, and contact-tuned."""
+        self._set_shape_roles(builder, shape_id, rigid=True, particles=False, visible=False)
+        builder.shape_margin[shape_id] = self._collider_margin
+        builder.shape_material_ke[shape_id] = self._grasp_contact_ke
+        builder.shape_material_kd[shape_id] = self._grasp_contact_kd
+        builder.shape_material_kf[shape_id] = self._grasp_contact_kf
+        builder.shape_material_mu[shape_id] = self._grasp_contact_mu
+
+    def _add_particle_collider(
+        self,
+        builder,
+        *,
+        body_id: int,
+        mesh: newton.Mesh,
+        friction: float,
+        label: str,
+    ) -> int:
+        """Attach an invisible hollow particle-only collider to a scene-owned body."""
+        shape_id = builder.add_shape_mesh(
+            body_id,
+            xform=wp.transform_identity(),
+            mesh=mesh,
+            cfg=newton.ModelBuilder.ShapeConfig(
+                mu=friction,
+                density=0.0,
+                margin=self._collider_margin,
+                has_shape_collision=False,
+                has_particle_collision=True,
+                is_visible=False,
+            ),
+            label=label,
+        )
+        self._set_shape_roles(builder, shape_id, rigid=False, particles=True, visible=False)
+        builder.shape_margin[shape_id] = self._collider_margin
+        builder.shape_material_mu[shape_id] = friction
+        return shape_id
+
+    def _add_rigid_collider(
+        self,
+        builder,
+        *,
+        body_id: int,
+        mesh: newton.Mesh,
+        friction: float,
+        label: str,
+    ) -> int:
+        """Attach an invisible hollow rigid-only collider to a solver-owned body."""
+        shape_id = builder.add_shape_mesh(
+            body_id,
+            xform=wp.transform_identity(),
+            mesh=mesh,
+            cfg=newton.ModelBuilder.ShapeConfig(
+                mu=friction,
+                density=0.0,
+                ke=self._grasp_contact_ke,
+                kd=self._grasp_contact_kd,
+                kf=self._grasp_contact_kf,
+                margin=self._collider_margin,
+                has_shape_collision=True,
+                has_particle_collision=False,
+                is_visible=False,
+            ),
+            label=label,
+        )
+        self._set_shape_roles(builder, shape_id, rigid=True, particles=False, visible=False)
+        builder.shape_margin[shape_id] = self._collider_margin
+        builder.shape_material_mu[shape_id] = friction
+        return shape_id
+
+    @staticmethod
+    def _set_shape_roles(builder, shape_id: int, *, rigid: bool, particles: bool, visible: bool) -> None:
+        flags = int(builder.shape_flags[shape_id])
+        assignments = (
+            (newton.ShapeFlags.COLLIDE_SHAPES, rigid),
+            (newton.ShapeFlags.COLLIDE_PARTICLES, particles),
+            (newton.ShapeFlags.VISIBLE, visible),
+        )
+        for flag, enabled in assignments:
+            if enabled:
+                flags |= int(flag)
+            else:
+                flags &= ~int(flag)
+        builder.shape_flags[shape_id] = flags
+
+    def _disable_robot_particle_collision(self, builder, body_ids: range, shape_ids: range) -> None:
         """The robot shapes must not collide with MPM particles (only the cup cavity mesh does)."""
         collide_particles = int(newton.ShapeFlags.COLLIDE_PARTICLES)
-        for shape_id in range(builder.shape_count):
+        for shape_id in shape_ids:
             body_id = int(builder.shape_body[shape_id])
-            if body_id < 0 or self._label_world(builder, "body", body_id) != env_id:
+            if body_id not in body_ids:
                 continue
             body_label = str(builder.body_label[body_id])
             if "/Robot/" in body_label or body_label.endswith("/Robot"):
                 builder.shape_flags[shape_id] &= ~collide_particles
 
-    def _configure_finger_contact_material(self, builder, env_id: int) -> None:
+    def _configure_finger_contact_material(self, builder, body_ids: range, shape_ids: range) -> None:
         """Use a rigid contact material on the two finger collision shapes.
 
         Applying the same material to the fingers and cup keeps the intended pair response
         independent of import-side material defaults.
         """
         finger_suffixes = ("/panda_leftfinger", "/panda_rightfinger")
-        for shape_id in range(builder.shape_count):
+        for shape_id in shape_ids:
             body_id = int(builder.shape_body[shape_id])
-            if body_id < 0 or self._label_world(builder, "body", body_id) != env_id:
+            if body_id not in body_ids:
                 continue
             if str(builder.body_label[body_id]).endswith(finger_suffixes):
                 builder.shape_material_ke[shape_id] = self._grasp_contact_ke
@@ -435,34 +403,14 @@ class FrankaPourEnv(ManagerBasedRLEnv):
                 builder.shape_material_kf[shape_id] = self._grasp_contact_kf
                 builder.shape_material_mu[shape_id] = self._grasp_contact_mu
 
-    @staticmethod
-    def _builder_label_starts(builder) -> dict[str, int]:
-        return {
-            attr: len(getattr(builder, attr))
-            for attr in ("body_label", "articulation_label", "joint_label", "shape_label")
-        }
-
-    @staticmethod
-    def _env_label(label: str, env_root: str) -> str:
-        if not isinstance(label, str):
-            return label
-        if label.startswith("/panda"):
-            return f"{env_root}{label}"
-        if label.startswith("/World/"):
-            return f"{env_root}/{label[len('/World/') :]}"
-        return label
-
-    @classmethod
-    def _rewrite_builder_labels(cls, builder, starts: dict[str, int], env_root: str) -> None:
-        for attr, start in starts.items():
-            labels = getattr(builder, attr)
-            for idx in range(start, len(labels)):
-                labels[idx] = cls._env_label(labels[idx], env_root)
-
     # ----------------------------------------------------------- post-physics
     def _setup_after_physics(self) -> None:
         dev = self.device
         self._robot = self.scene["robot"]
+        self._source_cup = self.scene["source_cup"]
+        self._target_cup = self.scene["target_cup"]
+        self._media: MPMObject = self.scene["media"]
+
         self._arm_joint_ids, _ = self._robot.find_joints(ARM_JOINTS, preserve_order=True)
         self._finger_joint_ids, _ = self._robot.find_joints(FINGER_JOINTS, preserve_order=True)
         tcp_body_ids, _ = self._robot.find_bodies(self.cfg.actions.arm_action.body_name)
@@ -481,30 +429,8 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             self._tcp_offset_quat = torch.tensor(tcp_offset.rot, device=dev).repeat(self.num_envs, 1)
 
         self.env_origins = self.scene.env_origins.to(device=dev, dtype=torch.float32)
-        self._hand_ids = torch.tensor(self._hand_ids_l, device=dev, dtype=torch.long)
-        self._cup_body_ids = torch.tensor(self._cup_body_ids_l, device=dev, dtype=torch.long)
-        self._target_body_ids = torch.tensor(self._target_body_ids_l, device=dev, dtype=torch.long)
-        # Free-joint coordinate starts: q is [px, py, pz, qx, qy, qz, qw] (xyzw), qd is the spatial vel.
-        self._cup_joint_q = torch.tensor(self._cup_joint_q_l, device=dev, dtype=torch.long)
-        self._cup_joint_qd = torch.tensor(self._cup_joint_qd_l, device=dev, dtype=torch.long)
-
-        self._arm_q_ids = torch.tensor(self._arm_q_l, device=dev, dtype=torch.long)
-        self._arm_qd_ids = torch.tensor(self._arm_qd_l, device=dev, dtype=torch.long)
-        model = NewtonManager.get_model()
-        joint_articulation = wp.to_torch(model.joint_articulation).long()
-        arm_joint_ids = torch.tensor(self._arm_joint_ids_l, device=dev, dtype=torch.long)
-        cup_joint_ids = torch.tensor(self._cup_joint_ids_l, device=dev, dtype=torch.long).unsqueeze(1)
-        arm_articulation_ids = joint_articulation[arm_joint_ids]
-        self._cup_articulation_ids = joint_articulation[cup_joint_ids]
-        self._reset_articulation_ids = torch.cat((arm_articulation_ids, self._cup_articulation_ids), dim=1)
-        if bool((self._reset_articulation_ids < 0).any()):
-            raise RuntimeError("Franka Pour reset joints must all belong to Newton articulations.")
-
-        # Media is a scene-level MPMObject asset: per-env particle views + the reset-default snapshot.
-        self._media: MPMObject = self.scene["media"]
         self._num_particles = int(self._media.particles_per_object)
         self._media_local_points_t = torch.as_tensor(self._media_local_points, device=dev, dtype=torch.float32)
-
         self._default_arm_q = self._robot.data.default_joint_pos.torch[:, self._arm_joint_ids].clone()
         self._source_inner_lo_t = torch.as_tensor(self._source_inner_lo, device=dev)
         self._source_inner_hi_t = torch.as_tensor(self._source_inner_hi, device=dev)
@@ -514,36 +440,32 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         self._containment_cache_step = -1
 
     # ----------------------------------------------------------- poses / obs
-    def _body_pose_e(self, body_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Env-frame ``(pos, xyzw quat)`` of the given Newton bodies (sanitized to finite)."""
-        bq = wp.to_torch(NewtonManager.get_state_0().body_q)[body_ids]
-        pos = torch.nan_to_num(bq[:, :3], nan=0.0, posinf=0.0, neginf=0.0) - self.env_origins
-        quat = bq[:, 3:7]
+    def _pose_w_to_e(self, pose_w: torch.Tensor) -> torch.Tensor:
+        """Convert a public world-frame pose view to a finite environment-frame pose."""
+        pos = torch.nan_to_num(pose_w[:, :3], nan=0.0, posinf=0.0, neginf=0.0) - self.env_origins
+        quat = pose_w[:, 3:7]
         norm = torch.linalg.norm(torch.nan_to_num(quat), dim=-1, keepdim=True)
         ident = torch.zeros_like(quat)
         ident[:, 3] = 1.0
         quat = torch.where(norm > 1e-6, quat / torch.clamp(norm, min=1e-6), ident)
-        return pos, quat
+        return torch.cat((pos, quat), dim=-1)
 
     def ee_pose_e(self) -> torch.Tensor:
         """End-effector (panda_hand) pose in the env frame: ``(num_envs, 7)`` pos + xyzw quat."""
-        pos, quat = self._body_pose_e(self._hand_ids)
-        return torch.cat((pos, quat), dim=-1)
+        return self._pose_w_to_e(self._robot.data.body_link_pose_w.torch[:, self._tcp_body_idx])
 
     def cup_pose_e(self) -> torch.Tensor:
         """Cup body pose in the env frame: ``(num_envs, 7)`` pos + xyzw quat."""
-        pos, quat = self._body_pose_e(self._cup_body_ids)
-        return torch.cat((pos, quat), dim=-1)
+        return self._pose_w_to_e(self._source_cup.data.root_link_pose_w.torch)
 
     def target_pose_e(self) -> torch.Tensor:
         """Receiving-cup pose in the env frame: ``(num_envs, 7)`` pos + xyzw quat."""
-        pos, quat = self._body_pose_e(self._target_body_ids)
-        return torch.cat((pos, quat), dim=-1)
+        return self._pose_w_to_e(self._target_cup.data.root_link_pose_w.torch)
 
     def tcp_pose_e(self) -> torch.Tensor:
         """DiffIK-controlled tool-centre pose in the robot-root/env frame."""
         body_pose_w = self._robot.data.body_link_pose_w.torch[:, self._tcp_body_idx]
-        root_pose_w = self._robot.data.root_pose_w.torch
+        root_pose_w = self._robot.data.root_link_pose_w.torch
         pos, quat = math_utils.subtract_frame_transforms(
             root_pose_w[:, :3], root_pose_w[:, 3:7], body_pose_w[:, :3], body_pose_w[:, 3:7]
         )
@@ -618,78 +540,79 @@ class FrankaPourEnv(ManagerBasedRLEnv):
 
     def state_finite(self) -> torch.Tensor:
         """Per-env instability guard over robot, source cup, and MPM media state."""
-        cup_body_q = wp.to_torch(NewtonManager.get_state_0().body_q)[self._cup_body_ids]
         return _state_finite(
             self._robot.data.joint_pos.torch,
-            cup_body_q,
+            self._source_cup.data.root_link_pose_w.torch,
             self._media.data.particle_pos_w.torch,
         )
 
     # ----------------------------------------------------------- reset
     def reset_pour_scene(self, env_ids: torch.Tensor) -> None:
-        """Reset the arm to home, open the gripper, place the cup on the table, and refill it."""
+        """Reset the arm, source cup, and particles through their public asset APIs."""
         if not isinstance(env_ids, torch.Tensor):
             env_ids = torch.as_tensor(list(env_ids), device=self.device, dtype=torch.long)
-        env_ids = env_ids.long()
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
         if env_ids.numel() == 0:
             return
-        model = NewtonManager.get_model()
-        s0, s1 = NewtonManager.get_state_0(), NewtonManager.get_state_1()
         n = env_ids.numel()
 
-        # Arm -> home, fingers -> open, in both the robot view and the Newton states.
         arm_q = self._default_arm_q[env_ids].clone()
-        zero_vel = torch.zeros_like(arm_q)
-        self._robot.write_joint_position_to_sim_index(position=arm_q, joint_ids=self._arm_joint_ids, env_ids=env_ids)
-        self._robot.write_joint_velocity_to_sim_index(velocity=zero_vel, joint_ids=self._arm_joint_ids, env_ids=env_ids)
-        self._robot.set_joint_position_target_index(target=arm_q, joint_ids=self._arm_joint_ids, env_ids=env_ids)
-        finger_open = torch.full((n, len(FINGER_JOINTS)), float(self.cfg.gripper_open_pos), device=self.device)
+        zero_arm_velocity = torch.zeros_like(arm_q)
         self._robot.write_joint_position_to_sim_index(
-            position=finger_open, joint_ids=self._finger_joint_ids, env_ids=env_ids
+            position=arm_q,
+            joint_ids=self._arm_joint_ids,
+            env_ids=env_ids,
         )
         self._robot.write_joint_velocity_to_sim_index(
-            velocity=torch.zeros_like(finger_open), joint_ids=self._finger_joint_ids, env_ids=env_ids
+            velocity=zero_arm_velocity,
+            joint_ids=self._arm_joint_ids,
+            env_ids=env_ids,
         )
         self._robot.set_joint_position_target_index(
-            target=finger_open, joint_ids=self._finger_joint_ids, env_ids=env_ids
+            target=arm_q,
+            joint_ids=self._arm_joint_ids,
+            env_ids=env_ids,
         )
 
-        # Cup -> resting pose on the table (free body): write the free-joint coords (pos + xyzw quat)
-        # and zero the cup joint velocity. The arm/finger joint_q were written via the robot view; we
-        # also re-assert the arm joint_q + zero the arm/cup joint velocities directly in the Newton
-        # states, then eval_fk so body_q reflects the reset pose.
+        finger_open = torch.full((n, len(FINGER_JOINTS)), float(self.cfg.gripper_open_pos), device=self.device)
+        self._robot.write_joint_position_to_sim_index(
+            position=finger_open,
+            joint_ids=self._finger_joint_ids,
+            env_ids=env_ids,
+        )
+        self._robot.write_joint_velocity_to_sim_index(
+            velocity=torch.zeros_like(finger_open),
+            joint_ids=self._finger_joint_ids,
+            env_ids=env_ids,
+        )
+        self._robot.set_joint_position_target_index(
+            target=finger_open,
+            joint_ids=self._finger_joint_ids,
+            env_ids=env_ids,
+        )
+
         cup_pos = torch.as_tensor(self._cup_reset_pos, device=self.device, dtype=torch.float32)
         cup_quat = torch.as_tensor(self._cup_reset_quat, device=self.device, dtype=torch.float32)
         cup_world = cup_pos.unsqueeze(0) + self.env_origins[env_ids]
-        cup_q_base = self._cup_joint_q[env_ids]
-        cup_qd_base = self._cup_joint_qd[env_ids]
-        articulation_mask = wp.from_torch(
-            boolean_selection_mask(model.articulation_count, self._reset_articulation_ids[env_ids]),
-            dtype=wp.bool,
+        cup_pose = torch.cat((cup_world, cup_quat.expand(n, -1)), dim=-1)
+        self._source_cup.write_root_pose_to_sim_index(root_pose=cup_pose, env_ids=env_ids)
+        self._source_cup.write_root_velocity_to_sim_index(
+            root_velocity=cup_pose.new_zeros((n, 6)),
+            env_ids=env_ids,
         )
-        states = (s0,) if s0 is s1 else (s0, s1)
-        for state in states:
-            jq = wp.to_torch(state.joint_q)
-            jqd = wp.to_torch(state.joint_qd)
-            for k in range(3):
-                jq[cup_q_base + k] = cup_world[:, k]
-            for k in range(4):
-                jq[cup_q_base + 3 + k] = cup_quat[k]
-            for k in range(6):
-                jqd[cup_qd_base + k] = 0.0
-            jq[self._arm_q_ids[env_ids]] = arm_q
-            # q and qd layouts diverge after every free cup joint (7 q coordinates vs 6 qd
-            # coordinates). Reusing q indices for qd happened to fit four worlds, then indexed two
-            # elements past the qd buffer at eight worlds.
-            jqd[self._arm_qd_ids[env_ids]] = 0.0
-            newton.eval_fk(model, state.joint_q, state.joint_qd, state, articulation_mask)
 
-        # Re-fill the cup cavity from the selected cups' live reset poses.
+        # Public root/joint writers invalidate FK. Reading a public body-pose view consumes
+        # the accumulated articulation mask, making all dirtied body poses authoritative
+        # before solver caches and source-cup proxy transforms are refreshed. Priming the
+        # robot view also prevents its next observation from issuing a redundant FK launch.
+        _ = self._robot.data.body_link_pose_w
+
         new_p = self._sample_cup_media(cup_world, cup_quat.expand(n, -1))
         self._media.write_particle_pos_to_sim_index(new_p, env_ids=env_ids)
         self._media.write_particle_velocity_to_sim_index(torch.zeros_like(new_p), env_ids=env_ids)
         NewtonManager.reset_solver_state(
             world_mask=wp.from_torch(boolean_selection_mask(self.num_envs, env_ids), dtype=wp.bool),
+            flags=newton.StateFlags.BODY | newton.StateFlags.PARTICLE,
         )
         self._containment_cache = None
         self._containment_cache_step = -1

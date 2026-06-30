@@ -362,6 +362,8 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.use_newton_actuators = False
         self.viewer.eye = (1.4, 1.4, 0.9)
         self.viewer.lookat = (0.5, 0.0, 0.1)
+        self.viewer.origin_type = "env"
+        self.viewer.env_index = 0
 
         self.scene.robot.init_state.joint_pos.update(
             dict(zip([f"panda_joint{i}" for i in range(1, 8)], self.arm_home, strict=True))

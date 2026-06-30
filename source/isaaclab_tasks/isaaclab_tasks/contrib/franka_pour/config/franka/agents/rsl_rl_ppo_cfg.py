@@ -15,7 +15,10 @@ class FrankaPourPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 10
     experiment_name = "franka_pour"
     run_name = "pour"
-    logger = "tensorboard"
+    # W&B uses the active CLI login (or WANDB_API_KEY); set WANDB_MODE=offline
+    # to keep run data local without changing the task config.
+    logger = "wandb"
+    wandb_project = "franka-pour-mpm"
     # Asymmetric actor-critic: the actor sees proprioception + EE/bowl poses; the critic additionally
     # sees privileged sim state (per-bowl particle fractions).
     obs_groups = {"actor": ["policy"], "critic": ["policy", "privileged"]}

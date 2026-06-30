@@ -24,7 +24,7 @@
 - Resolve: `source/isaaclab_visualizers/isaaclab_visualizers/newton/`
 - Resolve: package `pyproject.toml` and stub exports reported by the merge
 
-- [ ] **Step 1: Record the integration boundary**
+- [x] **Step 1: Record the integration boundary**
 
 Run:
 
@@ -36,7 +36,7 @@ git rev-list --left-right --count HEAD...upstream/develop
 
 Expected: clean worktree and the feature/upstream divergence is recorded before the merge.
 
-- [ ] **Step 2: Merge without rewriting the shared branch history**
+- [x] **Step 2: Merge without rewriting the shared branch history**
 
 Run:
 
@@ -46,7 +46,7 @@ git merge --no-ff upstream/develop
 
 Expected: the merge stops on the known MPM/IK/Newton conflicts; `contrib/franka_pour` applies without textual conflicts.
 
-- [ ] **Step 3: Resolve upstream-owned infrastructure from upstream**
+- [x] **Step 3: Resolve upstream-owned infrastructure from upstream**
 
 Use upstream implementations for ClonePlan/Fabric bindings, Newton/USD asset replication, Kit scene partitioning, Newton visualizer lifecycle, official Newton IK, official MPM demos, dependency pins, and package versions. Remove the feature branch's legacy `_sync_transforms_to_usd_xform_ops` and `_usd_xform_ops` paths.
 
@@ -60,7 +60,7 @@ queue_newton_physics_replication(cfg)
 
 The resolved Kit visualizer must leave per-environment RTX scene partitioning disabled unless `ISAAC_LAB_ENABLE_ISAAC_RTX_PER_ENV_SCENE_PARTITION=1` is explicitly set.
 
-- [ ] **Step 4: Reapply only the unique feature contracts**
+- [x] **Step 4: Reapply only the unique feature contracts**
 
 Retain these APIs and behaviors on top of upstream:
 
@@ -78,11 +78,11 @@ ProxyCouplingCfg
 
 Retain outer-capture preparation/status checks, canonical state swapping, sparse total-capacity handling, per-world hook invocation, coupled solver exports, and nested solver custom-attribute registration. Use upstream `rename_builder_labels()` and Fabric binding outputs rather than restoring the old clone loop.
 
-- [ ] **Step 5: Remove semantically duplicated pre-upstream files**
+- [x] **Step 5: Remove semantically duplicated pre-upstream files**
 
 Use upstream `isaaclab.utils.warp.particle_mesh.ParticleMeshCounter`, update any feature-branch imports, and remove the duplicate `isaaclab_newton/utils/particle_mesh.py`, its duplicate test, and changelog fragments whose features are now in upstream. Keep changelog fragments for coupled solving, multi-world capture, and Franka Pour.
 
-- [ ] **Step 6: Run import and focused infrastructure tests**
+- [x] **Step 6: Run import and focused infrastructure tests**
 
 Run:
 
@@ -96,7 +96,7 @@ Run:
 
 Expected: collection succeeds and all selected tests pass.
 
-- [ ] **Step 7: Commit the upstream integration**
+- [x] **Step 7: Commit the upstream integration**
 
 Run file-scoped pre-commit on every manually resolved file, then:
 
@@ -115,7 +115,7 @@ Expected: the pending merge commit is created with both parents and no conflict 
 - Create: `source/isaaclab_tasks/test/contrib/test_franka_pour_cube_bowl_spawner.py`
 - Modify: `source/isaaclab_tasks/isaaclab_tasks/contrib/franka_pour/__init__.py`
 
-- [ ] **Step 1: Write a failing stage-authoring test**
+- [x] **Step 1: Write a failing stage-authoring test**
 
 The test launches a stage, calls the spawner at `/World/Cup`, and verifies:
 
@@ -133,7 +133,7 @@ For a source config with a grasp proxy, assert `/World/Cup/geometry/grasp_proxy`
 `CollisionAPI`, is invisible, and shares the root rigid body. Add a second case for a kinematic
 target with no grasp proxy and verify the authored display color and physics material binding.
 
-- [ ] **Step 2: Run the test to verify RED**
+- [x] **Step 2: Run the test to verify RED**
 
 Run:
 
@@ -143,7 +143,7 @@ Run:
 
 Expected: collection fails because `CubeBowlSpawnerCfg` and `spawn_cube_bowl` do not exist.
 
-- [ ] **Step 3: Implement the config and spawner**
+- [x] **Step 3: Implement the config and spawner**
 
 Define a `RigidObjectSpawnerCfg` subclass with fixed tuple types and task geometry:
 
@@ -165,7 +165,7 @@ Implement `spawn_cube_bowl()` with `@clone`, `make_cube_bowl_mesh()`, a visual-o
 with exact triangle topology, an optional invisible `UsdGeom.Cube` grasp collider, normal rigid/mass
 schemas, and normal visual/physics material binding. Reject an existing prim and return the root prim.
 
-- [ ] **Step 4: Run the spawner and existing mesh tests to verify GREEN**
+- [x] **Step 4: Run the spawner and existing mesh tests to verify GREEN**
 
 Run:
 
@@ -177,7 +177,7 @@ Run:
 
 Expected: both files pass.
 
-- [ ] **Step 5: Commit the spawner**
+- [x] **Step 5: Commit the spawner**
 
 Run file-scoped pre-commit, stage the four files, and commit:
 
@@ -192,7 +192,7 @@ git commit -m "feat: Add rigid cube-bowl scene spawner"
 - Modify: `source/isaaclab_tasks/isaaclab_tasks/contrib/franka_pour/cup_media.py`
 - Modify: `source/isaaclab_tasks/test/contrib/test_franka_pour_env_cfg.py`
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 Add tests with these behavioral assertions:
 
@@ -221,7 +221,7 @@ SceneEntityCfg("target_cup")
 
 and the proxy selects `SceneEntityCfg("source_cup")`.
 
-- [ ] **Step 2: Run the tests to verify RED**
+- [x] **Step 2: Run the tests to verify RED**
 
 Run:
 
@@ -231,7 +231,7 @@ Run:
 
 Expected: failures show that `finalize()`, `source_cup`, and `target_cup` are absent and selectors still use cup label patterns.
 
-- [ ] **Step 3: Implement finalization and declarative cup configs**
+- [x] **Step 3: Implement finalization and declarative cup configs**
 
 Add optional typed scene fields:
 
@@ -247,7 +247,7 @@ Use `MujocoRigidBodyPropertiesCfg(gravcomp=1.0)` and the matching joint-drive sc
 
 Update coupled entries so source and target scene bodies are selected through `body_entities`; keep label patterns only for `TargetCupRigid` and `SpillFloor`.
 
-- [ ] **Step 4: Add fixed tuple annotations**
+- [x] **Step 4: Add fixed tuple annotations**
 
 Replace unspecific public tuple types with:
 
@@ -258,7 +258,7 @@ cup_reset_pos: tuple[float, float, float]
 target_cup_reset_pos: tuple[float, float, float]
 ```
 
-- [ ] **Step 5: Run config and media tests to verify GREEN**
+- [x] **Step 5: Run config and media tests to verify GREEN**
 
 Run:
 
@@ -270,7 +270,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 6: Commit deterministic scene configuration**
+- [x] **Step 6: Commit deterministic scene configuration**
 
 Run file-scoped pre-commit, stage the modified files, and commit:
 
@@ -281,25 +281,33 @@ git commit -m "refactor: Own Franka Pour cups in the scene"
 ### Task 4: Move cup runtime state to public RigidObject APIs
 
 **Files:**
+- Modify: `source/isaaclab_newton/isaaclab_newton/physics/newton_manager.py`
+- Modify: `source/isaaclab_newton/isaaclab_newton/assets/articulation/articulation_data.py`
+- Modify: `source/isaaclab_newton/isaaclab_newton/assets/rigid_object/rigid_object_data.py`
+- Modify: `source/isaaclab_newton/isaaclab_newton/assets/rigid_object_collection/rigid_object_collection_data.py`
+- Modify: `source/isaaclab_newton/changelog.d/multiworld-mpm-capture.minor.rst`
+- Modify: `source/isaaclab_newton/test/assets/test_rigid_object.py`
+- Modify: `source/isaaclab_newton/test/assets/test_rigid_object_collection.py`
+- Modify: `source/isaaclab_newton/test/physics/test_newton_manager_abstraction.py`
 - Modify: `source/isaaclab_tasks/isaaclab_tasks/contrib/franka_pour/pour_env.py`
 - Modify: `source/isaaclab_tasks/isaaclab_tasks/contrib/franka_pour/mdp/events.py`
 - Modify: `source/isaaclab_tasks/test/contrib/test_franka_pour_multiworld_runtime.py`
 
-- [ ] **Step 1: Write failing runtime ownership and reset tests**
+- [x] **Step 1: Write failing runtime ownership and reset tests**
 
 For two environments, assert:
 
 ```python
 assert env.scene["source_cup"].num_instances == 2
 assert env.scene["target_cup"].num_instances == 2
-assert torch.allclose(env.cup_pose_e(), env.scene["source_cup"].data.root_pose_w.torch - env_origin_pose)
+assert torch.allclose(env.cup_pose_e(), env.scene["source_cup"].data.root_link_pose_w.torch - env_origin_pose)
 ```
 
 Perturb only environment one through the source cup public writer, call `reset_pour_scene(env_ids=[1])`, and assert environment zero is unchanged while environment one returns to its default scene pose with zero velocity and refilled particles.
 
 Add structural assertions that the task no longer creates `_cup_joint_q`, `_cup_joint_qd`, `_cup_body_ids`, or `_target_body_ids` runtime buffers.
 
-- [ ] **Step 2: Run the focused runtime case to verify RED**
+- [x] **Step 2: Run the focused runtime case to verify RED**
 
 Run:
 
@@ -311,21 +319,23 @@ Run:
 
 Expected: scene lookup or public-state assertions fail because the cups are still builder-only.
 
-- [ ] **Step 3: Narrow the builder hook to solver-only objects**
+- [x] **Step 3: Narrow the builder hook to solver-only objects**
 
 Delete `_build_custom_proto`, `_add_cup_body`, generic label-start/rewrite helpers, manual source/target ID lists, manual free-joint coordinate lists, and direct cup FK bookkeeping.
 
 In the per-world hook:
 
-1. resolve the imported source and target cup bodies by full environment path;
+1. resolve the imported source and target cup bodies by Newton world plus exact short name, because
+   per-world hooks run before cloned labels are rewritten from the environment-zero source paths;
 2. clear particle collision from the imported source grasp proxy;
 3. attach invisible particle-only hollow meshes to both scene-owned bodies;
-4. create the invisible rigid-only `TargetCupRigid` body; and
-5. create the invisible particle-only `SpillFloor` plane.
+4. add the free-joint/articulation bridge required for Newton's public kinematic `RigidObject` view;
+5. create the invisible rigid-only `TargetCupRigid` body; and
+6. create the invisible particle-only `SpillFloor` plane.
 
 Keep finger contact material configuration in this hook until the same per-shape contact stiffness can be expressed through a public scene config. Every lookup must raise on zero or multiple matches.
 
-- [ ] **Step 4: Read and reset through public scene assets**
+- [x] **Step 4: Read and reset through public scene assets**
 
 Resolve:
 
@@ -334,11 +344,13 @@ self._source_cup = self.scene["source_cup"]
 self._target_cup = self.scene["target_cup"]
 ```
 
-Use their `data.root_pose_w` for observations and containment. Reset the source cup with `write_root_pose_to_sim_index()` and `write_root_velocity_to_sim_index()`. Reset the robot with its existing public joint writers and reset particles with the MPM object's public writers. Do not access Newton `body_q`, `joint_q`, or `joint_qd`, and do not call `newton.eval_fk()`.
+Use their `data.root_link_pose_w` for observations and containment. Reset the source cup with `write_root_pose_to_sim_index()` and `write_root_velocity_to_sim_index()`. Reset the robot with its existing public joint writers and reset particles with the MPM object's public writers. Do not access Newton `body_q`, `joint_q`, or `joint_qd`, and do not call `newton.eval_fk()`.
+
+Add `NewtonManager.forward_pending()` to apply and consume the filtered articulation dirty mask. Newton articulation and rigid-object pose getters use this path, so a public pose read refreshes only the environments touched by public writers and keeps selective reset proportional to the reset set.
 
 Remove the redundant `NewtonManager.set_decimation(self.cfg.decimation)` call from `load_managers()`.
 
-- [ ] **Step 5: Run the complete multi-world runtime test to verify GREEN**
+- [x] **Step 5: Run the complete multi-world runtime test to verify GREEN**
 
 Run:
 
@@ -348,7 +360,7 @@ Run:
 
 Expected: all eager, captured, parity, isolation, and selective-reset cases pass.
 
-- [ ] **Step 6: Commit the public-state refactor**
+- [x] **Step 6: Commit the public-state refactor**
 
 Run file-scoped pre-commit, stage the modified files, and commit:
 
@@ -362,7 +374,7 @@ git commit -m "refactor: Reset Pour cups through asset APIs"
 - Modify: `source/isaaclab_tasks/isaaclab_tasks/contrib/franka_pour/pour_env_cfg.py`
 - Modify: `source/isaaclab_tasks/test/contrib/test_franka_pour_multiworld_runtime.py`
 
-- [ ] **Step 1: Write a failing pose invariant**
+- [x] **Step 1: Write a failing pose invariant**
 
 After reset, require the public robot state to contain the configured arm and gripper values, then
 compute the actual DiffIK TCP and cup grasp point:
@@ -376,7 +388,7 @@ assert torch.all(distance < 0.005)
 
 Repeat the same assertions after one simulation step.
 
-- [ ] **Step 2: Run the invariant to verify RED**
+- [x] **Step 2: Run the invariant to verify RED**
 
 Run:
 
@@ -389,7 +401,7 @@ Run:
 Expected: the current reset fails with zero arm joints, a closed gripper, and approximately 0.89 m
 TCP error because solver reset overwrites the state written by the task.
 
-- [ ] **Step 3: Preserve task-authored joints during solver reset**
+- [x] **Step 3: Preserve task-authored joints during solver reset**
 
 Keep the existing `arm_home` tuple. Call the public reset boundary with:
 
@@ -403,12 +415,12 @@ NewtonManager.reset_solver_state(
 Do not include `JOINT_Q` or `JOINT_QD`; MuJoCo private buffers are still cleared while task-authored
 joint state survives.
 
-- [ ] **Step 4: Rerun the reset invariant GREEN**
+- [x] **Step 4: Rerun the reset invariant GREEN**
 
 Run the pre-grasp invariant twice from a fresh process and require both immediate and post-step
 assertions to pass.
 
-- [ ] **Step 5: Commit the pose correction**
+- [x] **Step 5: Commit the pose correction**
 
 Run file-scoped pre-commit, stage the config/test and any retained diagnostic, and commit:
 
@@ -424,28 +436,28 @@ git commit -m "fix: Preserve Franka Pour pre-grasp reset"
 - Modify if required: `source/isaaclab_newton/test/assets/test_rigid_object.py`
 - Modify if required: `source/isaaclab_visualizers/test/test_newton_adapter.py`
 
-- [ ] **Step 1: Add the failing Kit scene test**
+- [x] **Step 1: Add the failing Kit scene test**
 
 Launch two environments with origins at `+1.25` and `-1.25` and Kit visualization. Assert:
 
 ```python
 for env_id in (0, 1):
     assert stage.GetPrimAtPath(f"/World/envs/env_{env_id}/Robot").IsValid()
-    assert stage.GetPrimAtPath(f"/World/envs/env_{env_id}/source_cup").IsValid()
-    assert stage.GetPrimAtPath(f"/World/envs/env_{env_id}/target_cup").IsValid()
+    assert stage.GetPrimAtPath(f"/World/envs/env_{env_id}/SourceCup").IsValid()
+    assert stage.GetPrimAtPath(f"/World/envs/env_{env_id}/TargetCup").IsValid()
 ```
 
 Compare a representative robot body and source-cup Fabric/USD world transform with Newton state and assert no extra `env_origin` is present. Assert the viewport camera has no `omni:scenePartition` value by default.
 
-- [ ] **Step 2: Verify the test catches the pre-fix behavior**
+- [x] **Step 2: Verify the test catches the pre-fix behavior**
 
 Run the test against the pre-merge parent or temporarily revert the relevant implementation commit. Expected: environment one's robot is missing and both cup prims are missing.
 
-- [ ] **Step 3: Add the Newton viewer all-world test**
+- [x] **Step 3: Add the Newton viewer all-world test**
 
 Initialize the native visualizer headlessly and assert `model.world_count == 2`, no visible-world filter is active by default, world offsets are zero, and visible robot/cup/particle shape world IDs cover `{0, 1}`.
 
-- [ ] **Step 4: Run both visualization tests to verify GREEN**
+- [x] **Step 4: Run both visualization tests to verify GREEN**
 
 Run:
 
@@ -455,7 +467,7 @@ Run:
 
 Expected: Kit and Newton cases pass.
 
-- [ ] **Step 5: Commit visualization coverage**
+- [x] **Step 5: Commit visualization coverage**
 
 Run file-scoped pre-commit, stage the tests and any required infrastructure correction, and commit:
 
@@ -471,11 +483,11 @@ git commit -m "test: Cover Pour multi-environment rendering"
 - Modify: `source/isaaclab_tasks/changelog.d/max-franka-pour-scene-assets.rst`
 - Modify if present: Franka Pour run documentation and benchmark help text
 
-- [ ] **Step 1: Update module documentation**
+- [x] **Step 1: Update module documentation**
 
 Describe the source/target cups as scene-owned rigid objects, the grasp proxy and spill floor as solver-only, and the source cup proxy mapping as the only cross-solver mapping. Remove statements saying the cup is built exclusively through a Newton prototype.
 
-- [ ] **Step 2: Add the changelog fragment**
+- [x] **Step 2: Add the changelog fragment**
 
 Create:
 
@@ -487,7 +499,7 @@ Fixed
   reset them through public asset APIs, and render every cloned environment consistently.
 ```
 
-- [ ] **Step 3: Run static task tests and file-scoped hooks**
+- [x] **Step 3: Run static task tests and file-scoped hooks**
 
 Run:
 
@@ -502,7 +514,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 4: Commit documentation and cleanup**
+- [x] **Step 4: Commit documentation and cleanup**
 
 ```bash
 git commit -m "docs: Explain scene-owned Pour assets"
@@ -514,7 +526,7 @@ git commit -m "docs: Explain scene-owned Pour assets"
 - Verify all changed files
 - Do not create a PR or push a branch
 
-- [ ] **Step 1: Run the complete focused test matrix**
+- [x] **Step 1: Run the complete focused test matrix**
 
 Run:
 
@@ -522,6 +534,9 @@ Run:
 ./isaaclab.sh -p -m pytest \
   source/isaaclab_newton/test/cloner/test_rename_builder_labels.py \
   source/isaaclab_newton/test/physics/test_newton_manager_abstraction.py \
+  source/isaaclab_newton/test/assets/test_articulation.py \
+  source/isaaclab_newton/test/assets/test_rigid_object.py \
+  source/isaaclab_newton/test/assets/test_rigid_object_collection.py \
   source/isaaclab_newton/test/assets/test_mpm_object.py \
   source/isaaclab_tasks/test/contrib/test_franka_pour_cube_bowl_mesh.py \
   source/isaaclab_tasks/test/contrib/test_franka_pour_cube_bowl_spawner.py \
@@ -534,20 +549,20 @@ Run:
 
 Expected: zero failures.
 
-- [ ] **Step 2: Re-run the user-visible zero-agent reproduction**
+- [x] **Step 2: Re-run the user-visible zero-agent reproduction**
 
 Run with the compatible source checkouts:
 
 ```bash
 export NEWTON_SOURCE_DIR=/home/maximiliank/Work/newton-worktrees/implicit-mpm-coupled-sparse
-export WARP_SOURCE_DIR=/home/maximiliank/Work/warp-worktrees/sparse-rebuildable
+export WARP_SOURCE_DIR=/home/maximiliank/Work/warp-sparse-rebuildable-capture
 ./isaaclab.sh -p scripts/environments/zero_agent.py \
   --task Isaac-Pour-Franka-v0 --num_envs 2 --viz kit
 ```
 
 Expected: both robots, both visible cups, and both particle sets appear at their matching environment origins without CUDA copy errors or tunnelling during the reset smoke interval.
 
-- [ ] **Step 3: Verify captured stepping and one training iteration**
+- [x] **Step 3: Verify captured stepping and one training iteration**
 
 Run the captured/eager parity test, then:
 
@@ -559,7 +574,7 @@ Run the captured/eager parity test, then:
 
 Expected: environment construction, reset, one rollout, and one optimization iteration complete.
 
-- [ ] **Step 4: Run repository hooks and separate baseline failures**
+- [x] **Step 4: Run repository hooks and separate baseline failures**
 
 Run:
 
@@ -569,7 +584,7 @@ Run:
 
 Expected for completion: all changed files pass. If unrelated tracked scratch/demo files still fail, rerun pre-commit on the complete changed-file list and record the unrelated repository-wide failures verbatim; do not modify those unrelated files.
 
-- [ ] **Step 5: Perform spec and code-quality review**
+- [x] **Step 5: Perform spec and code-quality review**
 
 Review the final diff against every design requirement, confirm there are no conflict markers or stale direct-state paths, and run:
 

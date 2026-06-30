@@ -49,7 +49,9 @@ source-cup body/joint bookkeeping will be deleted.
 Robot gravity compensation will be authored through Newton's MuJoCo USD schema configuration where
 the current APIs support it. Backend-specific shape flags and contact stiffness that cannot yet be
 expressed by an Isaac Lab asset config remain in one narrowly scoped builder hook. The hook must use
-full environment paths and validate that every expected body or shape resolves exactly once.
+the current world's contiguous builder range and validate that every expected exact short body or
+shape name resolves exactly once. Full cloned environment paths are not stable at this pre-relabel
+hook boundary.
 
 Coupled solver ownership will use `SceneEntityCfg("source_cup")` and
 `SceneEntityCfg("target_cup")`. Label patterns remain only for the hidden receiver proxy and spill
@@ -81,6 +83,16 @@ rigid objects' public data views. Reset uses the rigid object's public indexed p
 writers, the articulation's public joint writers, and the MPM object's public particle writers.
 The task no longer writes Newton `joint_q`, `joint_qd`, or `body_q` directly and no longer calls
 `newton.eval_fk()` for cup reset.
+
+Public Newton asset writers accumulate an articulation dirty mask. Public pose getters consume that
+mask through `NewtonManager.forward_pending()`, so reset-time forward kinematics touches only the
+selected environments while remaining safe to record in an outer CUDA graph.
+
+The per-world hook resolves imported cup bodies by Newton world and exact short name. It runs before
+clone labels are rewritten, so an environment greater than zero can still carry the environment-zero
+source path at that boundary. Until Newton natively exposes kinematic rigid bodies through its public
+`RigidObject` view, the hook adds one free-joint/articulation bridge to the imported target body while
+retaining its kinematic flag and zero mass/inertia. The target joint is excluded from the MPM entry.
 
 The existing public `NewtonManager.reset_solver_state(world_mask=...)` call remains the boundary for
 clearing solver-private state after selected environments are reset.
@@ -125,7 +137,8 @@ branch is considered ready.
 
 ## Non-goals
 
-- No changes to Warp or Newton are required for this scene-ownership refactor.
+- No changes to the external Warp or Newton packages are required for this scene-ownership refactor;
+  the Isaac Lab Newton adapter adds masked pending-FK consumption for selective public asset writes.
 - No NanoVDB particle-grid construction refactor is included.
 - No replacement of the coupled solver or the validated contact model is included.
 - No pull request or remote push is performed as part of this work.

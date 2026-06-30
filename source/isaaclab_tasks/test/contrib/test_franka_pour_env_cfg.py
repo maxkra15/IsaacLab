@@ -200,22 +200,47 @@ def test_visible_source_geometry_matches_grasp_proxy_and_fits_gripper():
     assert cfg.source_cup_bottom_thickness < cfg.cup_grasp_height < outer_height
 
 
-def test_dynamic_cup_free_joint_belongs_to_a_newton_articulation():
+def test_scene_cups_use_narrow_solver_only_builder_hook():
     source_path = Path(franka_pour.__file__).with_name("pour_env.py")
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    add_cup_body = next(
-        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_add_cup_body"
-    )
-    builder_calls = {
-        node.func.attr
-        for node in ast.walk(add_cup_body)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr.startswith("add_")
-    }
+    function_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert {"_build_custom_proto", "_add_cup_body", "_add_target_cup_bodies"}.isdisjoint(function_names)
 
-    assert "add_link" in builder_calls
-    assert "add_body" not in builder_calls
-    assert "add_joint_free" in builder_calls
-    assert "add_articulation" in builder_calls
+    hook = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_add_pour_world_to_builder"
+    )
+    hook_calls = {
+        node.func.attr for node in ast.walk(hook) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert {"_find_world_body", "_add_particle_collider", "_add_rigid_collider"} <= hook_calls
+
+    target_bridge = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_add_kinematic_rigid_object_articulation"
+    )
+    bridge_calls = {
+        node.func.attr
+        for node in ast.walk(target_bridge)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert {"add_joint_free", "add_articulation"} <= bridge_calls
+
+
+def test_builder_hook_limits_lookups_to_current_world_tail():
+    from isaaclab_tasks.contrib.franka_pour.pour_env import FrankaPourEnv
+
+    builder = SimpleNamespace(
+        body_world=[None, None, 0, 0, 1, 1, 1],
+        shape_world=[None, 0, 0, 1, 1],
+    )
+
+    assert FrankaPourEnv._current_world_range(builder, "body", 1) == range(4, 7)
+    assert FrankaPourEnv._current_world_range(builder, "shape", 1) == range(3, 5)
+    with pytest.raises(RuntimeError, match="no body entries for open world 2"):
+        FrankaPourEnv._current_world_range(builder, "body", 2)
 
 
 def test_task_has_receiving_cup_safe_actions_and_success_threshold():
@@ -242,6 +267,8 @@ def test_training_curriculum_closes_by_default_and_prioritizes_lift_over_spill_a
 
     agent = FrankaPourPPORunnerCfg()
     assert agent.actor.distribution_cfg.init_std <= 0.1
+    assert agent.logger == "wandb"
+    assert agent.wandb_project == "franka-pour-mpm"
 
 
 def test_finger_actuator_is_kept_and_teleop_disables_timeout():
@@ -358,7 +385,7 @@ def test_tcp_pose_uses_public_robot_pose_data_and_configured_offset():
     attributes = {node.attr for node in ast.walk(tcp_pose) if isinstance(node, ast.Attribute)}
     assert "get_term" not in attributes
     assert "_compute_frame_pose" not in attributes
-    assert {"body_link_pose_w", "root_pose_w"} <= attributes
+    assert {"body_link_pose_w", "root_link_pose_w"} <= attributes
     assert {"subtract_frame_transforms", "combine_frame_transforms"} <= attributes
 
 
@@ -374,7 +401,7 @@ def test_media_refill_is_batched_on_device_without_host_readback():
     assert "quat_apply" in attributes
 
 
-def test_task_reset_delegates_history_and_masks_forward_kinematics():
+def test_task_reset_uses_public_asset_writers_and_body_pose_refresh():
     source_path = Path(franka_pour.__file__).with_name("pour_env.py")
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
 
@@ -391,13 +418,33 @@ def test_task_reset_delegates_history_and_masks_forward_kinematics():
     assert len(reset_calls) == 1
     assert all(keyword.arg != "state" for keyword in reset_calls[0].keywords)
 
-    fk_calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "eval_fk"
-    ]
-    assert fk_calls
-    assert all(
-        len(call.args) >= 5 and not (isinstance(call.args[4], ast.Constant) and call.args[4].value is None)
-        for call in fk_calls
+    reset = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "reset_pour_scene"
     )
+    call_names = {
+        node.func.attr
+        for node in ast.walk(reset)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert {
+        "write_joint_position_to_sim_index",
+        "write_joint_velocity_to_sim_index",
+        "write_root_pose_to_sim_index",
+        "write_root_velocity_to_sim_index",
+        "write_particle_pos_to_sim_index",
+        "write_particle_velocity_to_sim_index",
+        "reset_solver_state",
+    } <= call_names
+    assert {"eval_fk", "get_state_0", "get_state_1"}.isdisjoint(call_names)
+
+    reset_attributes = {node.attr for node in ast.walk(reset) if isinstance(node, ast.Attribute)}
+    assert "body_link_pose_w" in reset_attributes
+
+    manager_forward_calls = [
+        node
+        for node in ast.walk(reset)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"forward", "forward_pending"}
+    ]
+    assert manager_forward_calls == []

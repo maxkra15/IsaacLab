@@ -163,9 +163,56 @@ def _assert_media_collider_ownership(model, media_view) -> None:
         assert world in actual_by_world, f"Collider {label!r} references unexpected world {world}."
         actual_by_world[world].add(label.rsplit("/", 1)[-1])
 
-    expected = {"Cup", "TargetCup", "SpillFloor"}
+    expected = {"SourceCup", "TargetCup", "SpillFloor"}
     assert collider_count == 2 * len(expected)
     assert actual_by_world == {0: expected, 1: expected}
+
+
+def _assert_scene_solver_roles(model) -> None:
+    """Check exact per-world task bodies and solver-only collision roles."""
+    body_world = model.body_world.numpy()
+    body_mass = model.body_mass.numpy()
+    body_inv_mass = model.body_inv_mass.numpy()
+    body_flags = model.body_flags.numpy()
+    shape_body = model.shape_body.numpy()
+    shape_flags = model.shape_flags.numpy()
+    collide_shapes = int(newton.ShapeFlags.COLLIDE_SHAPES)
+    collide_particles = int(newton.ShapeFlags.COLLIDE_PARTICLES)
+    visible = int(newton.ShapeFlags.VISIBLE)
+
+    for world in range(2):
+        bodies_by_name: dict[str, list[int]] = {}
+        for body_id, label in enumerate(model.body_label):
+            if int(body_world[body_id]) == world:
+                bodies_by_name.setdefault(str(label).rsplit("/", 1)[-1], []).append(body_id)
+        for name in ("SourceCup", "TargetCup", "TargetCupRigid", "SpillFloor"):
+            assert len(bodies_by_name.get(name, [])) == 1, (world, name, bodies_by_name.get(name))
+
+        target_body = bodies_by_name["TargetCup"][0]
+        hidden_target_body = bodies_by_name["TargetCupRigid"][0]
+        for body_id in (target_body, hidden_target_body):
+            assert int(body_flags[body_id]) & int(newton.BodyFlags.KINEMATIC)
+            assert float(body_mass[body_id]) == 0.0
+            assert float(body_inv_mass[body_id]) == 0.0
+
+        expected_shapes = {
+            "SourceCup": ("/SourceCup/ParticleCollider", False, True, False),
+            "TargetCup": ("/TargetCup/ParticleCollider", False, True, False),
+            "TargetCupRigid": ("/TargetCupRigid/Collision", True, False, False),
+            "SpillFloor": ("/SpillFloor/Collision", False, True, False),
+        }
+        for body_name, (suffix, rigid, particles, is_visible) in expected_shapes.items():
+            body_id = bodies_by_name[body_name][0]
+            matches = [
+                shape_id
+                for shape_id, label in enumerate(model.shape_label)
+                if int(shape_body[shape_id]) == body_id and str(label).endswith(suffix)
+            ]
+            assert len(matches) == 1, (world, body_name, matches)
+            flags = int(shape_flags[matches[0]])
+            assert bool(flags & collide_shapes) is rigid
+            assert bool(flags & collide_particles) is particles
+            assert bool(flags & visible) is is_visible
 
 
 def _make_runtime_cfg(*, use_cuda_graph: bool = True, env_spacing: float = 0.0):
@@ -186,23 +233,14 @@ def _make_runtime_cfg(*, use_cuda_graph: bool = True, env_spacing: float = 0.0):
 
 
 def _move_world_0_cup_collider(task, offset: tuple[float, float, float]) -> None:
-    """Move only world 0's cup articulation while preserving its particle coordinates."""
+    """Move only world 0's scene-owned source cup through its public writer."""
     model = NewtonManager.get_model()
-    cup_q_start = int(task._cup_joint_q[0].item())
     offset_t = torch.as_tensor(offset, device=task.device, dtype=torch.float32)
-    articulation_mask_t = torch.zeros(model.articulation_count, device=task.device, dtype=torch.bool)
-    articulation_mask_t[task._cup_articulation_ids[0]] = True
-    articulation_mask = wp.from_torch(articulation_mask_t, dtype=wp.bool)
-
-    state_0 = NewtonManager.get_state_0()
-    state_1 = NewtonManager.get_state_1()
-    states = (state_0,) if state_0 is state_1 else (state_0, state_1)
-    expected_cup_positions = []
-    for state in states:
-        cup_position = wp.to_torch(state.joint_q)[cup_q_start : cup_q_start + 3]
-        cup_position += offset_t
-        expected_cup_positions.append(cup_position.clone())
-        newton.eval_fk(model, state.joint_q, state.joint_qd, state, articulation_mask)
+    env_ids = torch.tensor([0], device=task.device, dtype=torch.long)
+    cup_pose = task.scene["source_cup"].data.root_link_pose_w.torch[env_ids].clone()
+    cup_pose[:, :3] += offset_t
+    task.scene["source_cup"].write_root_pose_to_sim_index(root_pose=cup_pose, env_ids=env_ids)
+    _ = task.scene["source_cup"].data.body_link_pose_w
 
     world_mask_t = torch.zeros(task.num_envs, device=task.device, dtype=torch.bool)
     world_mask_t[0] = True
@@ -211,9 +249,12 @@ def _move_world_0_cup_collider(task, offset: tuple[float, float, float]) -> None
         flags=newton.StateFlags.BODY_Q,
     )
     wp.synchronize_device(model.device)
-    for state, expected in zip(states, expected_cup_positions, strict=True):
-        actual = wp.to_torch(state.joint_q)[cup_q_start : cup_q_start + 3]
-        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        task.scene["source_cup"].data.root_link_pose_w.torch[env_ids],
+        cup_pose,
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def _run_particle_rollout(
@@ -252,6 +293,106 @@ def _run_particle_rollout(
             )
 
         return trajectory, NewtonManager.is_cuda_graph_active()
+    finally:
+        if env is not None:
+            env.close()
+
+
+def _assert_pregrasp_state(task, *, arm_atol: float = 1.0e-5, gripper_atol: float = 1.0e-5) -> None:
+    expected_arm = torch.as_tensor(task.cfg.arm_home, device=task.device).expand(task.num_envs, -1)
+    arm_q = task._robot.data.joint_pos.torch[:, task._arm_joint_ids]
+    torch.testing.assert_close(arm_q, expected_arm, rtol=0.0, atol=arm_atol)
+    torch.testing.assert_close(
+        task.gripper_width(),
+        torch.full((task.num_envs,), 0.08, device=task.device),
+        rtol=0.0,
+        atol=gripper_atol,
+    )
+    tcp_error = torch.linalg.vector_norm(task.tcp_pos_e() - task.cup_grasp_point_e(), dim=-1)
+    assert bool(torch.all(tcp_error < 0.005)), f"TCP-to-grasp error is too large: {tcp_error.tolist()}"
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_reset_preserves_pregrasp_immediately_and_after_one_step():
+    """A task reset must not let the solver replace task-authored robot joints."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        env = gym.make(_TASK_ID, cfg=_make_runtime_cfg())
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        _assert_pregrasp_state(task)
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        actions[:, -1] = 1.0
+        env.step(actions)
+        assert NewtonManager.is_cuda_graph_active()
+        # Finite actuator gains allow sub-milliradian motion during a real
+        # dynamics step; the reset itself remains exact above.
+        _assert_pregrasp_state(task, arm_atol=1.0e-3, gripper_atol=1.0e-4)
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_scene_owned_cups_use_public_state_and_leave_caller_cfg_unmodified():
+    """The task resolves cloned cup assets without mutating its caller-owned config."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    caller_cfg = _make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5)
+    # Keep public views on the authoritative state after the eager step below.
+    caller_cfg.sim.physics.num_substeps = 2
+    assert caller_cfg.scene.source_cup is None
+    assert caller_cfg.scene.target_cup is None
+    assert caller_cfg.scene.media is None
+    try:
+        env = gym.make(_TASK_ID, cfg=caller_cfg)
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        assert caller_cfg.scene.source_cup is None
+        assert caller_cfg.scene.target_cup is None
+        assert caller_cfg.scene.media is None
+        assert task.cfg is not caller_cfg
+
+        source_cup = task.scene["source_cup"]
+        target_cup = task.scene["target_cup"]
+        assert source_cup.num_instances == 2
+        assert target_cup.num_instances == 2
+
+        source_pose_e = source_cup.data.root_link_pose_w.torch.clone()
+        source_pose_e[:, :3] -= task.scene.env_origins
+        target_pose_e = target_cup.data.root_link_pose_w.torch.clone()
+        target_pose_e[:, :3] -= task.scene.env_origins
+        torch.testing.assert_close(task.cup_pose_e(), source_pose_e)
+        torch.testing.assert_close(task.target_pose_e(), target_pose_e)
+        _assert_scene_solver_roles(NewtonManager.get_model())
+
+        for legacy_attribute in (
+            "_cup_body_ids",
+            "_target_body_ids",
+            "_cup_joint_q",
+            "_cup_joint_qd",
+            "_cup_articulation_ids",
+        ):
+            assert not hasattr(task, legacy_attribute)
+
+        target_pose_before = target_cup.data.root_link_pose_w.torch.clone()
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        actions[:, -1] = 1.0
+        env.step(actions)
+        wp.synchronize_device(NewtonManager.get_model().device)
+        torch.testing.assert_close(
+            target_cup.data.root_link_pose_w.torch,
+            target_pose_before,
+            rtol=0.0,
+            atol=0.0,
+        )
     finally:
         if env is not None:
             env.close()
@@ -345,13 +486,27 @@ def test_franka_pour_overlapping_worlds_step_selective_reset_and_step_again():
         parent_world_0_before = [_particle_snapshot(state, world_0) for state in parent_states]
         parent_world_1_before = [_particle_snapshot(state, world_1) for state in parent_states]
 
+        source_cup = task.scene["source_cup"]
+        source_world_1_pose_before = source_cup.data.root_link_pose_w.torch[1].clone()
+        source_world_1_velocity_before = source_cup.data.root_com_vel_w.torch[1].clone()
+        robot_world_1_q_before = task._robot.data.joint_pos.torch[1].clone()
+        robot_world_1_qd_before = task._robot.data.joint_vel.torch[1].clone()
+
+        selected_env = torch.tensor([0], dtype=torch.long, device=task.device)
+        perturbed_pose = source_cup.data.root_link_pose_w.torch[selected_env].clone()
+        perturbed_pose[:, 0] += 0.05
+        perturbed_velocity = torch.full((1, 6), 0.25, device=task.device)
+        source_cup.write_root_pose_to_sim_index(root_pose=perturbed_pose, env_ids=selected_env)
+        source_cup.write_root_velocity_to_sim_index(root_velocity=perturbed_velocity, env_ids=selected_env)
+        _ = source_cup.data.body_link_pose_w
+
         entry_reset_observations: list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = []
         real_entry_reset = media_solver.reset
 
         def checked_entry_reset(state, world_mask=None, flags=None):
             assert world_mask is not None
             np.testing.assert_array_equal(world_mask.numpy(), np.array([True, False], dtype=np.bool_))
-            assert flags is None
+            assert flags == newton.StateFlags.BODY | newton.StateFlags.PARTICLE
             assert state.particle_q.shape == (model.particle_count,)
             before = _particle_snapshot(state, world_1)
             real_entry_reset(state, world_mask=world_mask, flags=flags)
@@ -359,17 +514,70 @@ def test_franka_pour_overlapping_worlds_step_selective_reset_and_step_again():
             entry_reset_observations.append((before, after))
 
         with mock.patch.object(media_solver, "reset", side_effect=checked_entry_reset):
-            task.reset_pour_scene(torch.tensor([0], dtype=torch.long, device=task.device))
+            task.reset_pour_scene(selected_env)
         wp.synchronize_device(model.device)
 
+        expected_source_pose = torch.tensor(
+            [*task.cfg.cup_reset_pos, 0.0, 0.0, 0.0, 1.0],
+            device=task.device,
+        )
+        expected_source_pose[:3] += task.scene.env_origins[0]
+        torch.testing.assert_close(
+            source_cup.data.root_link_pose_w.torch[0],
+            expected_source_pose,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            source_cup.data.root_com_vel_w.torch[0],
+            torch.zeros(6, device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            source_cup.data.root_link_pose_w.torch[1],
+            source_world_1_pose_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            source_cup.data.root_com_vel_w.torch[1],
+            source_world_1_velocity_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task._robot.data.joint_pos.torch[1],
+            robot_world_1_q_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task._robot.data.joint_vel.torch[1],
+            robot_world_1_qd_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+        expected_refill = task._sample_cup_media(
+            expected_source_pose[:3].unsqueeze(0),
+            expected_source_pose[3:].unsqueeze(0),
+        )[0]
+        torch.testing.assert_close(
+            media.data.particle_pos_w.torch[0],
+            expected_refill,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            media.data.particle_vel_w.torch[0],
+            torch.zeros_like(expected_refill),
+            rtol=0.0,
+            atol=0.0,
+        )
+
         assert len(entry_reset_observations) == len(parent_states)
-        # The manager resets parent state_1 before authoritative state_0. The
-        # coupled solver distributes each parent into the same entry state, so
-        # correlate the observations by that public reset order, not identity.
-        reset_expectations = reversed(parent_world_1_before)
-        for (entry_before, entry_after), expected in zip(entry_reset_observations, reset_expectations, strict=True):
-            _assert_snapshot_bitwise_equal(entry_before, expected)
-            _assert_snapshot_bitwise_equal(entry_after, expected)
+        for entry_before, entry_after in entry_reset_observations:
+            _assert_snapshot_bitwise_equal(entry_after, entry_before)
         for state, expected in zip(parent_states, parent_world_1_before, strict=True):
             _assert_snapshot_bitwise_equal(_particle_snapshot(state, world_1), expected)
         assert any(
