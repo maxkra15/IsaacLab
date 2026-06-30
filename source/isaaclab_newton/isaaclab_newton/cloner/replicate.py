@@ -158,9 +158,12 @@ def _build_newton_builder_from_mapping(
             add_registered_mpm_objects_to_builder(builder, col, positions[col].tolist(), quaternions[col].tolist())
 
         # Run per-world builder hooks (e.g. deformable body registration).
-        if hasattr(NewtonManager, "_per_world_builder_hooks"):
-            for hook in NewtonManager._per_world_builder_hooks:
-                hook(builder, col, positions[col].tolist(), quaternions[col].tolist())
+        NewtonManager._run_builder_world_hooks(
+            builder,
+            col,
+            positions[col].tolist(),
+            quaternions[col].tolist(),
+        )
 
         # end the world context
         builder.end_world()

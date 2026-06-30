@@ -94,15 +94,6 @@ class NewtonMPMManager(NewtonManager):
         cls._project_outside_colliders = solver_cfg.project_outside_colliders
 
     @classmethod
-    def _supports_cuda_graph_capture(cls) -> bool:
-        """Return ``True`` only for fixed-grid MPM.
-
-        Sparse and dense grids reallocate as particles move, which is not
-        capturable in a CUDA graph; the fixed grid keeps a static topology.
-        """
-        return cls._solver.grid_type == "fixed"
-
-    @classmethod
     def _step_solver(
         cls, state_0: State, state_1: State, control: Control, contacts: Contacts | None, substep_dt: float
     ) -> None:

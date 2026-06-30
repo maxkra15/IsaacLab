@@ -134,6 +134,11 @@ class MPMObject(BaseDeformableObject):
         """Number of particles generated for each environment instance."""
         return self._particles_per_object
 
+    @property
+    def particle_offsets(self) -> wp.array(dtype=wp.int32):
+        """Starting model-particle index for each environment instance."""
+        return self._particle_offsets
+
     def reset(self, env_ids: Sequence[int] | None = None, env_mask: wp.array | None = None) -> None:
         """Reset selected particle instances to their default particle state."""
         if env_mask is not None:

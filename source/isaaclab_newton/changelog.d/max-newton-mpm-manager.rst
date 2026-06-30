@@ -10,9 +10,7 @@ Added
   :meth:`~isaaclab_newton.physics.NewtonManager._register_builder_attributes`
   (register a solver's Newton custom builder attributes) and
   :meth:`~isaaclab_newton.physics.NewtonManager._prepare_builder_for_finalize`
-  (allow a solver to normalize imported builder data before finalization) and
-  :meth:`~isaaclab_newton.physics.NewtonManager._supports_cuda_graph_capture`
-  (opt a solver out of CUDA graph capture).
+  (allow a solver to normalize imported builder data before finalization).
 * Added :attr:`~isaaclab_newton.physics.MPMSolverCfg.project_outside_colliders`
   (default ``False``): when set,
   :class:`~isaaclab_newton.physics.NewtonMPMManager` runs
@@ -38,5 +36,6 @@ Changed
 * The MPM demos now use the particle visualization update cadence for both
   Newton viewer particle logging and Kit USD point-cloud sync.
 * :meth:`~isaaclab_newton.physics.NewtonManager._capture_or_defer_graph` now
-  skips CUDA graph capture when the active solver reports it is unsupported,
-  so sparse/dense-grid MPM falls back to eager execution.
+  follows the active solver's public capture-capability contract. Bounded,
+  rebuildable sparse MPM supports capture; unsupported configurations fall
+  back to eager execution.

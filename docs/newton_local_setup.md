@@ -1,42 +1,32 @@
-# Isaac Lab Newton Local Setup
+# Local Newton and Warp source validation
 
-Last verified: 2026-06-04.
+Use explicit source overrides when testing unpublished Newton and Warp changes.
+`isaaclab.sh` never discovers adjacent checkouts implicitly.
 
-This workspace uses sibling checkouts under `/home/maximiliank/Work`.
+The reviewed feature pair is:
 
-## Active Branches
+- Newton: `46b44f9cc420210b0ef9efd171dd7c6a0ed31069`
+- Warp: `18782a34b545d2e7e3b874864087849f529ade75`
 
-- Isaac Lab feature reference: `/home/maximiliank/Work/IsaacLab` on `feat/newton-implicit-mpm`.
-- Isaac Lab MPM base: `/home/maximiliank/Work/IsaacLab-mpm` on `max/newton-mpm-manager`.
-- Isaac Lab coupling worktree: `/home/maximiliank/Work/IsaacLab-coupling` on `max/newton-coupling-manager`.
-- Newton PR 2848 reference: `/home/maximiliank/Work/newton-coupled` on `newton-coupled-rebased-main`.
-
-The verified local Newton PR 2848 commit, rebased onto current `origin/main`, is:
-
-```text
-f825e84e Refactor coupling hooks
-```
-
-This local branch has not been pushed.
-
-## Runtime Wiring
-
-`isaaclab.sh` prepends this repo's `source/*` packages and the adjacent Newton checkout by default. Override with `NEWTON_SOURCE_DIR=/path/to/newton`, or set `NEWTON_SOURCE_DIR=` to disable the local Newton checkout.
+Set checkout paths without committing workstation-specific locations:
 
 ```bash
-NEWTON_SOURCE_DIR=/home/maximiliank/Work/newton-coupled ./isaaclab.sh -p ...
+export NEWTON_SOURCE_DIR=/path/to/newton
+export WARP_SOURCE_DIR=/path/to/warp
 ```
 
-The coupling manager expects Newton PR 2848 APIs, especially:
+Validate that both checkouts are clean, have the reviewed revisions, and supply
+the imported Python packages and Warp native library:
 
-- `newton.solvers.experimental.coupled.SolverCoupled`
-- `newton.solvers.experimental.coupled.SolverCoupledProxy`
-- `newton.solvers.experimental.coupled.SolverCoupledADMM`
-- `SolverCoupled.Entry(..., configure_view=..., substeps=..., in_place=...)`
-- `SolverCoupledProxy.Proxy(..., bodies=..., particles=..., collision_pipeline=..., collide_interval=...)`
-- `SolverCoupledADMM.ContactPair(...)`
-- `SolverCoupledADMM.add_body_particle_attachment(...)`
+```bash
+./isaaclab.sh -p tools/validate_newton_sources.py \
+  --newton_revision 46b44f9cc420210b0ef9efd171dd7c6a0ed31069 \
+  --warp_revision 18782a34b545d2e7e3b874864087849f529ade75
+```
 
-## Worktree Rule
-
-Do not push to upstream IsaacLab. The active writable target for this task is the fork branch in `/home/maximiliank/Work/IsaacLab-coupling`.
+These overrides are only a local-development mechanism. A reproducible clean
+installation requires an immutable published Newton Git revision and a
+content-addressed Warp wheel built from the reviewed Warp revision. A Warp Git
+dependency is insufficient because the repository does not contain its native
+libraries. Never commit a local `file://` requirement or a path to a sibling
+checkout.

@@ -28,7 +28,7 @@ except OSError:
         _cudart = ctypes.CDLL("libcudart.so")
     except OSError:
         _cudart = None
-from newton import Axis, CollisionPipeline, Contacts, Control, Model, ModelBuilder, State, eval_fk
+from newton import Axis, CollisionPipeline, Contacts, Control, Model, ModelBuilder, State, StateFlags, eval_fk
 from newton._src.usd.schemas import SchemaResolverNewton, SchemaResolverPhysx
 from newton.sensors import SensorContact as NewtonContactSensor
 from newton.sensors import SensorFrameTransform
@@ -82,13 +82,13 @@ def _set_fabric_transforms(
 def _or_reset_masks_from_mask(
     env_mask: wp.array(dtype=wp.bool),
     articulation_ids: wp.array2d(dtype=int),
-    world_mask: wp.array(dtype=wp.int32),
+    world_mask: wp.array(dtype=wp.bool),
     fk_mask: wp.array(dtype=wp.bool),
 ):
     """OR env_mask into world_mask and set corresponding articulation bits in fk_mask."""
     world, arti = wp.tid()
     if env_mask[world]:
-        world_mask[world] = wp.int32(1)
+        world_mask[world] = True
         fk_mask[articulation_ids[world, arti]] = True
 
 
@@ -96,13 +96,13 @@ def _or_reset_masks_from_mask(
 def _scatter_reset_masks_from_ids(
     env_ids: wp.array(dtype=int),
     articulation_ids: wp.array2d(dtype=int),
-    world_mask: wp.array(dtype=wp.int32),
+    world_mask: wp.array(dtype=wp.bool),
     fk_mask: wp.array(dtype=wp.bool),
 ):
     """Scatter-set world_mask and fk_mask from sparse env_ids."""
     i, arti = wp.tid()
     world = env_ids[i]
-    world_mask[world] = wp.int32(1)
+    world_mask[world] = True
     fk_mask[articulation_ids[world, arti]] = True
 
 
@@ -214,8 +214,9 @@ class NewtonManager(PhysicsManager):
     _pending_extended_state_attributes: set[str] = set()
     _pending_extended_contact_attributes: set[str] = set()
     _report_contacts: bool = False
+    _per_world_builder_hooks: list[Callable[[ModelBuilder, int, list[float], list[float]], None]] = []
     # Per-world reset masks (allocated in start_simulation, consumed in step)
-    _world_reset_mask: wp.array | None = None  # (num_envs,) wp.int32 — for SolverKamino.reset(world_mask=...)
+    _world_reset_mask: wp.array | None = None  # (num_envs,) wp.bool — public solver reset world selection
     _fk_reset_mask: wp.array | None = None  # (articulation_count,) wp.bool — for eval_fk(mask=...)
     _fk_articulation_filter: wp.array | None = None
     """Optional articulation mask for generic FK. Solver-owned articulations are False."""
@@ -649,7 +650,7 @@ class NewtonManager(PhysicsManager):
             else:
                 with wp.ScopedDevice(device):
                     cls._simulate_full()
-            PhysicsManager._sim_time += physics_dt * cls._decimation
+            elapsed_sim_time = physics_dt * cls._decimation
         else:
             # --- Some actuators not graph-safe: step them eagerly, graph solver only ---
             if cls._adapter is not None:
@@ -662,7 +663,18 @@ class NewtonManager(PhysicsManager):
             else:
                 with wp.ScopedDevice(device):
                     cls._simulate_physics_only()
-            PhysicsManager._sim_time += physics_dt
+            elapsed_sim_time = physics_dt
+
+        # Inspect sticky device-side solver failures only after eager execution
+        # or graph replay has left the capture boundary. Solvers without
+        # asynchronous status use the base no-op implementation. An
+        # application-owned outer graph must call ``check_solver_status`` at
+        # its own post-replay host boundary.
+        if not cls._is_outer_cuda_graph_capture_active():
+            cls.check_solver_status()
+
+        # A failed step must not advance published simulation time.
+        PhysicsManager._sim_time += elapsed_sim_time
 
         if cls._usdrt_stage is not None:
             cls._mark_state_dirty()
@@ -776,6 +788,48 @@ class NewtonManager(PhysicsManager):
     def set_builder(cls, builder: ModelBuilder) -> None:
         """Set the Newton model builder."""
         NewtonManager._builder = builder
+
+    @classmethod
+    def register_builder_world_hook(
+        cls,
+        hook: Callable[[ModelBuilder, int, list[float], list[float]], None],
+    ) -> None:
+        """Register a callback that extends each replicated Newton world.
+
+        The callback runs after the world's replicated USD content and MPM
+        particle objects are added, but before :meth:`ModelBuilder.end_world`.
+
+        Args:
+            hook: Callback receiving the builder, environment index, world
+                position [m], and world quaternion.
+        """
+        if hook not in NewtonManager._per_world_builder_hooks:
+            NewtonManager._per_world_builder_hooks.append(hook)
+
+    @classmethod
+    def unregister_builder_world_hook(
+        cls,
+        hook: Callable[[ModelBuilder, int, list[float], list[float]], None],
+    ) -> None:
+        """Unregister a callback previously added by :meth:`register_builder_world_hook`.
+
+        Args:
+            hook: Callback to remove. Removing an unregistered callback is a no-op.
+        """
+        if hook in NewtonManager._per_world_builder_hooks:
+            NewtonManager._per_world_builder_hooks.remove(hook)
+
+    @classmethod
+    def _run_builder_world_hooks(
+        cls,
+        builder: ModelBuilder,
+        env_id: int,
+        position: list[float],
+        quaternion: list[float],
+    ) -> None:
+        """Run a stable snapshot of hooks for one open replicated world."""
+        for hook in tuple(NewtonManager._per_world_builder_hooks):
+            hook(builder, env_id, position, quaternion)
 
     @classmethod
     def create_builder(cls, up_axis: str | None = None, **kwargs) -> ModelBuilder:
@@ -1184,7 +1238,7 @@ class NewtonManager(PhysicsManager):
             )
         else:
             # Fallback: no topology info — mark everything dirty
-            NewtonManager._world_reset_mask.fill_(1)
+            NewtonManager._world_reset_mask.fill_(True)
             NewtonManager._fk_reset_mask.fill_(True)
 
     @classmethod
@@ -1243,7 +1297,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._use_newton_actuators_active = False
 
         # Allocate per-world reset masks (used by all solvers for masked FK, and by Kamino for masked reset)
-        NewtonManager._world_reset_mask = wp.zeros(cls._model.world_count, dtype=wp.int32, device=device)
+        NewtonManager._world_reset_mask = wp.zeros(cls._model.world_count, dtype=wp.bool, device=device)
         NewtonManager._fk_reset_mask = wp.zeros(cls._model.articulation_count, dtype=wp.bool, device=device)
 
         logger.info("Dispatching PHYSICS_READY callbacks")
@@ -1402,6 +1456,7 @@ class NewtonManager(PhysicsManager):
                     from isaaclab_newton.assets.mpm_object.mpm_object import add_registered_mpm_objects_to_builder
 
                     add_registered_mpm_objects_to_builder(builder, col, list(pos), list(quat))
+                cls._run_builder_world_hooks(builder, col, list(pos), list(quat))
                 builder.end_world()
 
             NewtonManager._cl_site_index_map = {
@@ -1538,8 +1593,8 @@ class NewtonManager(PhysicsManager):
 
         device = PhysicsManager._device
         use_cuda_graph = device is not None and cfg.use_cuda_graph and "cuda" in device  # type: ignore[union-attr]
-        if use_cuda_graph:
-            cls._prewarm_cuda_graph_allocations()
+        if use_cuda_graph and cls._supports_cuda_graph_capture():
+            cls._prepare_cuda_graph_capture_resources()
 
         # Skip the initial graph capture when the Newton actuator fast path is
         # active. Capturing here would use ``cls._decimation`` (still its default
@@ -1597,11 +1652,21 @@ class NewtonManager(PhysicsManager):
         try:
             cls._simulate_physics_only()
             wp.synchronize_device()
+            cls.check_solver_status()
         finally:
             NewtonManager._state_0 = state_0_ref
             NewtonManager._state_1 = state_1_ref
             cls._state_0.assign(state_0_snapshot)
             cls._state_1.assign(state_1_snapshot)
+            try:
+                cls.reset_solver_state()
+            finally:
+                # Solver reset may legally normalize the supplied public state
+                # (for example, reduced joint coordinates or MPM history). Keep
+                # the reset private caches, then restore caller-owned buffers a
+                # second time, including when reset reports an error.
+                cls._state_0.assign(state_0_snapshot)
+                cls._state_1.assign(state_1_snapshot)
 
     @classmethod
     def _iter_nested_solvers(cls, solver):
@@ -1939,7 +2004,13 @@ class NewtonManager(PhysicsManager):
     @classmethod
     def _supports_cuda_graph_capture(cls) -> bool:
         """Return whether the active solver configuration supports CUDA graph capture."""
-        return True
+        return bool(cls._solver is not None and cls._solver.supports_cuda_graph_capture)
+
+    @classmethod
+    def _is_outer_cuda_graph_capture_active(cls) -> bool:
+        """Return whether an application-owned CUDA graph is recording this manager step."""
+        device = PhysicsManager._device
+        return device is not None and wp.get_device(device).is_capturing
 
     @classmethod
     def _capture_relaxed_graph(cls, device: str):
@@ -2089,7 +2160,10 @@ class NewtonManager(PhysicsManager):
                     cls._collision_pipeline.collide(NewtonManager._state_0, contacts)
         else:
             cfg = PhysicsManager._cfg
-            need_copy_on_last = (cfg is not None and cfg.use_cuda_graph) and cls._num_substeps % 2 == 1  # type: ignore[union-attr]
+            recording_static_state = (  # type: ignore[union-attr]
+                cfg is not None and cfg.use_cuda_graph
+            ) or cls._is_outer_cuda_graph_capture_active()
+            need_copy_on_last = recording_static_state and cls._num_substeps % 2 == 1
             for i in range(cls._num_substeps):
                 cls._step_solver(
                     NewtonManager._state_0,
@@ -2188,6 +2262,101 @@ class NewtonManager(PhysicsManager):
         """Get the current state."""
         cls._ensure_visualization_model()
         return cls._state_0
+
+    @classmethod
+    def is_cuda_graph_active(cls) -> bool:
+        """Return whether the manager has recorded an active physics CUDA graph."""
+        return NewtonManager._graph is not None
+
+    @classmethod
+    def prepare_cuda_graph_capture(cls) -> None:
+        """Prepare the active solver for an application-owned CUDA graph.
+
+        This method allocates capture-persistent solver resources and performs
+        any required eager warmup, but it does not record or launch a graph.
+        Applications that own a larger outer graph should configure
+        ``use_cuda_graph=False``, call this method immediately after solver
+        initialization and before the first simulation step, then call
+        :meth:`check_solver_status` after each replay.
+
+        Raises:
+            RuntimeError: If the solver is uninitialized, the active device is
+                not CUDA, simulation has already advanced, capture is already
+                in progress, or the solver does not support CUDA graph capture.
+        """
+        if PhysicsManager._sim_time != 0.0:
+            raise RuntimeError("Prepare Newton CUDA graph capture before the first simulation step.")
+        cls._prepare_cuda_graph_capture_resources()
+
+    @classmethod
+    def _prepare_cuda_graph_capture_resources(cls) -> None:
+        """Prepare capture resources without applying the external-owner lifecycle guard."""
+        if cls._solver is None:
+            raise RuntimeError("Newton solver is not initialized; cannot prepare CUDA graph capture.")
+
+        device = PhysicsManager._device
+        if device is None or "cuda" not in str(device):
+            raise RuntimeError("Newton CUDA graph capture preparation requires a CUDA device.")
+        if cls._is_outer_cuda_graph_capture_active():
+            raise RuntimeError("Prepare Newton CUDA graph capture before beginning application-owned capture.")
+        if not cls._supports_cuda_graph_capture():
+            raise RuntimeError("The active Newton solver configuration does not support CUDA graph capture.")
+
+        cls._solver.prepare_cuda_graph_capture(cls._contacts)
+        cls._prewarm_cuda_graph_allocations()
+        cls.check_solver_status()
+
+    @classmethod
+    def check_solver_status(cls) -> None:
+        """Raise any sticky solver failure at an application-owned host boundary."""
+        if cls._solver is None:
+            raise RuntimeError("Newton solver is not initialized; cannot check solver status.")
+        cls._solver.check_status()
+
+    @classmethod
+    def reset_solver_state(
+        cls,
+        state: State | None = None,
+        world_mask: wp.array(dtype=wp.bool) | None = None,
+        flags: StateFlags | int | None = None,
+    ) -> None:
+        """Reset solver-private state through Newton's public reset contract.
+
+        The application remains responsible for writing its desired reset
+        values into the parent Newton state buffers. With no explicit
+        :paramref:`state`, this method resets both distinct manager buffers so
+        the next double-buffer swap cannot restore stale solver history. An
+        explicit state retains Newton's singular solver-reset semantics. The
+        current input buffer is reset last so solver-private caches finish in
+        sync with the authoritative manager state.
+
+        Args:
+            state: Optional parent Newton state containing the reset values.
+                When omitted, reset both distinct manager state buffers.
+            world_mask: Optional boolean selection mask of shape
+                ``(model.world_count,)`` on the model device. ``None`` resets
+                all worlds.
+            flags: Optional :class:`newton.StateFlags` bitmask identifying the
+                public state fields that changed.
+
+        Raises:
+            RuntimeError: If the solver or manager state buffers are not
+                initialized.
+        """
+        if cls._solver is None:
+            raise RuntimeError("Newton solver is not initialized; cannot reset solver state.")
+        states = (state,) if state is not None else (cls._state_1, cls._state_0)
+        unique_states: list[State] = []
+        seen: set[int] = set()
+        for candidate in states:
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            unique_states.append(candidate)
+        if not unique_states:
+            raise RuntimeError("Newton state is not initialized; provide an explicit state to reset.")
+        for candidate in unique_states:
+            cls._solver.reset(candidate, world_mask=world_mask, flags=flags)
 
     @classmethod
     def get_state(cls, scene_data_provider: SceneDataProvider | None = None) -> State:

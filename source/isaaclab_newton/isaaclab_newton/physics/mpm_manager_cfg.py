@@ -37,6 +37,7 @@ _SOLVER_CONFIG_FIELDS = (
     "collider_basis",
     "strain_basis",
     "velocity_basis",
+    "separate_worlds",
 )
 
 
@@ -90,7 +91,23 @@ class MPMSolverCfg(NewtonSolverCfg):
     """Number of empty cells to add around particles when allocating the grid."""
 
     max_active_cell_count: int = -1
-    """Maximum active cell count for dense-grid active subsets. ``-1`` means unlimited."""
+    """Grid capacity used by dense/fixed active subsets and rebuildable sparse grids.
+
+    This is one total shared reserve across all isolated worlds, not a
+    per-world limit. Multi-world callers should multiply their per-world
+    estimate by the world count. A positive value bounds both active FEM cells
+    and the persistent sparse topology when ``grid_type="sparse"``. ``-1``
+    retains the allocating sparse behavior and means no fixed active-cell
+    ceiling for other grid types.
+    """
+
+    separate_worlds: bool = True
+    """Keep each Newton world in an independent local MPM grid environment.
+
+    Independent worlds may overlap in physics-space without exchanging grid
+    mass, momentum, stress, or collider response. Set this to ``False`` only
+    to retain the legacy shared-grid behavior.
+    """
 
     transfer_scheme: Literal["apic", "pic"] = "apic"
     """Particle-grid transfer scheme."""
@@ -118,18 +135,19 @@ class MPMSolverCfg(NewtonSolverCfg):
     velocity_basis: str = "Q1"
     """Velocity basis function, such as ``"Q1"``, ``"B2"``, or ``"B3"``."""
 
-    # collision handling (applied by the Isaac Lab manager, not the Newton solver config)
+    # collision handling (applied by Isaac Lab managers, not the Newton solver config)
     project_outside_colliders: bool = False
     """Whether to hard-project particles out of collider interiors after each substep.
 
-    When ``True``, :class:`~isaaclab_newton.physics.NewtonMPMManager` calls
+    When ``True``, :class:`~isaaclab_newton.physics.NewtonMPMManager` or an MPM
+    entry in :class:`~isaaclab_newton.physics.NewtonCoupledManager` calls
     :meth:`SolverImplicitMPM.project_outside` immediately after every solver
-    substep: it applies a Coulomb response and pushes particles that drifted into
-    a collider back onto its surface. The implicit solve already resolves
-    colliders at the grid level; this is the particle-level correction that stops
-    material from slowly settling inside colliders, mirroring Newton's MPM
-    examples. Leave it ``False`` for collider-free scenes to skip a per-substep
-    projection pass over every particle.
+    substep. It applies a Coulomb response and pushes particles that drifted
+    into a collider back onto its surface. The implicit solve already resolves
+    colliders at the grid level; this is the particle-level correction that
+    stops material from slowly settling inside colliders, mirroring Newton's
+    MPM examples. Leave it ``False`` for collider-free scenes to skip a
+    per-substep projection pass over every particle.
 
     This is a manager-level stepping option and is intentionally **not** part of
     ``SolverImplicitMPM.Config``.
@@ -138,10 +156,11 @@ class MPMSolverCfg(NewtonSolverCfg):
     def to_solver_config(self) -> SolverImplicitMPM.Config:
         """Build a :class:`SolverImplicitMPM.Config` from this configuration.
 
-        Only fields present on the installed Newton's ``SolverImplicitMPM.Config``
-        are forwarded, so newer Isaac Lab configs keep working against older
-        Newton installs. Manager-level options such as
-        :attr:`project_outside_colliders` are intentionally not forwarded.
+        Supported Newton solver fields are forwarded. The
+        ``separate_worlds`` field is required because silently omitting it
+        would change isolated environments into one shared MPM grid.
+        Manager-level options such as :attr:`project_outside_colliders` are
+        intentionally not forwarded.
 
         Returns:
             A ``SolverImplicitMPM.Config`` instance ready for solver construction.
@@ -149,6 +168,11 @@ class MPMSolverCfg(NewtonSolverCfg):
         from newton.solvers import SolverImplicitMPM
 
         cfg = SolverImplicitMPM.Config()
+        if not hasattr(cfg, "separate_worlds"):
+            raise RuntimeError(
+                "Installed Newton SolverImplicitMPM.Config lacks required 'separate_worlds' support. "
+                "Install the Newton revision paired with this Isaac Lab branch."
+            )
         for key in _SOLVER_CONFIG_FIELDS:
             if hasattr(cfg, key):
                 setattr(cfg, key, getattr(self, key))

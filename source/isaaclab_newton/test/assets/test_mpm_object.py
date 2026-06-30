@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -44,6 +45,13 @@ def test_mpm_object_cfg_resolves_asset_class():
     )
 
     assert cfg.class_type.__name__ == MPMObject.__name__
+
+
+def test_mpm_object_exposes_particle_offsets_without_private_access():
+    """Tasks can map per-environment particles through a stable public array."""
+    offsets = object()
+
+    assert MPMObject.particle_offsets.fget(SimpleNamespace(_particle_offsets=offsets)) is offsets
 
 
 def test_mpm_grid_emission_records_constant_offsets_per_env():

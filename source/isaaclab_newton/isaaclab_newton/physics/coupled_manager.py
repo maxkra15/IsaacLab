@@ -14,7 +14,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
-from newton import Model
+import warp as wp
+from newton import BodyFlags, Contacts, Control, Model, ModelBuilder, State
 from newton.solvers.experimental.coupled import (
     SolverCoupled,
     SolverCoupledADMM,
@@ -51,6 +52,9 @@ class NewtonCoupledManager(NewtonManager):
     solvers own per-solver ``ModelView`` construction and
     cross-entry force or constraint exchange.
     """
+
+    _mpm_project_outside_entries: tuple[str, ...] = ()
+    """Coupled MPM entries that run particle projection after each substep."""
 
     @classmethod
     def get_entry_solver(cls, name: str):
@@ -108,20 +112,29 @@ class NewtonCoupledManager(NewtonManager):
 
         cls._apply_entry_solver_overrides(solver_cfg.entries)
         cls._configure_fk_articulation_filter(model, solver_cfg.entries)
+        cls._mpm_project_outside_entries = cls._mpm_project_outside_entry_names(solver_cfg.entries)
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = cls._needs_external_collision_pipeline(solver_cfg)
+        NewtonManager._needs_fk_before_step = any(
+            getattr(entry.solver_cfg, "solver_type", "") == "implicit_mpm" for entry in solver_cfg.entries
+        )
 
     @classmethod
-    def _initialize_contacts(cls) -> None:
-        """Allocate contacts and preallocate entry-local filtered contact buffers.
-
-        Newton's coupled solver filters external contacts into per-entry
-        buffers during :meth:`step`; preallocating them here keeps the first
-        stepped frame capturable in a CUDA graph.
-        """
-        super()._initialize_contacts()
-        if cls._contacts is not None and hasattr(NewtonManager._solver, "prepare_contacts"):
-            NewtonManager._solver.prepare_contacts(cls._contacts)
+    def _prepare_builder_for_finalize(cls, builder: ModelBuilder) -> None:
+        """Make kinematic bodies massless for implicit-MPM collider use."""
+        solver_cfg = getattr(PhysicsManager._cfg, "solver_cfg", None)
+        if not any(
+            getattr(entry.solver_cfg, "solver_type", None) == "implicit_mpm"
+            for entry in getattr(solver_cfg, "entries", ())
+        ):
+            return
+        kinematic_flag = int(BodyFlags.KINEMATIC)
+        for body_id, flags in enumerate(builder.body_flags):
+            if int(flags) & kinematic_flag:
+                builder.body_mass[body_id] = 0.0
+                builder.body_inv_mass[body_id] = 0.0
+                builder.body_inertia[body_id] = wp.mat33()
+                builder.body_inv_inertia[body_id] = wp.mat33()
 
     @classmethod
     def _resolve_solver_cfg(cls, model: Model, solver_cfg: CoupledSolverCfg) -> CoupledSolverCfg:
@@ -438,6 +451,38 @@ class NewtonCoupledManager(NewtonManager):
             if getattr(entry_cfg.solver_cfg, "solver_type", None) != "mujoco_warp":
                 continue
             apply_mujoco_warp_model_overrides(NewtonManager._solver.solver(entry_cfg.name), entry_cfg.solver_cfg)
+
+    @staticmethod
+    def _mpm_project_outside_entry_names(entries: list[CoupledSolverEntryCfg]) -> tuple[str, ...]:
+        """Return coupled MPM entry names that enable post-step projection."""
+        return tuple(
+            entry_cfg.name
+            for entry_cfg in entries
+            if getattr(entry_cfg.solver_cfg, "solver_type", None) == "implicit_mpm"
+            and getattr(entry_cfg.solver_cfg, "project_outside_colliders", False)
+        )
+
+    @classmethod
+    def _step_solver(
+        cls,
+        state_0: State,
+        state_1: State,
+        control: Control,
+        contacts: Contacts | None,
+        substep_dt: float,
+    ) -> None:
+        """Run one coupled substep and configured MPM particle projections."""
+        super()._step_solver(state_0, state_1, control, contacts, substep_dt)
+        for entry_name in cls._mpm_project_outside_entries:
+            entry_solver = cls._solver.solver(entry_name)
+            entry_state = cls._solver.entry_state(entry_name, phase="output")
+            entry_solver.project_outside(entry_state, entry_state, substep_dt)
+            cls._solver.reconcile_entry_state(entry_name, state_1, phase="output")
+
+    @classmethod
+    def _solver_specific_clear(cls) -> None:
+        """Reset coupled-manager class state on teardown."""
+        cls._mpm_project_outside_entries = ()
 
     @classmethod
     def _configure_fk_articulation_filter(cls, model: Model, entries: list[CoupledSolverEntryCfg]) -> None:

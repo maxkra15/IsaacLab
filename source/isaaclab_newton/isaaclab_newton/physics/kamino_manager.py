@@ -39,13 +39,12 @@ class NewtonKaminoManager(NewtonManager):
 
         Args:
             world_mask: Per-world mask indicating which worlds to reset.
-                Shape ``(num_worlds,)``, dtype ``wp.int32``. If None, resets all worlds.
+                Shape ``(num_worlds,)``, dtype ``wp.bool``. If None, resets all worlds.
         """
         cls._solver.reset(
-            state_out=cls._state_0,
-            joint_q=cls._state_0.joint_q,
-            joint_u=cls._state_0.joint_qd,
+            state=cls._state_0,
             world_mask=world_mask,
+            config=SolverKamino.ResetConfig.from_joints(),
         )
 
     @classmethod
