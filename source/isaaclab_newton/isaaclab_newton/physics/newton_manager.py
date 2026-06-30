@@ -11,11 +11,14 @@ import contextlib
 import ctypes
 import inspect
 import logging
+import re
 from abc import abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
+import torch
 import warp as wp
 
 # Load CUDA runtime for relaxed-mode graph capture (RTX-compatible).
@@ -35,25 +38,30 @@ from newton.sensors import SensorFrameTransform
 from newton.sensors import SensorIMU as NewtonSensorIMU
 from newton.solvers import SolverBase, SolverKamino, SolverNotifyFlags
 
+from pxr import UsdGeom
+
 from isaaclab.physics import CallbackHandle, PhysicsEvent, PhysicsManager
 from isaaclab.scene_data import SceneDataBackend, SceneDataFormat, SceneDataProvider
-from isaaclab.sim.utils.newton_model_utils import replace_newton_shape_colors
+from isaaclab.sim import SimulationContext
+from isaaclab.sim.utils.newton_model_utils import replace_newton_builder_shape_colors
 from isaaclab.sim.utils.stage import get_current_stage
 from isaaclab.utils import checked_apply
 from isaaclab.utils.string import resolve_matching_names
 from isaaclab.utils.timer import Timer
 
+from isaaclab_newton.cloner.newton_clone_utils import replicate_builder_mapping
+from isaaclab_newton.physics.visualization_builder import build_visualization_builder_from_stage_envs
+
 from .newton_manager_cfg import NewtonCfg, NewtonShapeCfg
 
 if TYPE_CHECKING:
-    from isaaclab.sim.simulation_context import SimulationContext
+    from pxr import Usd
 
     from isaaclab_newton.actuators import NewtonActuatorAdapter
 
     from .newton_collision_cfg import NewtonCollisionPipelineCfg
 
 logger = logging.getLogger(__name__)
-
 
 # Tagged union for entries in _cl_site_index_map.
 # _GlobalSite: (global_shape_idx, None)           — body_pattern was None
@@ -76,6 +84,46 @@ def _set_fabric_transforms(
     idx = int(newton_indices[i])
     transform = newton_body_q[idx]
     fabric_transforms[i] = wp.transpose(wp.mat44d(wp.transform_to_matrix(transform)))
+
+
+@wp.kernel(enable_backward=False)
+def _sync_particle_points(
+    fabric_points: wp.fabricarrayarray(dtype=wp.vec3f),
+    fabric_world_matrices: wp.fabricarray(dtype=wp.mat44d),
+    offsets: wp.fabricarray(dtype=wp.uint32),
+    counts: wp.fabricarray(dtype=wp.uint32),
+    particle_q: wp.array(dtype=wp.vec3f),
+):
+    """Write Newton particle positions into Fabric mesh point arrays as local-frame points.
+
+    Newton stores particle positions in world space in ``state.particle_q``. The Fabric
+    ``points`` attribute on a ``UsdGeom.Mesh`` is local-space -- Kit multiplies by the
+    mesh prim's resolved ``omni:fabric:worldMatrix`` at render time.
+
+    This kernel inverts the mesh prim's world matrix to convert each world-space particle
+    position into local-space before writing.
+    """
+    i = wp.tid()
+    offset = int(offsets[i])
+    num_points = int(counts[i])
+
+    # Un-transpose Fabric's stored matrix to get the standard homogeneous form
+    world_matrix = wp.transpose(wp.mat44f(fabric_world_matrices[i]))
+    inv_world_matrix = wp.inverse(world_matrix)
+
+    for j in range(num_points):
+        fabric_points[i][j] = wp.transform_point(inv_world_matrix, particle_q[offset + j])
+
+
+@dataclass
+class _ParticleVisualPrim:
+    """A ``UsdGeom.Points`` prim mirroring a slice of Newton's particle state."""
+
+    points_attr: Usd.Attribute
+    offset: int
+    count: int
+    sync_frequency: int
+    frames_since_sync: int
 
 
 @wp.kernel(enable_backward=False)
@@ -182,6 +230,11 @@ class NewtonManager(PhysicsManager):
         which subclass is active.
     """
 
+    @classmethod
+    def provides_implicit_damping(cls) -> bool:
+        # Newton's symplectic integrator has no implicit damping.
+        return False
+
     _solver_dt: float = 1.0 / 200.0
     _num_substeps: int = 1
     _decimation: int = 1
@@ -214,12 +267,10 @@ class NewtonManager(PhysicsManager):
     _pending_extended_state_attributes: set[str] = set()
     _pending_extended_contact_attributes: set[str] = set()
     _report_contacts: bool = False
-    _per_world_builder_hooks: list[Callable[[ModelBuilder, int, list[float], list[float]], None]] = []
     # Per-world reset masks (allocated in start_simulation, consumed in step)
-    _world_reset_mask: wp.array | None = None  # (num_envs,) wp.bool — public solver reset world selection
+    _world_reset_mask: wp.array | None = None  # (num_envs,) wp.bool — for SolverKamino.reset(world_mask=...)
     _fk_reset_mask: wp.array | None = None  # (articulation_count,) wp.bool — for eval_fk(mask=...)
     _fk_articulation_filter: wp.array | None = None
-    """Optional articulation mask for generic FK. Solver-owned articulations are False."""
 
     # Newton actuator adapter (owns actuators and double-buffered states)
     _adapter: NewtonActuatorAdapter | None = None
@@ -241,11 +292,7 @@ class NewtonManager(PhysicsManager):
     _particles_dirty: bool = False
     _newton_particle_offset_attr = "newton:particleOffset"
     _newton_particle_count_attr = "newton:particleCount"
-    _newton_particle_sync_frequency_attr = "newton:particleSyncFrequency"
-    _particle_visual_prim_paths: set[str] = set()
-    _particle_visual_sync_counts: dict[str, int] = {}
-    _pre_render_callbacks: dict[str, Callable[[], None]] = {}
-    _usd_xform_ops: dict[str, object] = {}
+    _particle_visual_prims: dict[str, _ParticleVisualPrim] = {}
 
     # cubric GPU transform hierarchy (replaces CPU update_world_xforms)
     _cubric = None
@@ -280,13 +327,15 @@ class NewtonManager(PhysicsManager):
     _LocalSite = tuple[None, list[list[int]]]
     _SiteEntry = _GlobalSite | _LocalSite
     _cl_site_index_map: dict[str, _SiteEntry] = {}
+    _cl_fabric_body_bindings: list[tuple[str, int]] | None = None
     _world_xforms: list[wp.transform] | None = None
-
-    # Per-source prototype builders produced during replication, keyed by the
-    # clone-plan source path. Retained (not re-imported) so single-model
-    # consumers such as batched Newton IK can finalize a single-env model and
-    # resolve it via ``isaaclab.cloner.resolve_clone_plan_source``.
+    # Per-source builders retained from replication, keyed by clone-plan source
+    # path. Single-model consumers (e.g. batched Newton IK) finalize a single-env
+    # model from these and resolve it via ``resolve_clone_plan_source``.
     _cl_protos: dict[str, ModelBuilder] = {}
+    _deformable_registry: list = []
+    _per_world_builder_hooks: list[Callable[[ModelBuilder, int, list[float], list[float]], None]] = []
+    _post_replicate_hooks: list[Callable[[ModelBuilder], None]] = []
 
     @classmethod
     def initialize(cls, sim_context: SimulationContext) -> None:
@@ -332,39 +381,19 @@ class NewtonManager(PhysicsManager):
     def forward(cls) -> None:
         """Update articulation kinematics without stepping physics.
 
-        Runs Newton's generic forward kinematics (``eval_fk``) for
-        articulations that are allowed to be FK-owned. Coupled solver entries
-        such as VBD rods own their body poses directly, so render-time FK must
-        not recompute those bodies from stale joint coordinates.
+        Runs Newton's generic forward kinematics (``eval_fk``) over **all**
+        articulations to compute body poses from joint coordinates. This is
+        the full (unmasked) FK path used during initial setup. For incremental
+        per-environment updates after resets, see :meth:`invalidate_fk` which
+        accumulates masks consumed by :meth:`step`.
         """
-        if cls._model is None or cls._state_0 is None:
-            return
         eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, cls._fk_articulation_filter)
-        if cls._usdrt_stage is not None:
-            cls._mark_transforms_dirty()
-            cls.sync_transforms_to_usd()
 
     @classmethod
     def pre_render(cls) -> None:
         """Flush deferred Fabric writes before cameras/visualizers read the scene."""
-        for name, callback in list(cls._pre_render_callbacks.items()):
-            try:
-                callback()
-            except Exception:
-                logger.exception("[NewtonManager] pre-render callback %s failed; deregistering", name)
-                NewtonManager._pre_render_callbacks.pop(name, None)
         cls.sync_transforms_to_usd()
         cls.sync_particles_to_usd()
-
-    @classmethod
-    def register_pre_render_callback(cls, name: str, callback: Callable[[], None]) -> None:
-        """Register a callback that runs before Newton writes render transforms to Fabric."""
-        NewtonManager._pre_render_callbacks[name] = callback
-
-    @classmethod
-    def deregister_pre_render_callback(cls, name: str) -> None:
-        """Remove a pre-render callback registered by name."""
-        NewtonManager._pre_render_callbacks.pop(name, None)
 
     @classmethod
     def sync_transforms_to_usd(cls) -> None:
@@ -395,10 +424,6 @@ class NewtonManager(PhysicsManager):
             return
         try:
             import usdrt
-
-            body_paths = getattr(cls._model, "body_label", None) or getattr(cls._model, "body_key", None)
-            if body_paths is not None:
-                cls._sync_transforms_to_usd_xform_ops(body_paths)
 
             # Lazy adapter creation: deferred from initialize_solver() to avoid
             # startup-ordering issues with the cubric plugin.
@@ -441,11 +466,6 @@ class NewtonManager(PhysicsManager):
                     NewtonManager._transforms_dirty = False
                     return
 
-                # Notify Fabric Scene Delegate that transform buffers are about
-                # to change. Without this, USDRT attributes read back correctly
-                # but Kit can keep rendering stale rigid-body transforms.
-                selection.PrepareForReuse()
-
                 fabric_transforms = wp.fabricarray(selection, "omni:fabric:worldMatrix")
                 newton_indices = wp.fabricarray(selection, cls._newton_index_attr)
                 wp.launch(
@@ -475,70 +495,80 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def sync_particles_to_usd(cls) -> None:
-        """Write Newton particle positions to Kit ``UsdGeom.Points`` prims.
+        """Write Newton particle positions to USD/Fabric for Kit viewport rendering.
 
-        For each point-based prim carrying a ``newton:particleOffset``
-        attribute, this function copies the corresponding slice of
-        ``state_0.particle_q`` into the USD ``points`` attribute so the Kit
-        viewport reflects the current particle state.
+        Two prim families are synced from ``state_0.particle_q``:
 
-        No-op when there is no simulation state or no particle visualization
-        prims registered.
+        * Fabric mesh prims tagged with ``newton:particleOffset`` /
+          ``newton:particleCount`` (deformable visual meshes) receive
+          local-frame points on the GPU via :meth:`_sync_fabric_mesh_particles`.
+        * ``UsdGeom.Points`` prims registered through
+          :meth:`register_particle_visual_prim` (MPM particle clouds) receive
+          world-frame points via :meth:`_sync_particle_points_prims`.
+
+        No-op when there is no particle state or nothing changed since the
+        last sync.
         """
-        if cls._state_0 is None or cls._state_0.particle_q is None or not cls._particle_visual_prim_paths:
+        if not cls._particles_dirty or cls._state_0 is None or cls._state_0.particle_q is None:
             return
-        if not cls._particles_dirty:
-            return
-
         try:
-            from pxr import Sdf, UsdGeom, Vt  # noqa: PLC0415
-
-            stage = get_current_stage()
-            due_prims = []
-            valid_prim_count = 0
-
-            for prim_path in sorted(cls._particle_visual_prim_paths):
-                prim = stage.GetPrimAtPath(prim_path)
-                if not prim.IsValid():
-                    continue
-
-                offset_attr = prim.GetAttribute(cls._newton_particle_offset_attr)
-                count_attr = prim.GetAttribute(cls._newton_particle_count_attr)
-                if not offset_attr.IsValid() or not count_attr.IsValid():
-                    continue
-
-                valid_prim_count += 1
-                sync_frequency = 1
-                frequency_attr = prim.GetAttribute(cls._newton_particle_sync_frequency_attr)
-                if frequency_attr.IsValid():
-                    sync_frequency_value = frequency_attr.Get()
-                    if sync_frequency_value is not None:
-                        sync_frequency = max(1, int(sync_frequency_value))
-
-                sync_count = cls._particle_visual_sync_counts.get(prim_path, sync_frequency - 1) + 1
-                NewtonManager._particle_visual_sync_counts[prim_path] = sync_count
-                if sync_count % sync_frequency != 0:
-                    continue
-
-                due_prims.append((prim, int(offset_attr.Get()), int(count_attr.Get())))
-
-            if valid_prim_count == 0:
-                NewtonManager._particles_dirty = False
-                return
-            if not due_prims:
-                return
-
-            wp.synchronize_device(PhysicsManager._device)
-            particle_q = cls._state_0.particle_q.numpy()
-
-            with Sdf.ChangeBlock():
-                for prim, offset, count in due_prims:
-                    points_np = particle_q[offset : offset + count]
-                    UsdGeom.Points(prim).GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(points_np))
-
-            NewtonManager._particles_dirty = len(due_prims) < valid_prim_count
+            cls._sync_fabric_mesh_particles()
+            NewtonManager._particles_dirty = cls._sync_particle_points_prims()
         except Exception:
             logger.exception("[NewtonManager] sync_particles_to_usd FAILED")
+
+    @classmethod
+    def _sync_fabric_mesh_particles(cls) -> None:
+        """Write ``state_0.particle_q`` into Fabric mesh point arrays as local-frame points."""
+        if cls._usdrt_stage is None:
+            return
+        import usdrt  # noqa: PLC0415
+
+        selection = cls._usdrt_stage.SelectPrims(
+            require_attrs=[
+                (usdrt.Sdf.ValueTypeNames.Point3fArray, "points", usdrt.Usd.Access.ReadWrite),
+                (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_particle_offset_attr, usdrt.Usd.Access.Read),
+                (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_particle_count_attr, usdrt.Usd.Access.Read),
+                (usdrt.Sdf.ValueTypeNames.Matrix4d, "omni:fabric:worldMatrix", usdrt.Usd.Access.Read),
+            ],
+            device=str(PhysicsManager._device),
+        )
+        if selection.GetCount() == 0:
+            return
+        wp.launch(
+            _sync_particle_points,
+            dim=selection.GetCount(),
+            inputs=[
+                wp.fabricarrayarray(data=selection, attrib="points", dtype=wp.vec3f),
+                wp.fabricarray(data=selection, attrib="omni:fabric:worldMatrix"),
+                wp.fabricarray(data=selection, attrib=cls._newton_particle_offset_attr),
+                wp.fabricarray(data=selection, attrib=cls._newton_particle_count_attr),
+                cls._state_0.particle_q,
+            ],
+            device=PhysicsManager._device,
+        )
+
+    @classmethod
+    def _sync_particle_points_prims(cls) -> bool:
+        """Write registered ``UsdGeom.Points`` prims; return ``True`` while throttled prims remain."""
+        if not cls._particle_visual_prims:
+            return False
+
+        due = []
+        for record in cls._particle_visual_prims.values():
+            record.frames_since_sync += 1
+            if record.frames_since_sync >= record.sync_frequency:
+                record.frames_since_sync = 0
+                due.append(record)
+        if due:
+            from pxr import Sdf, Vt  # noqa: PLC0415
+
+            particle_q = cls._state_0.particle_q.numpy()
+            with Sdf.ChangeBlock():
+                for record in due:
+                    points = particle_q[record.offset : record.offset + record.count]
+                    record.points_attr.Set(Vt.Vec3fArray.FromNumpy(points))
+        return len(due) < len(cls._particle_visual_prims)
 
     @classmethod
     def _mark_transforms_dirty(cls) -> None:
@@ -569,9 +599,27 @@ class NewtonManager(PhysicsManager):
         cls._mark_particles_dirty()
 
     @classmethod
-    def register_particle_visual_prim(cls, prim_path: str) -> None:
-        """Register a USD point prim to be initialized for Fabric particle sync."""
-        NewtonManager._particle_visual_prim_paths.add(prim_path)
+    def register_particle_visual_prim(
+        cls, prim_path: str, particle_offset: int, particle_count: int, sync_frequency: int = 1
+    ) -> None:
+        """Register a ``UsdGeom.Points`` prim whose points mirror a slice of Newton's particle state.
+
+        Args:
+            prim_path: Stage path of an existing ``UsdGeom.Points`` prim.
+            particle_offset: First index of the prim's slice in ``state.particle_q``.
+            particle_count: Number of particles in the slice.
+            sync_frequency: Sync the prim every N dirty render frames.
+        """
+        from pxr import UsdGeom  # noqa: PLC0415
+
+        prim = get_current_stage().GetPrimAtPath(prim_path)
+        NewtonManager._particle_visual_prims[prim_path] = _ParticleVisualPrim(
+            points_attr=UsdGeom.Points(prim).GetPointsAttr(),
+            offset=int(particle_offset),
+            count=int(particle_count),
+            sync_frequency=int(sync_frequency),
+            frames_since_sync=int(sync_frequency),
+        )
 
     @classmethod
     def step(cls) -> None:
@@ -665,11 +713,9 @@ class NewtonManager(PhysicsManager):
                     cls._simulate_physics_only()
             elapsed_sim_time = physics_dt
 
-        # Inspect sticky device-side solver failures only after eager execution
-        # or graph replay has left the capture boundary. Solvers without
-        # asynchronous status use the base no-op implementation. An
-        # application-owned outer graph must call ``check_solver_status`` at
-        # its own post-replay host boundary.
+        # Inspect sticky device-side failures only after eager execution or
+        # graph replay has left the capture boundary. An application-owned
+        # outer graph performs this check explicitly after replay.
         if not cls._is_outer_cuda_graph_capture_active():
             cls.check_solver_status()
 
@@ -678,7 +724,7 @@ class NewtonManager(PhysicsManager):
 
         if cls._usdrt_stage is not None:
             cls._mark_state_dirty()
-        elif cls._particle_visual_prim_paths:
+        elif cls._particle_visual_prims:
             cls._mark_particles_dirty()
 
         # Launch solver-specific debug logging after stepping.
@@ -766,23 +812,21 @@ class NewtonManager(PhysicsManager):
         NewtonManager._usdrt_stage = None
         NewtonManager._transforms_dirty = False
         NewtonManager._particles_dirty = False
-        NewtonManager._pre_render_callbacks = {}
-        NewtonManager._usd_xform_ops = {}
-        NewtonManager._particle_visual_prim_paths = set()
-        NewtonManager._particle_visual_sync_counts = {}
+        NewtonManager._particle_visual_prims = {}
+        NewtonManager._mpm_object_registry = []
+        NewtonManager._deformable_registry = []
+        NewtonManager._per_world_builder_hooks = []
+        NewtonManager._post_replicate_hooks = []
         NewtonManager._up_axis = "Z"
         NewtonManager._scene_data = None
         NewtonManager._scene_data_mapping = None
-        NewtonManager._cl_protos = {}
-        # MPM assets register particle emitters before model finalization. Asset instances may
-        # outlive a closed environment through task-owned references, so simulation teardown—not
-        # Python garbage collection—must delimit this scene-local registry.
-        NewtonManager._mpm_object_registry = []
         NewtonManager._model_changes = set()
         NewtonManager._scene_data_backend = None
         NewtonManager._cl_pending_sites = {}
         NewtonManager._cl_site_index_map = {}
+        NewtonManager._cl_fabric_body_bindings = None
         NewtonManager._world_xforms = None
+        NewtonManager._cl_protos = {}
         NewtonManager._pending_extended_state_attributes = set()
         NewtonManager._pending_extended_contact_attributes = set()
         NewtonManager._views = []
@@ -878,26 +922,18 @@ class NewtonManager(PhysicsManager):
         """
 
     @classmethod
-    def _prepare_builder_for_finalize(cls, builder: ModelBuilder) -> None:
-        """Subclass hook to normalize *builder* before model finalization.
-
-        Override in solver subclasses that need to adapt imported or replicated
-        builder data before :meth:`ModelBuilder.finalize` allocates model arrays.
-        The default implementation is a no-op.
-        """
-
-    @classmethod
     def _register_solver_custom_attributes(cls, builder: ModelBuilder) -> None:
-        """Register custom builder attributes required by the active Newton solver."""
+        """Register builder attributes required by the active solver and nested entries."""
         cfg = PhysicsManager._cfg
         solver_cfg = getattr(cfg, "solver_cfg", None)
         solver_cfgs = [solver_cfg]
         solver_cfgs.extend(getattr(entry, "solver_cfg", entry) for entry in getattr(solver_cfg, "entries", ()) or ())
+
         from .mpm_manager_cfg import MPMSolverCfg
 
         if any(
-            isinstance(solver_cfg_item, MPMSolverCfg) or getattr(solver_cfg_item, "solver_type", None) == "implicit_mpm"
-            for solver_cfg_item in solver_cfgs
+            isinstance(item, MPMSolverCfg) or getattr(item, "solver_type", None) == "implicit_mpm"
+            for item in solver_cfgs
         ):
             from newton.solvers import SolverImplicitMPM
 
@@ -941,82 +977,13 @@ class NewtonManager(PhysicsManager):
         return cls._fk_reset_mask
 
     @classmethod
-    def _sync_transforms_to_usd_xform_ops(cls, body_paths) -> None:
-        """Author Newton body world poses into USD local xformOps for Kit rendering."""
-        try:
-            from pxr import Gf, Sdf, UsdGeom  # noqa: PLC0415
-        except Exception:
-            return
+    def _prepare_builder_for_finalize(cls, builder: ModelBuilder) -> None:
+        """Subclass hook to normalize *builder* before model finalization.
 
-        stage = get_current_stage()
-        if stage is None:
-            return
-
-        try:
-            body_q = cls._state_0.body_q.numpy()
-        except Exception:
-            return
-
-        world_mats: dict[str, object] = {}
-        for body_id, prim_path in enumerate(body_paths):
-            if not isinstance(prim_path, str) or not prim_path.startswith("/") or body_id >= body_q.shape[0]:
-                continue
-            pose = body_q[body_id]
-            quat = np.asarray(pose[3:7], dtype=np.float64)
-            norm = float(np.linalg.norm(quat))
-            if not np.isfinite(norm) or norm <= 1.0e-12:
-                continue
-            quat /= norm
-
-            mat = Gf.Matrix4d(1.0)
-            mat.SetRotateOnly(Gf.Quatd(float(quat[3]), Gf.Vec3d(float(quat[0]), float(quat[1]), float(quat[2]))))
-            mat.SetTranslateOnly(Gf.Vec3d(float(pose[0]), float(pose[1]), float(pose[2])))
-            world_mats[prim_path] = mat
-
-        if not world_mats:
-            return
-
-        xform_cache = UsdGeom.XformCache()
-        xform_attr_name = "xformOp:transform:newton"
-        for prim_path, world_mat in world_mats.items():
-            prim = stage.GetPrimAtPath(prim_path)
-            if not prim.IsValid() or prim.IsInstanceProxy():
-                continue
-            parent = prim.GetParent()
-            parent_path = str(parent.GetPath()) if parent and parent.IsValid() else ""
-            parent_world = world_mats.get(parent_path)
-            if parent_world is None:
-                parent_world = (
-                    xform_cache.GetLocalToWorldTransform(parent) if parent and parent.IsValid() else Gf.Matrix4d(1.0)
-                )
-            local_mat = world_mat * parent_world.GetInverse()
-
-            transform_attr = NewtonManager._usd_xform_ops.get(prim_path)
-            if transform_attr is not None:
-                try:
-                    if (
-                        not transform_attr.IsValid()
-                        or transform_attr.GetPrim() != prim
-                        or transform_attr.GetName() != xform_attr_name
-                        or transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d
-                    ):
-                        transform_attr = None
-                except Exception:
-                    transform_attr = None
-            if transform_attr is None:
-                transform_attr = prim.GetAttribute(xform_attr_name)
-                if transform_attr.IsValid() and transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d:
-                    transform_attr.SetTypeName(Sdf.ValueTypeNames.Matrix4d)
-                if not transform_attr.IsValid() or transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d:
-                    transform_attr = prim.CreateAttribute(xform_attr_name, Sdf.ValueTypeNames.Matrix4d, False)
-                order_attr = prim.GetAttribute("xformOpOrder")
-                if order_attr.IsValid() and order_attr.GetTypeName() != Sdf.ValueTypeNames.TokenArray:
-                    order_attr.SetTypeName(Sdf.ValueTypeNames.TokenArray)
-                if not order_attr.IsValid():
-                    order_attr = prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray, False)
-                order_attr.Set([xform_attr_name])
-                NewtonManager._usd_xform_ops[prim_path] = transform_attr
-            transform_attr.Set(local_mat)
+        Override in solver subclasses that need to adapt imported or replicated
+        builder data before :meth:`ModelBuilder.finalize` allocates model arrays.
+        The default implementation is a no-op.
+        """
 
     @classmethod
     def cl_register_site(cls, body_pattern: str | None, xform: wp.transform, *, per_world: bool = False) -> str:
@@ -1085,72 +1052,72 @@ class NewtonManager(PhysicsManager):
     def _cl_inject_sites(
         cls,
         main_builder: ModelBuilder,
-        proto_builders: dict[str, ModelBuilder],
+        source_builders: dict[str, ModelBuilder],
     ) -> tuple[dict[str, int], dict[int, dict[str, list[int]]], dict[str, wp.transform]]:
-        """Inject registered sites into prototype builders before replication.
+        """Inject registered sites into source builders before replication.
 
-        Non-global sites are matched against prototype body labels using
+        Non-global sites are matched against source builder body labels using
         :func:`resolve_matching_names` (regex). Global sites
         (``body_pattern is None``) are added to *main_builder* with
         ``body=-1``.
 
-        Returns proto-local shape indices so that ``newton_replicate`` can
+        Returns source-builder-local shape indices so that ``newton_replicate`` can
         compute final indices during replication without a second pattern match.
 
         Pending requests are cleared after processing.
 
         Args:
             main_builder: Top-level builder that receives global sites.
-            proto_builders: ``{src_path: ModelBuilder}`` prototype builders.
+            source_builders: ``{source_path: ModelBuilder}`` source builders.
 
         Returns:
-            Tuple of ``(global_sites, proto_sites, world_sites)`` where
-            *global_sites* maps ``{label: main_builder_shape_idx}``,
-            *proto_sites* maps ``{id(proto): {label: [proto_local_shape_idx, ...]}}``,
-            and *world_sites* maps ``{label: env_root_relative_transform}``.
+            Tuple of ``(global_site_indices, source_site_indices, env_root_sites)`` where
+            *global_site_indices* maps ``{label: main_builder_shape_idx}``,
+            *source_site_indices* maps ``{id(source_builder): {label: [source_local_shape_idx, ...]}}``,
+            and *env_root_sites* maps ``{label: env_root_relative_transform}``.
         """
-        global_sites: dict[str, int] = {}
-        proto_sites: dict[int, dict[str, list[int]]] = {}
+        global_site_indices: dict[str, int] = {}
+        source_site_indices: dict[int, dict[str, list[int]]] = {}
 
-        world_sites: dict[str, wp.transform] = {}
+        env_root_sites: dict[str, wp.transform] = {}
 
         for (body_pattern, per_world, _xform_key), (label, xform) in cls._cl_pending_sites.items():
             if per_world:
-                world_sites[label] = xform
+                env_root_sites[label] = xform
                 continue
             if body_pattern is None:
                 site_idx = main_builder.add_site(body=-1, xform=xform, label=label)
-                global_sites[label] = site_idx
+                global_site_indices[label] = site_idx
                 continue
 
             any_matched = False
-            for src_prefix, proto in proto_builders.items():
-                body_labels = list(proto.body_label)
+            for _source_path, source_builder in source_builders.items():
+                body_labels = list(source_builder.body_label)
                 matched_indices, matched_names = resolve_matching_names(
                     body_pattern, body_labels, raise_when_no_match=False
                 )
-                if not matched_indices:  # Pattern has no matches in this prototype
+                if not matched_indices:  # Pattern has no matches in this source builder
                     continue
 
                 any_matched = True
-                proto_id = id(proto)
+                source_builder_id = id(source_builder)
                 site_indices: list[int] = []
                 for body_idx, body_name in zip(matched_indices, matched_names):
                     site_label = f"{body_name}/{label}"
-                    proto_site_idx = proto.add_site(body=body_idx, xform=xform, label=site_label)
-                    site_indices.append(proto_site_idx)
-                    logger.debug(f"Injected site '{site_label}' into prototype")
-                proto_sites.setdefault(proto_id, {})[label] = site_indices
+                    source_site_idx = source_builder.add_site(body=body_idx, xform=xform, label=site_label)
+                    site_indices.append(source_site_idx)
+                    logger.debug(f"Injected site '{site_label}' into source builder")
+                source_site_indices.setdefault(source_builder_id, {})[label] = site_indices
 
             if not any_matched:
                 raise ValueError(
-                    f"Site '{label}' with body_pattern '{body_pattern}' matched no prototype bodies "
-                    f"across {len(proto_builders)} prototype(s). "
-                    f"Check that the pattern matches a body label in the prototype builder."
+                    f"Site '{label}' with body_pattern '{body_pattern}' matched no source-builder bodies "
+                    f"across {len(source_builders)} source builder(s). "
+                    f"Check that the pattern matches a body label in a source builder."
                 )
 
         cls._cl_pending_sites.clear()
-        return global_sites, proto_sites, world_sites
+        return global_site_indices, source_site_indices, env_root_sites
 
     @classmethod
     def _cl_inject_sites_fallback(cls) -> None:
@@ -1281,8 +1248,6 @@ class NewtonManager(PhysicsManager):
             cls._model.set_gravity(cls._gravity_vector)
             cls._model.num_envs = cls._num_envs
 
-            replace_newton_shape_colors(cls._model)
-
         if cls._pending_extended_contact_attributes:
             cls._model.request_contact_attributes(*cls._pending_extended_contact_attributes)
             NewtonManager._pending_extended_contact_attributes = set()
@@ -1311,48 +1276,50 @@ class NewtonManager(PhysicsManager):
         if not cls._clone_physics_only:
             import usdrt
 
-            body_paths = getattr(cls._model, "body_label", None) or getattr(cls._model, "body_key", None)
-            if not body_paths:
-                logger.warning(
-                    "NewtonManager: model has no rigid bodies (body_label/body_key is empty). "
-                    "USD/Fabric body sync for RTX is skipped. "
-                    "Particle-only scenes (e.g. cloth) must register their own USD mesh update."
-                )
-                NewtonManager._usdrt_stage = None
+            body_paths = list(cls._model.body_label)
+            NewtonManager._usdrt_stage = get_current_stage(fabric=True)
+            body_bindings = NewtonManager._cl_fabric_body_bindings
+            if body_bindings is None:
+                # Non-replicated Newton stages do not pass through NewtonReplicateContext.
+                body_bindings = [(body_path, i) for i, body_path in enumerate(body_paths)]
+
+            fabric_hierarchy = usdrt.hierarchy.IFabricHierarchy().get_fabric_hierarchy(
+                cls._usdrt_stage.GetFabricId(), cls._usdrt_stage.GetStageIdAsStageId()
+            )
+
+            NewtonManager._initialize_fabric_body_prims(cls._usdrt_stage, fabric_hierarchy, usdrt, body_bindings)
+            NewtonManager._initialize_fabric_particle_prims(
+                cls._usdrt_stage,
+                fabric_hierarchy,
+                usdrt,
+                NewtonManager._particle_visual_prims,
+            )
+
+            cls._mark_state_dirty()
+            cls.sync_transforms_to_usd()
+            cls.sync_particles_to_usd()
+
+    @staticmethod
+    def _initialize_fabric_body_prims(stage, fabric_hierarchy, usdrt, body_bindings: Sequence[tuple[str, int]]) -> None:
+        """Initialize Fabric body prims used by Newton transform sync."""
+        for prim_path, body_index in body_bindings:
+            prim = stage.GetPrimAtPath(prim_path)
+            if prim.IsValid():
+                xformable_prim = usdrt.Rt.Xformable(prim)
+                xformable_prim.SetWorldXformFromUsd()
             else:
-                NewtonManager._usdrt_stage = get_current_stage(fabric=True)
-                for i, prim_path in enumerate(body_paths):
-                    prim = cls._usdrt_stage.GetPrimAtPath(prim_path)
-                    if prim is None or not prim.IsValid():
-                        # Custom Newton bodies (e.g. MPM-collider boxes, hidden rigid proxies) may have no USD
-                        # prim of their own; they cannot be RTX-rendered, and SetWorldXformFromUsd() on an
-                        # invalid Fabric prim hangs. Skip them -- their visuals (if any) are separate prims.
-                        continue
-                    prim.CreateAttribute(cls._newton_index_attr, usdrt.Sdf.ValueTypeNames.UInt, True)
-                    prim.GetAttribute(cls._newton_index_attr).Set(i)
-                    # Tag with PhysicsRigidBodyAPI so cubric's eRigidBody mode
-                    # applies Inverse propagation (preserves Newton's world
-                    # transforms and derives local) instead of Forward.
-                    prim.AddAppliedSchema("PhysicsRigidBodyAPI")
-                    xformable_prim = usdrt.Rt.Xformable(prim)
-                    if not xformable_prim.HasWorldXform():
-                        xformable_prim.SetWorldXformFromUsd()
+                prim = stage.DefinePrim(prim_path, "Xform")
+                xformable_prim = usdrt.Rt.Xformable(prim)
+                xformable_prim.CreateFabricHierarchyWorldMatrixAttr()
 
-                cls._mark_transforms_dirty()
-                cls.sync_transforms_to_usd()
+            prim.CreateAttribute(NewtonManager._newton_index_attr, usdrt.Sdf.ValueTypeNames.UInt, custom=True)
+            prim.GetAttribute(NewtonManager._newton_index_attr).Set(body_index)
+            # Tag with PhysicsRigidBodyAPI so cubric's eRigidBody mode applies
+            # Inverse propagation (preserves Newton's world transforms and derives
+            # local) instead of Forward.
+            prim.AddAppliedSchema("PhysicsRigidBodyAPI")
 
-            # Initialize Fabric world matrices for MPM particle point prims and push the
-            # initial particle positions, independent of whether rigid bodies exist.
-            if NewtonManager._particle_visual_prim_paths:
-                usdrt_stage = NewtonManager._usdrt_stage or get_current_stage(fabric=True)
-                fabric_hierarchy = usdrt.hierarchy.IFabricHierarchy().get_fabric_hierarchy(
-                    usdrt_stage.GetFabricId(), usdrt_stage.GetStageIdAsStageId()
-                )
-                NewtonManager._initialize_fabric_particle_prims(
-                    usdrt_stage, fabric_hierarchy, usdrt, NewtonManager._particle_visual_prim_paths
-                )
-                cls._mark_particles_dirty()
-                cls.sync_particles_to_usd()
+        fabric_hierarchy.update_world_xforms()
 
     @staticmethod
     def _initialize_fabric_particle_prims(stage, fabric_hierarchy, usdrt, prim_paths: Iterable[str]) -> None:
@@ -1400,73 +1367,51 @@ class NewtonManager(PhysicsManager):
         if not env_paths:
             # No env Xforms — flat loading
             builder.add_usd(stage, schema_resolvers=schema_resolvers)
+            replace_newton_builder_shape_colors(builder, stage)
             NewtonManager._world_xforms = [wp.transform()]
-            if getattr(cls, "_mpm_object_registry", None):
-                from isaaclab_newton.assets.mpm_object.mpm_object import add_registered_mpm_objects_to_builder
-
-                add_registered_mpm_objects_to_builder(builder, 0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
+            cls._run_builder_world_hooks(builder, 0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
         else:
             # Load everything except the env subtrees (ground plane, lights, etc.)
             ignore_paths = [path for _, path in env_paths]
             builder.add_usd(stage, ignore_paths=ignore_paths, schema_resolvers=schema_resolvers)
+            replace_newton_builder_shape_colors(builder, stage)
 
-            # Build a prototype from the first env (all envs assumed identical)
             _, proto_path = env_paths[0]
-            proto = cls.create_builder(up_axis=up_axis)
-            proto.add_usd(
-                stage,
-                root_path=proto_path,
-                schema_resolvers=schema_resolvers,
-            )
-            cls._cl_protos = {proto_path: proto}
+            source_builders = {proto_path: cls.create_builder(up_axis=up_axis)}
+            source_builders[proto_path].add_usd(stage, root_path=proto_path, schema_resolvers=schema_resolvers)
+            replace_newton_builder_shape_colors(source_builders[proto_path], stage)
+            cls._cl_protos = source_builders
 
-            # Inject registered sites into the proto before replication
-            global_sites, proto_sites, world_sites = cls._cl_inject_sites(builder, {proto_path: proto})
-            global_site_map: dict[str, tuple[int, None]] = {label: (idx, None) for label, idx in global_sites.items()}
-            num_worlds = len(env_paths)
-            local_site_map: dict[str, list[list[int]]] = {}
-            site_entries = proto_sites.get(id(proto), {})
-            world_xforms: list[wp.transform] = []
-
-            # Add each env as a separate Newton world
+            global_site_indices, source_site_indices, env_root_sites = cls._cl_inject_sites(builder, source_builders)
             xform_cache = UsdGeom.XformCache()
-            for col, (_, env_path) in enumerate(env_paths):
-                builder.begin_world()
-                offset = builder.shape_count
+            poses = []
+            for _, env_path in env_paths:
                 world_xform = xform_cache.GetLocalToWorldTransform(stage.GetPrimAtPath(env_path))
                 translation = world_xform.ExtractTranslation()
                 rotation = world_xform.ExtractRotationQuat()
-                pos = (translation[0], translation[1], translation[2])
-                quat = (
-                    rotation.GetImaginary()[0],
-                    rotation.GetImaginary()[1],
-                    rotation.GetImaginary()[2],
-                    rotation.GetReal(),
+                imag = rotation.GetImaginary()
+                poses.append(
+                    (
+                        (translation[0], translation[1], translation[2]),
+                        (imag[0], imag[1], imag[2], rotation.GetReal()),
+                    )
                 )
-                env_xform = wp.transform(pos, quat)
-                world_xforms.append(env_xform)
-                builder.add_builder(proto, xform=env_xform)
-                for label, xform in world_sites.items():
-                    if label not in local_site_map:
-                        local_site_map[label] = [[] for _ in range(num_worlds)]
-                    site_idx = builder.add_site(body=-1, xform=wp.transform_multiply(env_xform, xform), label=label)
-                    local_site_map[label][col].append(site_idx)
-                for label, proto_shape_indices in site_entries.items():
-                    if label not in local_site_map:
-                        local_site_map[label] = [[] for _ in range(num_worlds)]
-                    for proto_shape_idx in proto_shape_indices:
-                        local_site_map[label][col].append(offset + proto_shape_idx)
-                if getattr(cls, "_mpm_object_registry", None):
-                    from isaaclab_newton.assets.mpm_object.mpm_object import add_registered_mpm_objects_to_builder
 
-                    add_registered_mpm_objects_to_builder(builder, col, list(pos), list(quat))
-                cls._run_builder_world_hooks(builder, col, list(pos), list(quat))
-                builder.end_world()
+            positions = torch.tensor([pos for pos, _ in poses], dtype=torch.float32)
+            quaternions = torch.tensor([quat for _, quat in poses], dtype=torch.float32)
+            mapping = torch.ones((1, len(env_paths)), dtype=torch.bool)
+            replicate_args = (builder, (proto_path,), mapping, positions, quaternions, source_builders)
+            local_site_map, world_xforms = replicate_builder_mapping(
+                *replicate_args,
+                source_site_indices=source_site_indices,
+                env_root_sites=env_root_sites,
+                per_world_builder_hooks=(cls._run_builder_world_hooks,),
+            )
 
-            NewtonManager._cl_site_index_map = {
-                **global_site_map,
-                **{label: (None, per_world) for label, per_world in local_site_map.items()},
-            }
+            NewtonManager._cl_site_index_map = {label: (idx, None) for label, idx in global_site_indices.items()}
+            NewtonManager._cl_site_index_map.update(
+                (label, (None, per_world)) for label, per_world in local_site_map.items()
+            )
             NewtonManager._world_xforms = world_xforms
             NewtonManager._num_envs = len(env_paths)
 
@@ -1615,7 +1560,7 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def _prewarm_cuda_graph_allocations(cls) -> None:
-        """Pre-allocate solver scratch buffers that are not graph-capturable."""
+        """Pre-allocate nested MuJoCo-Warp scratch buffers before capture."""
         mujoco_warp_solvers = [
             solver for solver in cls._iter_nested_solvers(cls._solver) if getattr(solver, "mjw_data", None) is not None
         ]
@@ -1627,7 +1572,7 @@ class NewtonManager(PhysicsManager):
         cached_empty_constraint_scratch = cls._ensure_mujoco_warp_constraint_scratch_cache()
 
         for solver in mujoco_warp_solvers:
-            mjw_data = getattr(solver, "mjw_data", None)
+            mjw_data = solver.mjw_data
             naconmax = int(getattr(mjw_data, "naconmax", 0) or 0)
             nworld = int(getattr(mjw_data, "nworld", 0) or 0)
             model = getattr(solver, "model", None)
@@ -1642,7 +1587,7 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def _simulate_once_for_cuda_graph_warmup(cls) -> None:
-        """Run one eager step to force lazy solver allocations before capture."""
+        """Run one eager step to force lazy allocations, then restore public and private state."""
         if cls._model is None or cls._state_0 is None or cls._state_1 is None:
             return
 
@@ -1665,16 +1610,14 @@ class NewtonManager(PhysicsManager):
             try:
                 cls.reset_solver_state()
             finally:
-                # Solver reset may legally normalize the supplied public state
-                # (for example, reduced joint coordinates or MPM history). Keep
-                # the reset private caches, then restore caller-owned buffers a
-                # second time, including when reset reports an error.
+                # Solver reset may normalize public state. Preserve its private
+                # caches, then restore the caller-owned buffers a second time.
                 cls._state_0.assign(state_0_snapshot)
                 cls._state_1.assign(state_1_snapshot)
 
     @classmethod
     def _iter_nested_solvers(cls, solver):
-        """Yield a solver and any coupled sub-solvers."""
+        """Yield a solver and any recursively nested coupled entry solvers."""
         if solver is None:
             return
         yield solver
@@ -1685,37 +1628,37 @@ class NewtonManager(PhysicsManager):
 
     @staticmethod
     def _ensure_mujoco_warp_collision_context_cache():
-        """Cache MuJoCo Warp collision scratch arrays for CUDA graph capture."""
+        """Cache MuJoCo-Warp collision scratch arrays for CUDA graph capture."""
         try:
             from mujoco_warp._src import collision_core, collision_driver
         except ImportError:
             return None
 
-        current_create_collision_context = getattr(collision_driver, "create_collision_context", None)
-        if getattr(current_create_collision_context, "_isaaclab_cached_context", False):
-            return current_create_collision_context
+        current_create_context = getattr(collision_driver, "create_collision_context", None)
+        if getattr(current_create_context, "_isaaclab_cached_context", False):
+            return current_create_context
 
-        original_create_collision_context = collision_core.create_collision_context
+        original_create_context = collision_core.create_collision_context
         contexts = {}
 
-        def cached_create_collision_context(naconmax: int):
+        def cached_create_context(naconmax: int):
             key = (str(wp.get_device()), int(naconmax))
             context = contexts.get(key)
             if context is None:
-                context = original_create_collision_context(int(naconmax))
+                context = original_create_context(int(naconmax))
                 contexts[key] = context
             return context
 
-        cached_create_collision_context._isaaclab_cached_context = True
-        cached_create_collision_context._isaaclab_contexts = contexts
-        cached_create_collision_context._isaaclab_original = original_create_collision_context
-        collision_core.create_collision_context = cached_create_collision_context
-        collision_driver.create_collision_context = cached_create_collision_context
-        return cached_create_collision_context
+        cached_create_context._isaaclab_cached_context = True
+        cached_create_context._isaaclab_contexts = contexts
+        cached_create_context._isaaclab_original = original_create_context
+        collision_core.create_collision_context = cached_create_context
+        collision_driver.create_collision_context = cached_create_context
+        return cached_create_context
 
     @staticmethod
     def _ensure_mujoco_warp_constraint_scratch_cache():
-        """Cache MuJoCo Warp constraint scratch arrays for CUDA graph capture."""
+        """Cache MuJoCo-Warp constraint scratch arrays for CUDA graph capture."""
         try:
             from mujoco_warp._src import constraint
         except ImportError:
@@ -1770,7 +1713,7 @@ class NewtonManager(PhysicsManager):
 
     @staticmethod
     def _ensure_mujoco_warp_step_scratch_cache() -> None:
-        """Cache MuJoCo Warp per-step scratch allocations for CUDA graph capture."""
+        """Cache MuJoCo-Warp per-step scratch allocations for CUDA graph capture."""
         try:
             import mujoco_warp
             from mujoco_warp._src import forward
@@ -1778,9 +1721,7 @@ class NewtonManager(PhysicsManager):
             return
 
         current_step = getattr(mujoco_warp, "step", None)
-        if getattr(current_step, "_isaaclab_cached_scratch", False):
-            return
-        if current_step is None:
+        if getattr(current_step, "_isaaclab_cached_scratch", False) or current_step is None:
             return
 
         original_package_step = current_step
@@ -1885,9 +1826,7 @@ class NewtonManager(PhysicsManager):
                 pinned=kwargs.get("pinned", False),
                 retain_grad=kwargs.get("retain_grad", False),
             )
-            if cached is None:
-                return original_full(*args, **kwargs)
-            return cached
+            return original_full(*args, **kwargs) if cached is None else cached
 
         def cached_ones(*args, **kwargs):
             shape = args[0] if args else kwargs.get("shape")
@@ -1984,10 +1923,8 @@ class NewtonManager(PhysicsManager):
                         NewtonManager._graph = capture.graph
                         logger.info("Newton CUDA graph captured (standard Warp mode)")
 
-                        # Kamino: StateKamino.from_newton() lazily allocates body_f_total,
-                        # joint_q_prev, and joint_lambdas via wp.clone/wp.zeros during the
-                        # first step() inside graph capture. Replay once to pin those
-                        # memory-pool addresses before any eager solver.reset() call.
+                        # Kamino lazily allocates state during its first step.
+                        # Replay once before any eager reset can move those buffers.
                         if isinstance(cls._solver, SolverKamino):
                             wp.capture_launch(cls._graph)
                     except Exception as exc:
@@ -2008,7 +1945,7 @@ class NewtonManager(PhysicsManager):
     @classmethod
     def _supports_cuda_graph_capture(cls) -> bool:
         """Return whether the active solver configuration supports CUDA graph capture."""
-        return bool(cls._solver is not None and cls._solver.supports_cuda_graph_capture)
+        return bool(getattr(cls._solver, "supports_cuda_graph_capture", True))
 
     @classmethod
     def _is_outer_cuda_graph_capture_active(cls) -> bool:
@@ -2179,12 +2116,10 @@ class NewtonManager(PhysicsManager):
                 if need_copy_on_last and i == cls._num_substeps - 1:
                     NewtonManager._state_0.assign(NewtonManager._state_1)
                 else:
-                    # Keep state buffers canonical on NewtonManager. Assigning
-                    # through ``cls`` would create subclass-shadowed state on
-                    # leaf managers, then later resets would rebuild the base
-                    # state while step() continued to read stale subclass
-                    # buffers.
-                    NewtonManager._state_0, NewtonManager._state_1 = NewtonManager._state_1, NewtonManager._state_0
+                    NewtonManager._state_0, NewtonManager._state_1 = (
+                        NewtonManager._state_1,
+                        NewtonManager._state_0,
+                    )
                 NewtonManager._state_0.clear_forces()
                 if collide_mid_loop and (i + 1) % collide_every == 0 and i + 1 < cls._num_substeps:
                     cls._collision_pipeline.collide(NewtonManager._state_0, contacts)
@@ -2247,26 +2182,6 @@ class NewtonManager(PhysicsManager):
         cls._run_solver_substeps(contacts)
         cls._update_sensors(contacts)
 
-    # State accessors (used extensively by articulation/rigid object data)
-    @classmethod
-    def get_model(cls) -> Model:
-        """Get the Newton model.
-
-        When the active sim backend is Newton this returns the manager's own
-        authoritative model. When the active sim backend is PhysX a shadow
-        Newton model is built lazily (from the visualizer prebuilt artifact) so
-        renderers/visualizers that operate on Newton ``Model`` and ``State`` can
-        still drive a PhysX-simulated scene.
-        """
-        cls._ensure_visualization_model()
-        return cls._model
-
-    @classmethod
-    def get_state_0(cls) -> State:
-        """Get the current state."""
-        cls._ensure_visualization_model()
-        return cls._state_0
-
     @classmethod
     def is_cuda_graph_active(cls) -> bool:
         """Return whether the manager has recorded an active physics CUDA graph."""
@@ -2276,17 +2191,12 @@ class NewtonManager(PhysicsManager):
     def prepare_cuda_graph_capture(cls) -> None:
         """Prepare the active solver for an application-owned CUDA graph.
 
-        This method allocates capture-persistent solver resources and performs
-        any required eager warmup, but it does not record or launch a graph.
-        Applications that own a larger outer graph should configure
-        ``use_cuda_graph=False``, call this method immediately after solver
-        initialization and before the first simulation step, then call
-        :meth:`check_solver_status` after each replay.
+        This allocates capture-persistent resources without recording or
+        launching a nested graph. Call it after solver initialization and
+        before the first simulation step.
 
         Raises:
-            RuntimeError: If the solver is uninitialized, the active device is
-                not CUDA, simulation has already advanced, capture is already
-                in progress, or the solver does not support CUDA graph capture.
+            RuntimeError: If simulation has advanced or capture preparation is invalid.
         """
         if PhysicsManager._sim_time != 0.0:
             raise RuntimeError("Prepare Newton CUDA graph capture before the first simulation step.")
@@ -2294,7 +2204,7 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def _prepare_cuda_graph_capture_resources(cls) -> None:
-        """Prepare capture resources without applying the external-owner lifecycle guard."""
+        """Prepare capture resources without the external-owner lifecycle guard."""
         if cls._solver is None:
             raise RuntimeError("Newton solver is not initialized; cannot prepare CUDA graph capture.")
 
@@ -2341,11 +2251,11 @@ class NewtonManager(PhysicsManager):
                 ``(model.world_count,)`` on the model device. ``None`` resets
                 all worlds.
             flags: Optional :class:`newton.StateFlags` bitmask identifying the
-                public state fields that changed.
+                public state fields that changed. ``None`` forwards Newton's
+                full-reset semantics unchanged.
 
         Raises:
-            RuntimeError: If the solver or manager state buffers are not
-                initialized.
+            RuntimeError: If the solver or manager state buffers are not initialized.
         """
         if cls._solver is None:
             raise RuntimeError("Newton solver is not initialized; cannot reset solver state.")
@@ -2361,6 +2271,26 @@ class NewtonManager(PhysicsManager):
             raise RuntimeError("Newton state is not initialized; provide an explicit state to reset.")
         for candidate in unique_states:
             cls._solver.reset(candidate, world_mask=world_mask, flags=flags)
+
+    # State accessors (used extensively by articulation/rigid object data)
+    @classmethod
+    def get_model(cls) -> Model:
+        """Get the Newton model.
+
+        When the active sim backend is Newton this returns the manager's own
+        authoritative model. When the active sim backend is PhysX a shadow
+        Newton model is built lazily (from the visualizer prebuilt artifact) so
+        renderers/visualizers that operate on Newton ``Model`` and ``State`` can
+        still drive a PhysX-simulated scene.
+        """
+        cls._ensure_visualization_model()
+        return cls._model
+
+    @classmethod
+    def get_state_0(cls) -> State:
+        """Get the current state."""
+        cls._ensure_visualization_model()
+        return cls._state_0
 
     @classmethod
     def get_state(cls, scene_data_provider: SceneDataProvider | None = None) -> State:
@@ -2402,8 +2332,7 @@ class NewtonManager(PhysicsManager):
         built. This is the entry point that makes :meth:`get_model` /
         :meth:`get_state` work uniformly across both sim backends.
 
-        The shadow model is built by walking the USD stage via
-        :meth:`_build_visualization_model_from_stage` and finalizing the resulting
+        The shadow model is built by walking the USD stage and finalizing the resulting
         :class:`~newton.ModelBuilder`. Per-frame body transforms are pushed into
         ``_state_0.body_q`` by :meth:`update_visualization_state` using the new
         :class:`~isaaclab.scene_data.SceneDataProvider`.
@@ -2423,16 +2352,28 @@ class NewtonManager(PhysicsManager):
             )
             return
 
-        try:
-            builder = cls._build_visualization_model_from_stage(stage)
-        except Exception:
-            logger.exception(
-                "[NewtonManager] Failed to build a Newton ModelBuilder from the USD stage "
-                "for visualization (sim backend is PhysX)."
+        up_axis_token = UsdGeom.GetStageUpAxis(stage)
+        up_axis = Axis.from_string(str(up_axis_token))
+
+        env_pattern = re.compile(r"^env_(\d+)$")
+        env_paths = sorted(
+            (int(match.group(1)), child.GetPath().pathString)
+            for child in stage.GetPrimAtPath("/World/envs").GetChildren()
+            if (match := env_pattern.match(child.GetName()))
+        )
+        if not env_paths:
+            logger.error(
+                "[NewtonManager] No /World/envs/env_<id> prims found; cannot build a "
+                "Newton visualization model from the cloned Isaac Lab scene."
             )
             return
 
-        if builder is None or builder.body_count == 0:
+        NewtonManager._num_envs = len(env_paths)
+        sim = SimulationContext.instance()
+        assert sim is not None
+        builder = build_visualization_builder_from_stage_envs(stage, env_paths, sim.get_clone_plan(), up_axis=up_axis)
+
+        if builder.body_count == 0:
             logger.error(
                 "[NewtonManager] USD stage walk produced no Newton bodies; the shadow "
                 "Newton model for visualization will be empty. Common causes: the cloned "
@@ -2447,7 +2388,6 @@ class NewtonManager(PhysicsManager):
             NewtonManager._model = builder.finalize(device=device)
             NewtonManager._state_0 = cls._model.state()
             cls._model.num_envs = cls._num_envs
-            replace_newton_shape_colors(cls._model)
 
         except Exception:
             logger.exception(
@@ -2458,153 +2398,9 @@ class NewtonManager(PhysicsManager):
             NewtonManager._state_0 = None
 
     @classmethod
-    def _build_visualization_model_from_stage(cls, stage) -> ModelBuilder | None:
-        """Build a fresh Newton ``ModelBuilder`` from the USD stage for visualization.
-
-        Walks IsaacLab's ``/World/envs/env_<id>`` convention and adds each env as
-        its own Newton world. When the env subtree is identical across envs (the
-        common cloned-scene case) a single env_0 prototype is built once and
-        replicated via :meth:`ModelBuilder.add_builder`; otherwise each env is
-        ingested independently with :meth:`ModelBuilder.add_usd`.
-
-        This routine is intentionally independent of
-        :meth:`instantiate_builder_from_stage` (which targets the live-sim path
-        and uses a different naming convention and writes into ``cls._builder``
-        and ``cls._cl_site_index_map``). The visualization shadow path must not
-        pollute those live-sim slots. ``cls._num_envs`` is populated here too so
-        :meth:`get_num_envs` returns the env count when the sim backend is PhysX
-        (the live-sim path never runs in that configuration, so there is no slot
-        to collide with).
-
-        Args:
-            stage: USD stage to inspect.
-
-        Returns:
-            A populated :class:`~newton.ModelBuilder`, or ``None`` when no
-            ``/World/envs/env_<id>`` prims exist on the stage.
-        """
-        import re
-
-        from pxr import UsdGeom
-
-        up_axis_token = UsdGeom.GetStageUpAxis(stage)
-        up_axis = Axis.from_string(str(up_axis_token))
-        schema_resolvers = [SchemaResolverNewton(), SchemaResolverPhysx()]
-
-        env_pattern = re.compile(r"^env_(\d+)$")
-        env_paths: list[tuple[int, str]] = []
-        envs_root = stage.GetPrimAtPath("/World/envs")
-        if envs_root and envs_root.IsValid():
-            for child in envs_root.GetChildren():
-                if match := env_pattern.match(child.GetName()):
-                    env_paths.append((int(match.group(1)), child.GetPath().pathString))
-        env_paths.sort(key=lambda x: x[0])
-
-        builder = ModelBuilder(up_axis=up_axis)
-
-        if not env_paths:
-            # Fallback: ingest the whole stage as a single world.
-            builder.add_usd(stage, schema_resolvers=schema_resolvers)
-            NewtonManager._num_envs = 1
-            return builder
-
-        NewtonManager._num_envs = len(env_paths)
-
-        # Ingest stage-level (non-env) geometry into the global world (``current_world == -1``)
-        # so visualization sees the ground plane, ceilings, fixed props, etc. The legacy
-        # cloner-based prebuild did this via ``add_usd(stage, ignore_paths=["/World/envs"], ...)``
-        # before adding the per-env worlds; without this, renderers/visualizers driven off the
-        # shadow Newton model are missing every shape authored outside the env hierarchy.
-        builder.add_usd(
-            stage,
-            ignore_paths=[r"/World/envs($|/.*)"],
-            schema_resolvers=schema_resolvers,
-        )
-
-        # Build env_0 as a prototype, then replicate across envs.
-        proto_env_path = env_paths[0][1]
-        proto = ModelBuilder(up_axis=up_axis)
-        proto.add_usd(
-            stage,
-            root_path=proto_env_path,
-            schema_resolvers=schema_resolvers,
-        )
-
-        xform_cache = UsdGeom.XformCache()
-
-        # ``add_builder`` copies the prototype's ``body_label`` (and sibling label arrays)
-        # verbatim into each replicated world, so all worlds end up with prim paths under
-        # the prototype env (e.g. ``/World/envs/env_0/...``). The visualization sync uses
-        # these labels to map PhysX transforms (which carry distinct per-env paths) into
-        # ``state.body_q``; without rewriting, ``paths.index()`` resolves every match to
-        # world 0 and worlds 1..N never receive fresh poses. Rewrite the newly-added
-        # labels after each ``add_builder`` so each world references its own env prim path.
-        label_attrs = ("body_label", "articulation_label", "joint_label", "shape_label")
-        label_starts = {attr: len(getattr(builder, attr)) for attr in label_attrs}
-
-        # ``proto.add_usd`` ingests env_0's bodies at their absolute world positions
-        # (``UsdPhysics.LoadUsdPhysicsFromRange`` reports world-space transforms), so
-        # ``proto.body_q`` already encodes env_0's world transform. ``add_builder``
-        # composes its ``xform`` onto every imported body, so passing each env's
-        # absolute world transform here would double the offset; the correct xform is
-        # the env's pose relative to the prototype (identity for env_0, env_X * env_0^-1
-        # for the rest). Dynamic bodies are overwritten in ``update_visualization_state``
-        # via the PhysX sync, but static bodies (e.g. the table) keep this initial pose
-        # and render at the wrong position when env_0 is not at the world origin.
-        proto_world_gf = xform_cache.GetLocalToWorldTransform(stage.GetPrimAtPath(proto_env_path))
-        proto_translation = proto_world_gf.ExtractTranslation()
-        proto_rotation = proto_world_gf.ExtractRotationQuat()
-        proto_world_tf = wp.transform(
-            (proto_translation[0], proto_translation[1], proto_translation[2]),
-            (
-                proto_rotation.GetImaginary()[0],
-                proto_rotation.GetImaginary()[1],
-                proto_rotation.GetImaginary()[2],
-                proto_rotation.GetReal(),
-            ),
-        )
-        proto_world_tf_inv = wp.transform_inverse(proto_world_tf)
-
-        for _, env_path in env_paths:
-            world_xform = xform_cache.GetLocalToWorldTransform(stage.GetPrimAtPath(env_path))
-            translation = world_xform.ExtractTranslation()
-            rotation = world_xform.ExtractRotationQuat()
-            env_world_tf = wp.transform(
-                (translation[0], translation[1], translation[2]),
-                (
-                    rotation.GetImaginary()[0],
-                    rotation.GetImaginary()[1],
-                    rotation.GetImaginary()[2],
-                    rotation.GetReal(),
-                ),
-            )
-            relative_tf = wp.transform_multiply(env_world_tf, proto_world_tf_inv)
-            builder.begin_world()
-            builder.add_builder(proto, xform=relative_tf)
-            if env_path != proto_env_path:
-                for attr in label_attrs:
-                    labels = getattr(builder, attr)
-                    for i in range(label_starts[attr], len(labels)):
-                        labels[i] = labels[i].replace(proto_env_path, env_path, 1)
-            for attr in label_attrs:
-                label_starts[attr] = len(getattr(builder, attr))
-            builder.end_world()
-
-        return builder
-
-    @classmethod
     def get_scene_data_provider(cls) -> SceneDataProvider:
-        """Return the active scene data provider, or None if unavailable.
-
-        Prefers ``PhysicsManager._sim`` when set; otherwise falls back to
-        ``SimulationContext.instance()``.
-        """
-        sim = PhysicsManager._sim
-        if sim is None:
-            from isaaclab.sim import SimulationContext
-
-            sim = SimulationContext.instance()
-
+        """Return the active scene data provider."""
+        sim = SimulationContext.instance()
         assert sim is not None
         return sim.get_scene_data_provider()
 
@@ -2639,11 +2435,37 @@ class NewtonManager(PhysicsManager):
         if cls._scene_data is None:
             cls._scene_data = SceneDataFormat.Transform()
         if cls._scene_data_mapping is None:
-            body_paths = list(getattr(cls._model, "body_label", None) or [])
+            body_paths = cls._resolve_scene_data_body_paths(list(cls._model.body_label), scene_data_provider.usd_stage)
             cls._scene_data_mapping = scene_data_provider.create_mapping(body_paths)
 
         cls._scene_data.transforms = cls._state_0.body_q
         scene_data_provider.get_transforms(cls._scene_data, mapping=cls._scene_data_mapping)
+
+    @staticmethod
+    def _resolve_scene_data_body_paths(body_paths: list[str | None], stage) -> list[str | None]:
+        """Map Newton joint labels to their target rigid-body prim paths."""
+        if stage is None:
+            return body_paths
+
+        from pxr import UsdPhysics
+
+        def _joint_body_path(prim):
+            joint = UsdPhysics.Joint(prim)
+            for rel in (joint.GetBody1Rel(), joint.GetBody0Rel()):
+                for target_path in rel.GetTargets():
+                    target_prim = stage.GetPrimAtPath(target_path)
+                    if target_prim.IsValid() and target_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                        return target_path.pathString
+            return None
+
+        resolved_paths = body_paths.copy()
+        for index, body_path in enumerate(body_paths):
+            if body_path is None:
+                continue
+            prim = stage.GetPrimAtPath(body_path)
+            if prim.IsValid() and prim.IsA(UsdPhysics.Joint):
+                resolved_paths[index] = _joint_body_path(prim) or body_path
+        return resolved_paths
 
     @classmethod
     def get_state_1(cls) -> State:

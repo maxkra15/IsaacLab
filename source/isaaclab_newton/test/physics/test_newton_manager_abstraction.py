@@ -279,6 +279,43 @@ def test_mpm_custom_attribute_registration_is_idempotent(monkeypatch):
     assert register_call_count == 1
 
 
+def test_kamino_forward_uses_public_reset_config_when_available(monkeypatch):
+    """Kamino's current reset API receives the parent state and a joint-derived config."""
+    calls = []
+    state = SimpleNamespace(joint_q=object(), joint_qd=object())
+    world_mask = object()
+    solver = SimpleNamespace(reset=lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(NewtonManager, "_solver", solver, raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_0", state, raising=False)
+
+    NewtonKaminoManager._forward_kamino(world_mask=world_mask)
+
+    assert calls[0][0] == ()
+    assert calls[0][1]["state"] is state
+    assert calls[0][1]["world_mask"] is world_mask
+    assert isinstance(calls[0][1]["config"], SolverKamino.ResetConfig)
+
+
+def test_kamino_forward_falls_back_to_legacy_joint_reset(monkeypatch):
+    """The manager remains compatible with the upstream-pinned legacy Kamino signature."""
+    calls = []
+    state = SimpleNamespace(joint_q=object(), joint_qd=object())
+    world_mask = object()
+    solver = SimpleNamespace(reset=lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(NewtonManager, "_solver", solver, raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_0", state, raising=False)
+    monkeypatch.setattr(SolverKamino, "ResetConfig", None, raising=False)
+
+    NewtonKaminoManager._forward_kamino(world_mask=world_mask)
+
+    assert calls == [
+        (
+            (state,),
+            {"joint_q": state.joint_q, "joint_u": state.joint_qd, "world_mask": world_mask},
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     "num_substeps, collision_decimation, should_warn",
     [
@@ -665,7 +702,7 @@ def test_mpm_project_outside_colliders_gates_projection(project_outside):
 
 
 @pytest.mark.parametrize("supported", [True, False])
-def test_cuda_graph_capture_capability_is_owned_by_solver(monkeypatch, supported):
+def test_newton_cuda_graph_capture_capability_is_owned_by_solver(monkeypatch, supported):
     """The manager delegates graph capability to Newton's public solver contract."""
 
     monkeypatch.setattr(
@@ -676,7 +713,29 @@ def test_cuda_graph_capture_capability_is_owned_by_solver(monkeypatch, supported
     )
 
     assert NewtonManager._supports_cuda_graph_capture() is supported
-    assert NewtonMPMManager._supports_cuda_graph_capture() is supported
+
+
+@pytest.mark.parametrize(
+    "grid_type, advertised, expected",
+    [
+        ("fixed", False, True),
+        ("sparse", False, False),
+        ("sparse", True, True),
+        ("dense", True, False),
+    ],
+)
+def test_mpm_cuda_graph_capture_preserves_fixed_policy_and_accepts_sparse_opt_in(
+    monkeypatch, grid_type, advertised, expected
+):
+    """Fixed grids remain supported while a custom sparse solver can explicitly opt in."""
+    monkeypatch.setattr(
+        NewtonManager,
+        "_solver",
+        SimpleNamespace(grid_type=grid_type, supports_cuda_graph_capture=advertised),
+        raising=False,
+    )
+
+    assert NewtonMPMManager._supports_cuda_graph_capture() is expected
 
 
 @pytest.mark.parametrize("graph, expected", [(None, False), (object(), True)])
@@ -720,7 +779,7 @@ def _configure_manager_step_test(monkeypatch, *, use_graph=False, externally_cap
     monkeypatch.setattr(NewtonManager, "_simulate_full", classmethod(lambda cls: events.append("eager")))
     monkeypatch.setattr(wp, "capture_launch", lambda graph: events.append("replay"))
     monkeypatch.setattr(NewtonManager, "_usdrt_stage", None, raising=False)
-    monkeypatch.setattr(NewtonManager, "_particle_visual_prim_paths", set(), raising=False)
+    monkeypatch.setattr(NewtonManager, "_particle_visual_prims", {}, raising=False)
     monkeypatch.setattr(NewtonManager, "_log_solver_debug", classmethod(lambda cls: events.append("debug")))
     return events
 
@@ -824,6 +883,7 @@ def test_prepare_cuda_graph_capture_keeps_graph_ownership_external(monkeypatch):
     )
     monkeypatch.setattr(PhysicsManager, "_cfg", SimpleNamespace(use_cuda_graph=False), raising=False)
     monkeypatch.setattr(PhysicsManager, "_device", "cuda:0", raising=False)
+    monkeypatch.setattr(PhysicsManager, "_sim_time", 0.0, raising=False)
     monkeypatch.setattr(NewtonManager, "_solver", solver, raising=False)
     monkeypatch.setattr(NewtonManager, "_contacts", contacts, raising=False)
     monkeypatch.setattr(NewtonManager, "_graph", None, raising=False)
@@ -1079,7 +1139,7 @@ def test_mpm_unsupported_cuda_graph_capture_uses_eager_execution(monkeypatch):
     monkeypatch.setattr(
         NewtonManager,
         "_solver",
-        SimpleNamespace(supports_cuda_graph_capture=False),
+        SimpleNamespace(grid_type="sparse", supports_cuda_graph_capture=False),
         raising=False,
     )
     monkeypatch.setattr(NewtonManager, "_graph", object(), raising=False)

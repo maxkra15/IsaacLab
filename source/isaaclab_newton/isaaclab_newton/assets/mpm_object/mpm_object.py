@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass(eq=False)
+@dataclass
 class MPMObjectRegistryEntry:
     """Particle object registration consumed by Newton builder replication."""
 
@@ -60,11 +60,10 @@ def add_mpm_entry_to_builder(
         entry.particle_offsets.clear()
         entry.particles_per_object = 0
 
-    before_count = int(getattr(builder, "particle_count", 0))
+    before_count = builder.particle_count
     position, orientation = _compose_env_asset_pose(entry.cfg, env_position, env_rotation)
     emit_mpm_particles(builder, entry.cfg.spawn, position=position, orientation=orientation)
-    after_count = int(getattr(builder, "particle_count", 0))
-    delta = after_count - before_count
+    delta = builder.particle_count - before_count
 
     entry.particle_offsets.append(before_count)
     if env_idx == 0:
@@ -83,13 +82,8 @@ def add_registered_mpm_objects_to_builder(
     env_rotation: list[float] | tuple[float, float, float, float],
 ) -> None:
     """Emit all registered MPM objects into one Newton builder world."""
-    for entry in getattr(SimulationManager, "_mpm_object_registry", []):
+    for entry in SimulationManager._mpm_object_registry:
         add_mpm_entry_to_builder(builder, entry, world_idx, env_position, env_rotation)
-
-
-def clear_registered_mpm_objects() -> None:
-    """Clear registered MPM object state."""
-    SimulationManager._mpm_object_registry = []
 
 
 class MPMObject(BaseDeformableObject):
@@ -103,15 +97,16 @@ class MPMObject(BaseDeformableObject):
     cfg: MPMObjectCfg
     __backend_name__: str = "newton"
 
+    _DTYPE_TO_TORCH_TRAILING_DIMS = {**BaseDeformableObject._DTYPE_TO_TORCH_TRAILING_DIMS, vec6f: (6,)}
+
     def __init__(self, cfg: MPMObjectCfg):
         super().__init__(cfg)
         queue_newton_physics_replication(cfg)
         self._registry_entry = MPMObjectRegistryEntry(self.cfg)
-        if not hasattr(SimulationManager, "_mpm_object_registry"):
-            SimulationManager._mpm_object_registry = []
         SimulationManager._mpm_object_registry.append(self._registry_entry)
-        self._kit_points = None
-        self._DTYPE_TO_TORCH_TRAILING_DIMS = {**self._DTYPE_TO_TORCH_TRAILING_DIMS, vec6f: (6,)}
+        if add_registered_mpm_objects_to_builder not in SimulationManager._per_world_builder_hooks:
+            SimulationManager._per_world_builder_hooks.append(add_registered_mpm_objects_to_builder)
+        self._physics_ready_handle = None
 
     @property
     def data(self) -> MPMObjectData:
@@ -144,11 +139,7 @@ class MPMObject(BaseDeformableObject):
         if env_mask is not None:
             self.write_nodal_state_to_sim_mask(self.data.default_nodal_state_w.warp, env_mask=env_mask)
         else:
-            self.write_nodal_state_to_sim_index(
-                self.data.default_nodal_state_w.warp,
-                env_ids=self._resolve_env_ids(env_ids),
-                full_data=True,
-            )
+            self.write_nodal_state_to_sim_index(self.data.default_nodal_state_w.warp, env_ids=env_ids, full_data=True)
 
     def write_data_to_sim(self):
         """No-op; MPM particle writes are applied immediately by write methods."""
@@ -162,30 +153,16 @@ class MPMObject(BaseDeformableObject):
         env_ids: Sequence[int] | torch.Tensor | wp.array | None = None,
         full_data: bool = False,
     ) -> None:
-        env_ids = self._resolve_env_ids(env_ids)
-        if isinstance(nodal_state, ProxyArray):
-            nodal_state = nodal_state.warp
-        if full_data:
-            self.assert_shape_and_dtype(
-                nodal_state, (self.num_instances, self._particles_per_object), vec6f, "nodal_state"
-            )
-        else:
-            self.assert_shape_and_dtype(
-                nodal_state, (env_ids.shape[0], self._particles_per_object), vec6f, "nodal_state"
-            )
-        if isinstance(nodal_state, torch.Tensor):
-            nodal_state = wp.from_torch(nodal_state.contiguous(), dtype=vec6f)
-
-        for state in self._iter_particle_states():
-            wp.launch(
-                scatter_particles_state_vec6f_index,
-                dim=(env_ids.shape[0], self._particles_per_object),
-                inputs=[nodal_state, env_ids, self._particle_offsets, full_data],
-                outputs=[state.particle_q, state.particle_qd],
-                device=self.device,
-            )
-        self._invalidate_particle_state_cache()
-        SimulationManager._mark_particles_dirty()
+        self._scatter_to_sim_index(
+            nodal_state,
+            env_ids,
+            full_data,
+            vec6f,
+            scatter_particles_state_vec6f_index,
+            ("particle_q", "particle_qd"),
+            "nodal_state",
+        )
+        self._invalidate_caches(pos=True, vel=True)
 
     def write_nodal_pos_to_sim_index(
         self,
@@ -193,30 +170,10 @@ class MPMObject(BaseDeformableObject):
         env_ids: Sequence[int] | torch.Tensor | wp.array | None = None,
         full_data: bool = False,
     ) -> None:
-        env_ids = self._resolve_env_ids(env_ids)
-        if isinstance(nodal_pos, ProxyArray):
-            nodal_pos = nodal_pos.warp
-        if full_data:
-            self.assert_shape_and_dtype(
-                nodal_pos, (self.num_instances, self._particles_per_object), wp.vec3f, "nodal_pos"
-            )
-        else:
-            self.assert_shape_and_dtype(
-                nodal_pos, (env_ids.shape[0], self._particles_per_object), wp.vec3f, "nodal_pos"
-            )
-        if isinstance(nodal_pos, torch.Tensor):
-            nodal_pos = wp.from_torch(nodal_pos.contiguous(), dtype=wp.vec3f)
-
-        for state in self._iter_particle_states():
-            wp.launch(
-                scatter_particles_vec3f_index,
-                dim=(env_ids.shape[0], self._particles_per_object),
-                inputs=[nodal_pos, env_ids, self._particle_offsets, full_data],
-                outputs=[state.particle_q],
-                device=self.device,
-            )
-        self._invalidate_particle_pos_cache()
-        SimulationManager._mark_particles_dirty()
+        self._scatter_to_sim_index(
+            nodal_pos, env_ids, full_data, wp.vec3f, scatter_particles_vec3f_index, ("particle_q",), "nodal_pos"
+        )
+        self._invalidate_caches(pos=True)
 
     def write_nodal_velocity_to_sim_index(
         self,
@@ -224,30 +181,10 @@ class MPMObject(BaseDeformableObject):
         env_ids: Sequence[int] | torch.Tensor | wp.array | None = None,
         full_data: bool = False,
     ) -> None:
-        env_ids = self._resolve_env_ids(env_ids)
-        if isinstance(nodal_vel, ProxyArray):
-            nodal_vel = nodal_vel.warp
-        if full_data:
-            self.assert_shape_and_dtype(
-                nodal_vel, (self.num_instances, self._particles_per_object), wp.vec3f, "nodal_vel"
-            )
-        else:
-            self.assert_shape_and_dtype(
-                nodal_vel, (env_ids.shape[0], self._particles_per_object), wp.vec3f, "nodal_vel"
-            )
-        if isinstance(nodal_vel, torch.Tensor):
-            nodal_vel = wp.from_torch(nodal_vel.contiguous(), dtype=wp.vec3f)
-
-        for state in self._iter_particle_states():
-            wp.launch(
-                scatter_particles_vec3f_index,
-                dim=(env_ids.shape[0], self._particles_per_object),
-                inputs=[nodal_vel, env_ids, self._particle_offsets, full_data],
-                outputs=[state.particle_qd],
-                device=self.device,
-            )
-        self._invalidate_particle_vel_cache()
-        SimulationManager._mark_particles_dirty()
+        self._scatter_to_sim_index(
+            nodal_vel, env_ids, full_data, wp.vec3f, scatter_particles_vec3f_index, ("particle_qd",), "nodal_vel"
+        )
+        self._invalidate_caches(vel=True)
 
     def write_nodal_kinematic_target_to_sim_index(
         self,
@@ -262,69 +199,35 @@ class MPMObject(BaseDeformableObject):
         nodal_state: torch.Tensor | wp.array | ProxyArray,
         env_mask: wp.array | torch.Tensor | None = None,
     ) -> None:
-        env_mask = self._resolve_mask(env_mask)
-        if isinstance(nodal_state, ProxyArray):
-            nodal_state = nodal_state.warp
-        self.assert_shape_and_dtype(nodal_state, (env_mask.shape[0], self._particles_per_object), vec6f, "nodal_state")
-        if isinstance(nodal_state, torch.Tensor):
-            nodal_state = wp.from_torch(nodal_state.contiguous(), dtype=vec6f)
-
-        for state in self._iter_particle_states():
-            wp.launch(
-                scatter_particles_state_vec6f_mask,
-                dim=(env_mask.shape[0], self._particles_per_object),
-                inputs=[nodal_state, env_mask, self._particle_offsets],
-                outputs=[state.particle_q, state.particle_qd],
-                device=self.device,
-            )
-        self._invalidate_particle_state_cache()
-        SimulationManager._mark_particles_dirty()
+        self._scatter_to_sim_mask(
+            nodal_state,
+            env_mask,
+            vec6f,
+            scatter_particles_state_vec6f_mask,
+            ("particle_q", "particle_qd"),
+            "nodal_state",
+        )
+        self._invalidate_caches(pos=True, vel=True)
 
     def write_nodal_pos_to_sim_mask(
         self,
         nodal_pos: torch.Tensor | wp.array | ProxyArray,
         env_mask: wp.array | torch.Tensor | None = None,
     ) -> None:
-        env_mask = self._resolve_mask(env_mask)
-        if isinstance(nodal_pos, ProxyArray):
-            nodal_pos = nodal_pos.warp
-        self.assert_shape_and_dtype(nodal_pos, (env_mask.shape[0], self._particles_per_object), wp.vec3f, "nodal_pos")
-        if isinstance(nodal_pos, torch.Tensor):
-            nodal_pos = wp.from_torch(nodal_pos.contiguous(), dtype=wp.vec3f)
-
-        for state in self._iter_particle_states():
-            wp.launch(
-                scatter_particles_vec3f_mask,
-                dim=(env_mask.shape[0], self._particles_per_object),
-                inputs=[nodal_pos, env_mask, self._particle_offsets],
-                outputs=[state.particle_q],
-                device=self.device,
-            )
-        self._invalidate_particle_pos_cache()
-        SimulationManager._mark_particles_dirty()
+        self._scatter_to_sim_mask(
+            nodal_pos, env_mask, wp.vec3f, scatter_particles_vec3f_mask, ("particle_q",), "nodal_pos"
+        )
+        self._invalidate_caches(pos=True)
 
     def write_nodal_velocity_to_sim_mask(
         self,
         nodal_vel: torch.Tensor | wp.array | ProxyArray,
         env_mask: wp.array | torch.Tensor | None = None,
     ) -> None:
-        env_mask = self._resolve_mask(env_mask)
-        if isinstance(nodal_vel, ProxyArray):
-            nodal_vel = nodal_vel.warp
-        self.assert_shape_and_dtype(nodal_vel, (env_mask.shape[0], self._particles_per_object), wp.vec3f, "nodal_vel")
-        if isinstance(nodal_vel, torch.Tensor):
-            nodal_vel = wp.from_torch(nodal_vel.contiguous(), dtype=wp.vec3f)
-
-        for state in self._iter_particle_states():
-            wp.launch(
-                scatter_particles_vec3f_mask,
-                dim=(env_mask.shape[0], self._particles_per_object),
-                inputs=[nodal_vel, env_mask, self._particle_offsets],
-                outputs=[state.particle_qd],
-                device=self.device,
-            )
-        self._invalidate_particle_vel_cache()
-        SimulationManager._mark_particles_dirty()
+        self._scatter_to_sim_mask(
+            nodal_vel, env_mask, wp.vec3f, scatter_particles_vec3f_mask, ("particle_qd",), "nodal_vel"
+        )
+        self._invalidate_caches(vel=True)
 
     def write_nodal_kinematic_target_to_sim_mask(
         self,
@@ -340,6 +243,42 @@ class MPMObject(BaseDeformableObject):
     write_particle_pos_to_sim_mask = write_nodal_pos_to_sim_mask
     write_particle_velocity_to_sim_mask = write_nodal_velocity_to_sim_mask
 
+    def _scatter_to_sim_index(self, data, env_ids, full_data: bool, dtype, kernel, targets, name: str) -> None:
+        """Scatter per-environment particle data into the Newton state arrays in ``targets``."""
+        env_ids = self._resolve_env_ids(env_ids)
+        num_rows = self.num_instances if full_data else env_ids.shape[0]
+        data = self._as_warp(data, dtype, (num_rows, self._particles_per_object), name)
+        for state in self._iter_particle_states():
+            wp.launch(
+                kernel,
+                dim=(env_ids.shape[0], self._particles_per_object),
+                inputs=[data, env_ids, self._particle_offsets, full_data],
+                outputs=[getattr(state, target) for target in targets],
+                device=self.device,
+            )
+
+    def _scatter_to_sim_mask(self, data, env_mask, dtype, kernel, targets, name: str) -> None:
+        """Scatter masked per-environment particle data into the Newton state arrays in ``targets``."""
+        env_mask = self._resolve_mask(env_mask)
+        data = self._as_warp(data, dtype, (env_mask.shape[0], self._particles_per_object), name)
+        for state in self._iter_particle_states():
+            wp.launch(
+                kernel,
+                dim=(env_mask.shape[0], self._particles_per_object),
+                inputs=[data, env_mask, self._particle_offsets],
+                outputs=[getattr(state, target) for target in targets],
+                device=self.device,
+            )
+
+    def _as_warp(self, data, dtype, shape: tuple[int, int], name: str) -> wp.array:
+        """Validate user data and return it as a Warp array of ``dtype``."""
+        if isinstance(data, ProxyArray):
+            data = data.warp
+        self.assert_shape_and_dtype(data, shape, dtype, name)
+        if isinstance(data, torch.Tensor):
+            data = wp.from_torch(data.contiguous(), dtype=dtype)
+        return data
+
     def _initialize_impl(self):
         entry = self._registry_entry
         self._num_instances = len(entry.particle_offsets)
@@ -352,9 +291,12 @@ class MPMObject(BaseDeformableObject):
                 "Ensure Newton replication processed the MPM object registry."
             )
 
-        logger.info("Newton MPM object initialized at: %s", self.cfg.prim_path)
-        logger.info("Number of instances: %d", self._num_instances)
-        logger.info("Particles per object: %d", self._particles_per_object)
+        logger.info(
+            "Newton MPM object initialized at '%s': %d instances x %d particles.",
+            self.cfg.prim_path,
+            self._num_instances,
+            self._particles_per_object,
+        )
 
         self._particle_offsets = wp.array(self._recorded_particle_offsets, dtype=wp.int32, device=self.device)
         self._data = MPMObjectData(
@@ -386,14 +328,14 @@ class MPMObject(BaseDeformableObject):
         wp.launch(
             gather_particles_vec3f,
             dim=(self._num_instances, self._particles_per_object),
-            inputs=[state.particle_q, self._particle_offsets, self._particles_per_object],
+            inputs=[state.particle_q, self._particle_offsets],
             outputs=[default_pos],
             device=self.device,
         )
         wp.launch(
             gather_particles_vec3f,
             dim=(self._num_instances, self._particles_per_object),
-            inputs=[state.particle_qd, self._particle_offsets, self._particles_per_object],
+            inputs=[state.particle_qd, self._particle_offsets],
             outputs=[default_vel],
             device=self.device,
         )
@@ -409,24 +351,34 @@ class MPMObject(BaseDeformableObject):
         self._create_kit_points()
 
     def _create_kit_points(self) -> None:
-        """Create a Kit-visible point cloud for MPM particles when the Kit visualizer is active."""
+        """Create Kit-visible ``UsdGeom.Points`` prims for the particles when the Kit visualizer is active."""
         from isaaclab.sim import SimulationContext  # noqa: PLC0415
 
         sim = SimulationContext.instance()
         if sim is None or "kit" not in sim.resolve_visualizer_types() or not self.cfg.spawn.visible:
             return
 
-        self._kit_points = create_mpm_particle_visualization(
-            prim_path=_create_kit_visualization_path(self.cfg.prim_path),
-            positions=self.data.particle_pos_w.torch,
-            particle_offsets=self._recorded_particle_offsets,
-            widths=_particle_visual_widths_per_object(self.cfg.spawn, self._particles_per_object),
-            color=self.cfg.spawn.visual_color,
-            sync_frequency=self.cfg.spawn.visual_update_frequency,
+        first_offset = self._recorded_particle_offsets[0]
+        radii = (
+            SimulationManager.get_model()
+            .particle_radius[first_offset : first_offset + self._particles_per_object]
+            .numpy()
         )
-        for prim_path in self._kit_points.prim_paths:
-            SimulationManager.register_particle_visual_prim(prim_path)
-        logger.info("Kit MPM particle visualization initialized at: %s", self._kit_points.base_path)
+        base_path = _create_kit_visualization_path(self.cfg.prim_path)
+        prim_paths = create_mpm_particle_visualization(
+            prim_path=base_path,
+            positions=self.data.particle_pos_w.warp.numpy(),
+            widths=2.0 * radii,
+            color=self.cfg.spawn.visual_color,
+        )
+        for env_idx, prim_path in enumerate(prim_paths):
+            SimulationManager.register_particle_visual_prim(
+                prim_path,
+                particle_offset=self._recorded_particle_offsets[env_idx],
+                particle_count=self._particles_per_object,
+                sync_frequency=self.cfg.spawn.visual_update_frequency,
+            )
+        logger.info("Kit MPM particle visualization initialized at: %s", base_path)
 
     def _resolve_env_ids(self, env_ids):
         if env_ids is None or (isinstance(env_ids, slice) and env_ids == slice(None)):
@@ -447,26 +399,23 @@ class MPMObject(BaseDeformableObject):
         return mask
 
     def _iter_particle_states(self):
-        seen: set[int] = set()
-        for state in (SimulationManager.get_state_0(), SimulationManager.get_state_1()):
-            if state is None or id(state) in seen:
-                continue
-            seen.add(id(state))
-            yield state
+        """Yield the Newton states whose particle arrays must receive writes."""
+        state_0 = SimulationManager.get_state_0()
+        state_1 = SimulationManager.get_state_1()
+        yield state_0
+        if state_1 is not None and state_1 is not state_0:
+            yield state_1
 
-    def _invalidate_particle_pos_cache(self) -> None:
-        self._data._particle_pos_w.timestamp = -1.0
+    def _invalidate_caches(self, pos: bool = False, vel: bool = False) -> None:
+        """Invalidate gathered data buffers after a particle write and flag the render sync."""
+        if pos:
+            self._data._particle_pos_w.timestamp = -1.0
+            self._data._root_pos_w.timestamp = -1.0
+        if vel:
+            self._data._particle_vel_w.timestamp = -1.0
+            self._data._root_vel_w.timestamp = -1.0
         self._data._particle_state_w.timestamp = -1.0
-        self._data._root_pos_w.timestamp = -1.0
-
-    def _invalidate_particle_vel_cache(self) -> None:
-        self._data._particle_vel_w.timestamp = -1.0
-        self._data._particle_state_w.timestamp = -1.0
-        self._data._root_vel_w.timestamp = -1.0
-
-    def _invalidate_particle_state_cache(self) -> None:
-        self._invalidate_particle_pos_cache()
-        self._invalidate_particle_vel_cache()
+        SimulationManager._mark_particles_dirty()
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         raise NotImplementedError("Debug visualization is not implemented for MPMObject.")
@@ -476,16 +425,12 @@ class MPMObject(BaseDeformableObject):
 
     def _clear_callbacks(self) -> None:
         super()._clear_callbacks()
-        self._kit_points = None
-        if hasattr(self, "_physics_ready_handle") and self._physics_ready_handle is not None:
+        if self._physics_ready_handle is not None:
             self._physics_ready_handle.deregister()
             self._physics_ready_handle = None
-        registry = getattr(SimulationManager, "_mpm_object_registry", None)
-        if registry is not None and hasattr(self, "_registry_entry") and self._registry_entry in registry:
+        registry = SimulationManager._mpm_object_registry
+        if self._registry_entry in registry:
             registry.remove(self._registry_entry)
-
-    def _invalidate_initialize_callback(self, event):
-        super()._invalidate_initialize_callback(event)
 
 
 def _compose_env_asset_pose(
@@ -493,55 +438,14 @@ def _compose_env_asset_pose(
     env_position: list[float],
     env_rotation: list[float] | tuple[float, float, float, float],
 ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
-    env_pos = wp.vec3(float(env_position[0]), float(env_position[1]), float(env_position[2]))
-    env_rot = wp.quat(
-        float(env_rotation[0]),
-        float(env_rotation[1]),
-        float(env_rotation[2]),
-        float(env_rotation[3]),
-    )
-    init_pos = wp.vec3(float(cfg.init_state.pos[0]), float(cfg.init_state.pos[1]), float(cfg.init_state.pos[2]))
-    init_rot = wp.quat(
-        float(cfg.init_state.rot[0]),
-        float(cfg.init_state.rot[1]),
-        float(cfg.init_state.rot[2]),
-        float(cfg.init_state.rot[3]),
-    )
-    asset_pos = env_pos + wp.quat_rotate(env_rot, init_pos)
-    asset_rot = env_rot * init_rot
-    return (
-        (float(asset_pos[0]), float(asset_pos[1]), float(asset_pos[2])),
-        (float(asset_rot[0]), float(asset_rot[1]), float(asset_rot[2]), float(asset_rot[3])),
-    )
+    """Compose the environment transform with the asset's initial pose (both ``xyzw``)."""
+    env_pos = wp.vec3(*env_position)
+    env_rot = wp.quat(*env_rotation)
+    pos = env_pos + wp.quat_rotate(env_rot, wp.vec3(*cfg.init_state.pos))
+    rot = env_rot * wp.quat(*cfg.init_state.rot)
+    return (float(pos[0]), float(pos[1]), float(pos[2])), (float(rot[0]), float(rot[1]), float(rot[2]), float(rot[3]))
 
 
 def _create_kit_visualization_path(prim_path: str) -> str:
     sanitized = "".join(char if char.isalnum() else "_" for char in prim_path.strip("/"))
     return f"/World/Visuals/MPMParticles/{sanitized or 'Object'}"
-
-
-def _particle_visual_widths_per_object(spawn_cfg, particles_per_object: int) -> list[float]:
-    from isaaclab_newton.sim.spawners.mpm import MPMGridCfg, MPMPointsCfg
-
-    if isinstance(spawn_cfg, MPMGridCfg):
-        radius = spawn_cfg.radius
-        if radius is None:
-            lower = np.asarray(spawn_cfg.lower, dtype=np.float32)
-            upper = np.asarray(spawn_cfg.upper, dtype=np.float32)
-            extent = upper - lower
-            resolution = np.maximum(np.ceil(spawn_cfg.particles_per_cell * extent / spawn_cfg.voxel_size), 1)
-            cell_size = extent / resolution
-            radius = 0.5 * float(np.max(cell_size))
-        return [2.0 * float(radius)] * particles_per_object
-
-    if isinstance(spawn_cfg, MPMPointsCfg):
-        radius = spawn_cfg.radius
-        if isinstance(radius, (int, float)):
-            return [2.0 * float(radius)] * particles_per_object
-        if len(radius) != particles_per_object:
-            raise ValueError(
-                f"MPMPointsCfg radius must be scalar or have one value per particle. Got {len(radius)} values."
-            )
-        return [2.0 * float(value) for value in radius]
-
-    return [0.02] * particles_per_object

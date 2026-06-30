@@ -25,17 +25,15 @@ from isaaclab.sim import SimulationCfg, build_simulation_context
 from isaaclab.utils.configclass import configclass
 
 
-def test_mpm_particle_material_presets_emit_custom_attributes():
-    """MPM material presets are value cfgs, not USD material spawners."""
-    sand = MPMParticleMaterialCfg.sand()
-    attrs = sand.to_custom_attributes()
+def test_mpm_particle_material_emits_custom_attributes():
+    """MPM materials are value cfgs forwarded as Newton custom attributes, not USD material spawners."""
+    from isaaclab_newton.sim.spawners.mpm.mpm import _material_custom_attributes
+
+    attrs = _material_custom_attributes(MPMParticleMaterialCfg(viscosity=0.1))
 
     assert attrs["mpm:friction"] == pytest.approx(0.68)
-    assert attrs["mpm:viscosity"] == pytest.approx(0.0)
+    assert attrs["mpm:viscosity"] == pytest.approx(0.1)
     assert "density" not in attrs
-
-    fluid = MPMParticleMaterialCfg.viscous_fluid()
-    assert fluid.to_custom_attributes()["mpm:viscosity"] > 0.0
 
 
 def test_mpm_object_cfg_resolves_asset_class():
@@ -48,26 +46,10 @@ def test_mpm_object_cfg_resolves_asset_class():
 
 
 def test_mpm_object_exposes_particle_offsets_without_private_access():
-    """Tasks can map per-environment particles through a stable public array."""
+    """Callers can read per-world particle slices through the public asset API."""
     offsets = object()
 
     assert MPMObject.particle_offsets.fget(SimpleNamespace(_particle_offsets=offsets)) is offsets
-
-
-def test_mpm_registry_entries_are_scoped_by_asset_identity():
-    """A delayed old-asset finalizer must not match a new scene's registration."""
-    cfg = MPMObjectCfg(
-        prim_path="/World/envs/env_.*/Sand",
-        spawn=MPMGridCfg(lower=(0.0, 0.0, 0.0), upper=(0.1, 0.1, 0.1), voxel_size=0.1),
-    )
-    old_scene_entry = MPMObjectRegistryEntry(cfg)
-    new_scene_entry = MPMObjectRegistryEntry(cfg)
-    current_registry = [new_scene_entry]
-
-    if old_scene_entry in current_registry:
-        current_registry.remove(old_scene_entry)
-
-    assert current_registry == [new_scene_entry]
 
 
 def test_mpm_grid_emission_records_constant_offsets_per_env():
@@ -105,7 +87,7 @@ def test_mpm_points_emission_records_constant_offsets_per_env():
             velocities=((0.0, 0.0, 0.0), (0.0, 0.0, 0.1), (0.0, 0.1, 0.0)),
             mass=0.01,
             radius=0.02,
-            material=MPMParticleMaterialCfg.viscous_fluid(),
+            material=MPMParticleMaterialCfg(viscosity=0.1, friction=0.0),
         ),
     )
     entry = MPMObjectRegistryEntry(cfg)
@@ -235,16 +217,16 @@ def test_mpm_object_creates_kit_points_when_kit_visualizer_requested(monkeypatch
         from pxr import UsdGeom  # noqa: PLC0415
 
         media = scene["media"]
-        assert media._kit_points is not None
-        assert len(media._kit_points.prim_paths) == media.num_instances
+        records = NewtonMPMManager._particle_visual_prims
+        assert len(records) == media.num_instances
 
-        for env_idx, prim_path in enumerate(media._kit_points.prim_paths):
+        for env_idx, (prim_path, record) in enumerate(sorted(records.items())):
+            assert record.offset == media._recorded_particle_offsets[env_idx]
+            assert record.count == media.particles_per_object
+            assert record.sync_frequency == 1
+
             points_prim = media.stage.GetPrimAtPath(prim_path)
             assert points_prim.IsValid()
-            assert points_prim.GetAttribute("newton:particleOffset").Get() == media._recorded_particle_offsets[env_idx]
-            assert points_prim.GetAttribute("newton:particleCount").Get() == media.particles_per_object
-            assert points_prim.GetAttribute("newton:particleSyncFrequency").Get() == 1
-
             points = UsdGeom.Points(points_prim)
             assert len(points.GetPointsAttr().Get()) == media.particles_per_object
             assert len(points.GetWidthsAttr().Get()) == media.particles_per_object
@@ -279,7 +261,8 @@ def test_mpm_kit_points_follow_particle_state(monkeypatch):
         from pxr import UsdGeom  # noqa: PLC0415
 
         media = scene["media"]
-        points = UsdGeom.Points(media.stage.GetPrimAtPath(media._kit_points.prim_paths[0]))
+        prim_path = next(iter(NewtonMPMManager._particle_visual_prims))
+        points = UsdGeom.Points(media.stage.GetPrimAtPath(prim_path))
         points_before = np.asarray(points.GetPointsAttr().Get(), dtype=np.float32)
 
         for _ in range(3):

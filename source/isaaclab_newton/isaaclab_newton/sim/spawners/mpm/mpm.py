@@ -5,35 +5,21 @@
 
 from __future__ import annotations
 
-import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
 import warp as wp
 
+from isaaclab.sim.utils import clone, create_prim
+
 if TYPE_CHECKING:
     from pxr import Usd
 
-from .mpm_cfg import MPMGridCfg, MPMParticleSpawnerCfg, MPMPointsCfg
+from .mpm_cfg import MPMGridCfg, MPMParticleMaterialCfg, MPMParticleSpawnerCfg, MPMPointsCfg
 
 
-def _clone_after_kit_start(func: Callable) -> Callable:
-    cloned_func: Callable | None = None
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        nonlocal cloned_func
-        if cloned_func is None:
-            from isaaclab.sim.utils import clone
-
-            cloned_func = clone(func)
-        return cloned_func(*args, **kwargs)
-
-    return wrapper
-
-
-@_clone_after_kit_start
+@clone
 def spawn_mpm_particles(
     prim_path: str,
     cfg: MPMParticleSpawnerCfg,
@@ -47,16 +33,27 @@ def spawn_mpm_particles(
     Newton replication. The USD prim exists so Isaac Lab's normal asset spawning
     and clone-planning machinery can reason about the scene entity.
     """
-    from isaaclab.sim.utils import create_prim, get_current_stage
+    return create_prim(prim_path, prim_type="Xform", translation=translation, orientation=orientation)
 
-    stage = get_current_stage()
-    return create_prim(
-        prim_path,
-        prim_type="Xform",
-        translation=translation,
-        orientation=orientation,
-        stage=stage,
-    )
+
+def _material_custom_attributes(material: MPMParticleMaterialCfg) -> dict[str, float]:
+    """Map material cfg values to Newton ``mpm:*`` custom attributes for ``add_particles``.
+
+    ``density`` is intentionally absent: it is consumed by the particle
+    generators to derive per-particle mass, not forwarded to the solver.
+    """
+    return {
+        "mpm:young_modulus": float(material.young_modulus),
+        "mpm:poisson_ratio": float(material.poisson_ratio),
+        "mpm:viscosity": float(material.viscosity),
+        "mpm:friction": float(material.friction),
+        "mpm:damping": float(material.damping),
+        "mpm:yield_pressure": float(material.yield_pressure),
+        "mpm:tensile_yield_ratio": float(material.tensile_yield_ratio),
+        "mpm:yield_stress": float(material.yield_stress),
+        "mpm:hardening": float(material.hardening),
+        "mpm:dilatancy": float(material.dilatancy),
+    }
 
 
 def emit_mpm_particles(
@@ -112,7 +109,7 @@ def _emit_grid(
         mass=mass,
         jitter=float(cfg.jitter),
         radius_mean=radius,
-        custom_attributes=cfg.material.to_custom_attributes(),
+        custom_attributes=_material_custom_attributes(cfg.material),
     )
 
 
@@ -141,7 +138,7 @@ def _emit_points(
         vel=world_velocities.tolist(),
         mass=_expand_scalar_or_sequence(cfg.mass, points.shape[0], "mass"),
         radius=_expand_scalar_or_sequence(cfg.radius, points.shape[0], "radius"),
-        custom_attributes=cfg.material.to_custom_attributes(),
+        custom_attributes=_material_custom_attributes(cfg.material),
     )
 
 

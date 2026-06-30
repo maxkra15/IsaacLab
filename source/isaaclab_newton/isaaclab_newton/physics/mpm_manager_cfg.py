@@ -53,7 +53,7 @@ class MPMSolverCfg(NewtonSolverCfg):
     """Manager class for the implicit MPM solver."""
 
     solver_type: str = "implicit_mpm"
-    """Solver type metadata. Can be ``"implicit_mpm"``."""
+    """Solver type. Can be "implicit_mpm"."""
 
     # numerics
     max_iterations: int = 250
@@ -62,16 +62,13 @@ class MPMSolverCfg(NewtonSolverCfg):
     tolerance: float = 1.0e-4
     """Tolerance for the rheology solver."""
 
-    solver: str | tuple[str, ...] = "gauss-seidel"
-    """Solver to use for the rheology solve, or an ordered warm-start sequence.
+    solver: str | tuple[str, ...] = "auto"
+    """Rheology solver, or an ordered warm-start sequence of solvers.
 
-    Newton's upstream default is ``"auto"`` (which picks the solver from the
-    velocity basis: ``"gs"`` for ``Q1``, ``"gs-batched"`` for ``B2``/``B3``),
-    but Isaac Lab uses the explicit ``"gauss-seidel"`` spelling so environments
-    with older Newton 1.2.0.dev0 installs can step MPM without relying on
-    Newton's newer auto-resolution helper. Other accepted values include
-    ``"jacobi"``, ``"cg"``, ``"cr"``, and ``"gmres"``; pass a tuple such as
-    ``("cr", "gs")`` to warm-start solvers left-to-right.
+    ``"auto"`` lets Newton pick the solver from the velocity basis (``"gs"`` for
+    ``Q1``, ``"gs-batched"`` for ``B2``/``B3``). Other accepted values include
+    ``"gauss-seidel"``, ``"jacobi"``, ``"cg"``, ``"cr"``, and ``"gmres"``; pass a
+    tuple such as ``("cr", "gs")`` to warm-start solvers left-to-right.
     """
 
     warmstart_mode: Literal["none", "auto", "particles", "grid", "smoothed"] = "auto"
@@ -135,19 +132,18 @@ class MPMSolverCfg(NewtonSolverCfg):
     velocity_basis: str = "Q1"
     """Velocity basis function, such as ``"Q1"``, ``"B2"``, or ``"B3"``."""
 
-    # collision handling (applied by Isaac Lab managers, not the Newton solver config)
+    # collision handling (applied by the Isaac Lab manager, not the Newton solver config)
     project_outside_colliders: bool = False
     """Whether to hard-project particles out of collider interiors after each substep.
 
-    When ``True``, :class:`~isaaclab_newton.physics.NewtonMPMManager` or an MPM
-    entry in :class:`~isaaclab_newton.physics.NewtonCoupledManager` calls
+    When ``True``, :class:`~isaaclab_newton.physics.NewtonMPMManager` calls
     :meth:`SolverImplicitMPM.project_outside` immediately after every solver
-    substep. It applies a Coulomb response and pushes particles that drifted
-    into a collider back onto its surface. The implicit solve already resolves
-    colliders at the grid level; this is the particle-level correction that
-    stops material from slowly settling inside colliders, mirroring Newton's
-    MPM examples. Leave it ``False`` for collider-free scenes to skip a
-    per-substep projection pass over every particle.
+    substep: it applies a Coulomb response and pushes particles that drifted into
+    a collider back onto its surface. The implicit solve already resolves
+    colliders at the grid level; this is the particle-level correction that stops
+    material from slowly settling inside colliders, mirroring Newton's MPM
+    examples. Leave it ``False`` for collider-free scenes to skip a per-substep
+    projection pass over every particle.
 
     This is a manager-level stepping option and is intentionally **not** part of
     ``SolverImplicitMPM.Config``.
@@ -157,13 +153,16 @@ class MPMSolverCfg(NewtonSolverCfg):
         """Build a :class:`SolverImplicitMPM.Config` from this configuration.
 
         Supported Newton solver fields are forwarded. The
-        ``separate_worlds`` field is required because silently omitting it
+        :attr:`separate_worlds` field is required because silently omitting it
         would change isolated environments into one shared MPM grid.
         Manager-level options such as :attr:`project_outside_colliders` are
         intentionally not forwarded.
 
         Returns:
             A ``SolverImplicitMPM.Config`` instance ready for solver construction.
+
+        Raises:
+            RuntimeError: If the installed Newton revision lacks world isolation.
         """
         from newton.solvers import SolverImplicitMPM
 

@@ -14,7 +14,6 @@ vec6f = wp.types.vector(length=6, dtype=wp.float32)
 def gather_particles_vec3f(
     src: wp.array(dtype=wp.vec3f),
     offsets: wp.array(dtype=wp.int32),
-    num_particles: int,
     dst: wp.array2d(dtype=wp.vec3f),
 ):
     i, j = wp.tid()

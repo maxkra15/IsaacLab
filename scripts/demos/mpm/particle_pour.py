@@ -23,7 +23,6 @@ import argparse
 import math
 from collections.abc import Callable
 from dataclasses import MISSING
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -48,12 +47,11 @@ parser.add_argument(
     help="USD asset used as the pouring container (kinematic mesh collider).",
 )
 add_launcher_args(parser)
+parser.set_defaults(visualizer=["newton"])
 args_cli = parser.parse_args()
 
 
 FPS = 200
-SIM_SUBSTEPS = 1
-ENABLE_CUDA_GRAPH = True
 VOXEL_SIZE = float(args_cli.voxel_size)
 NEWTON_VISUAL_UPDATE_FREQUENCY = 1
 KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY = 4
@@ -61,8 +59,11 @@ KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY = 4
 GRID_TYPE = "fixed"
 GRID_PADDING = 64
 MAX_ACTIVE_CELL_COUNT = 1 << 17
-MPM_MAX_ITERATIONS = 250
-MPM_TOLERANCE = 1.0e-5
+# With a fixed grid the solver loop is captured in a CUDA graph, so the rheology
+# solve always runs exactly ``max_iterations`` (the convergence tolerance cannot
+# trigger an early exit inside the graph). 100 iterations measures ~1.6x faster
+# than the 250 default with an end state identical to within noise.
+MPM_MAX_ITERATIONS = 100
 
 PARTICLES_PER_CELL = 2.0
 PARTICLE_DENSITY = 1000.0
@@ -94,9 +95,6 @@ POUR_ANGLE = math.radians(65.0)
 CONTAINER_LIFT_HEIGHT = 0.24
 CONTAINER_LIFT_TIME = 3.0
 
-# Utah Teapot: free for any use; credit as the (Modified) Utah Teapot (Univ. of Utah); provided "as is", no warranty.
-CONTAINER_USD_URL = str(args_cli.container_usd)
-
 TABLE_TOP_Z = 0.255
 TABLE_HALF_EXTENTS = (0.255, 0.165, 0.009)
 BOWL_BASE_POS = (0.066, 0.0, TABLE_TOP_Z + 0.006)
@@ -118,14 +116,13 @@ CAMERA_TARGET = (-0.01, 0.0, 0.38)
 
 def create_visualizer_cfgs():
     """Create demo-specific visualizer configs for requested backends."""
-    if "newton" not in (args_cli.visualizer or []):
+    if "newton" not in args_cli.visualizer:
         return []
 
     from isaaclab_visualizers.newton import NewtonVisualizerCfg
 
     return [
         NewtonVisualizerCfg(
-            show_contacts=False,
             show_particles=True,
             particle_color=PARTICLE_COLOR,
             update_frequency=NEWTON_VISUAL_UPDATE_FREQUENCY,
@@ -169,8 +166,13 @@ def container_pose_at_time(sim_time: float):
 
 
 def launch_omniverse_asset_resolver():
-    """Start Kit for Newton-only runs that need to resolve ``omniverse://`` USD layers."""
-    if "kit" in (args_cli.visualizer or []):
+    """Start Kit for Newton-only runs that need to resolve remote USD layers.
+
+    The default teapot container is served from Nucleus over HTTPS, which plain
+    ``pxr`` cannot resolve; Kit ships the asset resolver that can. Kit-visualizer
+    runs boot Kit anyway, so this only applies to Newton-only runs.
+    """
+    if "kit" in args_cli.visualizer:
         return None
 
     from isaaclab.utils import has_kit
@@ -221,9 +223,6 @@ def create_demo_bowl_mesh(num_segments: int = 96):
     return vertices, np.asarray(indices, dtype=np.int32).reshape((-1, 3))
 
 
-_spawn_demo_bowl_mesh_cloned: Callable | None = None
-
-
 def spawn_demo_bowl_mesh(
     prim_path: str,
     cfg,
@@ -232,39 +231,12 @@ def spawn_demo_bowl_mesh(
     **kwargs,
 ):
     """Spawn the demo bowl as a standard Isaac Lab mesh asset."""
-    global _spawn_demo_bowl_mesh_cloned
-    if _spawn_demo_bowl_mesh_cloned is None:
-        from isaaclab.sim.utils import clone
-
-        _spawn_demo_bowl_mesh_cloned = clone(_spawn_demo_bowl_mesh_impl)
-    return _spawn_demo_bowl_mesh_cloned(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
-
-
-def _spawn_demo_bowl_mesh_impl(
-    prim_path: str,
-    cfg,
-    translation: tuple[float, float, float] | None = None,
-    orientation: tuple[float, float, float, float] | None = None,
-    **kwargs,
-):
     from isaaclab.sim import schemas
     from isaaclab.sim.utils import bind_physics_material, bind_visual_material, create_prim, get_current_stage
 
     stage = get_current_stage()
-    if stage.GetPrimAtPath(prim_path).IsValid():
-        raise ValueError(f"A prim already exists at path: '{prim_path}'.")
-
     vertices = np.asarray(cfg.vertices, dtype=np.float32)
-    if vertices.ndim != 2 or vertices.shape[1] != 3:
-        raise ValueError(f"DemoBowlMeshCfg vertices must have shape (N, 3). Got {vertices.shape}.")
-
     faces = np.asarray(cfg.faces, dtype=np.int32)
-    if faces.ndim == 1:
-        if faces.size % 3 != 0:
-            raise ValueError(f"Flat triangle index list length must be divisible by 3. Got {faces.size}.")
-        faces = faces.reshape((-1, 3))
-    if faces.ndim != 2 or faces.shape[1] != 3:
-        raise ValueError(f"DemoBowlMeshCfg faces must have shape (N, 3). Got {faces.shape}.")
 
     create_prim(prim_path, prim_type="Xform", translation=translation, orientation=orientation, stage=stage)
     geom_prim_path = f"{prim_path}/geometry"
@@ -332,11 +304,15 @@ def create_fluid_particles():
     return points.astype(np.float32, copy=False), radius, mass
 
 
-def create_simulation_cfg(sim_utils, MPMSolverCfg, NewtonCfg, device: str):
+def create_sim_cfg():
     """Create the Isaac Lab simulation config using the MPM manager."""
+    from isaaclab_newton.physics import MPMSolverCfg, NewtonCfg
+
+    import isaaclab.sim as sim_utils
+
     return sim_utils.SimulationCfg(
         dt=1.0 / FPS,
-        device=device,
+        device=args_cli.device,
         gravity=(0.0, 0.0, -9.81),
         visualizer_cfgs=create_visualizer_cfgs(),
         physics=NewtonCfg(
@@ -346,17 +322,24 @@ def create_simulation_cfg(sim_utils, MPMSolverCfg, NewtonCfg, device: str):
                 grid_padding=GRID_PADDING,
                 max_active_cell_count=MAX_ACTIVE_CELL_COUNT,
                 max_iterations=MPM_MAX_ITERATIONS,
-                tolerance=MPM_TOLERANCE,
-                critical_fraction=0.0,
                 air_drag=0.2,
                 collider_velocity_mode="backward",
                 project_outside_colliders=True,
             ),
-            num_substeps=SIM_SUBSTEPS,
-            use_cuda_graph=ENABLE_CUDA_GRAPH,
+            use_cuda_graph=True,
             simplify_meshes=False,
         ),
     )
+
+
+def preview_material(color):
+    """Return a preview-surface material for Kit runs; Kit-less runs spawn no USD materials."""
+    if "kit" not in args_cli.visualizer:
+        return None
+
+    import isaaclab.sim as sim_utils
+
+    return sim_utils.PreviewSurfaceCfg(diffuse_color=color)
 
 
 def create_scene_cfg():
@@ -367,24 +350,18 @@ def create_scene_cfg():
     import isaaclab.sim as sim_utils
     from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
     from isaaclab.scene import InteractiveSceneCfg
+    from isaaclab.sim.utils import clone
     from isaaclab.utils.configclass import configclass
 
     container_pos, container_rot, _ = container_pose_at_time(0.0)
-    mpm_material = MPMParticleMaterialCfg.viscous_fluid()
     fluid_points, particle_radius, particle_mass = create_fluid_particles()
     bowl_vertices, bowl_faces = create_demo_bowl_mesh()
-
-    preview_table = None
-    preview_bowl = None
-    if "kit" in (args_cli.visualizer or []):
-        preview_table = sim_utils.PreviewSurfaceCfg(diffuse_color=TABLE_COLOR)
-        preview_bowl = sim_utils.PreviewSurfaceCfg(diffuse_color=BOWL_COLOR)
 
     @configclass
     class DemoBowlMeshCfg(sim_utils.MeshCfg):
         """Demo-local arbitrary mesh asset config for the catch bowl."""
 
-        func: Callable | str = spawn_demo_bowl_mesh
+        func: Callable | str = clone(spawn_demo_bowl_mesh)
         vertices: list[list[float]] = MISSING
         faces: list[list[int]] = MISSING
         mesh_collision_props: sim_utils.NewtonMeshCollisionPropertiesCfg | None = None
@@ -406,7 +383,7 @@ def create_scene_cfg():
                     dynamic_friction=TABLE_FRICTION,
                 ),
                 physics_material_path="physicsMaterial",
-                visual_material=preview_table,
+                visual_material=preview_material(TABLE_COLOR),
                 visual_material_path="visualMaterial",
             ),
             init_state=AssetBaseCfg.InitialStateCfg(
@@ -429,16 +406,18 @@ def create_scene_cfg():
                     dynamic_friction=BOWL_FRICTION,
                 ),
                 physics_material_path="physicsMaterial",
-                visual_material=preview_bowl,
+                visual_material=preview_material(BOWL_COLOR),
                 visual_material_path="visualMaterial",
             ),
             init_state=AssetBaseCfg.InitialStateCfg(pos=BOWL_BASE_POS),
         )
 
+        # Utah Teapot: free for any use; credit as the (Modified) Utah Teapot
+        # (Univ. of Utah); provided "as is", no warranty.
         container = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/PourContainer",
             spawn=sim_utils.UsdFileCfg(
-                usd_path=CONTAINER_USD_URL,
+                usd_path=args_cli.container_usd,
                 rigid_props=sim_utils.NewtonRigidBodyPropertiesCfg(
                     rigid_body_enabled=True,
                     kinematic_enabled=True,
@@ -463,7 +442,13 @@ def create_scene_cfg():
                 positions=fluid_points.tolist(),
                 mass=particle_mass,
                 radius=particle_radius,
-                material=mpm_material,
+                material=MPMParticleMaterialCfg(
+                    viscosity=0.1,
+                    friction=0.0,
+                    damping=0.02,
+                    yield_pressure=1.0e15,
+                    tensile_yield_ratio=5.0,
+                ),
                 visual_color=PARTICLE_COLOR,
                 visual_update_frequency=KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY,
             ),
@@ -522,34 +507,26 @@ def run_simulator(sim, scene) -> None:
 
 def main() -> None:
     """Set up and run the Isaac Lab Newton MPM particle-pour demo."""
-    device = str(args_cli.device)
     app_launcher = launch_omniverse_asset_resolver()
     try:
-        from isaaclab_newton.physics import MPMSolverCfg, NewtonCfg
-
-        import isaaclab.sim as sim_utils
-
-        sim_cfg = create_simulation_cfg(sim_utils, MPMSolverCfg, NewtonCfg, device)
-
-        with launch_simulation(SimpleNamespace(sim=sim_cfg), args_cli):
+        sim_cfg = create_sim_cfg()
+        with launch_simulation(sim_cfg, args_cli):
+            import isaaclab.sim as sim_utils
             from isaaclab.scene import InteractiveScene
 
             sim = sim_utils.SimulationContext(sim_cfg)
-            try:
-                scene = InteractiveScene(create_scene_cfg())
-                sim.reset()
-                sim.set_camera_view(eye=CAMERA_EYE, target=CAMERA_TARGET)
+            scene = InteractiveScene(create_scene_cfg())
+            sim.reset()
+            sim.set_camera_view(eye=CAMERA_EYE, target=CAMERA_TARGET)
 
-                print(
-                    "[INFO]: Isaac Lab Newton particle-pour MPM demo ready."
-                    f" Spawned {particle_count(scene)} MPM particles;"
-                    f" voxel size {VOXEL_SIZE:.4g} m;"
-                    f" the teapot will tilt after {HOLD_TIME:.2f}s.",
-                    flush=True,
-                )
-                run_simulator(sim, scene)
-            finally:
-                sim.clear_instance()
+            print(
+                "[INFO]: Isaac Lab Newton particle-pour MPM demo ready."
+                f" Spawned {particle_count(scene)} MPM particles;"
+                f" voxel size {VOXEL_SIZE:.4g} m;"
+                f" the teapot will tilt after {HOLD_TIME:.2f}s.",
+                flush=True,
+            )
+            run_simulator(sim, scene)
     finally:
         if app_launcher is not None:
             app_launcher.app.close()

@@ -16,6 +16,11 @@ from .mpm_manager_cfg import MPMSolverCfg
 from .newton_manager import NewtonManager
 
 
+def _make_solver_config(solver_cfg: MPMSolverCfg) -> SolverImplicitMPM.Config:
+    """Build Newton's implicit MPM solver config from Isaac Lab's cfg."""
+    return solver_cfg.to_solver_config()
+
+
 class NewtonMPMManager(NewtonManager):
     """:class:`NewtonManager` specialization for Newton's implicit MPM solver.
 
@@ -77,21 +82,36 @@ class NewtonMPMManager(NewtonManager):
             model: Finalized Newton model the solver should run on.
             solver_cfg: Implicit MPM solver configuration.
         """
-        if model.particle_count == 0:
-            raise ValueError(
-                "Newton implicit MPM requires at least one particle. Add particles to the Newton builder before "
-                "starting the simulation."
-            )
-
         NewtonManager._solver = SolverImplicitMPM(
             model,
-            solver_cfg.to_solver_config(),
+            _make_solver_config(solver_cfg),
             temporary_store=TemporaryStore(),
         )
         NewtonManager._use_single_state = True
         NewtonManager._needs_collision_pipeline = False
         NewtonManager._needs_fk_before_step = True
         cls._project_outside_colliders = solver_cfg.project_outside_colliders
+
+    @classmethod
+    def _supports_cuda_graph_capture(cls) -> bool:
+        """Preserve fixed-grid support and accept an explicit sparse-solver opt-in.
+
+        Upstream fixed grids keep a static topology and remain capturable.
+        Sparse grids stay eager unless the concrete solver overrides Newton's
+        public capability contract (for example, a capacity-bounded rebuildable
+        sparse solver). Dense grids remain eager.
+        """
+        if cls._solver.grid_type == "fixed":
+            return True
+        if cls._solver.grid_type != "sparse":
+            return False
+
+        solver_vars = getattr(cls._solver, "__dict__", {})
+        type_vars = getattr(type(cls._solver), "__dict__", {})
+        explicitly_advertised = (
+            "supports_cuda_graph_capture" in solver_vars or "supports_cuda_graph_capture" in type_vars
+        )
+        return explicitly_advertised and bool(cls._solver.supports_cuda_graph_capture)
 
     @classmethod
     def _step_solver(

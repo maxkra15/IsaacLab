@@ -102,6 +102,15 @@ solver actually needs it:
   :class:`~isaaclab_newton.physics.NewtonMPMManager` is the in-tree example —
   it registers ``mpm:young_modulus`` and the rest of the implicit MPM
   particle attributes.
+* ``_prepare_builder_for_finalize(builder)``: normalize imported or replicated
+  builder data right before ``ModelBuilder.finalize()``.
+  :class:`~isaaclab_newton.physics.NewtonMPMManager` uses this to clear mass and
+  inertia on kinematic bodies so implicit MPM treats them as massless colliders.
+* ``_supports_cuda_graph_capture()``: report whether the active solver can run
+  inside a CUDA graph. The base manager delegates to Newton's public solver
+  capability. :class:`~isaaclab_newton.physics.NewtonMPMManager` preserves
+  fixed-grid support and also accepts an explicit capability advertised by a
+  capacity-bounded rebuildable sparse solver.
 * ``_solver_specific_clear()``: release any class-level state owned by the
   solver manager.
 
@@ -112,49 +121,38 @@ replicated Newton world can use
 The callback runs inside each builder world after replicated USD content and
 registered MPM particle objects have been added.
 
-CUDA graph capability belongs to the Newton solver, not the Isaac Lab manager.
-The base manager reads ``solver.supports_cuda_graph_capture`` and calls
-:meth:`~isaaclab_newton.physics.NewtonManager.prepare_cuda_graph_capture`
-before prewarming or recording a manager-owned graph. Coupled solvers apply
-those contracts recursively to their entries. Unsupported configurations
-remain available through eager stepping; for example, implicit MPM supports
-fixed-capacity fixed grids and capacity-bounded rebuildable sparse grids, while
-allocating sparse grids remain eager.
-
 Only one layer should own graph recording. For a larger application-owned
 graph, configure ``use_cuda_graph=False`` and call
 :meth:`~isaaclab_newton.physics.NewtonManager.prepare_cuda_graph_capture`
 immediately after solver initialization, before the first simulation step and
 before beginning capture. Allocation warmup restores initial parent state and
-solver history, so preparation rejects an already-advanced trajectory. The
-manager then executes the solver eagerly so its kernels are recorded directly
-into the application graph; it does not create or launch a nested manager
-graph.
+solver history. The manager then executes the solver eagerly so its kernels are
+recorded directly into the application graph; it does not create or launch a
+nested manager graph.
 
-After an eager step or manager-owned graph replay, the manager calls Newton's
+After eager stepping or manager-owned graph replay, the manager calls Newton's
 recursive ``solver.check_status()`` hook before advancing published simulation
-time. This surfaces sticky device failures such as sparse-grid capacity
-exhaustion at a safe host boundary. When an application records a larger outer
-CUDA graph, the manager defers the host readback; the outer owner must call
+time. This surfaces device failures such as sparse-grid capacity exhaustion at
+a safe host boundary. When an application records a larger outer CUDA graph,
+the manager defers the host readback; the outer owner must call
 :meth:`~isaaclab_newton.physics.NewtonManager.check_solver_status` after replay.
 Tests and orchestration code can use
 :meth:`~isaaclab_newton.physics.NewtonManager.is_cuda_graph_active` to confirm
-that manager-owned recording succeeded without accessing private graph state.
+that manager-owned recording succeeded.
 
 Environment code that changes parent Newton state during a partial reset should
 call :meth:`~isaaclab_newton.physics.NewtonManager.reset_solver_state` after
 writing the reset values. With no explicit state argument, the manager resets
-both distinct parent-state buffers so a later double-buffer swap cannot restore
-stale history. The alternate buffer is reset first and the authoritative input
-buffer last. Passing an explicit state keeps Newton's one-state reset semantics.
-The manager forwards the world mask and ``newton.StateFlags`` to the active
-solver so coupled entries can synchronize private history without exposing
-internal entry objects.
+both distinct parent-state buffers, finishing with the authoritative input
+buffer. Passing an explicit state keeps Newton's one-state reset semantics.
+The manager forwards the world mask and ``newton.StateFlags`` unchanged so
+callers can exclude state such as joint coordinates that must retain their
+newly written reset values.
 
-Solver-specific post-processing of a coupled entry must operate on the public
+Solver-specific post-processing of a coupled entry must operate on its public
 entry state and reconcile it through ``SolverCoupled.reconcile_entry_state``.
-This keeps entry-local custom history, such as implicit-MPM velocity gradients,
-authoritative while returning owned outputs to Isaac Lab's parent state.
+This keeps entry-local custom history authoritative while returning owned
+outputs to Isaac Lab's parent state.
 
 Keep the manager name prefixed with ``Newton`` and the solver config grouped
 with the other Newton solver configs so autocomplete and backend discovery stay

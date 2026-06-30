@@ -16,12 +16,16 @@ def test_mpm_config_imports_do_not_load_pxr():
         import sys
 
         from isaaclab_newton.assets.mpm_object import MPMObjectCfg
-        from isaaclab_newton.sim.spawners.mpm import (
-            MPMGridCfg,
-            MPMParticleMaterialCfg,
-            MPMPointsCfg,
-            emit_mpm_particles,
-            spawn_mpm_particles,
+        from isaaclab_newton.sim.spawners.mpm import MPMGridCfg, MPMParticleMaterialCfg, MPMPointsCfg
+
+        MPMObjectCfg(
+            prim_path="/World/envs/env_.*/Sand",
+            spawn=MPMGridCfg(
+                lower=(0.0, 0.0, 0.0),
+                upper=(0.1, 0.1, 0.1),
+                voxel_size=0.1,
+                material=MPMParticleMaterialCfg(),
+            ),
         )
 
         loaded_pxr_modules = [module for module in sys.modules if module == "pxr" or module.startswith("pxr.")]

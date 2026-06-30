@@ -8,7 +8,6 @@ __all__ = [
     "MPMParticleMaterialCfg",
     "MPMParticleSpawnerCfg",
     "MPMPointsCfg",
-    "MPMParticleVisualization",
     "create_mpm_particle_visualization",
     "emit_mpm_particles",
     "spawn_mpm_particles",
@@ -16,4 +15,4 @@ __all__ = [
 
 from .mpm import emit_mpm_particles, spawn_mpm_particles
 from .mpm_cfg import MPMGridCfg, MPMParticleMaterialCfg, MPMParticleSpawnerCfg, MPMPointsCfg
-from .visualization import MPMParticleVisualization, create_mpm_particle_visualization
+from .visualization import create_mpm_particle_visualization

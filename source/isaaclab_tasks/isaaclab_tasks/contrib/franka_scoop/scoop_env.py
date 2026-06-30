@@ -2142,7 +2142,7 @@ class FrankaScoopEnv(ManagerBasedRLEnv):
         """
         if getattr(self, "_region_counter", None) is not None:
             return
-        from isaaclab_newton.utils.particle_mesh import (
+        from isaaclab.utils.warp.particle_mesh import (
             ParticleMeshCounter,
             make_box_region_mesh,
             make_frustum_region_mesh,

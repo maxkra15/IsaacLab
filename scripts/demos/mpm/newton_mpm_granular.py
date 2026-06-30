@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import math
-from types import SimpleNamespace
 
 from isaaclab.app import add_launcher_args, launch_simulation
 
@@ -58,7 +57,6 @@ PARTICLE_JITTER = VOXEL_SIZE / PARTICLES_PER_CELL
 NEWTON_VISUAL_UPDATE_FREQUENCY = 1
 KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY = 4
 
-GROUND_PATH = "/World/Ground"
 PARTICLE_COLOR = (0.7, 0.6, 0.4)
 
 IDENTITY_ROT = (0.0, 0.0, 0.0, 1.0)
@@ -68,7 +66,7 @@ Y_ROT_NEG_45_DEG = (0.0, -math.sin(math.pi / 8.0), 0.0, math.cos(math.pi / 8.0))
 
 def create_visualizer_cfgs():
     """Create demo-specific visualizer configs for the requested backends."""
-    if "newton" not in (args_cli.visualizer or []):
+    if "newton" not in args_cli.visualizer:
         return []
 
     from isaaclab_visualizers.newton import NewtonVisualizerCfg
@@ -106,22 +104,27 @@ def create_sim_cfg():
     )
 
 
+def preview_material(color):
+    """Return a preview-surface material for Kit runs; Kit-less runs spawn no USD materials."""
+    if "kit" not in args_cli.visualizer:
+        return None
+
+    import isaaclab.sim as sim_utils
+
+    return sim_utils.PreviewSurfaceCfg(diffuse_color=color)
+
+
 def create_scene_cfg():
     """Create an Isaac Lab scene config using declarative assets."""
     from isaaclab_newton.assets.mpm_object import MPMObjectCfg
-    from isaaclab_newton.sim.spawners.mpm import MPMGridCfg, MPMParticleMaterialCfg
+    from isaaclab_newton.sim.spawners.mpm import MPMGridCfg
 
     import isaaclab.sim as sim_utils
     from isaaclab.assets import AssetBaseCfg
     from isaaclab.scene import InteractiveSceneCfg
     from isaaclab.utils.configclass import configclass
 
-    mpm_material = MPMParticleMaterialCfg.sand()
-
     def collider_cfg(prim_path: str, center, half_extents, orientation, friction: float = 0.1) -> AssetBaseCfg:
-        visual_material = None
-        if "kit" in (args_cli.visualizer or []):
-            visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.45, 0.45))
         return AssetBaseCfg(
             prim_path=prim_path,
             spawn=sim_utils.CuboidCfg(
@@ -131,7 +134,7 @@ def create_scene_cfg():
                     static_friction=friction,
                     dynamic_friction=friction,
                 ),
-                visual_material=visual_material,
+                visual_material=preview_material((0.45, 0.45, 0.45)),
             ),
             init_state=AssetBaseCfg.InitialStateCfg(pos=center, rot=orientation),
         )
@@ -141,7 +144,7 @@ def create_scene_cfg():
         """Scene containing static colliders and one Newton MPM object."""
 
         ground = AssetBaseCfg(
-            prim_path=GROUND_PATH,
+            prim_path="/World/Ground",
             spawn=sim_utils.GroundPlaneCfg(size=(6.0, 6.0), color=(0.30, 0.30, 0.30)),
         )
 
@@ -158,7 +161,6 @@ def create_scene_cfg():
                 voxel_size=VOXEL_SIZE,
                 particles_per_cell=PARTICLES_PER_CELL,
                 jitter=PARTICLE_JITTER,
-                material=mpm_material,
                 visual_color=PARTICLE_COLOR,
                 visual_update_frequency=KIT_PARTICLE_VISUAL_UPDATE_FREQUENCY,
             ),
@@ -203,22 +205,19 @@ def run_simulator(sim, scene) -> None:
 def main() -> None:
     """Launch and run the Isaac Lab MPM granular demo."""
     sim_cfg = create_sim_cfg()
-    with launch_simulation(SimpleNamespace(sim=sim_cfg), args_cli):
+    with launch_simulation(sim_cfg, args_cli):
         import isaaclab.sim as sim_utils
         from isaaclab.scene import InteractiveScene
 
         sim = sim_utils.SimulationContext(sim_cfg)
-        try:
-            sim.set_camera_view(eye=(4.0, -6.0, 4.0), target=(0.0, 0.0, 1.0))
-            scene = InteractiveScene(create_scene_cfg())
-            sim.reset()
-            print(
-                f"[INFO]: Isaac Lab Newton granular MPM demo ready. Spawned {particle_count(scene)} particles.",
-                flush=True,
-            )
-            run_simulator(sim, scene)
-        finally:
-            sim.clear_instance()
+        sim.set_camera_view(eye=(4.0, -6.0, 4.0), target=(0.0, 0.0, 1.0))
+        scene = InteractiveScene(create_scene_cfg())
+        sim.reset()
+        print(
+            f"[INFO]: Isaac Lab Newton granular MPM demo ready. Spawned {particle_count(scene)} particles.",
+            flush=True,
+        )
+        run_simulator(sim, scene)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,9 @@ if [ -n "$warp_source_dir" ]; then
 fi
 export PYTHONPATH="$source_roots:${PYTHONPATH:-}"
 
+# Let Kit associate direct wrapper launches with the Isaac Sim desktop icon.
+export RESOURCE_NAME="${RESOURCE_NAME:-IsaacSim}"
+
 # If a local Isaac Sim binary is present, source its env setup so that
 # PYTHONPATH/PATH/EXP_PATH are correct without depending on a conda
 # activate.d hook (those don't fire reliably under e.g. `conda run`).

@@ -44,5 +44,5 @@ class FrankaReachPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class FrankaReachNewtonIKPPORunnerCfg(FrankaReachPPORunnerCfg):
-    experiment_name = "reach_franka_newton_ik_rel"
+    experiment_name = "franka_reach_newton_ik_rel"
     clip_actions = 1.0

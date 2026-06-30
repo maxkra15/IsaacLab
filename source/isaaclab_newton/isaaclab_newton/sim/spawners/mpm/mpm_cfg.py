@@ -19,6 +19,8 @@ class MPMParticleMaterialCfg:
     This is a lightweight value config. It does not create or bind a USD material
     prim; values are forwarded to Newton as ``mpm:*`` custom attributes when
     particles are added to the model builder.
+
+    The defaults model a dry sand-like granular material.
     """
 
     density: float = 1000.0
@@ -53,21 +55,6 @@ class MPMParticleMaterialCfg:
 
     dilatancy: float = 0.0
     """Granular dilatancy coefficient."""
-
-    def to_custom_attributes(self) -> dict[str, float]:
-        """Return Newton custom attributes for ``ModelBuilder.add_particles`` calls."""
-        return {
-            "mpm:young_modulus": float(self.young_modulus),
-            "mpm:poisson_ratio": float(self.poisson_ratio),
-            "mpm:viscosity": float(self.viscosity),
-            "mpm:friction": float(self.friction),
-            "mpm:damping": float(self.damping),
-            "mpm:yield_pressure": float(self.yield_pressure),
-            "mpm:tensile_yield_ratio": float(self.tensile_yield_ratio),
-            "mpm:yield_stress": float(self.yield_stress),
-            "mpm:hardening": float(self.hardening),
-            "mpm:dilatancy": float(self.dilatancy),
-        }
 
 
 @configclass
@@ -127,29 +114,3 @@ class MPMPointsCfg(MPMParticleSpawnerCfg):
 
     radius: float | Sequence[float] = 0.01
     """Particle radius values [m], either scalar or one value per particle."""
-
-
-def _sand_material() -> MPMParticleMaterialCfg:
-    """Return a reusable sand-like granular material preset."""
-    return MPMParticleMaterialCfg()
-
-
-def _viscous_fluid_material() -> MPMParticleMaterialCfg:
-    """Return a reusable viscous fluid-like material preset."""
-    return MPMParticleMaterialCfg(
-        density=1000.0,
-        young_modulus=1.0e15,
-        poisson_ratio=0.3,
-        viscosity=0.1,
-        friction=0.0,
-        damping=0.02,
-        yield_pressure=1.0e15,
-        tensile_yield_ratio=5.0,
-        yield_stress=0.0,
-        hardening=0.0,
-        dilatancy=0.0,
-    )
-
-
-MPMParticleMaterialCfg.sand = staticmethod(_sand_material)
-MPMParticleMaterialCfg.viscous_fluid = staticmethod(_viscous_fluid_material)
