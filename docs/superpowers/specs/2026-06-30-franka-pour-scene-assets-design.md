@@ -25,20 +25,21 @@ include the behavior introduced by upstream changes #6073, #6119, #6204, and #62
 - `media`: the existing `MPMObjectCfg`.
 
 The two cup configs use a task-local rigid mesh spawner. The spawner authors a root rigid body and a
-watertight open-top bowl mesh from `make_cube_bowl_mesh()`, including collision, mass, rigid-body,
-visual-material, and physics-material USD schemas. This makes the cups cloneable, renderable,
-recordable, and accessible through the standard scene dictionary without introducing a general
-Isaac Lab API for one task's geometry.
+watertight visual open-top bowl mesh from `make_cube_bowl_mesh()`, including mass, rigid-body,
+visual-material, and physics-material USD schemas. The source also receives an invisible USD box
+collider for the grasp. This makes the cups cloneable, renderable, recordable, and accessible through
+the standard scene dictionary without introducing a general Isaac Lab API for one task's geometry.
 
 The dynamic source cup still requires two solver representations on the same Newton body:
 
-- its visible hollow mesh is particle-collision-only; and
-- an invisible solid box is rigid-shape-collision-only for the Panda grasp.
+- its visible hollow USD mesh is visual-only;
+- an invisible solid USD box is rigid-shape-collision-only for the Panda grasp; and
+- an invisible Newton hollow mesh is particle-collision-only.
 
-The Newton per-world builder hook will configure the imported visible mesh's flags and attach the
-invisible grasp proxy to the scene-owned source-cup body. The hook will also create the invisible
-rigid-only receiver duplicate and spill plane required for disjoint coupled-solver ownership. Those
-objects have no user-facing state and remain solver implementation details.
+The Newton per-world builder hook will clear particle collision from the imported grasp proxy and
+attach the hollow particle colliders to the scene-owned source and target bodies. The hook will also
+create the invisible rigid-only receiver duplicate and spill plane required for disjoint coupled-solver
+ownership. Those objects have no user-facing state and remain solver implementation details.
 
 The hook will no longer build, clone, or relabel visible cups. Generic label-rewrite code and manual
 source-cup body/joint bookkeeping will be deleted.
