@@ -6,9 +6,9 @@
 """Manager-based RL env: Franka grasping a dynamic cup of MPM media and pouring it.
 
 A single rigid **dynamic** cup body rests on the table; the Franka grasps it with its fingers
-through MuJoCo friction contacts (like the lift task grasps its cube) and pours the granular MPM
-media by tilting. A Newton :class:`CoupledSolverCfg` with **proxy coupling** advances the robot +
-cup (MJWarp ``arm`` entry) and the media (implicit ``media`` entry) together in ``sim.step()``.
+through Newton-generated friction contacts resolved by MJWarp and pours the granular MPM media by
+tilting. A Newton :class:`CoupledSolverCfg` with **proxy coupling** advances the robot + cup (MJWarp
+``arm`` entry) and the media (implicit ``media`` entry) together in ``sim.step()``.
 
 The cup carries two co-located shapes on one body (see :meth:`FrankaPourEnv._add_cup_body`):
 
@@ -202,7 +202,7 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             lock_inertia=True,
             label="/World/Cup",
         )
-        # Free joint so MuJoCo treats the cup as a movable dynamic body (grasped/pushed by contacts);
+        # Free joint so MJWarp treats the cup as a movable dynamic body (grasped/pushed by contacts);
         # the joint coords mirror body_q (xyzw quat) and are how a reset rewrites the cup pose.
         cup_joint = proto.add_joint_free(child=cup_body, label="/World/Cup/FreeJoint")
         proto.add_articulation([cup_joint], label="/World/Cup")
@@ -421,9 +421,8 @@ class FrankaPourEnv(ManagerBasedRLEnv):
     def _configure_finger_contact_material(self, builder, env_id: int) -> None:
         """Use a rigid contact material on the two finger collision shapes.
 
-        MuJoCo mixes material compliance from both shapes in a pair.  Applying the same material
-        to the fingers and the cup proxy keeps the intended stiffness independent of import-side
-        material defaults.
+        Applying the same material to the fingers and cup keeps the intended pair response
+        independent of import-side material defaults.
         """
         finger_suffixes = ("/panda_leftfinger", "/panda_rightfinger")
         for shape_id in range(builder.shape_count):

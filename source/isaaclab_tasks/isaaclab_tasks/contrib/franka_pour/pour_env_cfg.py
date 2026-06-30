@@ -12,9 +12,9 @@ stable, familiar base. On top we add a coupled Newton solver with **proxy coupli
 * an implicit ``media`` entry owns the MPM particles.
 
 The cup is a real dynamic rigid body resting on the table: the Franka grasps it with its fingers
-through MuJoCo friction contacts (exactly like the lift task grasps its cube), and a Newton proxy
-mapping exposes the cup's ``COLLIDE_PARTICLES`` cavity mesh to the MPM solver as an auto-pose-synced
-collider that retains/pours the media. This replaces the earlier welded-kinematic-cup design.
+through Newton-generated friction contacts resolved by MJWarp, and a Newton proxy mapping exposes
+the cup's ``COLLIDE_PARTICLES`` cavity mesh to the MPM solver as an auto-pose-synced collider that
+retains/pours the media. This replaces the earlier welded-kinematic-cup design.
 
 The cup carries two co-located shapes on the same body: a SOLID grasp box (``COLLIDE_SHAPES``,
 arm-entry-only) the fingers can actually grip, and a hollow cavity mesh (``COLLIDE_PARTICLES``) the
@@ -31,6 +31,7 @@ from isaaclab_newton.physics import (
     MJWarpSolverCfg,
     MPMSolverCfg,
     NewtonCfg,
+    NewtonCollisionPipelineCfg,
     ProxyCouplingCfg,
 )
 from isaaclab_newton.sim.spawners.mpm import MPMParticleMaterialCfg
@@ -125,7 +126,7 @@ class PourSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Relative DiffIK for the arm (6-dim EE delta) plus a binary gripper open/close (1-dim).
 
-    The gripper is now a real grasp interface: closing it grips the dynamic cup through MuJoCo
+    The gripper is now a real grasp interface: closing it grips the dynamic cup through Newton
     friction contacts (the cup is no longer welded)."""
 
     arm_action = mdp.DifferentialInverseKinematicsActionCfg(
@@ -370,10 +371,10 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         name=RIGID_ENTRY,
                         # Proxy coupling keeps the MPM stable, so the arm integrator can be the faster
                         # "implicitfast" (unlike base coupling, which needed "euler"). The cup is a
-                        # dynamic rigid body owned by this entry; the fingers grasp it via MuJoCo
-                        # contacts and the proxy bridges its cavity mesh to the MPM solver.
+                        # dynamic rigid body owned by this entry; Newton generates its contacts and
+                        # the proxy bridges its cavity mesh to the MPM solver.
                         solver_cfg=MJWarpSolverCfg(
-                            use_mujoco_contacts=True, integrator="implicitfast", njmax=510, nconmax=400
+                            use_mujoco_contacts=False, integrator="implicitfast", njmax=510, nconmax=400
                         ),
                         body_entities=[SceneEntityCfg("robot")],
                         body_label_patterns=[CUP_LABEL_PATTERN, TARGET_CUP_RIGID_LABEL_PATTERN],
@@ -420,8 +421,11 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                     ],
                     iterations=self.proxy_iterations,
                 ),
-                use_collision_pipeline=False,
+                use_collision_pipeline=True,
             ),
+            # Rigid contacts use Newton's outer pipeline. Implicit MPM handles particle/shape
+            # collisions internally, so allocating outer soft contacts would waste O(P*S) work.
+            collision_cfg=NewtonCollisionPipelineCfg(soft_contact_max=0),
             num_substeps=self.num_substeps,
             use_cuda_graph=self.use_cuda_graph,
         )

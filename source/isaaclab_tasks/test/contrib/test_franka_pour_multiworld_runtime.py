@@ -168,10 +168,10 @@ def _assert_media_collider_ownership(model, media_view) -> None:
     assert actual_by_world == {0: expected, 1: expected}
 
 
-def _make_runtime_cfg(*, use_cuda_graph: bool = True):
+def _make_runtime_cfg(*, use_cuda_graph: bool = True, env_spacing: float = 0.0):
     cfg = parse_env_cfg(_TASK_ID, device="cuda:0", num_envs=2)
     cfg.seed = 37
-    cfg.scene.env_spacing = 0.0
+    cfg.scene.env_spacing = env_spacing
     cfg.decimation = 1
     cfg.num_substeps = 1
     cfg.sim.render_interval = 1
@@ -252,6 +252,36 @@ def _run_particle_rollout(
             )
 
         return trajectory, NewtonManager.is_cuda_graph_active()
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_offset_world_tables_support_both_cups():
+    """Each rigid world collides with its own finite table at production spacing."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        env = gym.make(_TASK_ID, cfg=_make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5))
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        assert task.num_envs == 2
+        assert not torch.equal(task.scene.env_origins[0], task.scene.env_origins[1])
+        torch.testing.assert_close(task.cup_pose_e()[:, 2], torch.zeros(2, device=task.device), rtol=0.0, atol=0.0)
+
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        actions[:, -1] = 1.0  # keep the gripper open so this tests table support only
+        for _ in range(30):
+            env.step(actions)
+
+        wp.synchronize_device(NewtonManager.get_model().device)
+        cup_z = task.cup_pose_e()[:, 2]
+        assert bool(torch.all(cup_z > -0.02)), f"A source cup fell through its local table: z={cup_z.tolist()}"
+        torch.testing.assert_close(cup_z[0], cup_z[1], rtol=0.0, atol=2.0e-3)
     finally:
         if env is not None:
             env.close()

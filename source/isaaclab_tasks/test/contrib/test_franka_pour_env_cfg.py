@@ -50,7 +50,11 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     arm = entries["arm"]
     media = entries["media"]
     assert arm.solver_cfg.integrator == "implicitfast"
-    assert arm.solver_cfg.use_mujoco_contacts is True
+    assert arm.solver_cfg.use_mujoco_contacts is False
+    assert solver.use_collision_pipeline is True
+    assert cfg.sim.physics.collision_cfg.soft_contact_max == 0
+    assert arm.preserve_shape_ids is True
+    assert arm.include_static_shapes is True
     assert CUP_LABEL_PATTERN in arm.body_label_patterns
     assert TARGET_CUP_RIGID_LABEL_PATTERN in arm.body_label_patterns
     assert media.all_particles is True
