@@ -153,6 +153,21 @@ def _scatter_reset_masks_from_ids(
     fk_mask[articulation_ids[world, arti]] = True
 
 
+@wp.kernel(enable_backward=False)
+def _or_world_reset_mask(env_mask: wp.array(dtype=wp.bool), world_mask: wp.array(dtype=wp.bool)):
+    """OR an environment mask into the pending world-reset mask."""
+    world = wp.tid()
+    if env_mask[world]:
+        world_mask[world] = True
+
+
+@wp.kernel(enable_backward=False)
+def _scatter_world_reset_mask(env_ids: wp.array(dtype=int), world_mask: wp.array(dtype=wp.bool)):
+    """Scatter sparse environment ids into the pending world-reset mask."""
+    world = env_ids[wp.tid()]
+    world_mask[world] = True
+
+
 class NewtonSceneDataBackend(SceneDataBackend):
     """Scene data backend that reads rigid body transforms from Newton's simulation state.
 
@@ -268,6 +283,7 @@ class NewtonManager(PhysicsManager):
     _pending_extended_state_attributes: set[str] = set()
     _pending_extended_contact_attributes: set[str] = set()
     _report_contacts: bool = False
+    _supports_contact_sensors: bool = True
 
     # Per-world reset masks (allocated in start_simulation, consumed in step/forward).
     _world_reset_mask: wp.array | None = None  # (num_envs,) wp.bool — for SolverKamino.reset(world_mask=...)
@@ -411,7 +427,9 @@ class NewtonManager(PhysicsManager):
         data layer invokes ``NewtonManager.forward()`` on the base class, where ``cls`` is the
         base ``NewtonManager``; the bound delegate dispatches to the concrete subclass override.
         """
-        cls._reset_solver_internals(cls._world_reset_mask)
+        # Asset data calls through the base NewtonManager, so recover the active subclass hook.
+        manager = getattr(PhysicsManager._sim, "physics_manager", cls)
+        manager._reset_solver_internals(cls._world_reset_mask)
         cls._eval_fk(cls._world_reset_mask, cls._fk_reset_mask)
         if cls._fk_reset_mask is not None:
             cls._fk_reset_mask.zero_()
@@ -818,6 +836,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._newton_frame_transform_sensors = []
         NewtonManager._newton_imu_sensors = []
         NewtonManager._report_contacts = False
+        NewtonManager._supports_contact_sensors = True
         NewtonManager._adapter = None
         NewtonManager._post_actuator_callbacks = []
         # Set by an articulation that took the ``use_newton_actuators=True``
@@ -1136,6 +1155,37 @@ class NewtonManager(PhysicsManager):
             # Fallback: no topology info — mark everything dirty
             NewtonManager._world_reset_mask.fill_(True)
             NewtonManager._fk_reset_mask.fill_(True)
+
+    @classmethod
+    def invalidate_state(
+        cls,
+        env_mask: wp.array | None = None,
+        env_ids: wp.array | None = None,
+    ) -> None:
+        """Mark particle or maximal-coordinate state writes for solver reset.
+
+        Unlike :meth:`invalidate_fk`, this does not dirty articulation FK. It
+        marks affected worlds so the solver can clear internal history at the
+        next :meth:`step` or :meth:`forward` boundary.
+        """
+        if cls._world_reset_mask is None:
+            return
+        if env_mask is not None:
+            wp.launch(
+                _or_world_reset_mask,
+                dim=env_mask.shape[0],
+                inputs=[env_mask, NewtonManager._world_reset_mask],
+                device=PhysicsManager._device,
+            )
+        elif env_ids is not None:
+            wp.launch(
+                _scatter_world_reset_mask,
+                dim=env_ids.shape[0],
+                inputs=[env_ids, NewtonManager._world_reset_mask],
+                device=PhysicsManager._device,
+            )
+        else:
+            NewtonManager._world_reset_mask.fill_(True)
 
     @classmethod
     def start_simulation(cls) -> None:
@@ -2138,6 +2188,11 @@ class NewtonManager(PhysicsManager):
             contact_partners_shape_expr: Expression for contact partner shape names.
             verbose: Print verbose information.
         """
+        if not NewtonManager._supports_contact_sensors:
+            raise NotImplementedError(
+                "Newton contact sensors are not yet supported by the active coupled solver because its "
+                "contact forces live in per-entry buffers."
+            )
         if body_names_expr is None and shape_names_expr is None:
             raise ValueError("At least one of body_names_expr or shape_names_expr must be provided")
         if body_names_expr is not None and shape_names_expr is not None:

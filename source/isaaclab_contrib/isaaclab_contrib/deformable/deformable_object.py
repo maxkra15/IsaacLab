@@ -436,6 +436,7 @@ class DeformableObject(BaseDeformableObject):
                 device=self.device,
             )
 
+        SimulationManager.invalidate_state(env_ids=env_ids)
         self._invalidate_nodal_pos_cache()
 
     def write_nodal_velocity_to_sim_index(
@@ -474,6 +475,7 @@ class DeformableObject(BaseDeformableObject):
                 device=self.device,
             )
 
+        SimulationManager.invalidate_state(env_ids=env_ids)
         self._invalidate_nodal_vel_cache()
 
     def write_nodal_kinematic_target_to_sim_index(
@@ -550,6 +552,7 @@ class DeformableObject(BaseDeformableObject):
                 device=self.device,
             )
 
+        SimulationManager.invalidate_state(env_mask=env_mask)
         self._invalidate_nodal_state_cache()
 
     def write_nodal_pos_to_sim_mask(
@@ -581,6 +584,7 @@ class DeformableObject(BaseDeformableObject):
                 device=self.device,
             )
 
+        SimulationManager.invalidate_state(env_mask=env_mask)
         self._invalidate_nodal_pos_cache()
 
     def write_nodal_velocity_to_sim_mask(
@@ -612,6 +616,7 @@ class DeformableObject(BaseDeformableObject):
                 device=self.device,
             )
 
+        SimulationManager.invalidate_state(env_mask=env_mask)
         self._invalidate_nodal_vel_cache()
 
     def write_nodal_kinematic_target_to_sim_mask(

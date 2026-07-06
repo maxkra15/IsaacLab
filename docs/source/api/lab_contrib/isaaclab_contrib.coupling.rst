@@ -7,20 +7,38 @@ isaaclab_contrib.coupling
 
   .. autosummary::
 
+    coupled_manager_cfg.CoupledSolverEntryCfg
     coupled_manager_cfg.CoupledSolverCfg
+    coupled_manager_cfg.CoupledProxyCfg
     coupled_manager_cfg.CoupledProxySolverCfg
+    coupled_manager_cfg.CoupledAdmmContactPairCfg
     coupled_manager_cfg.CoupledAdmmSolverCfg
     coupled_manager.NewtonCoupledSolverManager
 
 Coupled Solver Configurations
 -----------------------------
 
+.. autoclass:: isaaclab_contrib.coupling.coupled_manager_cfg.CoupledSolverEntryCfg
+  :members:
+  :show-inheritance:
+  :exclude-members: __init__
+
 .. autoclass:: isaaclab_contrib.coupling.coupled_manager_cfg.CoupledSolverCfg
   :members:
   :show-inheritance:
   :exclude-members: __init__
 
+.. autoclass:: isaaclab_contrib.coupling.coupled_manager_cfg.CoupledProxyCfg
+  :members:
+  :show-inheritance:
+  :exclude-members: __init__
+
 .. autoclass:: isaaclab_contrib.coupling.coupled_manager_cfg.CoupledProxySolverCfg
+  :members:
+  :show-inheritance:
+  :exclude-members: __init__
+
+.. autoclass:: isaaclab_contrib.coupling.coupled_manager_cfg.CoupledAdmmContactPairCfg
   :members:
   :show-inheritance:
   :exclude-members: __init__

@@ -244,8 +244,17 @@ class NewtonVBDManager(NewtonManager):
         """
         kwargs = cls._filter_solver_kwargs(SolverVBD, solver_cfg)
         NewtonManager._solver = SolverVBD(model, **kwargs)
+        if not solver_cfg.rigid_joint_hard:
+            cls._set_all_vbd_joints_soft(NewtonManager._solver)
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = True
+
+    @staticmethod
+    def _set_all_vbd_joints_soft(solver: SolverVBD) -> None:
+        """Set all VBD structural joint constraints to penalty-only."""
+        solver = getattr(solver, "_solver", solver)
+        for joint_index in range(int(solver.model.joint_count)):
+            solver.set_joint_constraint_mode(joint_index, hard=False)
 
     @classmethod
     def _simulate_physics_only(cls) -> None:
