@@ -34,6 +34,18 @@ else:
     _MappingBatch = tuple
 
 
+def _solver_cfg_requires_graph_coloring(solver_cfg) -> bool:
+    """Return whether a solver cfg or any coupled sub-solver needs VBD graph coloring."""
+    if solver_cfg is None:
+        return False
+    if getattr(solver_cfg, "requires_graph_coloring", False):
+        return True
+    return any(
+        _solver_cfg_requires_graph_coloring(getattr(entry_cfg, "solver_cfg", None))
+        for entry_cfg in getattr(solver_cfg, "entries", ()) or ()
+    )
+
+
 def _build_newton_builder_from_mapping(
     stage: Usd.Stage,
     sources: Sequence[str],
@@ -68,26 +80,25 @@ def _build_newton_builder_from_mapping(
     )
     replace_newton_builder_shape_colors(builder, stage)
 
-    # Deformable prim paths are handled by per_world_builder_hooks, not add_usd.
+    # Deformable and cable prim paths are handled by per_world_builder_hooks, not add_usd.
     # Resolve the regex prim_path patterns to concrete env_0 paths so add_usd
     # can skip them via ignore_paths.
-    deformable_patterns = tuple(
-        re.compile(entry.prim_path.replace(".*", "[^/]*")) for entry in NewtonManager._deformable_registry
-    )
-    deformable_ignore_paths = []
-    if deformable_patterns:
+    hook_entries = [*NewtonManager._deformable_registry, *getattr(NewtonManager, "_cable_registry", ())]
+    hook_patterns = tuple(re.compile(entry.prim_path.replace(".*", "[^/]*")) for entry in hook_entries)
+    hook_ignore_paths = []
+    if hook_patterns:
         for source in sources:
             for child in Usd.PrimRange(stage.GetPrimAtPath(source)):
                 child_path = str(child.GetPath())
-                if any(pattern.fullmatch(child_path) for pattern in deformable_patterns):
-                    deformable_ignore_paths.append(child_path)
+                if any(pattern.fullmatch(child_path) for pattern in hook_patterns):
+                    hook_ignore_paths.append(child_path)
 
     source_builders = build_source_builders(
         stage,
         sources,
         lambda: manager_cls.create_builder(up_axis=up_axis),
         schema_resolvers,
-        ignore_paths=deformable_ignore_paths or None,
+        ignore_paths=hook_ignore_paths or None,
         simplify_meshes=simplify_meshes,
     )
 
@@ -102,6 +113,11 @@ def _build_newton_builder_from_mapping(
         per_world_builder_hooks=NewtonManager._per_world_builder_hooks,
         post_replicate_hooks=NewtonManager._post_replicate_hooks,
     )
+
+    # Hook-built cables are added after source-builder import, so ensure the
+    # final replicated graph is colored when VBD owns any coupled entry.
+    if _solver_cfg_requires_graph_coloring(getattr(PhysicsManager._cfg, "solver_cfg", None)):
+        builder.color()
 
     site_index_map = {label: (idx, None) for label, idx in global_sites.items()}
     site_index_map.update((label, (None, per_world)) for label, per_world in local_site_map.items())
