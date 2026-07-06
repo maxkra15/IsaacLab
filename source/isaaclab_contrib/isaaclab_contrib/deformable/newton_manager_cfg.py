@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from isaaclab_newton.physics import FeatherstoneSolverCfg, MJWarpSolverCfg, NewtonCfg, NewtonSolverCfg
 
@@ -30,8 +30,13 @@ class VBDSolverCfg(NewtonSolverCfg):
     class_type: type[NewtonManager] | str = "{DIR}.vbd_manager:NewtonVBDManager"
     """Manager class for the VBD solver."""
 
+    requires_graph_coloring: ClassVar[bool] = True
+
     iterations: int = 10
     """Number of VBD iterations per substep."""
+
+    friction_epsilon: float = 0.01
+    """Regularization epsilon for Coulomb friction in VBD contacts [m/s]."""
 
     integrate_with_external_rigid_solver: bool = False
     """Whether rigid bodies are integrated by an external solver (one-way coupling).
@@ -78,6 +83,53 @@ class VBDSolverCfg(NewtonSolverCfg):
     rigid_contact_k_start: float = 1.0e2
     """Initial stiffness seed for all rigid body contacts [N/m]."""
 
+    rigid_contact_hard: bool = True
+    """Whether VBD treats rigid contacts as hard constraints."""
+
+    rigid_contact_history: bool = False
+    """Whether to warm-start body-body contacts from collision-pipeline matching.
+
+    The collision pipeline must populate contact-match indices, for example by
+    enabling ``contact_matching="latest"``.
+    """
+
+    rigid_body_contact_buffer_size: int = 64
+    """Maximum number of body-body contacts tracked per rigid body."""
+
+    rigid_avbd_beta: float = 0.0
+    """Per-iteration AVBD penalty-stiffness ramp rate."""
+
+    rigid_avbd_gamma: float = 0.999
+    """Per-step decay for AVBD penalty stiffness and hard-mode multipliers."""
+
+    rigid_body_particle_contact_buffer_size: int = 256
+    """Maximum number of body-particle contacts tracked per rigid body."""
+
+    rigid_joint_linear_ke: float = 1.0e5
+    """Maximum linear penalty stiffness for VBD rigid joints [N/m]."""
+
+    rigid_joint_angular_ke: float = 1.0e5
+    """Maximum angular penalty stiffness for VBD rigid joints [N·m/rad]."""
+
+    rigid_joint_linear_k_start: float = 1.0e2
+    """Initial linear penalty seed for VBD rigid joints [N/m]."""
+
+    rigid_joint_angular_k_start: float = 1.0e1
+    """Initial angular penalty seed for VBD rigid joints [N·m/rad]."""
+
+    rigid_joint_linear_kd: float = 0.0
+    """Damping coefficient for non-cable linear joint constraints [N·s/m]."""
+
+    rigid_joint_angular_kd: float = 0.0
+    """Damping coefficient for non-cable angular joint constraints [N·m·s/rad]."""
+
+    rigid_joint_hard: bool = True
+    """Whether VBD structural rigid joints use augmented-Lagrangian constraints.
+
+    Set to ``False`` to use penalty-only structural joints. The coupled manager
+    applies this option after the entry solver is constructed.
+    """
+
 
 @configclass
 class CoupledMJWarpVBDSolverCfg(NewtonSolverCfg):
@@ -89,6 +141,8 @@ class CoupledMJWarpVBDSolverCfg(NewtonSolverCfg):
 
     class_type: type[NewtonManager] | str = "{DIR}.coupled_mjwarp_vbd_manager:NewtonCoupledMJWarpVBDManager"
     """Manager class for the coupled MJWarp + VBD solver."""
+
+    requires_graph_coloring: ClassVar[bool] = True
 
     rigid_solver_cfg: MJWarpSolverCfg = MJWarpSolverCfg()
     """Rigid-body sub-solver configuration."""
@@ -114,6 +168,8 @@ class CoupledFeatherstoneVBDSolverCfg(NewtonSolverCfg):
 
     class_type: type[NewtonManager] | str = "{DIR}.coupled_featherstone_vbd_manager:NewtonCoupledFeatherstoneVBDManager"
     """Manager class for the coupled Featherstone + VBD solver."""
+
+    requires_graph_coloring: ClassVar[bool] = True
 
     rigid_solver_cfg: FeatherstoneSolverCfg = FeatherstoneSolverCfg()
     """Rigid-body sub-solver configuration."""

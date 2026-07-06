@@ -29,7 +29,7 @@ Repository = "https://github.com/isaac-sim/IsaacLab"
 kit = []
 newton = [
     "warp-lang",
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@c7ae7c7648cd0717df39e5c94b95d5a02c997320",
+    "newton[sim] @ https://github.com/newton-physics/newton/archive/b24dc255392126fe42a609ea6c4e4c8dca8009cc.tar.gz",
     "newton-usd-schemas>=0.3.1",
     "PyOpenGL-accelerate",
     "pyglet>=2.1.6,<3",
@@ -37,19 +37,19 @@ newton = [
     "typing-extensions>=4.15.0",
 ]
 rerun = [
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@c7ae7c7648cd0717df39e5c94b95d5a02c997320",
+    "newton[sim] @ https://github.com/newton-physics/newton/archive/b24dc255392126fe42a609ea6c4e4c8dca8009cc.tar.gz",
     "newton-usd-schemas>=0.3.1",
     "rerun-sdk>=0.29.0",
     "pyarrow==22.0.0",
 ]
 viser = [
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@c7ae7c7648cd0717df39e5c94b95d5a02c997320",
+    "newton[sim] @ https://github.com/newton-physics/newton/archive/b24dc255392126fe42a609ea6c4e4c8dca8009cc.tar.gz",
     "newton-usd-schemas>=0.3.1",
     "viser>=1.0.16",
 ]
 all = [
     "imgui-bundle>=1.92.5",
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@c7ae7c7648cd0717df39e5c94b95d5a02c997320",
+    "newton[sim] @ https://github.com/newton-physics/newton/archive/b24dc255392126fe42a609ea6c4e4c8dca8009cc.tar.gz",
     "newton-usd-schemas>=0.3.1",
     "PyOpenGL-accelerate",
     "pyglet>=2.1.6,<3",

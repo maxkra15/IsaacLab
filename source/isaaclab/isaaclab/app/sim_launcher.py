@@ -34,8 +34,10 @@ from isaaclab.sensors.camera.camera_cfg import CameraCfg
 logger = logging.getLogger(__name__)
 
 # Class names of the kitless physics backends (Newton, OvPhysX). Matched by exact
-# name so subclasses with distinct names (e.g. ``CoupledNewtonCfg``) opt out.
-_KITLESS_PHYSICS_CFGS = ("NewtonCfg", "OvPhysxCfg")
+# name so subclasses opt in explicitly: a Newton subclass that genuinely needs Kit
+# is left off this list, while kitless-capable subclasses (e.g. ``CoupledNewtonCfg``)
+# are named here so the kitless launch path applies.
+_KITLESS_PHYSICS_CFGS = ("NewtonCfg", "CoupledNewtonCfg", "OvPhysxCfg")
 
 
 def add_launcher_args(parser: argparse.ArgumentParser) -> None:
@@ -311,6 +313,10 @@ Launch Decisions (derived purely from a scan).
 def _has_kit_visualizer(config_scan: Scan, launcher_args: argparse.Namespace | dict | None) -> bool:
     """Return whether the run requests the Kit visualizer through config or CLI."""
     visualizer_types = _get_visualizer_types(launcher_args)
+    if bool(_get_arg(launcher_args, "headless", False)) and bool(_get_arg(launcher_args, "headless_explicit", False)):
+        return False
+    if bool(_get_arg(launcher_args, "visualizer_explicit", False)):
+        return "kit" in visualizer_types
     return "kit" in visualizer_types or config_scan.visualizer_intent["has_kit_visualizer"]
 
 
@@ -445,6 +451,9 @@ def launch_simulation(
     visualizer_explicit_none = _get_arg(launcher_args, "visualizer") is None and _get_arg(
         launcher_args, "visualizer_explicit", False
     )
+    headless_explicit = bool(_get_arg(launcher_args, "headless", False)) and bool(
+        _get_arg(launcher_args, "headless_explicit", False)
+    )
 
     close_fn: Any = None
     if needs_kit:
@@ -461,12 +470,12 @@ def launch_simulation(
             if sim_cfg is not None and hasattr(app_launcher, "device"):
                 sim_cfg.device = app_launcher.device
             close_fn = app_launcher.app.close
-    elif visualizer_types or visualizer_explicit_none:
+    elif visualizer_types or visualizer_explicit_none or headless_explicit:
         # Kitless path: AppLauncher is skipped, so persist the visualizer selection in
         # SettingsManager so SimulationContext._get_cli_visualizer_types() can find it.
         from isaaclab.app import AppLauncher
 
-        disable_all = visualizer_explicit_none or "none" in visualizer_types
+        disable_all = visualizer_explicit_none or headless_explicit or "none" in visualizer_types
         base = vars(launcher_args) if isinstance(launcher_args, argparse.Namespace) else launcher_args
         if base is not None:
             AppLauncher.sync_visualizer_cli_settings_to_carb(

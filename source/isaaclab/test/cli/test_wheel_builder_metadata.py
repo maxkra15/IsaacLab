@@ -47,11 +47,11 @@ def _rsl_rl_pin_from_pyproject() -> str:
 
 
 def _newton_pin_from_pyproject(relative_path: str, extra_name: str) -> str:
-    """Return the ``newton[sim]`` direct URL pin declared by a package extra."""
+    """Return the Newton direct URL pin declared by a package extra."""
     dependencies = _load_toml(relative_path)["project"]["optional-dependencies"][extra_name]
     return _single_dependency(
         dependencies,
-        "newton[sim] @ git+https://github.com/newton-physics/newton.git@",
+        "newton[sim] @ https://github.com/newton-physics/newton/archive/",
         f"{relative_path}[{extra_name}]",
     )
 
@@ -86,7 +86,7 @@ def test_wheel_builder_newton_pin_matches_source_packages():
 
     wheel_newton_pin = _single_dependency(
         _wheel_builder_dependencies_by_extra()["newton"],
-        "newton[sim] @ git+https://github.com/newton-physics/newton.git@",
+        "newton[sim] @ https://github.com/newton-physics/newton/archive/",
         "tools/wheel_builder/res/python_packages.toml[newton]",
     )
     assert wheel_newton_pin == expected_pin

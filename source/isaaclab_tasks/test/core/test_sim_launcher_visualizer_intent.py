@@ -90,3 +90,70 @@ def test_launch_simulation_kitless_viz_none_sets_disable_all(monkeypatch):
         pass
 
     assert captured == {"types": "", "explicit": True, "disable_all": True}
+
+
+def test_explicit_newton_visualizer_overrides_configured_kit_visualizer():
+    """An explicit kitless visualizer must override a configured Kit default."""
+    config_scan = sim_launcher.Scan(
+        resolved_physics_cfg=None,
+        effective_cfg=None,
+        visualizer_intent={"has_any_visualizers": True, "has_kit_visualizer": True},
+        has_ovrtx=False,
+        has_kit_camera=False,
+        has_kit_physics=False,
+        has_kitless_physics=True,
+        has_ovphysx_physics=False,
+        needs_kit=False,
+    )
+    launcher_args = argparse.Namespace(visualizer="newton", visualizer_explicit=True)
+
+    assert sim_launcher._has_kit_visualizer(config_scan, launcher_args) is False
+
+
+def test_explicit_headless_overrides_configured_kit_visualizer():
+    """Explicit headless mode must override a configured Kit default."""
+    config_scan = sim_launcher.Scan(
+        resolved_physics_cfg=None,
+        effective_cfg=None,
+        visualizer_intent={"has_any_visualizers": True, "has_kit_visualizer": True},
+        has_ovrtx=False,
+        has_kit_camera=False,
+        has_kit_physics=False,
+        has_kitless_physics=True,
+        has_ovphysx_physics=False,
+        needs_kit=False,
+    )
+    launcher_args = argparse.Namespace(
+        headless=True,
+        headless_explicit=True,
+        visualizer=None,
+        visualizer_explicit=False,
+    )
+
+    assert sim_launcher._has_kit_visualizer(config_scan, launcher_args) is False
+
+
+def test_launch_simulation_explicit_headless_sets_disable_all(monkeypatch):
+    """Kitless explicit headless mode must persist disable-all settings."""
+    captured = {"explicit": None, "disable_all": None}
+
+    class _FakeAppLauncher:
+        @staticmethod
+        def sync_visualizer_cli_settings_to_carb(launcher_args: dict) -> None:
+            captured["explicit"] = launcher_args["visualizer_explicit"]
+            captured["disable_all"] = launcher_args["visualizer_disable_all"]
+
+    _force_kitless(monkeypatch)
+    monkeypatch.setitem(sys.modules, "isaaclab.app", types.SimpleNamespace(AppLauncher=_FakeAppLauncher))
+    env_cfg = _DummyEnvCfg(_DummySimCfg(None))
+    launcher_args = argparse.Namespace(
+        headless=True,
+        headless_explicit=True,
+        visualizer=None,
+        visualizer_explicit=False,
+    )
+
+    with sim_launcher.launch_simulation(env_cfg, launcher_args):
+        pass
+
+    assert captured == {"explicit": True, "disable_all": True}

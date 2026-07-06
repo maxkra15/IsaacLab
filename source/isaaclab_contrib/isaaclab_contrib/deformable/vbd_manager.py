@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import numpy as np
 import warp as wp
 from isaaclab_newton.physics.newton_manager import NewtonManager
 from newton import Model, ModelBuilder
@@ -244,8 +245,39 @@ class NewtonVBDManager(NewtonManager):
         """
         kwargs = cls._filter_solver_kwargs(SolverVBD, solver_cfg)
         NewtonManager._solver = SolverVBD(model, **kwargs)
+        if not solver_cfg.rigid_joint_hard:
+            cls._set_all_vbd_joints_soft(NewtonManager._solver)
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = True
+
+    @staticmethod
+    def _set_all_vbd_joints_soft(solver) -> None:
+        """Set all VBD structural joint constraints to penalty-only in one host round trip."""
+        solver = getattr(solver, "_solver", solver)
+        if int(getattr(getattr(solver, "model", None), "joint_count", 0)) == 0:
+            return
+        starts = solver._to_numpy(solver.joint_constraint_start, dtype=np.int32)
+        dimensions = solver._to_numpy(solver.joint_constraint_dim, dtype=np.int32)
+        is_hard = solver._to_numpy(solver.joint_is_hard, dtype=np.int32)
+        linear_lambda = solver._to_numpy(solver.joint_lambda_lin)
+        angular_lambda = solver._to_numpy(solver.joint_lambda_ang)
+        linear_c0 = solver._to_numpy(solver.joint_C0_lin)
+        angular_c0 = solver._to_numpy(solver.joint_C0_ang)
+
+        structural = np.minimum(dimensions, 2)
+        is_hard[starts[structural >= 1]] = 0
+        is_hard[starts[structural >= 2] + 1] = 0
+        linear_lambda[:] = 0.0
+        linear_c0[:] = 0.0
+        has_angular = dimensions > 1
+        angular_lambda[has_angular] = 0.0
+        angular_c0[has_angular] = 0.0
+
+        solver.joint_is_hard = wp.array(is_hard, dtype=wp.int32, device=solver.device)
+        solver.joint_lambda_lin = wp.array(linear_lambda, dtype=wp.vec3, device=solver.device)
+        solver.joint_lambda_ang = wp.array(angular_lambda, dtype=wp.vec3, device=solver.device)
+        solver.joint_C0_lin = wp.array(linear_c0, dtype=wp.vec3, device=solver.device)
+        solver.joint_C0_ang = wp.array(angular_c0, dtype=wp.vec3, device=solver.device)
 
     @classmethod
     def _simulate_physics_only(cls) -> None:
