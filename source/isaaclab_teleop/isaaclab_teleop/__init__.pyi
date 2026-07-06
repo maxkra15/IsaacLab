@@ -16,9 +16,11 @@ __all__ = [
     "XrCfg",
     "create_isaac_teleop_device",
     "poll_control_events",
+    "preload_cloudxr_websockets",
     "remove_camera_configs",
 ]
 
+from .cloudxr import preload_cloudxr_websockets
 from .control_events import TELEOP_CONTROL_CHANNEL_UUID, ControlEvents, SupportsControlEvents, poll_control_events
 from .isaac_teleop_cfg import CLOUDXR_AVP_ENV, CLOUDXR_JS_ENV, IsaacTeleopCfg
 from .isaac_teleop_device import IsaacTeleopDevice, create_isaac_teleop_device

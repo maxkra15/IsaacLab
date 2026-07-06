@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -11,22 +11,61 @@ set -e
 # Get repo directory.
 export ISAACLAB_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
-# Find python to run CLI.
-if [ -n "$VIRTUAL_ENV" ]; then
-    python_exe="$VIRTUAL_ENV/bin/python"
-elif [ -n "$CONDA_PREFIX" ]; then
-    python_exe="$CONDA_PREFIX/bin/python"
-elif [ -f "$ISAACLAB_PATH/env_isaaclab/bin/python" ]; then
-    python_exe="$ISAACLAB_PATH/env_isaaclab/bin/python"
-elif [ -f "$ISAACLAB_PATH/_isaac_sim/python.sh" ]; then
-    python_exe="$ISAACLAB_PATH/_isaac_sim/python.sh"
-else
-    # Fallback to system python
-    python_exe="python3"
+# Ignore stale environment variables instead of failing on a Python executable
+# that no longer exists.
+if [ -n "${VIRTUAL_ENV:-}" ] && [ ! -x "$VIRTUAL_ENV/bin/python" ]; then
+    echo "[WARNING] Ignoring stale VIRTUAL_ENV=$VIRTUAL_ENV (no executable Python found)." >&2
+    unset VIRTUAL_ENV
+fi
+if [ -n "${CONDA_PREFIX:-}" ] && [ ! -x "$CONDA_PREFIX/bin/python" ]; then
+    echo "[WARNING] Ignoring stale CONDA_PREFIX=$CONDA_PREFIX (no executable Python found)." >&2
+    unset CONDA_PREFIX
 fi
 
-# Add source/isaaclab to PYTHONPATH so we can import isaaclab.cli.
-export PYTHONPATH="$ISAACLAB_PATH/source/isaaclab:$PYTHONPATH"
+# Select one Python environment. Active environments take precedence, followed
+# by the conventional repository-local environments.
+python_env=""
+python_env_kind=""
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+    python_env="$VIRTUAL_ENV"
+    python_env_kind="venv"
+elif [ -n "${CONDA_PREFIX:-}" ]; then
+    python_env="$CONDA_PREFIX"
+    python_env_kind="conda"
+elif [ -x "$ISAACLAB_PATH/env_isaaclab/bin/python" ]; then
+    python_env="$ISAACLAB_PATH/env_isaaclab"
+    python_env_kind="venv"
+elif [ -x "$ISAACLAB_PATH/.venv/bin/python" ]; then
+    python_env="$ISAACLAB_PATH/.venv"
+    python_env_kind="venv"
+fi
+
+selected_python=""
+if [ -n "$python_env" ]; then
+    selected_python="$python_env/bin/python"
+    export PATH="$python_env/bin:$PATH"
+    if [ "$python_env_kind" = "venv" ]; then
+        export VIRTUAL_ENV="$python_env"
+    fi
+fi
+
+# Put this checkout's packages first, then the selected environment's
+# site-packages. Isaac Sim's source-build launcher appends its bundled package
+# paths later, preserving this ordering.
+python_paths=""
+for source_path in "$ISAACLAB_PATH"/source/*; do
+    if [ -d "$source_path" ]; then
+        python_paths="${python_paths:+$python_paths:}$source_path"
+    fi
+done
+if [ -n "$selected_python" ]; then
+    python_site_packages="$($selected_python -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+    python_paths="${python_paths:+$python_paths:}$python_site_packages"
+fi
+if [ -n "${PYTHONPATH:-}" ]; then
+    python_paths="${python_paths:+$python_paths:}$PYTHONPATH"
+fi
+export PYTHONPATH="$python_paths"
 
 # Let Kit associate direct wrapper launches with the Isaac Sim desktop icon.
 export RESOURCE_NAME="${RESOURCE_NAME:-IsaacSim}"
@@ -38,26 +77,28 @@ if [ -d "$ISAACLAB_PATH/_isaac_sim" ]; then
     if [ -f "$ISAACLAB_PATH/_isaac_sim/setup_conda_env.sh" ]; then
         # shellcheck disable=SC1091
         . "$ISAACLAB_PATH/_isaac_sim/setup_conda_env.sh" >/dev/null 2>&1 || true
-    elif [ -f "$ISAACLAB_PATH/_isaac_sim/setup_python_env.sh" ]; then
-        export ISAAC_PATH="$ISAACLAB_PATH/_isaac_sim"
-        export CARB_APP_PATH="$ISAAC_PATH/kit"
-        export EXP_PATH="$ISAAC_PATH/apps"
-        # shellcheck disable=SC1091
-        . "$ISAACLAB_PATH/_isaac_sim/setup_python_env.sh" >/dev/null 2>&1 || true
-        # Unlike setup_conda_env.sh, setup_python_env.sh prepends Kit's
-        # pip_prebundle directories to PYTHONPATH. Those ship vendored copies of
-        # common libraries (e.g. an older typing_extensions lacking Sentinel)
-        # that then shadow the active venv/conda environment. Put the active
-        # environment's site-packages first so it always wins.
-        if [ -n "$VIRTUAL_ENV" ] || [ -n "$CONDA_PREFIX" ]; then
-            env_site_packages="$("$python_exe" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
-            if [ -n "$env_site_packages" ]; then
-                export PYTHONPATH="$env_site_packages:$PYTHONPATH"
-            fi
+    elif [ -x "$ISAACLAB_PATH/_isaac_sim/python.sh" ] && [ -f "$ISAACLAB_PATH/_isaac_sim/setup_python_env.sh" ]; then
+        # A source-built Isaac Sim configures its complete runtime from
+        # python.sh. PYTHONEXE lets it retain the selected Isaac Lab venv.
+        if [ -n "$selected_python" ]; then
+            export PYTHONEXE="$selected_python"
+        else
+            unset PYTHONEXE
         fi
+        python_exe="$ISAACLAB_PATH/_isaac_sim/python.sh"
     else
-        echo "[WARNING] _isaac_sim is present but _isaac_sim/setup_conda_env.sh or _isaac_sim/setup_python_env.sh is missing; Isaac Sim env vars not exported." >&2
-        echo "[WARNING] Re-extract the Isaac Sim binary zip if you intend to use the bundled binary." >&2
+        echo "[WARNING] _isaac_sim is present but has no recognized environment setup." >&2
+    fi
+fi
+
+if [ -z "${python_exe:-}" ]; then
+    if [ -n "$selected_python" ]; then
+        python_exe="$selected_python"
+    elif [ -x "$ISAACLAB_PATH/_isaac_sim/python.sh" ]; then
+        python_exe="$ISAACLAB_PATH/_isaac_sim/python.sh"
+    else
+        # Fallback to system python.
+        python_exe="python3"
     fi
 fi
 

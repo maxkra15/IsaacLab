@@ -359,6 +359,13 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 app_launcher_args = vars(args_cli)
+
+# Cache IsaacTeleop's WebSockets dependency before Kit exposes its bundled copy.
+if args_cli.auto_launch_cloudxr and args_cli.cloudxr_env and args_cli.cloudxr_env.strip().lower() != "none":
+    from isaaclab_teleop.cloudxr import preload_cloudxr_websockets
+
+    preload_cloudxr_websockets()
+
 app_launcher = AppLauncher(app_launcher_args)
 simulation_app = app_launcher.app
 
