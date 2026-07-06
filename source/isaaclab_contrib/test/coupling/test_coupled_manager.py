@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import warp as wp
-from isaaclab_newton.physics import MJWarpSolverCfg, XPBDSolverCfg
+from isaaclab_newton.physics import MJWarpSolverCfg, MPMSolverCfg, XPBDSolverCfg
 from newton import ShapeFlags
 from newton.solvers.experimental.coupled import CouplingInterface, SolverCoupledADMM, SolverCoupledProxy
 
@@ -33,6 +33,7 @@ from isaaclab_contrib.coupling.coupled_manager_cfg import (
     CoupledAdmmSolverCfg,
     CoupledProxyCfg,
     CoupledProxySolverCfg,
+    CoupledSolverCfg,
     CoupledSolverEntryCfg,
 )
 from isaaclab_contrib.deformable.newton_manager_cfg import VBDSolverCfg
@@ -148,6 +149,18 @@ def test_scene_entity_and_string_selectors_resolve_full_body_labels():
         None,
         "entry 'cable'",
     ) == [2]
+
+
+def test_scene_entity_selector_expands_environment_namespace_macro():
+    """Scene selectors accept the standard unresolved Isaac Lab environment macro."""
+    scene_cfg = _FakeSceneCfg(robot=_FakeAsset("{ENV_REGEX_NS}/Robot"))
+
+    assert NewtonCoupledSolverManager._resolve_entity_to_body_ids(
+        _FakeModel(),
+        SceneEntityCfg("robot"),
+        scene_cfg,
+        "entry 'rigid'",
+    ) == [0, 1]
 
 
 def test_scene_entity_selector_reports_unmatched_body_pattern():
@@ -361,6 +374,18 @@ def test_proxy_validation_checks_endpoints_and_source_ownership(proxy, match):
         ),
         (CoupledProxyCfg(source="rigid", destination="soft", bodies=[0], mass_scale=0.0), "mass_scale must be > 0"),
         (
+            CoupledProxyCfg(source="rigid", destination="soft", bodies=[0], proxy_relaxation=-0.1),
+            "proxy_relaxation must be finite and >= 0",
+        ),
+        (
+            CoupledProxyCfg(source="rigid", destination="soft", bodies=[0], proxy_relaxation=float("inf")),
+            "proxy_relaxation must be finite and >= 0",
+        ),
+        (
+            CoupledProxyCfg(source="rigid", destination="soft", bodies=[0], proxy_relaxation=float("nan")),
+            "proxy_relaxation must be finite and >= 0",
+        ),
+        (
             CoupledProxyCfg(source="rigid", destination="soft", bodies=[0], collide_interval=0),
             "collide_interval must be >= 1",
         ),
@@ -414,11 +439,16 @@ def test_proxy_build_uses_custom_and_default_collision_pipelines(monkeypatch):
         return model_view
 
     cfg = CoupledProxySolverCfg(
+        entries=[
+            CoupledSolverEntryCfg(name="rigid", solver_cfg=XPBDSolverCfg()),
+            CoupledSolverEntryCfg(name="soft", solver_cfg=XPBDSolverCfg()),
+        ],
         proxies=[
             CoupledProxyCfg(
                 source="rigid",
                 destination="soft",
                 bodies=[0],
+                proxy_relaxation=0.35,
                 collision_pipeline_factory=custom_pipeline,
             ),
             CoupledProxyCfg(source="soft", destination="rigid", particles=[0]),
@@ -430,8 +460,91 @@ def test_proxy_build_uses_custom_and_default_collision_pipelines(monkeypatch):
     solver = NewtonCoupledSolverManager._build_proxy_coupled_solver(object(), [], cfg)
 
     assert solver.coupling.iterations == 3
+    assert solver.coupling.proxies[0].proxy_relaxation == pytest.approx(0.35)
     assert solver.coupling.proxies[0].collision_pipeline is custom_pipeline
     assert solver.coupling.proxies[1].collision_pipeline is coupled_manager._default_proxy_collision_pipeline
+
+
+def test_proxy_build_omits_default_collision_pipeline_for_implicit_mpm_destination(monkeypatch):
+    """Implicit MPM handles proxy colliders internally and needs no external contact pipeline."""
+    cfg = CoupledProxySolverCfg(
+        entries=[
+            CoupledSolverEntryCfg(name="rigid", solver_cfg=XPBDSolverCfg()),
+            CoupledSolverEntryCfg(name="media", solver_cfg=MPMSolverCfg()),
+        ],
+        proxies=[CoupledProxyCfg(source="rigid", destination="media", bodies=[0])],
+    )
+    monkeypatch.setattr(coupled_manager, "SolverCoupledProxy", _RecordingProxy)
+
+    solver = NewtonCoupledSolverManager._build_proxy_coupled_solver(object(), [], cfg)
+
+    assert solver.coupling.proxies[0].collision_pipeline is None
+
+
+def test_implicit_mpm_entry_builds_solver_with_config_and_temporary_store(monkeypatch):
+    """The MPM adapter uses its structured config and an entry-local temporary store."""
+    model_view = object()
+    solver_config = object()
+    temporary_store = object()
+
+    class _RecordingImplicitMPM:
+        def __init__(self, model, config, *, temporary_store):
+            self.model = model
+            self.config = config
+            self.temporary_store = temporary_store
+
+    monkeypatch.setitem(
+        NewtonCoupledSolverManager._SOLVER_CLASS_BY_CFG_TYPE,
+        MPMSolverCfg,
+        _RecordingImplicitMPM,
+    )
+    monkeypatch.setattr(MPMSolverCfg, "to_solver_config", lambda self: solver_config)
+    monkeypatch.setattr(coupled_manager, "TemporaryStore", lambda: temporary_store)
+    entry_cfg = CoupledSolverEntryCfg(
+        name="media",
+        solver_cfg=MPMSolverCfg(),
+        particles=[0, 1],
+        in_place=True,
+    )
+
+    entry = NewtonCoupledSolverManager._build_entry(entry_cfg)
+    solver = entry.solver(model_view)
+
+    assert isinstance(solver, _RecordingImplicitMPM)
+    assert solver.model is model_view
+    assert solver.config is solver_config
+    assert solver.temporary_store is temporary_store
+
+
+@pytest.mark.parametrize(("substeps", "in_place"), [(4, False), (1, True)])
+def test_entry_build_forwards_substeps_and_in_place(substeps, in_place):
+    entry_cfg = CoupledSolverEntryCfg(
+        name="entry",
+        solver_cfg=XPBDSolverCfg(),
+        substeps=substeps,
+        in_place=in_place,
+    )
+
+    entry = NewtonCoupledSolverManager._build_entry(entry_cfg)
+
+    assert entry.substeps == substeps
+    assert entry.in_place is in_place
+
+
+@pytest.mark.parametrize(
+    ("substeps", "in_place", "match"),
+    [
+        (0, False, "substeps must be >= 1"),
+        (2, True, "in_place requires substeps=1"),
+    ],
+)
+def test_entry_validation_rejects_invalid_substeps_and_in_place(substeps, in_place, match):
+    cfg = _valid_proxy_cfg()
+    cfg.entries[0].substeps = substeps
+    cfg.entries[0].in_place = in_place
+
+    with pytest.raises(ValueError, match=match):
+        NewtonCoupledSolverManager._validate_solver_cfg(_FakeModel(), cfg)
 
 
 def test_proxy_shape_overrides_apply_only_to_selected_body_shapes():
@@ -469,7 +582,7 @@ def test_solver_cfg_external_contact_requirements(solver_cfg, expected):
 
 
 def test_algorithm_defaults_route_outer_and_entry_local_collision_pipelines(monkeypatch):
-    """Proxy defaults to local paths; ADMM defaults to one shared outer path."""
+    """Base infers its outer path, proxy defaults local, and ADMM defaults outer."""
     model = _FakeModel()
     proxy_cfg = _valid_proxy_cfg()
     recorded_entries: list[tuple[str, bool]] = []
@@ -483,8 +596,9 @@ def test_algorithm_defaults_route_outer_and_entry_local_collision_pipelines(monk
         NewtonCoupledSolverManager,
         "_build_entry",
         classmethod(
-            lambda cls, entry_cfg, *, local_collision=False: recorded_entries.append((entry_cfg.name, local_collision))
-            or entry_cfg.name
+            lambda cls, entry_cfg, *, local_collision=False: (
+                recorded_entries.append((entry_cfg.name, local_collision)) or entry_cfg.name
+            )
         ),
     )
     monkeypatch.setattr(
@@ -496,6 +610,11 @@ def test_algorithm_defaults_route_outer_and_entry_local_collision_pipelines(monk
         NewtonCoupledSolverManager,
         "_build_admm_coupled_solver",
         classmethod(lambda cls, model, entries, cfg: SimpleNamespace(kind="admm")),
+    )
+    monkeypatch.setattr(
+        coupled_manager,
+        "SolverCoupled",
+        lambda *, model, entries: SimpleNamespace(kind="base", model=model, entries=entries),
     )
     monkeypatch.setattr(
         NewtonCoupledSolverManager,
@@ -516,6 +635,27 @@ def test_algorithm_defaults_route_outer_and_entry_local_collision_pipelines(monk
     old_solver = coupled_manager.NewtonManager._solver
     old_outer = coupled_manager.NewtonManager._needs_collision_pipeline
     try:
+        base_cfg = CoupledSolverCfg(entries=proxy_cfg.entries)
+        NewtonCoupledSolverManager._build_solver(model, base_cfg)
+        assert coupled_manager.NewtonManager._solver.kind == "base"
+        assert coupled_manager.NewtonManager._solver.model is model
+        assert coupled_manager.NewtonManager._solver.entries == ["rigid", "soft"]
+        assert coupled_manager.NewtonManager._needs_collision_pipeline is True
+        assert recorded_entries == [("rigid", False), ("soft", False)]
+
+        recorded_entries.clear()
+        internal_entries = [
+            _entry("rigid", bodies=[0, 1], particles=[0]),
+            _entry("soft", bodies=[2], particles=[1, 2]),
+        ]
+        for entry in internal_entries:
+            entry.solver_cfg = MJWarpSolverCfg(use_mujoco_contacts=True)
+        NewtonCoupledSolverManager._build_solver(model, CoupledSolverCfg(entries=internal_entries))
+        assert coupled_manager.NewtonManager._solver.kind == "base"
+        assert coupled_manager.NewtonManager._needs_collision_pipeline is False
+        assert recorded_entries == [("rigid", False), ("soft", False)]
+
+        recorded_entries.clear()
         NewtonCoupledSolverManager._build_solver(model, proxy_cfg)
         assert coupled_manager.NewtonManager._needs_collision_pipeline is False
         assert recorded_entries == [("rigid", True), ("soft", False)]

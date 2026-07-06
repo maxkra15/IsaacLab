@@ -3111,7 +3111,7 @@ def test_jacobian_refreshes_after_manual_joint_write(
     env_ids = wp.array([0], dtype=wp.int32, device=device)
     articulation.write_joint_position_to_sim_index(position=q_target, env_ids=env_ids)
 
-    # If the FK trigger works: forward() runs, body_q is refreshed to match q_target,
+    # If the FK trigger works: forward_pending() runs, body_q is refreshed to match q_target,
     # eval_jacobian / shift kernel see fresh body poses, J reflects q_target → differs from J at baseline.
     # If the trigger is missing: body_q stays at baseline, J unchanged from J_link_0 / J_com_0.
     J_link_1 = articulation.data.body_link_jacobian_w.torch.clone()

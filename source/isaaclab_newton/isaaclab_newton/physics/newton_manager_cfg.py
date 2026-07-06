@@ -126,6 +126,10 @@ class NewtonCfg(PhysicsCfg):
     - :class:`XPBDSolverCfg` (always),
     - :class:`FeatherstoneSolverCfg` (always).
 
+    :class:`~isaaclab_contrib.coupling.CoupledSolverCfg` infers pipeline use
+    from its sub-solver entries unless its ``use_collision_pipeline`` override
+    is set explicitly.
+
     :class:`~isaaclab_newton.physics.MPMSolverCfg` does not use this pipeline;
     implicit MPM treats rigid geometry as colliders internally.
 

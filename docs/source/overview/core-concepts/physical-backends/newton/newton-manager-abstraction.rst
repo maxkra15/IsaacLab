@@ -106,12 +106,53 @@ solver actually needs it:
   builder data right before ``ModelBuilder.finalize()``.
   :class:`~isaaclab_newton.physics.NewtonMPMManager` uses this to clear mass and
   inertia on kinematic bodies so implicit MPM treats them as massless colliders.
-* ``_supports_cuda_graph_capture()``: return ``False`` to opt the solver out of
-  CUDA graph capture and fall back to eager execution. Defaults to ``True``;
-  :class:`~isaaclab_newton.physics.NewtonMPMManager` returns ``True`` only for a
-  fixed grid, since sparse/dense MPM grids reallocate as particles move.
+* ``_supports_cuda_graph_capture()``: report whether the active solver can run
+  inside a CUDA graph. The base manager delegates to Newton's public solver
+  capability. :class:`~isaaclab_newton.physics.NewtonMPMManager` preserves
+  fixed-grid support and also accepts an explicit capability advertised by a
+  capacity-bounded rebuildable sparse solver.
 * ``_solver_specific_clear()``: release any class-level state owned by the
   solver manager.
+
+Tasks that need to author solver-specific bodies or constraints into every
+replicated Newton world can use
+:meth:`~isaaclab_newton.physics.NewtonManager.register_builder_world_hook` and
+:meth:`~isaaclab_newton.physics.NewtonManager.unregister_builder_world_hook`.
+The callback runs inside each builder world after replicated USD content and
+registered MPM particle objects have been added.
+
+Only one layer should own graph recording. For a larger application-owned
+graph, configure ``use_cuda_graph=False`` and call
+:meth:`~isaaclab_newton.physics.NewtonManager.prepare_cuda_graph_capture`
+immediately after solver initialization, before the first simulation step and
+before beginning capture. Allocation warmup restores initial parent state and
+solver history. The manager then executes the solver eagerly so its kernels are
+recorded directly into the application graph; it does not create or launch a
+nested manager graph.
+
+After eager stepping or manager-owned graph replay, the manager calls Newton's
+recursive ``solver.check_status()`` hook before advancing published simulation
+time. This surfaces device failures such as sparse-grid capacity exhaustion at
+a safe host boundary. When an application records a larger outer CUDA graph,
+the manager defers the host readback; the outer owner must call
+:meth:`~isaaclab_newton.physics.NewtonManager.check_solver_status` after replay.
+Tests and orchestration code can use
+:meth:`~isaaclab_newton.physics.NewtonManager.is_cuda_graph_active` to confirm
+that manager-owned recording succeeded.
+
+Environment code that changes parent Newton state during a partial reset should
+call :meth:`~isaaclab_newton.physics.NewtonManager.reset_solver_state` after
+writing the reset values. With no explicit state argument, the manager resets
+both distinct parent-state buffers, finishing with the authoritative input
+buffer. Passing an explicit state keeps Newton's one-state reset semantics.
+The manager forwards the world mask and ``newton.StateFlags`` unchanged so
+callers can exclude state such as joint coordinates that must retain their
+newly written reset values.
+
+Solver-specific post-processing of a coupled entry must operate on its public
+entry state and reconcile it through ``SolverCoupled.reconcile_entry_state``.
+This keeps entry-local custom history authoritative while returning owned
+outputs to Isaac Lab's parent state.
 
 Keep the manager name prefixed with ``Newton`` and the solver config grouped
 with the other Newton solver configs so autocomplete and backend discovery stay

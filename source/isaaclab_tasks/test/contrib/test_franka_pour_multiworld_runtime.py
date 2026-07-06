@@ -1,0 +1,1253 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Headless runtime integration for isolated multi-world Franka Pour MPM."""
+
+from __future__ import annotations
+
+import inspect
+import os
+import re
+from unittest import mock
+
+import pytest
+
+_RUNTIME_UNAVAILABLE_REASON = "Isaac Sim runtime is unavailable because EXP_PATH is not set."
+_RUNTIME_AVAILABLE = bool(os.environ.get("EXP_PATH"))
+
+if _RUNTIME_AVAILABLE:
+    from isaaclab.app import AppLauncher
+
+    # Launch Kit before importing simulation-dependent modules.
+    app_launcher = AppLauncher(headless=True)
+    simulation_app = app_launcher.app
+
+    import gymnasium as gym
+    import newton
+    import numpy as np
+    import torch
+    import warp as wp
+    import warp.fem as fem
+    from isaaclab_newton.physics import NewtonManager
+
+    import isaaclab.sim as sim_utils
+
+    from isaaclab_contrib.coupling import NewtonCoupledSolverManager
+
+    import isaaclab_tasks  # noqa: F401
+    from isaaclab_tasks.contrib.franka_pour.pour_env_cfg import MPM_ENTRY
+    from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+pytestmark = [pytest.mark.isaacsim_ci, pytest.mark.newton_ci]
+
+_TASK_ID = "Isaac-Pour-Franka-v0"
+_MPM_HISTORY_FIELDS = (
+    "particle_elastic_strain",
+    "particle_transform",
+    "particle_qd_grad",
+    "particle_stress",
+    "particle_Jp",
+)
+_CONSTITUTIVE_HISTORY_FIELDS = (
+    "particle_elastic_strain",
+    "particle_transform",
+    "particle_stress",
+    "particle_Jp",
+)
+
+
+def _require_sparse_capture_stack() -> None:
+    """Skip only when an explicit CUDA/rebuildable-Warp capability is absent."""
+    if not wp.is_cuda_available():
+        pytest.skip("Franka Pour multi-world runtime integration requires a CUDA device.")
+
+    device = wp.get_device("cuda:0")
+    if not wp.is_mempool_enabled(device):
+        pytest.skip("Sparse MPM CUDA graph capture requires the Warp CUDA memory pool.")
+    with wp.ScopedDevice(device):
+        if not wp.is_conditional_graph_supported():
+            pytest.skip("Sparse MPM CUDA graph capture requires Warp conditional-graph support.")
+
+    try:
+        volume_allocate = inspect.signature(wp.Volume.allocate_by_voxels).parameters
+        volume_rebuild = inspect.signature(wp.Volume.rebuild).parameters
+        nanogrid_init = inspect.signature(fem.Nanogrid).parameters
+        nanogrid_rebuild = inspect.signature(fem.Nanogrid.rebuild).parameters
+    except (AttributeError, TypeError, ValueError):
+        pytest.skip("Installed Warp lacks the rebuildable Volume/Nanogrid API required by sparse MPM capture.")
+    rebuildable_api = (
+        {"rebuildable", "status", "point_mask"} <= volume_allocate.keys()
+        and {"status", "point_mask"} <= volume_rebuild.keys()
+        and "rebuildable" in nanogrid_init
+        and {"status", "point_mask"} <= nanogrid_rebuild.keys()
+    )
+    if not rebuildable_api:
+        pytest.skip("Installed Warp lacks the rebuildable Volume/Nanogrid API required by sparse MPM capture.")
+    if not getattr(fem.Nanogrid, "REBUILDABLE_EDGE_TOPOLOGY", False):
+        pytest.skip("Installed Warp lacks rebuildable NanoVDB edge topology required by MPM colliders.")
+
+
+def _particle_snapshot(state, particle_slice: slice) -> dict[str, np.ndarray]:
+    """Copy core and implicit-MPM particle state for one contiguous world."""
+    arrays = {
+        "particle_q": state.particle_q,
+        "particle_qd": state.particle_qd,
+        **{name: getattr(state.mpm, name) for name in _MPM_HISTORY_FIELDS},
+    }
+    return {name: np.ascontiguousarray(array.numpy()[particle_slice]).copy() for name, array in arrays.items()}
+
+
+def _assert_snapshot_bitwise_equal(actual: dict[str, np.ndarray], expected: dict[str, np.ndarray]) -> None:
+    """Assert exact storage equality, including floating-point sign bits."""
+    assert actual.keys() == expected.keys()
+    for name in expected:
+        assert actual[name].shape == expected[name].shape, name
+        assert actual[name].dtype == expected[name].dtype, name
+        np.testing.assert_array_equal(actual[name].view(np.uint8), expected[name].view(np.uint8), err_msg=name)
+
+
+def _snapshot_changed(actual: dict[str, np.ndarray], expected: dict[str, np.ndarray]) -> bool:
+    return any(not np.array_equal(actual[name].view(np.uint8), expected[name].view(np.uint8)) for name in expected)
+
+
+def _assert_rollout_world_equivalent(
+    actual: dict[str, np.ndarray], expected: dict[str, np.ndarray], *, context: str
+) -> None:
+    """Compare physical MPM outputs from independently constructed seeded rollouts."""
+    np.testing.assert_allclose(
+        actual["particle_q"],
+        expected["particle_q"],
+        rtol=1.0e-6,
+        atol=5.0e-7,
+        err_msg=f"{context}, field=particle_q",
+    )
+    np.testing.assert_allclose(
+        actual["particle_qd"],
+        expected["particle_qd"],
+        rtol=5.0e-4,
+        atol=3.0e-5,
+        err_msg=f"{context}, field=particle_qd",
+    )
+    for name in _CONSTITUTIVE_HISTORY_FIELDS:
+        np.testing.assert_array_equal(actual[name], expected[name], err_msg=f"{context}, field={name}")
+
+    # Sparse-grid/FEM accumulation order makes particle_qd_grad vary even
+    # between independently constructed eager, seeded rollouts. The two-step
+    # q/qd comparison exercises its downstream effect; the single-environment
+    # selective-reset test still checks this field bitwise.
+    assert np.all(np.isfinite(actual["particle_qd_grad"])), context
+    assert np.all(np.isfinite(expected["particle_qd_grad"])), context
+
+
+def _assert_media_collider_ownership(model, media_view) -> None:
+    """Check the entry's effective particle colliders and their Newton worlds."""
+    assert media_view.parent is model
+    particle_collision = int(newton.ShapeFlags.COLLIDE_PARTICLES)
+    shape_flags = media_view.shape_flags.numpy()
+    shape_bodies = media_view.shape_body.numpy()
+    body_worlds = media_view.body_world.numpy()
+    actual_by_world: dict[int, set[str]] = {0: set(), 1: set()}
+    collider_count = 0
+
+    for shape_id, flags in enumerate(shape_flags):
+        if int(flags) & particle_collision == 0:
+            continue
+        collider_count += 1
+        body_id = int(shape_bodies[shape_id])
+        assert body_id >= 0, f"Media entry unexpectedly exposes global particle collider {shape_id}."
+        world = int(body_worlds[body_id])
+        label = str(media_view.body_label[body_id])
+        match = re.search(r"/env_(\d+)(?:/|$)", label)
+        assert match is not None, f"Particle collider body has no replicated-world label: {label!r}."
+        assert world == int(match.group(1)), f"Collider {label!r} is assigned to Newton world {world}."
+        assert world in actual_by_world, f"Collider {label!r} references unexpected world {world}."
+        actual_by_world[world].add(label.rsplit("/", 1)[-1])
+
+    expected = {"SourceCup", "TargetCup", "SpillFloor"}
+    assert collider_count == 2 * len(expected)
+    assert actual_by_world == {0: expected, 1: expected}
+
+
+def _assert_scene_solver_roles(model) -> None:
+    """Check exact per-world task bodies and solver-only collision roles."""
+    body_world = model.body_world.numpy()
+    body_mass = model.body_mass.numpy()
+    body_inv_mass = model.body_inv_mass.numpy()
+    body_flags = model.body_flags.numpy()
+    shape_body = model.shape_body.numpy()
+    shape_flags = model.shape_flags.numpy()
+    collide_shapes = int(newton.ShapeFlags.COLLIDE_SHAPES)
+    collide_particles = int(newton.ShapeFlags.COLLIDE_PARTICLES)
+    visible = int(newton.ShapeFlags.VISIBLE)
+
+    for world in range(2):
+        bodies_by_name: dict[str, list[int]] = {}
+        for body_id, label in enumerate(model.body_label):
+            if int(body_world[body_id]) == world:
+                bodies_by_name.setdefault(str(label).rsplit("/", 1)[-1], []).append(body_id)
+        for name in ("SourceCup", "TargetCup", "SpillFloor"):
+            assert len(bodies_by_name.get(name, [])) == 1, (world, name, bodies_by_name.get(name))
+        assert "TargetCupRigid" not in bodies_by_name
+
+        target_body = bodies_by_name["TargetCup"][0]
+        assert int(body_flags[target_body]) & int(newton.BodyFlags.KINEMATIC)
+        assert float(body_mass[target_body]) == 0.0
+        assert float(body_inv_mass[target_body]) == 0.0
+
+        expected_shapes = (
+            ("SourceCup", "/SourceCup/ParticleCollider", False, True, False),
+            ("TargetCup", "/TargetCup/ParticleCollider", False, True, False),
+            ("TargetCup", "/TargetCup/Collision", True, False, False),
+            ("SpillFloor", "/SpillFloor/Collision", False, True, False),
+        )
+        for body_name, suffix, rigid, particles, is_visible in expected_shapes:
+            body_id = bodies_by_name[body_name][0]
+            matches = [
+                shape_id
+                for shape_id, label in enumerate(model.shape_label)
+                if int(shape_body[shape_id]) == body_id and str(label).endswith(suffix)
+            ]
+            assert len(matches) == 1, (world, body_name, matches)
+            flags = int(shape_flags[matches[0]])
+            assert bool(flags & collide_shapes) is rigid
+            assert bool(flags & collide_particles) is particles
+            assert bool(flags & visible) is is_visible
+
+
+def _make_runtime_cfg(*, use_cuda_graph: bool = True, env_spacing: float = 0.0, mpm_iterations: int = 2):
+    cfg = parse_env_cfg(_TASK_ID, device="cuda:0", num_envs=2)
+    cfg.seed = 37
+    # Keep the existing solver/reset regressions on the full-task open-hand approach contract.
+    # The dedicated curriculum test below exercises mixed easy/full stages explicitly.
+    cfg.curriculum_start_stage = cfg.curriculum_stage_names.index("full")
+    cfg.curriculum_freeze = True
+    cfg.scene.env_spacing = env_spacing
+    cfg.decimation = 1
+    cfg.num_substeps = 1
+    cfg.mpm_iterations = mpm_iterations
+    cfg.use_cuda_graph = use_cuda_graph
+    cfg.sim.render_interval = 1
+
+    entries = {entry.name: entry for entry in cfg.sim.physics.solver_cfg.entries}
+    assert entries[MPM_ENTRY].in_place
+    return cfg
+
+
+def _move_world_0_cup_collider(task, offset: tuple[float, float, float]) -> None:
+    """Move only world 0's scene-owned source cup through its public writers."""
+    model = NewtonManager.get_model()
+    offset_t = torch.as_tensor(offset, device=task.device, dtype=torch.float32)
+    env_ids = torch.tensor([0], device=task.device, dtype=torch.long)
+    cup_pose = task.scene["source_cup"].data.root_link_pose_w.torch[env_ids].clone()
+    cup_pose[:, :3] += offset_t
+    task.scene["source_cup"].write_root_pose_to_sim_index(root_pose=cup_pose, env_ids=env_ids)
+    cup_velocity = torch.zeros((1, 6), device=task.device, dtype=torch.float32)
+    cup_velocity[:, :3] = offset_t / float(task.step_dt)
+    task.scene["source_cup"].write_root_velocity_to_sim_index(root_velocity=cup_velocity, env_ids=env_ids)
+    _ = task.scene["source_cup"].data.body_link_pose_w
+
+    world_mask_t = torch.zeros(task.num_envs, device=task.device, dtype=torch.bool)
+    world_mask_t[0] = True
+    NewtonManager.reset_solver_state(
+        world_mask=wp.from_torch(world_mask_t, dtype=wp.bool),
+        flags=newton.StateFlags.BODY,
+    )
+    wp.synchronize_device(model.device)
+    torch.testing.assert_close(
+        task.scene["source_cup"].data.root_link_pose_w.torch[env_ids],
+        cup_pose,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def _run_particle_rollout(
+    *,
+    use_cuda_graph: bool,
+    cup_offset_world_0: tuple[float, float, float] | None = None,
+    steps: int = 2,
+) -> tuple[list[list[dict[str, np.ndarray]]], bool]:
+    """Run a seeded two-world rollout and return per-step, per-world MPM state."""
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        # The collider perturbation must produce a measurable response in only two control steps;
+        # use the production nonlinear solve depth while the broader lifecycle suite stays at two.
+        env = gym.make(
+            _TASK_ID,
+            cfg=_make_runtime_cfg(use_cuda_graph=use_cuda_graph, mpm_iterations=24),
+        )
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        if cup_offset_world_0 is not None:
+            _move_world_0_cup_collider(task, cup_offset_world_0)
+
+        model = NewtonManager.get_model()
+        media = task.scene[MPM_ENTRY]
+        particle_offsets = media.particle_offsets.numpy().astype(np.int64, copy=False)
+        particles_per_world = int(media.particles_per_object)
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        trajectory = []
+        for _ in range(steps):
+            env.step(actions)
+            wp.synchronize_device(model.device)
+            state = NewtonManager.get_state_0()
+            trajectory.append(
+                [
+                    _particle_snapshot(state, slice(int(begin), int(begin) + particles_per_world))
+                    for begin in particle_offsets
+                ]
+            )
+
+        return trajectory, NewtonManager.is_cuda_graph_active()
+    finally:
+        if env is not None:
+            env.close()
+
+
+def _assert_full_task_reset_state(task, *, arm_atol: float = 1.0e-5, gripper_atol: float = 1.0e-5) -> None:
+    """Check that the physical reset and trajectory controller start from one coherent state."""
+    arm_action = task.action_manager.get_term("arm_action")
+    arm_q = task._robot.data.joint_pos.torch[:, task._arm_joint_ids]
+    torch.testing.assert_close(arm_q, arm_action.reference_target, rtol=0.0, atol=arm_atol)
+    torch.testing.assert_close(arm_action.processed_actions, arm_q, rtol=0.0, atol=arm_atol)
+    torch.testing.assert_close(
+        arm_action.reference_phase,
+        torch.zeros(task.num_envs, device=task.device),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        task.gripper_width(),
+        torch.full((task.num_envs,), 0.08, device=task.device),
+        rtol=0.0,
+        atol=gripper_atol,
+    )
+    tcp_distance = torch.linalg.vector_norm(task.tcp_pos_e() - task.cup_grasp_point_e(), dim=-1)
+    minimum_distance = task.cfg.curriculum_randomized_reset_tcp_min_grasp_distance - 0.005
+    assert bool(torch.all(tcp_distance >= minimum_distance)), (
+        f"Full-task TCP reset is not a real approach: distance={tcp_distance.tolist()}"
+    )
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_reset_starts_on_reference_and_zero_action_advances_trajectory():
+    """A task reset must start on its reference, whose nominal command advances at zero action."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        env = gym.make(_TASK_ID, cfg=_make_runtime_cfg())
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        assert task.action_manager.active_terms == ["arm_action", "gripper_action"]
+        assert task.action_manager.action_term_dim == [8, 1]
+        assert task.action_manager.total_action_dim == 9
+        _assert_full_task_reset_state(task)
+        arm_action = task.action_manager.get_term("arm_action")
+        phase_before = arm_action.reference_phase.clone()
+        target_before = arm_action.reference_target.clone()
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        actions[:, -1] = 1.0
+        env.step(actions)
+        assert NewtonManager.is_cuda_graph_active()
+        assert bool(torch.all(arm_action.reference_phase > phase_before))
+        assert bool(torch.any(arm_action.reference_target != target_before))
+        # The first coordinate is a residual speed command around nominal progress, so an all-zero
+        # arm action follows the trajectory rather than holding the reset pose. Joint residuals
+        # remain zero, making the processed target equal to the interpolated reference exactly.
+        torch.testing.assert_close(arm_action.processed_actions, arm_action.reference_target, rtol=0.0, atol=0.0)
+        assert bool(torch.all(task.state_finite()))
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_randomized_stage_builds_safe_ik_resets_and_resets_selected_world():
+    """Randomized full-task resets stay reachable, separated, bounded, and world-selective."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        cfg = _make_runtime_cfg()
+        randomized_stage = cfg.curriculum_stage_names.index("randomized")
+        cfg.curriculum_start_stage = randomized_stage
+        cfg.curriculum_randomization_start_level = len(cfg.curriculum_randomization_extent_levels) - 1
+        cfg.curriculum_freeze = True
+        env = gym.make(_TASK_ID, cfg=cfg)
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        source_bank = task._randomized_source_pos_bank_t
+        source_yaw_bank = task._randomized_source_yaw_bank_t
+        source_quat_bank = task._randomized_source_quat_bank_t
+        target_bank = task._randomized_target_pos_bank_t
+        tcp_start_bank = task._randomized_tcp_pos_bank_t
+        tcp_start_quat_bank = task._randomized_tcp_quat_bank_t
+        arm_bank = task._randomized_arm_q_bank_t
+        assert source_bank.shape == target_bank.shape
+        assert source_bank.shape == tcp_start_bank.shape
+        assert source_yaw_bank.shape == (source_bank.shape[0],)
+        assert source_quat_bank.shape == tcp_start_quat_bank.shape == (source_bank.shape[0], 4)
+        assert source_bank.shape[0] == arm_bank.shape[0] > 1
+        assert source_bank.shape[0] == (
+            task.cfg.curriculum_randomized_reset_ik_grid_size**2
+            * task.cfg.curriculum_randomized_reset_ik_samples_per_source
+        )
+        source_center = torch.as_tensor(task.cfg.cup_reset_pos[:2], device=task.device)
+        source_range = torch.as_tensor(task.cfg.curriculum_randomized_source_position_range, device=task.device)
+        extent_pools = task._randomized_extent_index_pools
+        assert all(left.numel() < right.numel() for left, right in zip(extent_pools, extent_pools[1:], strict=False))
+        torch.testing.assert_close(extent_pools[-1], torch.arange(source_bank.shape[0], device=task.device))
+        target_center = torch.as_tensor(task.cfg.curriculum_randomized_target_center_xy, device=task.device)
+        target_range = torch.as_tensor(task.cfg.curriculum_randomized_target_position_range, device=task.device)
+        tcp_standoff = torch.as_tensor(task.cfg.curriculum_randomized_reset_tcp_standoff, device=task.device)
+        tcp_jitter_range = torch.as_tensor(task.cfg.curriculum_randomized_reset_tcp_jitter, device=task.device)
+        grasp_points = source_bank.clone()
+        grasp_points[:, 2] += task.cfg.cup_grasp_height
+        tcp_jitter = tcp_start_bank - grasp_points - tcp_standoff
+        for extent, pool in zip(task.cfg.curriculum_randomization_extent_levels, extent_pools, strict=True):
+            normalized_source = torch.abs(source_bank[pool, :2] - source_center) / source_range
+            normalized_source_yaw = torch.abs(source_yaw_bank[pool, None]) / float(
+                task.cfg.curriculum_randomized_source_yaw_range
+            )
+            normalized_target = torch.abs(target_bank[pool, :2] - target_center) / target_range
+            normalized_jitter = torch.abs(tcp_jitter[pool]) / tcp_jitter_range
+            difficulty = torch.cat(
+                (normalized_source, normalized_source_yaw, normalized_target, normalized_jitter), dim=-1
+            ).amax(dim=-1)
+            assert bool(torch.all(difficulty <= extent + 1.0e-6))
+        assert bool(torch.all(task.curriculum_stage == randomized_stage))
+
+        source_offsets = source_bank[:, :2] - source_center
+        assert bool(torch.all(torch.abs(source_offsets) <= source_range + 1.0e-6))
+        torch.testing.assert_close(source_offsets.amin(dim=0), -source_range, rtol=0.0, atol=1.0e-6)
+        torch.testing.assert_close(source_offsets.amax(dim=0), source_range, rtol=0.0, atol=1.0e-6)
+        nominal_source_rows = torch.isclose(source_bank[:, :2], source_center, atol=1.0e-7, rtol=0.0).all(dim=-1)
+        nominal_source_yaws = source_yaw_bank[nominal_source_rows]
+        assert nominal_source_yaws.shape == (task.cfg.curriculum_randomized_reset_ik_samples_per_source,)
+        assert bool(torch.any(torch.abs(nominal_source_yaws) > 0.0))
+        assert float(nominal_source_yaws.amin()) == pytest.approx(-task.cfg.curriculum_randomized_source_yaw_range)
+        assert float(nominal_source_yaws.amax()) == pytest.approx(task.cfg.curriculum_randomized_source_yaw_range)
+        assert float(source_yaw_bank.amin()) == pytest.approx(-task.cfg.curriculum_randomized_source_yaw_range)
+        assert float(source_yaw_bank.amax()) == pytest.approx(task.cfg.curriculum_randomized_source_yaw_range)
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(source_quat_bank, dim=-1),
+            torch.ones(source_bank.shape[0], device=task.device),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        expected_source_quat = torch.zeros_like(source_quat_bank)
+        expected_source_quat[:, 2] = torch.sin(0.5 * source_yaw_bank)
+        expected_source_quat[:, 3] = torch.cos(0.5 * source_yaw_bank)
+        torch.testing.assert_close(source_quat_bank, expected_source_quat, rtol=0.0, atol=1.0e-6)
+        assert bool(torch.all(torch.abs(target_bank[:, :2] - target_center) <= target_range + 1.0e-6))
+
+        tcp_displacements = tcp_start_bank - grasp_points
+        assert bool(torch.all(torch.abs(tcp_displacements - tcp_standoff) <= tcp_jitter_range + 1.0e-6))
+        minimum_vertical_standoff = tcp_standoff[2] - tcp_jitter_range[2]
+        assert float(minimum_vertical_standoff) >= task.cfg.curriculum_randomized_reset_tcp_min_grasp_distance - 1.0e-6
+        assert bool(
+            torch.all(
+                torch.linalg.vector_norm(tcp_displacements, dim=-1)
+                >= task.cfg.curriculum_randomized_reset_tcp_min_grasp_distance - 1.0e-6
+            )
+        )
+        torch.testing.assert_close(
+            tcp_displacements.reshape(-1, task.cfg.curriculum_randomized_reset_ik_samples_per_source, 3).mean(dim=1),
+            tcp_standoff.expand(task.cfg.curriculum_randomized_reset_ik_grid_size**2, -1),
+            rtol=0.0,
+            atol=1.0e-7,
+        )
+        yaw_by_source = source_yaw_bank.reshape(
+            task.cfg.curriculum_randomized_reset_ik_grid_size**2,
+            task.cfg.curriculum_randomized_reset_ik_samples_per_source,
+        )
+        expected_yaw_marginal = torch.sort(yaw_by_source[0]).values.expand_as(yaw_by_source)
+        torch.testing.assert_close(torch.sort(yaw_by_source, dim=-1).values, expected_yaw_marginal)
+        assert torch.unique(yaw_by_source, dim=0).shape[0] == task.cfg.curriculum_randomized_reset_ik_samples_per_source
+        for jitter_slot in range(task.cfg.curriculum_randomized_reset_ik_samples_per_source):
+            _, yaw_counts = torch.unique(yaw_by_source[:, jitter_slot], return_counts=True)
+            assert int(yaw_counts.amax() - yaw_counts.amin()) <= 1
+        assert bool(torch.all(task._reach_source_yaw_bank_t == 0.0))
+
+        source_outer_half_x = task.cfg.source_cup_inner_width / 2.0 + task.cfg.source_cup_wall_thickness
+        source_outer_half_y = task.cfg.source_cup_inner_depth / 2.0 + task.cfg.source_cup_wall_thickness
+        target_outer_half_y = task.cfg.target_cup_inner_depth / 2.0 + task.cfg.target_cup_wall_thickness
+        minimum_y_separation = (
+            source_outer_half_x * torch.abs(torch.sin(source_yaw_bank))
+            + source_outer_half_y * torch.abs(torch.cos(source_yaw_bank))
+            + target_outer_half_y
+            + task.cfg.curriculum_randomized_cup_clearance
+        )
+        assert bool(torch.all(source_bank[:, 1] - target_bank[:, 1] >= minimum_y_separation - 1.0e-6))
+        assert bool(torch.all(task._randomized_reset_ik_cost_t <= task.cfg.curriculum_randomized_reset_ik_max_cost))
+        assert bool(
+            torch.all(task._randomized_reset_ik_margin_t >= task.cfg.curriculum_randomized_reset_ik_joint_margin)
+        )
+        waypoint_bank = torch.stack(
+            (
+                task._randomized_arm_q_bank_t,
+                task._randomized_pregrasp_arm_q_bank_t,
+                task._randomized_grasp_arm_q_bank_t,
+                task._randomized_carry_arm_q_bank_t,
+                task._randomized_pour_arm_q_bank_t,
+                task._randomized_tilt_arm_q_bank_t,
+            ),
+            dim=1,
+        )
+        joint_lower = torch.as_tensor(
+            [task.cfg.actions.arm_action.clip[name][0] for name in task.cfg.actions.arm_action.joint_names],
+            device=task.device,
+        )
+        joint_upper = torch.as_tensor(
+            [task.cfg.actions.arm_action.clip[name][1] for name in task.cfg.actions.arm_action.joint_names],
+            device=task.device,
+        )
+        assert bool(torch.isfinite(waypoint_bank).all())
+        assert bool(torch.all(waypoint_bank >= joint_lower))
+        assert bool(torch.all(waypoint_bank <= joint_upper))
+
+        selected = torch.tensor([0], device=task.device, dtype=torch.long)
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        actions[:, -1] = 1.0
+        for bank_index in range(source_bank.shape[0]):
+            sampled_index = torch.tensor([bank_index], device=task.device, dtype=torch.long)
+            with mock.patch.object(torch, "randint", return_value=sampled_index):
+                task.reset_pour_scene(selected)
+            achieved_tcp_pose = task.tcp_pose_e()[0]
+            tcp_position_error = torch.linalg.vector_norm(achieved_tcp_pose[:3] - tcp_start_bank[bank_index])
+            tcp_quat_alignment = torch.abs(torch.dot(achieved_tcp_pose[3:7], tcp_start_quat_bank[bank_index]))
+            assert float(tcp_position_error) < 0.005, (
+                f"Reset bank row {bank_index} TCP position error is {float(tcp_position_error):.6g} m."
+            )
+            assert float(tcp_quat_alignment) > 1.0 - 1.0e-5, (
+                f"Reset bank row {bank_index} TCP quaternion alignment is {float(tcp_quat_alignment):.6g}."
+            )
+            _, _, terminated, truncated, _ = env.step(actions)
+            assert not bool(torch.any(terminated)), f"Reset bank row {bank_index} terminated after one step."
+            assert not bool(torch.any(truncated)), f"Reset bank row {bank_index} timed out after one step."
+            assert bool(torch.all(task.state_finite())), f"Reset bank row {bank_index} produced non-finite state."
+            assert bool(torch.all(task.rigid_state_in_bounds())), f"Reset bank row {bank_index} exceeded rigid bounds."
+            assert bool(torch.all(task.particles_in_workspace())), f"Reset bank row {bank_index} lost particles."
+        assert NewtonManager.is_cuda_graph_active()
+        env.reset()
+
+        arm_action = task.action_manager.get_term("arm_action")
+        world_0_root = task._robot.data.root_link_pose_w.torch[0].clone()
+        world_1_q = task._robot.data.joint_pos.torch[1].clone()
+        world_1_root = task._robot.data.root_link_pose_w.torch[1].clone()
+        world_1_source = task._source_cup.data.root_link_pose_w.torch[1].clone()
+        world_1_target = task._target_cup.data.root_link_pose_w.torch[1].clone()
+        world_1_media = task._media.data.particle_pos_w.torch[1].clone()
+        world_1_phase = arm_action.reference_phase[1].clone()
+        world_1_reference = arm_action.reference_target[1].clone()
+        world_1_command = arm_action.processed_actions[1].clone()
+
+        bank_index = source_bank.shape[0] - 1
+        sampled_index = torch.tensor([bank_index], device=task.device, dtype=torch.long)
+        with mock.patch.object(torch, "randint", return_value=sampled_index):
+            task.reset_pour_scene(selected)
+        wp.synchronize_device(NewtonManager.get_model().device)
+
+        torch.testing.assert_close(task.cup_pose_e()[0, :3], source_bank[bank_index], rtol=0.0, atol=1.0e-6)
+        torch.testing.assert_close(task.cup_pose_e()[0, 3:7], source_quat_bank[bank_index], rtol=0.0, atol=1.0e-6)
+        torch.testing.assert_close(task.target_pose_e()[0, :3], target_bank[bank_index], rtol=0.0, atol=1.0e-6)
+        torch.testing.assert_close(
+            task.target_pose_e()[0, 3:7],
+            torch.tensor((0.0, 0.0, 0.0, 1.0), device=task.device),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        torch.testing.assert_close(
+            task._robot.data.joint_pos.torch[0, task._arm_joint_ids],
+            arm_bank[bank_index],
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        torch.testing.assert_close(arm_action.reference_phase[0], torch.tensor(0.0, device=task.device))
+        torch.testing.assert_close(arm_action.reference_target[0], arm_bank[bank_index], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(arm_action.processed_actions[0], arm_bank[bank_index], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            task.gripper_width()[0],
+            torch.tensor(task.gripper_open_width, device=task.device),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        tcp_start_error = torch.linalg.vector_norm(task.tcp_pos_e()[0] - tcp_start_bank[bank_index])
+        assert float(tcp_start_error) < 0.005, f"Randomized reset TCP-start error is {float(tcp_start_error):.6g} m."
+        tcp_quat_alignment = torch.abs(torch.dot(task.tcp_pose_e()[0, 3:7], tcp_start_quat_bank[bank_index]))
+        assert float(tcp_quat_alignment) > 1.0 - 1.0e-5
+        tcp_grasp_distance = torch.linalg.vector_norm(task.tcp_pos_e()[0] - task.cup_grasp_point_e()[0])
+        assert float(tcp_grasp_distance) >= task.cfg.curriculum_randomized_reset_tcp_min_grasp_distance - 0.005
+
+        torch.testing.assert_close(task._robot.data.root_link_pose_w.torch[0], world_0_root, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task._robot.data.joint_pos.torch[1], world_1_q, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task._robot.data.root_link_pose_w.torch[1], world_1_root, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task._source_cup.data.root_link_pose_w.torch[1], world_1_source, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task._target_cup.data.root_link_pose_w.torch[1], world_1_target, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task._media.data.particle_pos_w.torch[1], world_1_media, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(arm_action.reference_phase[1], world_1_phase, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(arm_action.reference_target[1], world_1_reference, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(arm_action.processed_actions[1], world_1_command, rtol=0.0, atol=0.0)
+
+        randomized_target = task._target_cup.data.root_link_pose_w.torch[0].clone()
+        env.step(actions)
+        wp.synchronize_device(NewtonManager.get_model().device)
+        assert NewtonManager.is_cuda_graph_active()
+        torch.testing.assert_close(
+            task._target_cup.data.root_link_pose_w.torch[0],
+            randomized_target,
+            rtol=0.0,
+            atol=0.0,
+        )
+        assert bool(torch.all(task.state_finite()))
+        assert bool(torch.all(task.particles_in_workspace()))
+
+        assert "reach" not in task.cfg.curriculum_stage_names
+        full_stage = task.cfg.curriculum_stage_names.index("full")
+        task.set_curriculum_stage(selected, full_stage)
+        reach_index = task._reach_arm_q_bank_t.shape[0] - 1
+        sampled_index = torch.tensor([reach_index], device=task.device, dtype=torch.long)
+        with mock.patch.object(torch, "randint", return_value=sampled_index):
+            task.reset_pour_scene(selected)
+        wp.synchronize_device(NewtonManager.get_model().device)
+        torch.testing.assert_close(
+            task.cup_pose_e()[0, :3],
+            torch.tensor(task.cfg.cup_reset_pos, device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task.target_pose_e()[0, :3],
+            torch.tensor(task.cfg.target_cup_reset_pos, device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task._robot.data.joint_pos.torch[0, task._arm_joint_ids],
+            task._reach_arm_q_bank_t[reach_index],
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        reach_tcp_error = torch.linalg.vector_norm(task.tcp_pos_e()[0] - task._reach_tcp_pos_bank_t[reach_index])
+        assert float(reach_tcp_error) < 0.005
+        assert float(torch.linalg.vector_norm(task.tcp_pos_e()[0] - task.cup_grasp_point_e()[0])) >= (
+            task.cfg.curriculum_randomized_reset_tcp_min_grasp_distance - 0.005
+        )
+        torch.testing.assert_close(arm_action.reference_phase[0], torch.tensor(0.0, device=task.device))
+        torch.testing.assert_close(
+            arm_action.reference_target[0],
+            task._reach_arm_q_bank_t[reach_index],
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            arm_action.processed_actions[0],
+            task._reach_arm_q_bank_t[reach_index],
+            rtol=0.0,
+            atol=0.0,
+        )
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_extreme_finite_rigid_state_resets_before_returned_observation():
+    """A finite dynamics outlier must be reset before RSL-RL can normalize the next observation."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        env = gym.make(_TASK_ID, cfg=_make_runtime_cfg())
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        real_scene_update = task.scene.update
+        arm_joint_id = task._arm_joint_ids[0]
+
+        def update_then_inject_outlier(dt: float) -> None:
+            real_scene_update(dt)
+            task._robot.data.joint_vel.torch[0, arm_joint_id] = 1.0e6
+
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        with mock.patch.object(task.scene, "update", side_effect=update_then_inject_outlier):
+            observations, _, terminated, truncated, _ = env.step(actions)
+
+        assert terminated.tolist() == [True, False]
+        assert truncated.tolist() == [False, False]
+        assert task.termination_manager.get_term("extreme_rigid_state").tolist() == [True, False]
+        assert bool(torch.isfinite(observations["policy"]).all())
+        assert bool(torch.isfinite(observations["privileged"]).all())
+        assert bool(torch.all(torch.abs(observations["policy"][0, 7:14]) <= task.cfg.state_bound_max_joint_velocity))
+        assert float(task._success_dwell_count[0]) == 0.0
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_curriculum_mixed_stage_reset_tracks_references_and_stays_isolated():
+    """Reset two worlds at different stages, advance both references, and step captured."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        env = gym.make(_TASK_ID, cfg=_make_runtime_cfg())
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        observations, info = env.reset()
+
+        assert task.curriculum_manager.active_terms == ["stage"]
+        assert set(observations) == {"policy", "privileged"}
+        assert observations["policy"].shape == (2, 72)
+        assert observations["privileged"].shape == (2, 20)
+        assert bool(torch.isfinite(observations["policy"]).all())
+        assert bool(torch.isfinite(observations["privileged"]).all())
+        assert info["log"]["Curriculum/stage/stage"] == 3.0
+        assert "Curriculum/stage/success_rate" in info["log"]
+        assert "Curriculum/stage/target_frac" in info["log"]
+        assert "Curriculum/stage/completed_episodes" in info["log"]
+
+        env_ids = torch.tensor([0, 1], device=task.device, dtype=torch.long)
+        task.set_curriculum_stage(torch.tensor([0], device=task.device), 0)
+        task.set_curriculum_stage(torch.tensor([1], device=task.device), 3)
+        task.reset_pour_scene(env_ids)
+
+        arm_action = task.action_manager.get_term("arm_action")
+        expected_q = arm_action.reference_target.clone()
+        arm_q = task._robot.data.joint_pos.torch[:, task._arm_joint_ids]
+        torch.testing.assert_close(arm_q, expected_q, rtol=0.0, atol=1.0e-6)
+        torch.testing.assert_close(arm_action.processed_actions, expected_q, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            arm_action.reference_phase,
+            torch.tensor([0.62, 0.0], device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task.gripper_width(),
+            torch.tensor([task.gripper_grasp_width, task.gripper_open_width], device=task.device),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        gripper_action = task.action_manager.get_term("gripper_action")
+        torch.testing.assert_close(
+            gripper_action.action_offset[:, 0],
+            torch.full((2,), task.cfg.actions.gripper_action.close_position, device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task.pour_target_frac,
+            torch.tensor([0.1, 0.30], device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+        grasp_error = torch.linalg.vector_norm(task.tcp_pos_e() - task.cup_grasp_point_e(), dim=-1)
+        assert float(grasp_error[0]) < 2.0e-5
+        assert float(grasp_error[1]) >= task.cfg.curriculum_randomized_reset_tcp_min_grasp_distance - 0.005
+        assert float(task.cup_pose_e()[0, 2]) > 0.16
+        torch.testing.assert_close(
+            task.cup_pose_e()[0, :2],
+            torch.tensor(task.cfg.target_cup_reset_pos[:2], device=task.device)
+            + torch.tensor(task.cfg.pour_source_offset_xy, device=task.device),
+            rtol=0.0,
+            atol=2.0e-5,
+        )
+        torch.testing.assert_close(
+            task.cup_pose_e()[1, :3],
+            torch.tensor(task.cfg.cup_reset_pos, device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+        source_pose = task._source_cup.data.root_link_pose_w.torch
+        expected_media = task._sample_cup_media(source_pose[:, :3], source_pose[:, 3:7])
+        torch.testing.assert_close(task._media.data.particle_pos_w.torch, expected_media, rtol=0.0, atol=0.0)
+        assert bool(torch.all(task.particles_in_workspace()))
+
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        phase_before = arm_action.reference_phase.clone()
+        task.action_manager.process_action(actions)
+        assert bool(torch.all(arm_action.reference_phase > phase_before))
+        torch.testing.assert_close(arm_action.processed_actions, arm_action.reference_target, rtol=0.0, atol=0.0)
+        filtered_close = task.cfg.gripper_preload_pos + task.cfg.actions.gripper_action.alpha * (
+            task.cfg.actions.gripper_action.close_position - task.cfg.gripper_preload_pos
+        )
+        torch.testing.assert_close(
+            gripper_action.processed_actions,
+            torch.tensor(
+                [
+                    [filtered_close, filtered_close],
+                    [task.cfg.gripper_open_pos, task.cfg.gripper_open_pos],
+                ],
+                device=task.device,
+            ),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+        actions[1, -1] = 1.0
+        env.step(actions)
+        for _ in range(9):
+            env.step(actions)
+        wp.synchronize_device(NewtonManager.get_model().device)
+        assert NewtonManager.is_cuda_graph_active()
+        assert bool(torch.all(task.state_finite()))
+        assert bool(torch.all(task.particles_in_workspace()))
+        assert float(task.cup_pose_e()[0, 2]) > 0.12
+        assert float(torch.linalg.vector_norm(task.tcp_pos_e()[0] - task.cup_grasp_point_e()[0])) < 0.03
+
+        world_1_q = task._robot.data.joint_pos.torch[1].clone()
+        world_1_cup = task._source_cup.data.root_link_pose_w.torch[1].clone()
+        world_1_media = task._media.data.particle_pos_w.torch[1].clone()
+        world_1_phase = arm_action.reference_phase[1].clone()
+        world_1_reference = arm_action.reference_target[1].clone()
+        world_1_command = arm_action.processed_actions[1].clone()
+        world_1_threshold = task.pour_target_frac[1].clone()
+
+        selected = torch.tensor([0], device=task.device, dtype=torch.long)
+        task.set_curriculum_stage(selected, 1)
+        task.reset_pour_scene(selected)
+        wp.synchronize_device(NewtonManager.get_model().device)
+
+        torch.testing.assert_close(task._robot.data.joint_pos.torch[1], world_1_q, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task._source_cup.data.root_link_pose_w.torch[1], world_1_cup, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task._media.data.particle_pos_w.torch[1], world_1_media, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(arm_action.reference_phase[1], world_1_phase, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(arm_action.reference_target[1], world_1_reference, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(arm_action.processed_actions[1], world_1_command, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task.pour_target_frac[1], world_1_threshold, rtol=0.0, atol=0.0)
+
+        torch.testing.assert_close(
+            task._robot.data.joint_pos.torch[0, task._arm_joint_ids],
+            task._curriculum_arm_q_t[1],
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        torch.testing.assert_close(arm_action.reference_phase[0], torch.tensor(0.40, device=task.device))
+        torch.testing.assert_close(arm_action.reference_target[0], task._curriculum_arm_q_t[1], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(arm_action.processed_actions[0], task._curriculum_arm_q_t[1], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            task.cup_pose_e()[0, :2],
+            torch.tensor(task.cfg.cup_reset_pos[:2], device=task.device),
+            rtol=0.0,
+            atol=2.0e-5,
+        )
+        assert float(task.cup_pose_e()[0, 2]) > 0.16
+        for _ in range(3):
+            env.step(actions)
+        assert NewtonManager.is_cuda_graph_active()
+        assert bool(torch.all(task.state_finite()))
+        assert float(task.cup_pose_e()[0, 2]) > 0.12
+
+        task.set_curriculum_stage(selected, 2)
+        grasp_index = task._reach_grasp_arm_q_bank_t.shape[0] - 1
+        sampled_index = torch.tensor([grasp_index], device=task.device, dtype=torch.long)
+        with mock.patch.object(torch, "randint", return_value=sampled_index):
+            task.reset_pour_scene(selected)
+        torch.testing.assert_close(
+            task._robot.data.joint_pos.torch[0, task._arm_joint_ids],
+            task._reach_grasp_arm_q_bank_t[grasp_index],
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        torch.testing.assert_close(arm_action.reference_phase[0], torch.tensor(0.24, device=task.device))
+        torch.testing.assert_close(
+            arm_action.reference_target[0],
+            task._reach_grasp_arm_q_bank_t[grasp_index],
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task.cup_pose_e()[0, :3],
+            torch.tensor(task.cfg.cup_reset_pos, device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(task.gripper_width()[0], torch.tensor(task.gripper_open_width, device=task.device))
+        torch.testing.assert_close(task.pour_target_frac[0], torch.tensor(0.3, device=task.device))
+        for _ in range(3):
+            env.step(actions)
+        assert NewtonManager.is_cuda_graph_active()
+        assert bool(torch.all(task.state_finite()))
+        assert float(task.cup_pose_e()[0, 2]) > -0.02
+
+        # Exercise the real manager lifecycle: consume stage-2 success, advance globally, then
+        # let the reset event apply stage 3 and clear only the selected world's episode latches.
+        curriculum_term = task.curriculum_manager._term_cfgs[0].func
+        curriculum_term.stage = 2
+        curriculum_term.success_rate = 0.0
+        curriculum_term.resets_in_stage = 0
+        task.cfg.curriculum_freeze = False
+        task.cfg.curriculum_min_resets_per_stage = 1
+        task.cfg.curriculum_previous_stage_replay_fraction = 0.0
+        task.cfg.curriculum_success_threshold = 0.5
+        task.episode_length_buf[0] = 10
+        task.episode_succeeded[0] = True
+        task.ep_max_target_frac[0] = 0.4
+        task.episode_succeeded[1] = True
+        task.ep_max_target_frac[1] = 0.25
+        delivered_term = task.reward_manager.get_term_cfg("delivered").func
+        task._target_entry_seen[:, 0] = True
+        task._held_delivered[:, 0] = True
+        delivered_term._previous_credit[:] = 0.1
+        world_1_target_entry_seen = task._target_entry_seen[1].clone()
+        world_1_held_delivered = task._held_delivered[1].clone()
+        world_1_delivery_credit = delivered_term._previous_credit[1].clone()
+
+        task._reset_idx(selected)
+
+        assert curriculum_term.stage == 3
+        assert int(task.curriculum_stage[0]) == 3
+        assert not bool(task.episode_succeeded[0])
+        assert float(task.ep_max_target_frac[0]) == 0.0
+        assert not bool(torch.any(task._target_entry_seen[0]))
+        assert not bool(torch.any(task._held_delivered[0]))
+        assert float(delivered_term._previous_credit[0]) == 0.0
+        assert bool(task.episode_succeeded[1])
+        assert float(task.ep_max_target_frac[1]) == pytest.approx(0.25)
+        torch.testing.assert_close(task._target_entry_seen[1], world_1_target_entry_seen, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task._held_delivered[1], world_1_held_delivered, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(delivered_term._previous_credit[1], world_1_delivery_credit, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            task._robot.data.joint_pos.torch[0, task._arm_joint_ids],
+            arm_action.reference_target[0],
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        torch.testing.assert_close(arm_action.reference_phase[0], torch.tensor(0.0, device=task.device))
+        torch.testing.assert_close(task.gripper_width()[0], torch.tensor(0.08, device=task.device))
+        torch.testing.assert_close(task.pour_target_frac[0], torch.tensor(0.30, device=task.device))
+        assert task.extras["log"]["Curriculum/stage/stage"] == 3.0
+        env.step(actions)
+        assert NewtonManager.is_cuda_graph_active()
+        assert bool(torch.all(task.state_finite()))
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_scene_owned_cups_use_public_state_and_leave_caller_cfg_unmodified():
+    """The task resolves cloned cup assets without mutating its caller-owned config."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    caller_cfg = _make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5)
+    # Keep public views on the authoritative state after the eager step below.
+    caller_cfg.num_substeps = 2
+    assert caller_cfg.scene.source_cup is None
+    assert caller_cfg.scene.target_cup is None
+    assert caller_cfg.scene.media is None
+    try:
+        env = gym.make(_TASK_ID, cfg=caller_cfg)
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        assert caller_cfg.scene.source_cup is None
+        assert caller_cfg.scene.target_cup is None
+        assert caller_cfg.scene.media is None
+        assert task.cfg is not caller_cfg
+
+        source_cup = task.scene["source_cup"]
+        target_cup = task.scene["target_cup"]
+        assert source_cup.num_instances == 2
+        assert target_cup.num_instances == 2
+
+        source_pose_e = source_cup.data.root_link_pose_w.torch.clone()
+        source_pose_e[:, :3] -= task.scene.env_origins
+        target_pose_e = target_cup.data.root_link_pose_w.torch.clone()
+        target_pose_e[:, :3] -= task.scene.env_origins
+        torch.testing.assert_close(task.cup_pose_e(), source_pose_e)
+        torch.testing.assert_close(task.target_pose_e(), target_pose_e)
+        _assert_scene_solver_roles(NewtonManager.get_model())
+        assert NewtonManager.get_model().particle_max_velocity == pytest.approx(task.cfg.particle_max_velocity)
+
+        for legacy_attribute in (
+            "_cup_body_ids",
+            "_target_body_ids",
+            "_cup_joint_q",
+            "_cup_joint_qd",
+            "_cup_articulation_ids",
+        ):
+            assert not hasattr(task, legacy_attribute)
+
+        target_pose_before = target_cup.data.root_link_pose_w.torch.clone()
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        actions[:, -1] = 1.0
+        env.step(actions)
+        wp.synchronize_device(NewtonManager.get_model().device)
+        torch.testing.assert_close(
+            target_cup.data.root_link_pose_w.torch,
+            target_pose_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_offset_world_tables_support_both_cups():
+    """Each rigid world collides with its own finite table at production spacing."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        env = gym.make(_TASK_ID, cfg=_make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5))
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        assert task.num_envs == 2
+        assert not torch.equal(task.scene.env_origins[0], task.scene.env_origins[1])
+        torch.testing.assert_close(task.cup_pose_e()[:, 2], torch.zeros(2, device=task.device), rtol=0.0, atol=0.0)
+
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        actions[:, -1] = 1.0  # keep the gripper open so this tests table support only
+        for _ in range(30):
+            env.step(actions)
+
+        wp.synchronize_device(NewtonManager.get_model().device)
+        cup_z = task.cup_pose_e()[:, 2]
+        assert bool(torch.all(cup_z > -0.02)), f"A source cup fell through its local table: z={cup_z.tolist()}"
+        torch.testing.assert_close(cup_z[0], cup_z[1], rtol=0.0, atol=2.0e-3)
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_overlapping_worlds_step_selective_reset_and_step_again():
+    """Exercise real isolated MPM ownership and an asynchronous one-world reset."""
+    _require_sparse_capture_stack()
+    sim_utils.create_new_stage()
+    env = None
+    try:
+        env = gym.make(_TASK_ID, cfg=_make_runtime_cfg())
+        task = env.unwrapped
+        task.sim._app_control_on_stop_handle = None
+        env.reset()
+
+        assert task.num_envs == 2
+        torch.testing.assert_close(task.scene.env_origins[0], task.scene.env_origins[1], rtol=0.0, atol=0.0)
+
+        model = NewtonManager.get_model()
+        media = task.scene[MPM_ENTRY]
+        particle_offsets = media.particle_offsets.numpy().astype(np.int64, copy=False)
+        particles_per_world = int(media.particles_per_object)
+        particle_worlds = model.particle_world.numpy()
+        particle_world_starts = model.particle_world_start.numpy()
+
+        assert int(model.world_count) == 2
+        assert int(model.particle_count) == 2 * particles_per_world
+        np.testing.assert_array_equal(particle_offsets, particle_world_starts[:2])
+        assert int(particle_world_starts[2]) == int(model.particle_count)
+        assert int(particle_world_starts[-1]) == int(model.particle_count)
+        for world, begin in enumerate(particle_offsets):
+            end = int(begin) + particles_per_world
+            np.testing.assert_array_equal(particle_worlds[int(begin) : end], np.full(particles_per_world, world))
+
+        media_view = NewtonCoupledSolverManager.get_entry_view(MPM_ENTRY)
+        media_solver = NewtonCoupledSolverManager.get_entry_solver(MPM_ENTRY)
+        assert media_solver.model is media_view
+        assert int(media_view.particle_count) == int(model.particle_count)
+        assert media_view.particle_q is model.particle_q
+        assert media_view.particle_world is model.particle_world
+        np.testing.assert_array_equal(media_view.particle_world.numpy(), particle_worlds)
+        _assert_media_collider_ownership(model, media_view)
+        assert media_solver.supports_cuda_graph_capture
+
+        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
+        env.step(actions)
+        wp.synchronize_device(model.device)
+        assert NewtonManager.is_cuda_graph_active(), (
+            "Franka Pour requested CUDA capture but no manager graph is active."
+        )
+
+        # Force one finite particle beyond the local workspace. The captured physics step must
+        # retain enough sparse hierarchy headroom to reach the termination boundary, then reset
+        # only that environment and clear the solver's sticky rebuild status.
+        selected_env = torch.tensor([0], dtype=torch.long, device=task.device)
+        escaped_positions = media.data.particle_pos_w.torch[0:1].clone()
+        escaped_positions[0, 0] = task.scene.env_origins[0] + torch.tensor(
+            [task.cfg.particle_workspace_upper_bound[0] + 0.05, 0.0, 0.2], device=task.device
+        )
+        media.write_particle_pos_to_sim_index(escaped_positions, env_ids=selected_env)
+        _, _, terminated, truncated, _ = env.step(actions)
+        wp.synchronize_device(model.device)
+        assert terminated.tolist() == [True, False]
+        assert truncated.tolist() == [False, False]
+        assert bool(torch.all(task.particles_in_workspace()))
+        assert NewtonManager.is_cuda_graph_active()
+        NewtonManager.check_solver_status()
+
+        # Advance once from the automatic reset so the pre-existing manual-reset regression below
+        # again has non-default MPM history to clear.
+        env.step(actions)
+        wp.synchronize_device(model.device)
+
+        world_0 = slice(int(particle_offsets[0]), int(particle_offsets[0]) + particles_per_world)
+        world_1 = slice(int(particle_offsets[1]), int(particle_offsets[1]) + particles_per_world)
+        parent_states = []
+        for state in (NewtonManager.get_state_0(), NewtonManager.get_state_1()):
+            if all(state is not candidate for candidate in parent_states):
+                parent_states.append(state)
+        assert len(parent_states) == 2
+        parent_world_0_before = [_particle_snapshot(state, world_0) for state in parent_states]
+        parent_world_1_before = [_particle_snapshot(state, world_1) for state in parent_states]
+
+        source_cup = task.scene["source_cup"]
+        source_world_1_pose_before = source_cup.data.root_link_pose_w.torch[1].clone()
+        source_world_1_velocity_before = source_cup.data.root_com_vel_w.torch[1].clone()
+        robot_world_1_q_before = task._robot.data.joint_pos.torch[1].clone()
+        robot_world_1_qd_before = task._robot.data.joint_vel.torch[1].clone()
+
+        perturbed_pose = source_cup.data.root_link_pose_w.torch[selected_env].clone()
+        perturbed_pose[:, 0] += 0.05
+        perturbed_velocity = torch.full((1, 6), 0.25, device=task.device)
+        source_cup.write_root_pose_to_sim_index(root_pose=perturbed_pose, env_ids=selected_env)
+        source_cup.write_root_velocity_to_sim_index(root_velocity=perturbed_velocity, env_ids=selected_env)
+        _ = source_cup.data.body_link_pose_w
+
+        entry_reset_observations: list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = []
+        real_entry_reset = media_solver.reset
+
+        def checked_entry_reset(state, world_mask=None, flags=None):
+            assert world_mask is not None
+            np.testing.assert_array_equal(world_mask.numpy(), np.array([True, False], dtype=np.bool_))
+            assert flags == newton.StateFlags.BODY | newton.StateFlags.PARTICLE
+            assert state.particle_q.shape == (model.particle_count,)
+            before = _particle_snapshot(state, world_1)
+            real_entry_reset(state, world_mask=world_mask, flags=flags)
+            after = _particle_snapshot(state, world_1)
+            entry_reset_observations.append((before, after))
+
+        with mock.patch.object(media_solver, "reset", side_effect=checked_entry_reset):
+            task.reset_pour_scene(selected_env)
+        wp.synchronize_device(model.device)
+
+        expected_source_pose = torch.tensor(
+            [*task.cfg.cup_reset_pos, 0.0, 0.0, 0.0, 1.0],
+            device=task.device,
+        )
+        expected_source_pose[:3] += task.scene.env_origins[0]
+        torch.testing.assert_close(
+            source_cup.data.root_link_pose_w.torch[0],
+            expected_source_pose,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            source_cup.data.root_com_vel_w.torch[0],
+            torch.zeros(6, device=task.device),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            source_cup.data.root_link_pose_w.torch[1],
+            source_world_1_pose_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            source_cup.data.root_com_vel_w.torch[1],
+            source_world_1_velocity_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task._robot.data.joint_pos.torch[1],
+            robot_world_1_q_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            task._robot.data.joint_vel.torch[1],
+            robot_world_1_qd_before,
+            rtol=0.0,
+            atol=0.0,
+        )
+        expected_refill = task._sample_cup_media(
+            expected_source_pose[:3].unsqueeze(0),
+            expected_source_pose[3:].unsqueeze(0),
+        )[0]
+        torch.testing.assert_close(
+            media.data.particle_pos_w.torch[0],
+            expected_refill,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            media.data.particle_vel_w.torch[0],
+            torch.zeros_like(expected_refill),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+        assert len(entry_reset_observations) == len(parent_states)
+        for entry_before, entry_after in entry_reset_observations:
+            _assert_snapshot_bitwise_equal(entry_after, entry_before)
+        for state, expected in zip(parent_states, parent_world_1_before, strict=True):
+            _assert_snapshot_bitwise_equal(_particle_snapshot(state, world_1), expected)
+        assert any(
+            _snapshot_changed(_particle_snapshot(state, world_0), expected)
+            for state, expected in zip(parent_states, parent_world_0_before, strict=True)
+        ), "Selective reset did not change the selected world's particle state."
+
+        env.step(actions)
+        wp.synchronize_device(model.device)
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
+def test_franka_pour_captured_matches_eager_and_moving_cup_stays_isolated():
+    """Compare eager/captured physics and perturb only one overlapping material world."""
+    _require_sparse_capture_stack()
+
+    eager, eager_graph_active = _run_particle_rollout(use_cuda_graph=False)
+    captured, captured_graph_active = _run_particle_rollout(use_cuda_graph=True)
+    moved, moved_graph_active = _run_particle_rollout(
+        use_cuda_graph=True,
+        cup_offset_world_0=(0.025, 0.0, 0.0),
+    )
+
+    assert eager_graph_active is False
+    assert captured_graph_active is True
+    assert moved_graph_active is True
+    for step, (eager_worlds, captured_worlds) in enumerate(zip(eager, captured, strict=True), start=1):
+        for world, (eager_world, captured_world) in enumerate(zip(eager_worlds, captured_worlds, strict=True)):
+            assert eager_world.keys() == captured_world.keys()
+            _assert_rollout_world_equivalent(
+                captured_world,
+                eager_world,
+                context=f"step={step}, world={world}, mode=captured-vs-eager",
+            )
+
+    for step, (moved_worlds, captured_worlds) in enumerate(zip(moved, captured, strict=True), start=1):
+        _assert_rollout_world_equivalent(
+            moved_worlds[1],
+            captured_worlds[1],
+            context=f"step={step}, world=1, mode=world-0-collider-perturbation",
+        )
+    world_0_position_delta = float(np.max(np.abs(moved[-1][0]["particle_q"] - captured[-1][0]["particle_q"])))
+    assert world_0_position_delta > 1.0e-6, (
+        "Moving world 0's cup did not measurably affect world 0's material: "
+        f"max particle position delta={world_0_position_delta:.9g}."
+    )

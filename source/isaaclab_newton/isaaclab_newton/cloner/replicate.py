@@ -99,7 +99,7 @@ def _build_newton_builder_from_mapping(
         *replicate_args,
         source_site_indices=source_sites,
         env_root_sites=root_sites,
-        per_world_builder_hooks=NewtonManager._per_world_builder_hooks,
+        per_world_builder_hooks=(NewtonManager._run_builder_world_hooks,),
         post_replicate_hooks=NewtonManager._post_replicate_hooks,
     )
 

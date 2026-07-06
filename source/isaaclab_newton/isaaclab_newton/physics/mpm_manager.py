@@ -18,25 +18,7 @@ from .newton_manager import NewtonManager
 
 def _make_solver_config(solver_cfg: MPMSolverCfg) -> SolverImplicitMPM.Config:
     """Build Newton's implicit MPM solver config from Isaac Lab's cfg."""
-    return SolverImplicitMPM.Config(
-        max_iterations=solver_cfg.max_iterations,
-        tolerance=solver_cfg.tolerance,
-        solver=solver_cfg.solver,
-        warmstart_mode=solver_cfg.warmstart_mode,
-        collider_velocity_mode=solver_cfg.collider_velocity_mode,
-        voxel_size=solver_cfg.voxel_size,
-        grid_type=solver_cfg.grid_type,
-        grid_padding=solver_cfg.grid_padding,
-        max_active_cell_count=solver_cfg.max_active_cell_count,
-        transfer_scheme=solver_cfg.transfer_scheme,
-        integration_scheme=solver_cfg.integration_scheme,
-        critical_fraction=solver_cfg.critical_fraction,
-        air_drag=solver_cfg.air_drag,
-        collider_normal_from_sdf_gradient=solver_cfg.collider_normal_from_sdf_gradient,
-        collider_basis=solver_cfg.collider_basis,
-        strain_basis=solver_cfg.strain_basis,
-        velocity_basis=solver_cfg.velocity_basis,
-    )
+    return solver_cfg.to_solver_config()
 
 
 class NewtonMPMManager(NewtonManager):
@@ -112,12 +94,25 @@ class NewtonMPMManager(NewtonManager):
 
     @classmethod
     def _supports_cuda_graph_capture(cls) -> bool:
-        """Return ``True`` only for fixed-grid MPM.
+        """Preserve fixed-grid support and accept an explicit sparse-solver opt-in.
 
-        Sparse and dense grids reallocate as particles move, which is not
-        capturable in a CUDA graph; the fixed grid keeps a static topology.
+        Upstream fixed grids keep a static topology and remain capturable.
+        Sparse grids stay eager unless the concrete solver overrides Newton's
+        public capability contract (for example, a capacity-bounded rebuildable
+        sparse solver). Dense grids remain eager.
         """
-        return cls._solver.grid_type == "fixed"
+        advertised_support = bool(getattr(cls._solver, "supports_cuda_graph_capture", False))
+        if cls._solver.grid_type == "fixed":
+            return advertised_support
+        if cls._solver.grid_type != "sparse":
+            return False
+
+        solver_vars = getattr(cls._solver, "__dict__", {})
+        type_vars = getattr(type(cls._solver), "__dict__", {})
+        explicitly_advertised = (
+            "supports_cuda_graph_capture" in solver_vars or "supports_cuda_graph_capture" in type_vars
+        )
+        return explicitly_advertised and advertised_support
 
     @classmethod
     def _step_solver(

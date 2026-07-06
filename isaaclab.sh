@@ -25,8 +25,41 @@ else
     python_exe="python3"
 fi
 
-# Add source/isaaclab to PYTHONPATH so we can import isaaclab.cli.
-export PYTHONPATH="$ISAACLAB_PATH/source/isaaclab:$PYTHONPATH"
+# Add repo-local source packages to PYTHONPATH so this checkout does not
+# accidentally import matching packages from a shared virtual environment.
+source_roots="$ISAACLAB_PATH/source/isaaclab"
+for source_dir in "$ISAACLAB_PATH"/source/*; do
+    if [ "$source_dir" = "$ISAACLAB_PATH/source/isaaclab" ]; then
+        continue
+    fi
+    if [ -d "$source_dir" ]; then
+        source_roots="$source_roots:$source_dir"
+    fi
+done
+
+# Local physics-source overrides are explicit so an adjacent checkout cannot
+# silently replace the versions installed in the active environment.
+newton_source_dir="${NEWTON_SOURCE_DIR:-}"
+if [ -n "$newton_source_dir" ]; then
+    if [ ! -f "$newton_source_dir/newton/__init__.py" ]; then
+        echo "[ERROR] NEWTON_SOURCE_DIR does not contain newton/__init__.py: $newton_source_dir" >&2
+        exit 1
+    fi
+    source_roots="$newton_source_dir:$source_roots"
+fi
+
+warp_source_dir="${WARP_SOURCE_DIR:-}"
+if [ -n "$warp_source_dir" ]; then
+    if [ ! -f "$warp_source_dir/warp/__init__.py" ]; then
+        echo "[ERROR] WARP_SOURCE_DIR does not contain warp/__init__.py: $warp_source_dir" >&2
+        exit 1
+    fi
+    source_roots="$warp_source_dir:$source_roots"
+    if [ -d "$warp_source_dir/warp/bin" ]; then
+        export LD_LIBRARY_PATH="$warp_source_dir/warp/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+fi
+export PYTHONPATH="$source_roots:${PYTHONPATH:-}"
 
 # Let Kit associate direct wrapper launches with the Isaac Sim desktop icon.
 export RESOURCE_NAME="${RESOURCE_NAME:-IsaacSim}"

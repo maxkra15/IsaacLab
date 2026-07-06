@@ -964,7 +964,7 @@ def test_body_pose_write_marks_fk_reset_mask(device, writer):
         cube_object.update(sim.cfg.dt)
 
         # Clear the dirty flag so we can observe that the write sets it.
-        SimulationManager.forward()
+        SimulationManager.forward_pending()
         assert not _fk_reset_mask_dirty()
 
         pre_write_pose = wp.to_torch(cube_object.data.body_link_pose_w).clone()

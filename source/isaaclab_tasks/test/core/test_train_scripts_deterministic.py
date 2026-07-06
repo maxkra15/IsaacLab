@@ -154,6 +154,26 @@ def test_play_scripts_call_configure_seed_after_runner_or_agent_construction():
         )
 
 
+def test_rsl_rl_scripts_only_randomize_initial_episode_age_for_continuing_tasks():
+    """RSL-RL must not shorten a finite-horizon deadline without advancing its physical state."""
+    scripts = (
+        "scripts/reinforcement_learning/rsl_rl/train_rsl_rl.py",
+        "scripts/reinforcement_learning/rsl_rl/train.py",
+        "scripts/benchmarks/benchmark_rsl_rl.py",
+    )
+
+    for relative_path in scripts:
+        tree = _load_tree(relative_path)
+        learn_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and _called_name(node) == "learn"]
+        assert len(learn_calls) == 1, f"{relative_path}: expected exactly one runner.learn(...) call."
+        keyword = next(
+            (item for item in learn_calls[0].keywords if item.arg == "init_at_random_ep_len"),
+            None,
+        )
+        assert keyword is not None, f"{relative_path}: init_at_random_ep_len must be explicit."
+        assert ast.unparse(keyword.value) == "not env_cfg.is_finite_horizon", relative_path
+
+
 def _latest_event_file(before: set[Path], logs_root: Path) -> Path:
     candidates = set(logs_root.glob("**/events*"))
     new_files = [p for p in candidates if p not in before]

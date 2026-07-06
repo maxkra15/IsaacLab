@@ -85,20 +85,40 @@ class NewtonKaminoManager(NewtonManager):
             fk_mask: Per-articulation mask of articulations to update (``None`` means all).
         """
         if cls._get_kamino_solver_cfg().use_fk_solver:
-            cls._solver.reset(
-                cls._state_0,
-                world_mask=world_reset_mask,
-                config=SolverKamino.ResetConfig.from_joints(),
-            )
+            reset_config_type = getattr(SolverKamino, "ResetConfig", None)
+            from_joints = getattr(reset_config_type, "from_joints", None)
+            if callable(from_joints):
+                cls._solver.reset(
+                    state=cls._state_0,
+                    world_mask=world_reset_mask,
+                    config=from_joints(),
+                )
+            else:
+                cls._solver.reset(
+                    cls._state_0,
+                    joint_q=cls._state_0.joint_q,
+                    joint_u=cls._state_0.joint_qd,
+                    world_mask=world_reset_mask,
+                )
         else:
             eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, fk_mask)
 
             # Reset solver internals without performing Kamino's FK.
-            cls._solver.reset(
-                cls._state_0,
-                world_mask=world_reset_mask,
-                config=SolverKamino.ResetConfig.preserve(),
-            )
+            reset_config_type = getattr(SolverKamino, "ResetConfig", None)
+            preserve = getattr(reset_config_type, "preserve", None)
+            if callable(preserve):
+                cls._solver.reset(
+                    state=cls._state_0,
+                    world_mask=world_reset_mask,
+                    config=preserve(),
+                )
+            else:
+                cls._solver.reset(
+                    cls._state_0,
+                    joint_q=cls._state_0.joint_q,
+                    joint_u=cls._state_0.joint_qd,
+                    world_mask=world_reset_mask,
+                )
 
     @classmethod
     def _build_solver(cls, model: Model, solver_cfg: KaminoSolverCfg) -> None:

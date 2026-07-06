@@ -255,7 +255,12 @@ def main(
 
     # run training with continuous benchmark monitoring
     with early_stop_ctx, BenchmarkMonitor(benchmark, interval=1.0):
-        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+        runner.learn(
+            num_learning_iterations=agent_cfg.max_iterations,
+            # A finite-horizon task cannot randomize its deadline without also sampling the
+            # corresponding physical state. Continuing tasks retain the staggered-reset behavior.
+            init_at_random_ep_len=not env_cfg.is_finite_horizon,
+        )
 
     if world_rank == 0:
         # Final update after training completes

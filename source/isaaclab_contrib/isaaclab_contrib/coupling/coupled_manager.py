@@ -16,14 +16,17 @@ import warp as wp
 from isaaclab_newton.physics import (
     FeatherstoneSolverCfg,
     MJWarpSolverCfg,
+    MPMSolverCfg,
     NewtonSolverCfg,
     XPBDSolverCfg,
 )
+from isaaclab_newton.physics.mjwarp_manager import apply_mujoco_warp_model_overrides
 from isaaclab_newton.physics.newton_manager import NewtonManager
-from newton import CollisionPipeline, Model, ShapeFlags, eval_fk
+from newton import BodyFlags, CollisionPipeline, Contacts, Control, Model, ModelBuilder, ShapeFlags, State, eval_fk
 from newton._src.solvers.coupled.proxy_utils import sync_proxy_particles_kernel, sync_proxy_states_kernel
-from newton.solvers import SolverBase, SolverFeatherstone, SolverMuJoCo, SolverVBD, SolverXPBD
+from newton.solvers import SolverBase, SolverFeatherstone, SolverImplicitMPM, SolverMuJoCo, SolverVBD, SolverXPBD
 from newton.solvers.experimental.coupled import CouplingInterface, SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
+from warp.fem import TemporaryStore
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.physics import PhysicsManager
@@ -132,12 +135,14 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
 
     _SOLVER_CLASS_BY_CFG_TYPE: ClassVar[dict[type[NewtonSolverCfg], type[SolverBase]]] = {
         MJWarpSolverCfg: SolverMuJoCo,
+        MPMSolverCfg: SolverImplicitMPM,
         VBDSolverCfg: SolverVBD,
         FeatherstoneSolverCfg: SolverFeatherstone,
         XPBDSolverCfg: SolverXPBD,
     }
     _fk_articulation_filter: wp.array | None = None
     _combined_fk_mask: wp.array | None = None
+    _mpm_project_outside_entries: tuple[str, ...] = ()
 
     @classmethod
     def get_entry_solver(cls, name: str):
@@ -187,7 +192,13 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
         needs_outer_pipeline = (
             resolved_cfg.use_collision_pipeline
             if resolved_cfg.use_collision_pipeline is not None
-            else isinstance(resolved_cfg, CoupledAdmmSolverCfg)
+            else (
+                isinstance(resolved_cfg, CoupledAdmmSolverCfg)
+                or (
+                    type(resolved_cfg) is CoupledSolverCfg
+                    and any(cls._solver_cfg_needs_external_contacts(entry.solver_cfg) for entry in resolved_cfg.entries)
+                )
+            )
         )
         proxy_destinations = (
             {proxy.destination for proxy in resolved_cfg.proxies}
@@ -205,18 +216,23 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
             )
             for entry_cfg in resolved_cfg.entries
         ]
-        if isinstance(resolved_cfg, CoupledProxySolverCfg):
+        if type(resolved_cfg) is CoupledSolverCfg:
+            NewtonManager._solver = SolverCoupled(model=model, entries=entries)
+        elif isinstance(resolved_cfg, CoupledProxySolverCfg):
             NewtonManager._solver = cls._build_proxy_coupled_solver(model, entries, resolved_cfg)
         elif isinstance(resolved_cfg, CoupledAdmmSolverCfg):
             NewtonManager._solver = cls._build_admm_coupled_solver(model, entries, resolved_cfg)
         else:
             raise TypeError(
                 f"CoupledSolverCfg subclass {type(resolved_cfg).__name__!r} is not supported; "
-                "use CoupledProxySolverCfg or CoupledAdmmSolverCfg."
+                "use CoupledSolverCfg, CoupledProxySolverCfg, or CoupledAdmmSolverCfg."
             )
 
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = needs_outer_pipeline
+        NewtonManager._needs_fk_before_step = any(
+            isinstance(entry.solver_cfg, MPMSolverCfg) for entry in resolved_cfg.entries
+        )
         NewtonManager._requires_teleport_reset = True
         NewtonManager._supports_contact_sensors = False
         if NewtonManager._report_contacts:
@@ -226,6 +242,36 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
             )
         cls._apply_vbd_joint_constraint_modes(resolved_cfg.entries)
         cls._configure_fk_articulation_filter(model, resolved_cfg.entries)
+        cls._mpm_project_outside_entries = tuple(
+            entry.name
+            for entry in resolved_cfg.entries
+            if isinstance(entry.solver_cfg, MPMSolverCfg) and entry.solver_cfg.project_outside_colliders
+        )
+
+    @classmethod
+    def _prepare_builder_for_finalize(cls, builder: ModelBuilder) -> None:
+        """Normalize kinematic colliders when an entry uses implicit MPM."""
+        super()._prepare_builder_for_finalize(builder)
+        physics_cfg = PhysicsManager._cfg
+        solver_cfg = getattr(physics_cfg, "solver_cfg", None)
+        if not any(isinstance(entry.solver_cfg, MPMSolverCfg) for entry in getattr(solver_cfg, "entries", ())):
+            return
+
+        kinematic_flag = int(BodyFlags.KINEMATIC)
+        for body_id, flags in enumerate(builder.body_flags):
+            if int(flags) & kinematic_flag:
+                builder.body_mass[body_id] = 0.0
+                builder.body_inv_mass[body_id] = 0.0
+                builder.body_inertia[body_id] = wp.mat33()
+                builder.body_inv_inertia[body_id] = wp.mat33()
+
+    @classmethod
+    def _register_builder_attributes(cls, builder: ModelBuilder) -> None:
+        """Register custom attributes required by concrete coupled algorithms."""
+        super()._register_builder_attributes(builder)
+        physics_cfg = PhysicsManager._cfg
+        if isinstance(getattr(physics_cfg, "solver_cfg", None), CoupledAdmmSolverCfg):
+            SolverCoupledADMM.register_custom_attributes(builder)
 
     @classmethod
     def _resolve_solver_cfg(cls, model: Model, solver_cfg: CoupledSolverCfg) -> CoupledSolverCfg:
@@ -340,7 +386,7 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
                 raise ValueError(
                     f"CoupledSolverCfg {field}: scene entity {spec.name!r} is not on the attached scene cfg."
                 )
-            asset_pattern = asset_cfg.prim_path
+            asset_pattern = str(asset_cfg.prim_path).replace("{ENV_REGEX_NS}", r"/World/envs/env_.*")
             body_patterns = [spec.body_names] if isinstance(spec.body_names, str) else spec.body_names
             description = f"scene entity {spec.name!r}"
 
@@ -403,16 +449,30 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
     @classmethod
     def _build_entry(cls, entry_cfg: CoupledSolverEntryCfg, *, local_collision: bool = False) -> SolverCoupled.Entry:
         solver_cls = cls._resolve_solver_class(entry_cfg.solver_cfg)
-        solver_kwargs = cls._filter_solver_kwargs(solver_cls, entry_cfg.solver_cfg)
+        solver_kwargs = (
+            None
+            if isinstance(entry_cfg.solver_cfg, MPMSolverCfg)
+            else cls._filter_solver_kwargs(solver_cls, entry_cfg.solver_cfg)
+        )
 
         def solver_factory(
             model_view,
             _solver_cls=solver_cls,
             _kwargs=solver_kwargs,
+            _solver_cfg=entry_cfg.solver_cfg,
             _local=local_collision,
             _use_solver_effective_mass=entry_cfg.use_solver_effective_mass,
         ):
-            solver = _solver_cls(model=model_view, **_kwargs)
+            if isinstance(_solver_cfg, MPMSolverCfg):
+                solver = _solver_cls(
+                    model_view,
+                    _solver_cfg.to_solver_config(),
+                    temporary_store=TemporaryStore(),
+                )
+            else:
+                solver = _solver_cls(model=model_view, **_kwargs)
+                if isinstance(_solver_cfg, MJWarpSolverCfg):
+                    apply_mujoco_warp_model_overrides(solver, _solver_cfg)
             return (
                 _EntryCollisionPipelineSolver(
                     solver,
@@ -430,6 +490,8 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
             particles=list(entry_cfg.particles),
             joints=list(getattr(entry_cfg, "joints", ())),
             shapes=list(getattr(entry_cfg, "shapes", ())),
+            substeps=int(entry_cfg.substeps),
+            in_place=bool(entry_cfg.in_place),
         )
 
     @staticmethod
@@ -445,6 +507,7 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
         entries: list[SolverCoupled.Entry],
         solver_cfg: CoupledProxySolverCfg,
     ) -> SolverCoupledProxy:
+        entry_cfgs = {entry.name: entry for entry in solver_cfg.entries}
         proxies = [
             SolverCoupledProxy.Proxy(
                 source=proxy.source,
@@ -453,7 +516,16 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
                 particles=list(proxy.particles),
                 mode=proxy.mode,
                 mass_scale=float(proxy.mass_scale),
-                collision_pipeline=proxy.collision_pipeline_factory or _default_proxy_collision_pipeline,
+                proxy_relaxation=float(proxy.proxy_relaxation),
+                collision_pipeline=(
+                    proxy.collision_pipeline_factory
+                    or (
+                        _default_proxy_collision_pipeline
+                        if proxy.destination not in entry_cfgs
+                        or cls._solver_cfg_needs_external_contacts(entry_cfgs[proxy.destination].solver_cfg)
+                        else None
+                    )
+                ),
                 collide_interval=proxy.collide_interval,
             )
             for proxy in solver_cfg.proxies
@@ -504,6 +576,11 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
             raise ValueError("CoupledSolverEntryCfg.name must be non-empty.")
         if len(set(names)) != len(names):
             raise ValueError(f"Coupled solver entry names must be unique, got {names!r}.")
+        for entry in solver_cfg.entries:
+            if entry.substeps < 1:
+                raise ValueError(f"CoupledSolverEntryCfg {entry.name!r} substeps must be >= 1.")
+            if entry.in_place and entry.substeps != 1:
+                raise ValueError(f"CoupledSolverEntryCfg {entry.name!r} in_place requires substeps=1.")
 
         cls._validate_complete_ownership(model, solver_cfg.entries, "bodies", int(model.body_count))
         cls._validate_complete_ownership(model, solver_cfg.entries, "particles", int(model.particle_count))
@@ -570,6 +647,8 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
             raise ValueError("CoupledProxyCfg particles must be owned by its source entry.")
         if proxy.mass_scale <= 0.0:
             raise ValueError("CoupledProxyCfg.mass_scale must be > 0.")
+        if not np.isfinite(proxy.proxy_relaxation) or proxy.proxy_relaxation < 0.0:
+            raise ValueError("CoupledProxyCfg.proxy_relaxation must be finite and >= 0.")
         if proxy.collide_interval is not None and proxy.collide_interval < 1:
             raise ValueError("CoupledProxyCfg.collide_interval must be >= 1.")
         if proxy.mode not in ("lagged", "staggered"):
@@ -674,6 +753,31 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
         eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, mask)
 
     @classmethod
+    def _step_solver(
+        cls,
+        state_0: State,
+        state_1: State,
+        control: Control,
+        contacts: Contacts | None,
+        substep_dt: float,
+    ) -> None:
+        """Run one coupled step and configured MPM particle projections."""
+        super()._step_solver(state_0, state_1, control, contacts, substep_dt)
+        solver = NewtonManager._solver
+        reconcile_entry = getattr(solver, "reconcile_entry_state", None)
+        needs_full_reconcile = False
+        for entry_name in cls._mpm_project_outside_entries:
+            entry_solver = solver.solver(entry_name)
+            entry_state = solver.entry_state(entry_name, phase="output")
+            entry_solver.project_outside(entry_state, entry_state, substep_dt)
+            if callable(reconcile_entry):
+                reconcile_entry(entry_name, state_1, phase="output")
+            else:
+                needs_full_reconcile = True
+        if needs_full_reconcile:
+            solver._reconcile_state(state_1)
+
+    @classmethod
     def step(cls) -> None:
         """Reset history after state teleports, then run the normal Newton step."""
         sim = PhysicsManager._sim
@@ -742,4 +846,5 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
     def _solver_specific_clear(cls):
         cls._fk_articulation_filter = None
         cls._combined_fk_mask = None
+        cls._mpm_project_outside_entries = ()
         super()._solver_specific_clear()

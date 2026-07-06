@@ -46,6 +46,7 @@ new backend, see :doc:`../../multi_backend_architecture`.
   :titlesonly:
 
   installation
+  local-development
   supported-features
   mjwarp-solver
   kamino-solver

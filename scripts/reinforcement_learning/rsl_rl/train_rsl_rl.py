@@ -196,7 +196,12 @@ def run(argv: list[str]) -> None:
         dump_train_configs(log_dir, env_cfg, agent_cfg)
 
         try:
-            runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+            runner.learn(
+                num_learning_iterations=agent_cfg.max_iterations,
+                # Random episode ages are valid for continuing tasks, but a finite-horizon task
+                # would receive a shortened deadline without the matching physical state.
+                init_at_random_ep_len=not env_cfg.is_finite_horizon,
+            )
             print(f"Training time: {round(time.time() - start_time, 2)} seconds")
             env.close()
         except KeyboardInterrupt:

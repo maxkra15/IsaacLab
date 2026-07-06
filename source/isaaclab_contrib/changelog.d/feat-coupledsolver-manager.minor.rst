@@ -15,6 +15,13 @@ Added
   entries, instantiates each sub-solver from its config, and connects entries
   through named proxy mappings or ADMM contact pairs.
 
+* Added implicit-MPM entries, per-entry substeps and in-place stepping, base
+  :class:`newton.solvers.experimental.coupled.SolverCoupled` operation, and
+  configurable proxy-force relaxation to
+  :mod:`isaaclab_contrib.coupling`. Implicit-MPM proxy destinations use the
+  solver's internal collider path instead of allocating a redundant Newton
+  collision pipeline.
+
 * Added support for raw prim-path regex strings (e.g.
   ``"/World/envs/env_.*/MyCube"``) in the body-selector lists of
   :class:`~isaaclab_contrib.coupling.coupled_manager_cfg.CoupledSolverEntryCfg`

@@ -1329,7 +1329,7 @@ def test_body_link_pose_w_fresh_after_root_pose_write(device, writer):
 
     After ``write_root_{link,com}_pose_to_sim_{index,mask}``, the cached ``_sim_bind_body_link_pose_w``
     (Newton ``body_q``) is stale until forward kinematics is re-evaluated. The getter must call
-    :meth:`SimulationManager.forward` so the returned tensor matches the written pose. Without the fix,
+    :meth:`SimulationManager.forward_pending` so the returned tensor matches the written pose. Without the fix,
     the getter returns the pre-write value. The write must also dirty the simulator-side
     ``_fk_reset_mask`` so collision queries (which read ``body_q`` directly, not via the property)
     re-run FK before the next step.
@@ -1355,7 +1355,7 @@ def test_body_link_pose_w_fresh_after_root_pose_write(device, writer):
         pre_write_pose = wp.to_torch(cube_object.data.body_link_pose_w).clone().view(num_cubes, 7)
 
         # Clear the dirty flag so we can observe that the write sets it.
-        SimulationManager.forward()
+        SimulationManager.forward_pending()
         assert not _fk_reset_mask_dirty()
 
         # Build a target pose clearly distinct from the current one in both translation and orientation.
@@ -1379,14 +1379,14 @@ def test_body_link_pose_w_fresh_after_root_pose_write(device, writer):
         elif writer == "com_mask":
             cube_object.write_root_com_pose_to_sim_mask(root_pose=target_pose)
 
-        # The simulator-side dirty flag must be set before any property read clears it via forward().
+        # The simulator-side dirty flag must be set before a property read consumes it via forward_pending().
         assert _fk_reset_mask_dirty(), "pose write must call SimulationManager.invalidate_fk()"
 
         # Read without stepping: getter must trigger forward kinematics and return the fresh pose.
         body_link = wp.to_torch(cube_object.data.body_link_pose_w).view(num_cubes, 7)
         # Defeat alias accidents: the property must not still return the pre-write value.
         assert not torch.allclose(body_link[..., :3], pre_write_pose[..., :3], rtol=1e-4, atol=1e-4), (
-            "body_link_pose_w returned the pre-write cached pose; forward() was not invoked"
+            "body_link_pose_w returned the pre-write cached pose; forward_pending() was not invoked"
         )
         # Translation must match the write.
         torch.testing.assert_close(body_link[..., :3], target_pose[..., :3], rtol=1e-4, atol=1e-4)

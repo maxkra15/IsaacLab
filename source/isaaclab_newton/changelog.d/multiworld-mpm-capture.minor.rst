@@ -1,0 +1,53 @@
+Added
+^^^^^
+
+* Added :attr:`~isaaclab_newton.assets.MPMObject.particle_offsets` for mapping per-environment
+  particle buffers without private asset access.
+* Added :meth:`~isaaclab_newton.physics.NewtonManager.reset_solver_state`,
+  :meth:`~isaaclab_newton.physics.NewtonManager.prepare_cuda_graph_capture`, and
+  :meth:`~isaaclab_newton.physics.NewtonManager.is_cuda_graph_active` as public lifecycle seams.
+* Added :meth:`~isaaclab_newton.physics.NewtonManager.check_solver_status` for application-owned
+  outer graphs to inspect sticky device failures after replay.
+* Added :meth:`~isaaclab_newton.physics.NewtonManager.forward_pending` to consume the masked
+  forward-kinematics work accumulated by selective public asset writes without recomputing every
+  articulation.
+* Added :meth:`~isaaclab_newton.physics.NewtonManager.register_builder_world_hook` and
+  :meth:`~isaaclab_newton.physics.NewtonManager.unregister_builder_world_hook` so tasks can extend
+  replicated Newton worlds without mutating manager internals.
+* Added :meth:`~isaaclab_newton.physics.NewtonManager.get_clone_prototype_model` for auxiliary
+  single-world consumers such as batched inverse kinematics.
+
+Changed
+^^^^^^^
+
+* Changed Newton CUDA graph setup to use each solver's public capture-capability and preparation
+  contracts, including recursive coupled-solver preparation.
+* Changed Newton environment reset masks to boolean arrays and updated the Kamino manager to use
+  Newton's public solver reset contract.
+* Changed Newton articulation and rigid-object pose getters to refresh only pending forward
+  kinematics, preserving per-environment reset scaling. No migration is required; callers may
+  remove redundant full :meth:`~isaaclab_newton.physics.NewtonManager.forward` calls before
+  reading these public pose views.
+
+Fixed
+^^^^^
+
+* Fixed :class:`~isaaclab_contrib.coupling.NewtonCoupledSolverManager` so kinematic rigid bodies
+  selected for implicit MPM work as massless colliders and refresh forward kinematics before
+  stepping.
+* Fixed coupled implicit-MPM particle projection to operate on authoritative entry state and
+  reconcile through Newton's public coupled-state API.
+* Fixed selective reset to update both manager state buffers and finish from the authoritative
+  input state without exposing solver internals.
+* Fixed CUDA graph allocation warmup to restore solver-private state before recording the first
+  real step and reject sparse-capacity failures before advancing simulation time.
+* Fixed Newton teardown to discard MPM object registrations before constructing another scene.
+* Fixed local Warp source overrides to expose checkout-built native libraries to the dynamic loader.
+* Fixed explicit Newton forward calls to publish refreshed articulation link poses to Fabric before
+  returning, preventing stale or offset Kit rendering after environment resets.
+* Fixed implicit-MPM configuration forwarding for explicit sparse-grid leaf and internal-node
+  capacities, allowing captured applications to size hierarchy growth independently of active cells.
+* Fixed auxiliary clone-prototype finalization replacing geometry resources still referenced by the
+  live simulation model by copying mutable builder state and geometry sources first.
+* Fixed Kit visualization of Newton-driven bodies by propagating GPU transforms through rendered
+  child prims and instance proxies.

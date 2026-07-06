@@ -76,6 +76,17 @@ class CoupledSolverEntryCfg:
     shape_label_patterns: list[str] = field(default_factory=list)
     """Regexes matched against full Newton shape labels for additional ownership."""
 
+    substeps: int = 1
+    """Number of equal substeps this entry runs inside one coupled step."""
+
+    in_place: bool = False
+    """Whether this entry steps in-place instead of using a second state buffer.
+
+    This is intended for solvers such as implicit MPM that explicitly support
+    in-place stepping. In-place entries currently require :attr:`substeps` to
+    be one.
+    """
+
 
 @configclass
 class CoupledProxyCfg:
@@ -102,6 +113,9 @@ class CoupledProxyCfg:
 
     mass_scale: float = 1.0
     """Scale applied to proxy effective mass and inertia in the destination view."""
+
+    proxy_relaxation: float = 1.0
+    """Relaxation factor applied to lagged proxy feedback forces."""
 
     collide_interval: int | None = None
     """Collision refresh interval when :attr:`collision_pipeline_factory` is set.
@@ -147,7 +161,8 @@ class CoupledSolverCfg(NewtonSolverCfg):
     Every body and particle in the parent model must have one unambiguous
     owner among :attr:`entries`. Joint and shape ownership is also unique, but
     may intentionally omit constraints or collision geometry from all views.
-    Use a concrete subclass to configure the coupling interfaces.
+    The base class steps and reconciles entries without an additional coupling
+    algorithm; use a concrete subclass to configure proxy or ADMM coupling.
     """
 
     class_type: type[NewtonManager] | str = "{DIR}.coupled_manager:NewtonCoupledSolverManager"
