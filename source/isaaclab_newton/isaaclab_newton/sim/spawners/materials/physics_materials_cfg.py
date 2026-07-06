@@ -10,6 +10,7 @@ from typing import ClassVar
 
 from isaaclab.sim.spawners.materials.physics_materials_cfg import (
     DeformableBodyMaterialBaseCfg,
+    PhysicsMaterialCfg,
     RigidBodyMaterialFragment,
     SurfaceDeformableBodyMaterialBaseCfg,
 )
@@ -78,6 +79,37 @@ class NewtonSurfaceDeformableBodyMaterialCfg(SurfaceDeformableBodyMaterialBaseCf
 
     edge_kd: float = 1e-2
     """Bending damping [N*m*s]. Used by Newton backend for cloth meshes."""
+
+
+@configclass
+class NewtonCableMaterialCfg(PhysicsMaterialCfg):
+    """Newton-specific physics material for cable rods.
+
+    The generic deformable-material spawner authors these provisional
+    ``newton:*`` attributes on a :class:`UsdShade.Material` prim. Cable assets
+    read the attributes when registering their Newton rod representation.
+    """
+
+    _usd_namespace: ClassVar[str | None] = "newton"
+    _usd_applied_schema: ClassVar[str | None] = None
+    _usd_field_exceptions: ClassVar[dict] = {}
+
+    func: Callable | str = "isaaclab.sim.spawners.materials.physics_materials:spawn_deformable_body_material"
+
+    stretch_stiffness: float = 1.0e9
+    """Material-like axial stiffness [N], normalized internally by segment length."""
+
+    bend_stiffness: float = 0.0
+    """Material-like bend and twist stiffness [N·m²], normalized internally by segment length."""
+
+    stretch_damping: float = 0.0
+    """Per-joint stretch damping [N·s/m]."""
+
+    bend_damping: float = 0.0
+    """Per-joint bend and twist damping [N·m·s/rad]."""
+
+    density: float = 1500.0
+    """Material density [kg/m³] used to compute each cable segment's mass."""
 
 
 @configclass
