@@ -433,6 +433,9 @@ class NewtonManager(PhysicsManager):
         manager = getattr(PhysicsManager._sim, "physics_manager", cls)
         manager._reset_solver_internals(cls._world_reset_mask)
         cls._eval_fk(cls._world_reset_mask, cls._fk_reset_mask)
+        if cls._usdrt_stage is not None:
+            cls._mark_transforms_dirty()
+            cls.sync_transforms_to_usd()
         if cls._fk_reset_mask is not None:
             cls._fk_reset_mask.zero_()
         if cls._world_reset_mask is not None:
@@ -461,11 +464,10 @@ class NewtonManager(PhysicsManager):
         The Warp kernel reads ``state_0.body_q[newton_index[i]]`` and writes the
         corresponding ``mat44d`` to ``omni:fabric:worldMatrix`` for each prim.
 
-        When cubric is available the method mirrors PhysX's ``DirectGpuHelper``
-        pattern: pause Fabric change tracking, write transforms, resume tracking,
-        then call ``IAdapter::compute`` on the GPU to propagate the hierarchy and
-        notify the Fabric Scene Delegate.  Otherwise it falls back to the CPU
-        ``update_world_xforms()`` path.
+        Rigid-only scenes use Cubric's inverse body propagation. Declarative MPM
+        scenes materialize their complete render hierarchy once, write absolute
+        body poses as reset-stack local matrices, and propagate descendants with
+        Fabric's GPU hierarchy update. The CPU hierarchy is a compatibility fallback.
         """
         if cls._usdrt_stage is None or cls._model is None or cls._state_0 is None:
             return
@@ -474,9 +476,16 @@ class NewtonManager(PhysicsManager):
         try:
             import usdrt
 
+            complete_hierarchy = bool(cls._mpm_object_registry)
+
             # Lazy adapter creation: deferred from initialize_solver() to avoid
             # startup-ordering issues with the cubric plugin.
-            if cls._cubric is not None and cls._cubric.available and cls._cubric_adapter is None:
+            if (
+                not complete_hierarchy
+                and cls._cubric is not None
+                and cls._cubric.available
+                and cls._cubric_adapter is None
+            ):
                 NewtonManager._cubric_adapter = cls._cubric.create_adapter()
                 if cls._cubric_adapter is not None:
                     logger.info("cubric GPU transform hierarchy enabled")
@@ -484,7 +493,7 @@ class NewtonManager(PhysicsManager):
                     logger.warning("cubric adapter creation failed; falling back to update_world_xforms()")
                     NewtonManager._cubric = None
 
-            use_cubric = cls._cubric is not None and cls._cubric_adapter is not None
+            use_cubric = not complete_hierarchy and cls._cubric is not None and cls._cubric_adapter is not None
 
             fabric_hierarchy = None
             if hasattr(usdrt, "hierarchy"):
@@ -504,9 +513,10 @@ class NewtonManager(PhysicsManager):
                 fabric_hierarchy.track_local_xform_changes(False)
 
             try:
+                transform_attribute = "omni:fabric:localMatrix" if complete_hierarchy else "omni:fabric:worldMatrix"
                 selection = cls._usdrt_stage.SelectPrims(
                     require_attrs=[
-                        (usdrt.Sdf.ValueTypeNames.Matrix4d, "omni:fabric:worldMatrix", usdrt.Usd.Access.ReadWrite),
+                        (usdrt.Sdf.ValueTypeNames.Matrix4d, transform_attribute, usdrt.Usd.Access.ReadWrite),
                         (usdrt.Sdf.ValueTypeNames.UInt, cls._newton_index_attr, usdrt.Usd.Access.Read),
                     ],
                     device=str(PhysicsManager._device),
@@ -515,7 +525,9 @@ class NewtonManager(PhysicsManager):
                     NewtonManager._transforms_dirty = False
                     return
 
-                fabric_transforms = wp.fabricarray(selection, "omni:fabric:worldMatrix")
+                if complete_hierarchy:
+                    selection.PrepareForReuse()
+                fabric_transforms = wp.fabricarray(selection, transform_attribute)
                 newton_indices = wp.fabricarray(selection, cls._newton_index_attr)
                 wp.launch(
                     _set_fabric_transforms,
@@ -527,7 +539,13 @@ class NewtonManager(PhysicsManager):
 
                 NewtonManager._transforms_dirty = False
 
-                if use_cubric and fabric_hierarchy is not None:
+                if complete_hierarchy and fabric_hierarchy is not None:
+                    update_world_xforms_gpu = getattr(fabric_hierarchy, "update_world_xforms_gpu", None)
+                    gpu_updated = callable(update_world_xforms_gpu) and update_world_xforms_gpu(False)
+                    if not gpu_updated:
+                        logger.debug("Fabric GPU hierarchy update unavailable; using CPU transform propagation")
+                        fabric_hierarchy.update_world_xforms()
+                elif use_cubric and fabric_hierarchy is not None:
                     fabric_id = cls._usdrt_stage.GetFabricId().id
                     if fabric_id != cls._cubric_bound_fabric_id:
                         cls._cubric.bind_to_stage(cls._cubric_adapter, fabric_id)
@@ -1296,6 +1314,10 @@ class NewtonManager(PhysicsManager):
                 cls._usdrt_stage.GetFabricId(), cls._usdrt_stage.GetStageIdAsStageId()
             )
 
+            if cls._mpm_object_registry:
+                NewtonManager._initialize_fabric_xform_hierarchy(
+                    get_current_stage(), cls._usdrt_stage, fabric_hierarchy, usdrt
+                )
             NewtonManager._initialize_fabric_body_prims(cls._usdrt_stage, fabric_hierarchy, usdrt, body_bindings)
             NewtonManager._initialize_fabric_particle_prims(
                 cls._usdrt_stage,
@@ -1309,24 +1331,46 @@ class NewtonManager(PhysicsManager):
             cls.sync_particles_to_usd()
 
     @staticmethod
+    def _initialize_fabric_xform_hierarchy(usd_stage, fabric_stage, fabric_hierarchy, usdrt) -> None:
+        """Materialize all rendered transforms required by declarative MPM scenes."""
+        from pxr import Usd, UsdGeom
+
+        for usd_prim in Usd.PrimRange.Stage(usd_stage, Usd.TraverseInstanceProxies()):
+            prim_path = usd_prim.GetPath().pathString
+            if not prim_path.startswith("/World") or not usd_prim.IsA(UsdGeom.Xformable):
+                continue
+            fabric_prim = fabric_stage.GetPrimAtPath(usdrt.Sdf.Path(prim_path))
+            if not fabric_prim.IsValid():
+                continue
+            xformable = usdrt.Rt.Xformable(fabric_prim)
+            if not xformable.GetFabricHierarchyWorldMatrixAttr().IsValid():
+                xformable.CreateFabricHierarchyWorldMatrixAttr()
+            if not xformable.GetFabricHierarchyLocalMatrixAttr().IsValid():
+                xformable.CreateFabricHierarchyLocalMatrixAttr()
+            xformable.SetWorldXformFromUsd()
+
+        fabric_hierarchy.update_world_xforms()
+
+    @staticmethod
     def _initialize_fabric_body_prims(stage, fabric_hierarchy, usdrt, body_bindings: Sequence[tuple[str, int]]) -> None:
         """Initialize Fabric body prims used by Newton transform sync."""
+        complete_hierarchy = bool(NewtonManager._mpm_object_registry)
         for prim_path, body_index in body_bindings:
+            if not isinstance(prim_path, str) or not prim_path.startswith("/"):
+                continue
             prim = stage.GetPrimAtPath(prim_path)
-            if prim.IsValid():
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.SetWorldXformFromUsd()
-            else:
-                prim = stage.DefinePrim(prim_path, "Xform")
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.CreateFabricHierarchyWorldMatrixAttr()
+            if not prim.IsValid():
+                continue
+            xformable = usdrt.Rt.Xformable(prim)
+            xformable.SetWorldXformFromUsd()
 
             prim.CreateAttribute(NewtonManager._newton_index_attr, usdrt.Sdf.ValueTypeNames.UInt, custom=True)
             prim.GetAttribute(NewtonManager._newton_index_attr).Set(body_index)
-            # Tag with PhysicsRigidBodyAPI so cubric's eRigidBody mode applies
-            # Inverse propagation (preserves Newton's world transforms and derives
-            # local) instead of Forward.
-            prim.AddAppliedSchema("PhysicsRigidBodyAPI")
+            if complete_hierarchy:
+                fabric_hierarchy.set_reset_xform_stack(usdrt.Sdf.Path(prim_path), True)
+            else:
+                # Cubric preserves Newton world transforms and derives local transforms.
+                prim.AddAppliedSchema("PhysicsRigidBodyAPI")
 
         fabric_hierarchy.update_world_xforms()
 
@@ -1337,7 +1381,13 @@ class NewtonManager(PhysicsManager):
         for prim_path in prim_paths:
             prim = stage.GetPrimAtPath(prim_path)
             if prim.IsValid():
-                usdrt.Rt.Xformable(prim).SetWorldXformFromUsd()
+                xformable = usdrt.Rt.Xformable(prim)
+                if NewtonManager._mpm_object_registry:
+                    if not xformable.GetFabricHierarchyWorldMatrixAttr().IsValid():
+                        xformable.CreateFabricHierarchyWorldMatrixAttr()
+                    if not xformable.GetFabricHierarchyLocalMatrixAttr().IsValid():
+                        xformable.CreateFabricHierarchyLocalMatrixAttr()
+                xformable.SetWorldXformFromUsd()
 
         if prim_paths:
             fabric_hierarchy.update_world_xforms()
@@ -1590,7 +1640,7 @@ class NewtonManager(PhysicsManager):
         # Runs before graph capture below so the capture warmup sees a valid body_q.
         cls._eval_fk(None, None)
 
-        if cls._usdrt_stage is not None:
+        if cls._usdrt_stage is not None and not cls._mpm_object_registry:
             cls._setup_cubric_bindings()
 
         # Skip the initial graph capture when the Newton actuator fast path is

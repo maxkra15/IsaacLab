@@ -521,6 +521,47 @@ def test_solver_status_hook_is_optional_and_forwarded(monkeypatch):
     assert calls == ["status"]
 
 
+def test_forward_publishes_reset_fk_to_fabric(monkeypatch):
+    """A public forward call must publish reset joint poses before returning."""
+    from isaaclab.physics import PhysicsManager
+
+    events = []
+    world_mask = SimpleNamespace(zero_=lambda: events.append("clear_world"))
+    fk_mask = SimpleNamespace(zero_=lambda: events.append("clear_fk"))
+    manager = SimpleNamespace(_reset_solver_internals=lambda mask: events.append(("reset", mask)))
+
+    monkeypatch.setattr(PhysicsManager, "_sim", SimpleNamespace(physics_manager=manager), raising=False)
+    monkeypatch.setattr(NewtonManager, "_world_reset_mask", world_mask, raising=False)
+    monkeypatch.setattr(NewtonManager, "_fk_reset_mask", fk_mask, raising=False)
+    monkeypatch.setattr(NewtonManager, "_usdrt_stage", object(), raising=False)
+    monkeypatch.setattr(
+        NewtonManager,
+        "_eval_fk",
+        classmethod(lambda cls, worlds, articulations: events.append(("fk", worlds, articulations))),
+    )
+    monkeypatch.setattr(
+        NewtonManager,
+        "_mark_transforms_dirty",
+        classmethod(lambda cls: events.append("mark_transforms")),
+    )
+    monkeypatch.setattr(
+        NewtonManager,
+        "sync_transforms_to_usd",
+        classmethod(lambda cls: events.append("sync_transforms")),
+    )
+
+    NewtonManager.forward()
+
+    assert events == [
+        ("reset", world_mask),
+        ("fk", world_mask, fk_mask),
+        "mark_transforms",
+        "sync_transforms",
+        "clear_fk",
+        "clear_world",
+    ]
+
+
 @pytest.mark.parametrize("graph, expected", [(None, False), (object(), True)])
 def test_cuda_graph_active_reports_recorded_manager_graph(monkeypatch, graph, expected):
     monkeypatch.setattr(NewtonManager, "_graph", graph, raising=False)
