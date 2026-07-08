@@ -1342,7 +1342,7 @@ def test_mpm_uses_s2_colliders_and_bounded_200_env_capacity():
     # available in the graph-capturable sparse-grid path.
     assert solver_cfg.velocity_basis == "Q1"
     assert solver_cfg.collider_basis == "S2"
-    assert solver_cfg.project_outside_colliders is True
+    assert solver_cfg.project_outside_colliders is False
     assert _media_entry(play_cfg).solver_cfg.collider_basis == "S2"
     assert play_cfg.sim.physics.use_cuda_graph is False
     assert solver_cfg.max_upper_node_count == upper_capacity

@@ -66,8 +66,8 @@ Changed
 Fixed
 ^^^^^
 
-* Fixed particles slowly penetrating the Franka Pour source cup by applying the configured
-  particle-level collider projection after each coupled implicit-MPM substep.
+* Fixed the coupled solver manager ignoring the opt-in ``project_outside_colliders`` MPM setting.
+  The setting remains disabled by default and Franka Pour relies on its normal S2 grid collision.
 * Fixed the source cup's rigid grasp proxy to match the visible cup instead of extending above its
   rim and creating phantom contacts.
 * Fixed Franka Pour startup memory scaling by deriving sparse-grid capacity from its fixed particle

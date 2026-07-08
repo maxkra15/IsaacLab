@@ -1466,6 +1466,8 @@ def test_franka_pour_offset_world_tables_support_both_cups():
         task.sim._app_control_on_stop_handle = None
         env.reset()
 
+        entries = {entry.name: entry for entry in task.cfg.sim.physics.solver_cfg.entries}
+        assert entries[MPM_ENTRY].solver_cfg.project_outside_colliders is False
         assert task.num_envs == 2
         assert not torch.equal(task.scene.env_origins[0], task.scene.env_origins[1])
         torch.testing.assert_close(task.cup_pose_e()[:, 2], torch.zeros(2, device=task.device), rtol=0.0, atol=0.0)
