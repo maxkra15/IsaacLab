@@ -65,6 +65,8 @@ Changed
 Fixed
 ^^^^^
 
+* Fixed particles slowly penetrating the Franka Pour source cup by applying the configured
+  particle-level collider projection after each coupled implicit-MPM substep.
 * Fixed the source cup's rigid grasp proxy to match the visible cup instead of extending above its
   rim and creating phantom contacts.
 * Fixed Franka Pour startup memory scaling by deriving sparse-grid capacity from its fixed particle

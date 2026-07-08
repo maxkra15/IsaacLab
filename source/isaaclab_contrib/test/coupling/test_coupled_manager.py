@@ -529,10 +529,11 @@ def test_mpm_entry_uses_typed_config_and_forwards_execution_policy(monkeypatch):
     """MPM construction preserves world isolation, substeps, and in-place stepping."""
 
     class _RecordingMpmSolver:
-        def __init__(self, model, config, temporary_store):
+        def __init__(self, model, config, temporary_store, *, project_outside_colliders):
             self.model = model
             self.config = config
             self.temporary_store = temporary_store
+            self.project_outside_colliders = project_outside_colliders
 
     store = object()
     monkeypatch.setitem(NewtonCoupledSolverManager._SOLVER_CLASS_BY_CFG_TYPE, MPMSolverCfg, _RecordingMpmSolver)
@@ -557,8 +558,66 @@ def test_mpm_entry_uses_typed_config_and_forwards_execution_policy(monkeypatch):
     assert solver.config.separate_worlds is True
     assert solver.config.max_active_cell_count == 256
     assert solver.temporary_store is store
+    assert solver.project_outside_colliders is False
     assert solver_entry.substeps == 2
     assert solver_entry.in_place is True
+
+
+def test_mpm_entry_forwards_particle_projection_policy(monkeypatch):
+    """Coupled MPM construction must preserve the manager-level projection option."""
+
+    class _RecordingMpmSolver:
+        def __init__(self, model, config, temporary_store, *, project_outside_colliders):
+            del config, temporary_store
+            self.model = model
+            self.project_outside_colliders = project_outside_colliders
+
+    monkeypatch.setitem(NewtonCoupledSolverManager._SOLVER_CLASS_BY_CFG_TYPE, MPMSolverCfg, _RecordingMpmSolver)
+    entry = NewtonCoupledSolverManager._ResolvedEntry(
+        config=CoupledSolverEntryCfg(
+            name="media",
+            solver_cfg=MPMSolverCfg(project_outside_colliders=True),
+            in_place=True,
+        ),
+        bodies=[],
+        particles=[0],
+        joints=[],
+        shapes=[],
+    )
+
+    solver = NewtonCoupledSolverManager._build_entry(entry).solver("media-view")
+
+    assert solver.model == "media-view"
+    assert solver.project_outside_colliders is True
+
+
+def test_coupled_mpm_projection_runs_after_implicit_step(monkeypatch):
+    """Projection must correct the MPM output before the coupler reconciles it."""
+    calls: list[tuple] = []
+    solver = object.__new__(coupled_manager._CoupledImplicitMPMSolver)
+    solver._project_outside_colliders = True
+    state_in = object()
+    state_out = object()
+
+    monkeypatch.setattr(
+        coupled_manager.SolverImplicitMPM,
+        "step",
+        lambda self, source, destination, control, contacts, dt: calls.append(
+            ("step", source, destination, control, contacts, dt)
+        ),
+    )
+    monkeypatch.setattr(
+        coupled_manager.SolverImplicitMPM,
+        "project_outside",
+        lambda self, source, destination, dt: calls.append(("project", source, destination, dt)),
+    )
+
+    solver.step(state_in, state_out, "control", "contacts", 0.01)
+
+    assert calls == [
+        ("step", state_in, state_out, "control", "contacts", 0.01),
+        ("project", state_out, state_out, 0.01),
+    ]
 
 
 def test_algorithm_defaults_route_outer_and_entry_local_collision_pipelines(monkeypatch):

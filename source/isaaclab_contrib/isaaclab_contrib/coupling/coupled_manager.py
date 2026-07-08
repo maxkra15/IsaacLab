@@ -20,7 +20,7 @@ from isaaclab_newton.physics import (
     XPBDSolverCfg,
 )
 from isaaclab_newton.physics.newton_manager import NewtonManager
-from newton import BodyFlags, CollisionPipeline, Model, ModelBuilder, ShapeFlags, eval_fk
+from newton import BodyFlags, CollisionPipeline, Contacts, Control, Model, ModelBuilder, ShapeFlags, State, eval_fk
 from newton.solvers import SolverBase, SolverFeatherstone, SolverImplicitMPM, SolverMuJoCo, SolverVBD, SolverXPBD
 from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
 from warp.fem import TemporaryStore
@@ -54,6 +54,34 @@ def _and_bool_masks(
     result[index] = left[index] and right[index]
 
 
+class _CoupledImplicitMPMSolver(SolverImplicitMPM):
+    """Apply Isaac Lab's optional particle projection inside a coupled MPM step."""
+
+    def __init__(
+        self,
+        model: ModelView,
+        config: SolverImplicitMPM.Config,
+        temporary_store: TemporaryStore,
+        *,
+        project_outside_colliders: bool = False,
+    ):
+        super().__init__(model, config, temporary_store=temporary_store)
+        self._project_outside_colliders = bool(project_outside_colliders)
+
+    def step(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control | None,
+        contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Advance MPM and project penetrated particles before state reconciliation."""
+        super().step(state_in, state_out, control, contacts, dt)
+        if self._project_outside_colliders:
+            self.project_outside(state_out, state_out, dt)
+
+
 class NewtonCoupledSolverManager(NewtonVBDManager):
     """Build and manage Newton proxy or ADMM coupling from named entries."""
 
@@ -77,7 +105,7 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
 
     _SOLVER_CLASS_BY_CFG_TYPE: ClassVar[dict[type[NewtonSolverCfg], type[SolverBase]]] = {
         MJWarpSolverCfg: SolverMuJoCo,
-        MPMSolverCfg: SolverImplicitMPM,
+        MPMSolverCfg: _CoupledImplicitMPMSolver,
         VBDSolverCfg: SolverVBD,
         FeatherstoneSolverCfg: SolverFeatherstone,
         XPBDSolverCfg: SolverXPBD,
@@ -379,6 +407,7 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
                     model_view,
                     _solver_cfg.to_solver_config(),
                     temporary_store=TemporaryStore(),
+                    project_outside_colliders=_solver_cfg.project_outside_colliders,
                 )
             else:
                 solver = _solver_cls(model=model_view, **_kwargs)

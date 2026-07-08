@@ -1340,6 +1340,7 @@ def test_mpm_uses_pic27_colliders_and_bounded_200_env_capacity():
     # while Q1 keeps the captured velocity solve compact.
     assert solver_cfg.velocity_basis == "Q1"
     assert solver_cfg.collider_basis == "pic27"
+    assert solver_cfg.project_outside_colliders is True
     assert solver_cfg.max_upper_node_count == upper_capacity
     assert capacity == _aligned_particle_capacity(cfg) * cfg.scene.num_envs
     assert upper_capacity == 64

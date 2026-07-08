@@ -832,7 +832,10 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                             # rebuilds in place while each RL environment stays grid-isolated.
                             solver="jacobi",
                             separate_worlds=True,
-                            project_outside_colliders=False,
+                            # The implicit grid solve handles contact response; this particle-level
+                            # correction prevents finite particles from drifting through the thin
+                            # source-cup walls between substeps.
+                            project_outside_colliders=True,
                         ),
                         all_particles=True,
                         bodies=[SPILL_FLOOR_LABEL_PATTERN],
