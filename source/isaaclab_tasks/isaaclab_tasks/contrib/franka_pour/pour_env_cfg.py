@@ -727,7 +727,9 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     num_substeps: int = 2
     proxy_iterations: int = 1
     proxy_mass_scale: float = 1.0
-    use_cuda_graph: bool = True
+    # S2 collider sampling currently requires eager sparse-grid topology updates.
+    # Keep capture disabled while comparing its source-cup containment with PIC27.
+    use_cuda_graph: bool = False
     # Warp FEM partitions topology by environment ID, so isolated worlds need not occupy distinct
     # physical coordinates. Colocating headless-scale batches avoids float32 cancellation in MPM
     # and contact calculations; smaller interactive layouts retain visible environment spacing.
@@ -820,11 +822,10 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                             strain_basis="P0",
                             transfer_scheme="apic",
                             max_iterations=self.mpm_iterations,
-                            # Keep Q1 velocity unknowns while sampling colliders at particle points.
-                            # PIC27 caps local collider nodes at 27 per cell and avoids the
-                            # capacity-sized grid-node reserve of the former S2 collider basis.
+                            # Keep the compact Q1 velocity solve while temporarily restoring the
+                            # higher-order S2 collider basis for a containment comparison.
                             velocity_basis="Q1",
-                            collider_basis="pic27",
+                            collider_basis="S2",
                             # "forward": the moving cup carries its media ("backward" drains it).
                             collider_velocity_mode="forward",
                             # Jacobi is the validated nonlinear path for outer capture. Combined
@@ -1622,7 +1623,6 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
 @configclass
 class FrankaPourEnvCfg_PLAY(FrankaPourEnvCfg):
     def __post_init__(self):
-        self.use_cuda_graph = True
         super().__post_init__()
         self.scene.num_envs = 4
         self.curriculum_start_stage = len(self.curriculum_stage_names) - 1

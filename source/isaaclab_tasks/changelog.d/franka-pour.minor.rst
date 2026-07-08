@@ -55,8 +55,9 @@ Changed
   prefers an open-arm IK branch, collision-screens the complete grasp-through-tilt path with its
   authored finger states, includes a mid-insertion pose, and grips the side wall 83 mm above the
   table instead of descending over the rim.
-* Changed Franka Pour MPM collider sampling to the particle-bounded ``pic27`` basis while retaining
-  the compact Q1 velocity solve.
+* Temporarily restored Franka Pour MPM collider sampling to the higher-order ``S2`` basis while
+  retaining the compact Q1 velocity solve, and disabled outer CUDA graph capture for this
+  source-cup containment comparison.
 * Changed the receiving cup to one scene-owned rigid body proxied into MPM, so rendering, rigid
   contacts, particle collision, and randomized resets share one authoritative pose.
 * Shortened Franka Pour training episodes from 12 seconds to 5 seconds so failed attempts recycle

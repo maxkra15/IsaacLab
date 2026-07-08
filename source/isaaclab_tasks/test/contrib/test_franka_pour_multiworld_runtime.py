@@ -65,7 +65,7 @@ _CONSTITUTIVE_HISTORY_FIELDS = (
 
 
 def _require_sparse_capture_stack() -> None:
-    """Require CUDA/rebuildable-Warp capabilities used by this task's P0/Q1/pic27 path."""
+    """Require CUDA/rebuildable-Warp capabilities used by this task's sparse multi-world path."""
     if not wp.is_cuda_available():
         pytest.skip("Franka Pour multi-world runtime integration requires a CUDA device.")
 
@@ -220,7 +220,13 @@ def _assert_scene_solver_roles(model) -> None:
             assert bool(flags & visible) is is_visible
 
 
-def _make_runtime_cfg(*, use_cuda_graph: bool = True, env_spacing: float = 0.0, mpm_iterations: int = 2):
+def _make_runtime_cfg(
+    *,
+    use_cuda_graph: bool = True,
+    env_spacing: float = 0.0,
+    mpm_iterations: int = 2,
+    collider_basis: str | None = None,
+):
     cfg = parse_env_cfg(_TASK_ID, device="cuda:0", num_envs=2)
     cfg.seed = 37
     # Keep the existing solver/reset regressions on the full-task open-hand approach contract.
@@ -235,6 +241,12 @@ def _make_runtime_cfg(*, use_cuda_graph: bool = True, env_spacing: float = 0.0, 
     cfg.sim.render_interval = 1
 
     entries = {entry.name: entry for entry in cfg.sim.physics.solver_cfg.entries}
+    # Capture-focused regressions retain PIC27 until rebuildable S2 edge topology is available.
+    # Eager tests exercise the task's configured S2 basis unless they explicitly request another.
+    if collider_basis is not None:
+        entries[MPM_ENTRY].solver_cfg.collider_basis = collider_basis
+    elif use_cuda_graph:
+        entries[MPM_ENTRY].solver_cfg.collider_basis = "pic27"
     assert entries[MPM_ENTRY].in_place
     return cfg
 
@@ -281,7 +293,7 @@ def _run_particle_rollout(
         # use the production nonlinear solve depth while the broader lifecycle suite stays at two.
         env = gym.make(
             _TASK_ID,
-            cfg=_make_runtime_cfg(use_cuda_graph=use_cuda_graph, mpm_iterations=24),
+            cfg=_make_runtime_cfg(use_cuda_graph=use_cuda_graph, mpm_iterations=24, collider_basis="pic27"),
         )
         task = env.unwrapped
         task.sim._app_control_on_stop_handle = None
@@ -1467,6 +1479,10 @@ def test_franka_pour_offset_world_tables_support_both_cups():
         cup_z = task.cup_pose_e()[:, 2]
         assert bool(torch.all(cup_z > -0.02)), f"A source cup fell through its local table: z={cup_z.tolist()}"
         torch.testing.assert_close(cup_z[0], cup_z[1], rtol=0.0, atol=2.0e-3)
+        source_fraction = task.count_in_source() / float(task.num_particles)
+        assert bool(torch.all(source_fraction >= 0.99)), (
+            f"S2 failed to retain resting media in the source cup: fraction={source_fraction.tolist()}"
+        )
     finally:
         if env is not None:
             env.close()
