@@ -14,7 +14,39 @@ from isaaclab.utils.configclass import configclass
 from .newton_manager_cfg import NewtonSolverCfg
 
 if TYPE_CHECKING:
+    from newton.solvers import SolverImplicitMPM
+
     from isaaclab_newton.physics import NewtonManager
+
+
+_SOLVER_CONFIG_FIELDS = (
+    "max_iterations",
+    "tolerance",
+    "solver",
+    "warmstart_mode",
+    "collider_velocity_mode",
+    "voxel_size",
+    "grid_type",
+    "grid_padding",
+    "max_active_cell_count",
+    "max_leaf_node_count",
+    "max_lower_node_count",
+    "max_upper_node_count",
+    "transfer_scheme",
+    "integration_scheme",
+    "critical_fraction",
+    "air_drag",
+    "collider_normal_from_sdf_gradient",
+    "collider_basis",
+    "strain_basis",
+    "velocity_basis",
+    "separate_worlds",
+)
+_SPARSE_NODE_CAPACITY_FIELDS = (
+    "max_leaf_node_count",
+    "max_lower_node_count",
+    "max_upper_node_count",
+)
 
 
 @configclass
@@ -64,7 +96,32 @@ class MPMSolverCfg(NewtonSolverCfg):
     """Number of empty cells to add around particles when allocating the grid."""
 
     max_active_cell_count: int = -1
-    """Maximum active cell count for dense-grid active subsets. ``-1`` means unlimited."""
+    """Total active-cell capacity shared by all worlds.
+
+    A positive value also enables capacity-bounded sparse-grid rebuilding.
+    ``-1`` retains allocating sparse behavior and leaves other grids unbounded.
+    """
+
+    max_leaf_node_count: int = -1
+    """Total leaf-node capacity for a rebuildable sparse grid.
+
+    ``-1`` derives the value from :attr:`max_active_cell_count`.
+    """
+
+    max_lower_node_count: int = -1
+    """Total lower-internal-node capacity for a rebuildable sparse grid.
+
+    ``-1`` derives the value from the initial topology.
+    """
+
+    max_upper_node_count: int = -1
+    """Total upper-internal-node capacity for a rebuildable sparse grid.
+
+    ``-1`` derives the value from the initial topology.
+    """
+
+    separate_worlds: bool = True
+    """Keep each Newton world in an independent local MPM grid environment."""
 
     transfer_scheme: Literal["apic", "pic"] = "apic"
     """Particle-grid transfer scheme."""
@@ -108,3 +165,32 @@ class MPMSolverCfg(NewtonSolverCfg):
     This is a manager-level stepping option and is intentionally **not** part of
     ``SolverImplicitMPM.Config``.
     """
+
+    def to_solver_config(self) -> SolverImplicitMPM.Config:
+        """Build the Newton solver config without silently dropping required features.
+
+        Raises:
+            RuntimeError: If the installed Newton revision lacks multi-world
+                isolation or an explicitly requested sparse capacity field.
+        """
+        from newton.solvers import SolverImplicitMPM
+
+        config = SolverImplicitMPM.Config()
+        if not hasattr(config, "separate_worlds"):
+            raise RuntimeError(
+                "Installed Newton SolverImplicitMPM.Config lacks required 'separate_worlds' support. "
+                "Install the Newton revision paired with this Isaac Lab branch."
+            )
+        missing_capacity_fields = [
+            name for name in _SPARSE_NODE_CAPACITY_FIELDS if getattr(self, name) != -1 and not hasattr(config, name)
+        ]
+        if missing_capacity_fields:
+            fields = ", ".join(repr(name) for name in missing_capacity_fields)
+            raise RuntimeError(
+                "Installed Newton SolverImplicitMPM.Config lacks requested sparse hierarchy capacity field(s) "
+                f"{fields}. Install the Newton revision paired with this Isaac Lab branch."
+            )
+        for name in _SOLVER_CONFIG_FIELDS:
+            if hasattr(config, name):
+                setattr(config, name, getattr(self, name))
+        return config

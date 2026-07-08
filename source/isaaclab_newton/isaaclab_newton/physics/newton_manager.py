@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import ctypes
 import inspect
 import logging
@@ -17,6 +18,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import warp as wp
 
@@ -30,7 +32,7 @@ except OSError:
         _cudart = ctypes.CDLL("libcudart.so")
     except OSError:
         _cudart = None
-from newton import Axis, CollisionPipeline, Contacts, Control, Model, ModelBuilder, State, eval_fk
+from newton import Axis, CollisionPipeline, Contacts, Control, Model, ModelBuilder, State, StateFlags, eval_fk
 from newton._src.usd.schemas import SchemaResolverNewton, SchemaResolverPhysx
 from newton.sensors import SensorContact as NewtonContactSensor
 from newton.sensors import SensorFrameTransform
@@ -763,6 +765,8 @@ class NewtonManager(PhysicsManager):
                     cls._simulate_physics_only()
             PhysicsManager._sim_time += physics_dt
 
+        cls.check_solver_status()
+
         if cls._usdrt_stage is not None:
             cls._mark_state_dirty()
         elif cls._particle_visual_prims:
@@ -878,6 +882,36 @@ class NewtonManager(PhysicsManager):
     def set_builder(cls, builder: ModelBuilder) -> None:
         """Set the Newton model builder."""
         NewtonManager._builder = builder
+
+    @classmethod
+    def register_builder_world_hook(
+        cls,
+        hook: Callable[[ModelBuilder, int, list[float], list[float]], None],
+    ) -> None:
+        """Register an idempotent callback that extends each replicated world.
+
+        The callback runs after a world's scene content has been copied into
+        the Newton builder and before that world is closed.
+
+        Args:
+            hook: Callback receiving the builder, world index, world position,
+                and world orientation.
+        """
+        if hook not in NewtonManager._per_world_builder_hooks:
+            NewtonManager._per_world_builder_hooks.append(hook)
+
+    @classmethod
+    def unregister_builder_world_hook(
+        cls,
+        hook: Callable[[ModelBuilder, int, list[float], list[float]], None],
+    ) -> None:
+        """Remove a callback previously registered with :meth:`register_builder_world_hook`.
+
+        Args:
+            hook: Previously registered per-world builder callback.
+        """
+        if hook in NewtonManager._per_world_builder_hooks:
+            NewtonManager._per_world_builder_hooks.remove(hook)
 
     @classmethod
     def create_builder(cls, up_axis: str | None = None, **kwargs) -> ModelBuilder:
@@ -1620,6 +1654,7 @@ class NewtonManager(PhysicsManager):
             return
 
         if use_cuda_graph:
+            cls._prepare_solver_cuda_graph_capture()
             with Timer(name="newton_cuda_graph", msg="CUDA graph took:"):
                 if cls._usdrt_stage is None:
                     simulate = cls._simulate_full if cls._is_all_graphable() else cls._simulate_physics_only
@@ -1628,10 +1663,14 @@ class NewtonManager(PhysicsManager):
                     NewtonManager._graph = capture.graph
                     logger.info("Newton CUDA graph captured (standard Warp mode)")
 
-                    # Kamino: StateKamino.from_newton() lazily allocates body_f_total,
-                    # joint_q_prev, and joint_lambdas via wp.clone/wp.zeros during the
-                    # first step() inside graph capture. Replay once to pin those
-                    # memory-pool addresses before any eager solver.reset() call.
+                    # Instantiate conditional child graphs before task setup creates and releases
+                    # auxiliary models. This call does not execute the captured simulation.
+                    instantiate = getattr(wp, "capture_instantiate", None)
+                    if callable(instantiate):
+                        instantiate(cls._graph)
+
+                    # Kamino lazily allocates state during its first step. Replay once before
+                    # any eager reset can move those buffers.
                     if isinstance(cls._solver, SolverKamino):
                         wp.capture_launch(cls._graph)
                 else:
@@ -1648,7 +1687,58 @@ class NewtonManager(PhysicsManager):
     @classmethod
     def _supports_cuda_graph_capture(cls) -> bool:
         """Return whether the active solver configuration supports CUDA graph capture."""
-        return True
+        return bool(getattr(cls._solver, "supports_cuda_graph_capture", True))
+
+    @classmethod
+    def _prepare_solver_cuda_graph_capture(cls) -> None:
+        """Materialize solver-owned resources required by graph replay."""
+        prepare = getattr(cls._solver, "prepare_cuda_graph_capture", None)
+        if callable(prepare):
+            prepare(cls._contacts)
+
+    @classmethod
+    def check_solver_status(cls) -> None:
+        """Raise a sticky asynchronous solver failure at a host boundary."""
+        check_status = getattr(cls._solver, "check_status", None)
+        if callable(check_status):
+            check_status()
+
+    @classmethod
+    def is_cuda_graph_active(cls) -> bool:
+        """Return whether the manager owns a recorded physics CUDA graph."""
+        return NewtonManager._graph is not None
+
+    @classmethod
+    def reset_solver_state(
+        cls,
+        state: State | None = None,
+        world_mask: wp.array(dtype=wp.bool) | None = None,
+        flags: StateFlags | int | None = None,
+    ) -> None:
+        """Reset solver-private state after the application rewrites simulation state.
+
+        With no explicit state, both distinct manager buffers are reset so a
+        later double-buffer swap cannot restore stale per-solver history.
+
+        Args:
+            state: State to reset. If omitted, resets both distinct manager states.
+            world_mask: Optional mask selecting Newton worlds to reset.
+            flags: State components whose solver-private history must be reset.
+        """
+        if cls._solver is None:
+            raise RuntimeError("Newton solver is not initialized; cannot reset solver state.")
+        states = (state,) if state is not None else (cls._state_1, cls._state_0)
+        unique_states: list[State] = []
+        seen: set[int] = set()
+        for candidate in states:
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            unique_states.append(candidate)
+        if not unique_states:
+            raise RuntimeError("Newton state is not initialized; provide an explicit state to reset.")
+        for candidate in unique_states:
+            cls._solver.reset(candidate, world_mask=world_mask, flags=flags)
 
     @classmethod
     def _capture_relaxed_graph(cls, device: str):
@@ -1874,6 +1964,46 @@ class NewtonManager(PhysicsManager):
         """
         cls._ensure_visualization_model()
         return cls._model
+
+    @classmethod
+    def get_clone_prototype_builder(cls, source_path: str) -> ModelBuilder:
+        """Return an independent mutable copy of a retained clone prototype.
+
+        Args:
+            source_path: Source prim path retained by the active clone plan.
+
+        Returns:
+            Builder copy that can be finalized or modified independently.
+        """
+        if cls._model is None:
+            raise RuntimeError("Newton model is not initialized; cannot copy a clone prototype.")
+        prototype = cls._cl_protos.get(source_path)
+        if prototype is None:
+            available = ", ".join(sorted(cls._cl_protos))
+            raise RuntimeError(f"No Newton clone prototype for {source_path!r}. Available: {available}")
+
+        def clone_mutable_container(value):
+            if isinstance(value, list):
+                return [clone_mutable_container(item) for item in value]
+            if isinstance(value, dict):
+                return {key: clone_mutable_container(item) for key, item in value.items()}
+            if isinstance(value, set):
+                return set(value)
+            if isinstance(value, np.ndarray):
+                return value.copy()
+            return value
+
+        builder = copy.copy(prototype)
+        for name, value in vars(prototype).items():
+            if isinstance(value, (list, dict, set, np.ndarray)):
+                setattr(builder, name, clone_mutable_container(value))
+
+        independent_sources = []
+        for source in prototype.shape_source:
+            copy_source = getattr(source, "copy", None)
+            independent_sources.append(copy_source() if callable(copy_source) else copy.copy(source))
+        builder.shape_source = independent_sources
+        return builder
 
     @classmethod
     def get_state_0(cls) -> State:

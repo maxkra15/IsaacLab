@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import warp as wp
-from isaaclab_newton.physics import MJWarpSolverCfg, XPBDSolverCfg
+from isaaclab_newton.physics import MJWarpSolverCfg, MPMSolverCfg, XPBDSolverCfg
 from newton import ShapeFlags
 from newton.solvers.experimental.coupled import CouplingInterface, SolverCoupledADMM, SolverCoupledProxy
 
@@ -523,6 +523,42 @@ def test_vbd_soft_joint_mode_is_applied_when_entry_solver_is_constructed(monkeyp
 
     assert solver.model == "soft-view"
     assert softened == [solver]
+
+
+def test_mpm_entry_uses_typed_config_and_forwards_execution_policy(monkeypatch):
+    """MPM construction preserves world isolation, substeps, and in-place stepping."""
+
+    class _RecordingMpmSolver:
+        def __init__(self, model, config, temporary_store):
+            self.model = model
+            self.config = config
+            self.temporary_store = temporary_store
+
+    store = object()
+    monkeypatch.setitem(NewtonCoupledSolverManager._SOLVER_CLASS_BY_CFG_TYPE, MPMSolverCfg, _RecordingMpmSolver)
+    monkeypatch.setattr(coupled_manager, "TemporaryStore", lambda: store)
+    entry = NewtonCoupledSolverManager._ResolvedEntry(
+        config=CoupledSolverEntryCfg(
+            name="media",
+            solver_cfg=MPMSolverCfg(separate_worlds=True, max_active_cell_count=256),
+            substeps=2,
+            in_place=True,
+        ),
+        bodies=[],
+        particles=[0],
+        joints=[],
+        shapes=[],
+    )
+
+    solver_entry = NewtonCoupledSolverManager._build_entry(entry)
+    solver = solver_entry.solver("media-view")
+
+    assert solver.model == "media-view"
+    assert solver.config.separate_worlds is True
+    assert solver.config.max_active_cell_count == 256
+    assert solver.temporary_store is store
+    assert solver_entry.substeps == 2
+    assert solver_entry.in_place is True
 
 
 def test_algorithm_defaults_route_outer_and_entry_local_collision_pipelines(monkeypatch):

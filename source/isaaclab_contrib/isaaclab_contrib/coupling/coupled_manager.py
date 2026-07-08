@@ -15,13 +15,15 @@ import warp as wp
 from isaaclab_newton.physics import (
     FeatherstoneSolverCfg,
     MJWarpSolverCfg,
+    MPMSolverCfg,
     NewtonSolverCfg,
     XPBDSolverCfg,
 )
 from isaaclab_newton.physics.newton_manager import NewtonManager
-from newton import CollisionPipeline, Model, ShapeFlags, eval_fk
-from newton.solvers import SolverBase, SolverFeatherstone, SolverMuJoCo, SolverVBD, SolverXPBD
-from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
+from newton import BodyFlags, CollisionPipeline, Model, ModelBuilder, ShapeFlags, eval_fk
+from newton.solvers import SolverBase, SolverFeatherstone, SolverImplicitMPM, SolverMuJoCo, SolverVBD, SolverXPBD
+from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
+from warp.fem import TemporaryStore
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.physics import PhysicsManager
@@ -75,12 +77,41 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
 
     _SOLVER_CLASS_BY_CFG_TYPE: ClassVar[dict[type[NewtonSolverCfg], type[SolverBase]]] = {
         MJWarpSolverCfg: SolverMuJoCo,
+        MPMSolverCfg: SolverImplicitMPM,
         VBDSolverCfg: SolverVBD,
         FeatherstoneSolverCfg: SolverFeatherstone,
         XPBDSolverCfg: SolverXPBD,
     }
     _fk_articulation_filter: wp.array | None = None
     _combined_fk_mask: wp.array | None = None
+
+    @classmethod
+    def get_entry_solver(cls, name: str) -> SolverBase:
+        """Return a named sub-solver from the active coupled solver.
+
+        Args:
+            name: Unique coupled-entry name.
+
+        Returns:
+            Solver owned by the named entry.
+        """
+        if NewtonManager._solver is None:
+            raise RuntimeError("Newton coupled solver is not initialized.")
+        return NewtonManager._solver.solver(name)
+
+    @classmethod
+    def get_entry_view(cls, name: str) -> ModelView:
+        """Return a named sub-solver model view from the active coupled solver.
+
+        Args:
+            name: Unique coupled-entry name.
+
+        Returns:
+            Model view owned by the named entry.
+        """
+        if NewtonManager._solver is None:
+            raise RuntimeError("Newton coupled solver is not initialized.")
+        return NewtonManager._solver.view(name)
 
     @classmethod
     def _resolve_solver_class(cls, sub_cfg: NewtonSolverCfg) -> type[SolverBase]:
@@ -147,6 +178,9 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
 
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = needs_outer_pipeline
+        NewtonManager._needs_fk_before_step = any(
+            isinstance(entry.config.solver_cfg, MPMSolverCfg) for entry in resolved_entries
+        )
         NewtonManager._supports_contact_sensors = False
         if NewtonManager._report_contacts:
             raise NotImplementedError(
@@ -154,6 +188,32 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
                 "in per-entry buffers. Remove the contact sensor."
             )
         cls._configure_fk_articulation_filter(model, resolved_entries)
+
+    @classmethod
+    def _register_builder_attributes(cls, builder: ModelBuilder) -> None:
+        """Register custom attributes required by nested coupled entries."""
+        super()._register_builder_attributes(builder)
+        physics_cfg = PhysicsManager._cfg
+        solver_cfg = getattr(physics_cfg, "solver_cfg", None)
+        if any(isinstance(entry.solver_cfg, MPMSolverCfg) for entry in getattr(solver_cfg, "entries", ())):
+            if not builder.has_custom_attribute("mpm:young_modulus"):
+                SolverImplicitMPM.register_custom_attributes(builder)
+
+    @classmethod
+    def _prepare_builder_for_finalize(cls, builder: ModelBuilder) -> None:
+        """Normalize kinematic colliders when a coupled entry uses implicit MPM."""
+        super()._prepare_builder_for_finalize(builder)
+        physics_cfg = PhysicsManager._cfg
+        solver_cfg = getattr(physics_cfg, "solver_cfg", None)
+        if not any(isinstance(entry.solver_cfg, MPMSolverCfg) for entry in getattr(solver_cfg, "entries", ())):
+            return
+        kinematic_flag = int(BodyFlags.KINEMATIC)
+        for body_id, flags in enumerate(builder.body_flags):
+            if int(flags) & kinematic_flag:
+                builder.body_mass[body_id] = 0.0
+                builder.body_inv_mass[body_id] = 0.0
+                builder.body_inertia[body_id] = wp.mat33()
+                builder.body_inv_inertia[body_id] = wp.mat33()
 
     @classmethod
     def _resolve_entry(
@@ -298,18 +358,30 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
     def _build_entry(cls, entry: _ResolvedEntry, *, local_collision: bool = False) -> SolverCoupled.Entry:
         entry_cfg = entry.config
         solver_cls = cls._resolve_solver_class(entry_cfg.solver_cfg)
-        solver_kwargs = cls._filter_solver_kwargs(solver_cls, entry_cfg.solver_cfg)
+        solver_kwargs = (
+            None
+            if isinstance(entry_cfg.solver_cfg, MPMSolverCfg)
+            else cls._filter_solver_kwargs(solver_cls, entry_cfg.solver_cfg)
+        )
 
         def solver_factory(
             model_view,
             _solver_cls=solver_cls,
             _kwargs=solver_kwargs,
+            _solver_cfg=entry_cfg.solver_cfg,
             _local=local_collision,
             _use_solver_effective_mass=entry_cfg.use_solver_effective_mass,
             _soft_vbd_joints=isinstance(entry_cfg.solver_cfg, VBDSolverCfg)
             and not entry_cfg.solver_cfg.rigid_joint_hard,
         ):
-            solver = _solver_cls(model=model_view, **_kwargs)
+            if isinstance(_solver_cfg, MPMSolverCfg):
+                solver = _solver_cls(
+                    model_view,
+                    _solver_cfg.to_solver_config(),
+                    temporary_store=TemporaryStore(),
+                )
+            else:
+                solver = _solver_cls(model=model_view, **_kwargs)
             if _soft_vbd_joints:
                 cls._set_all_vbd_joints_soft(solver)
             return (
@@ -329,6 +401,8 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
             particles=entry.particles,
             joints=entry.joints,
             shapes=entry.shapes,
+            substeps=int(entry_cfg.substeps),
+            in_place=bool(entry_cfg.in_place),
         )
 
     @classmethod
@@ -405,6 +479,9 @@ class NewtonCoupledSolverManager(NewtonVBDManager):
             raise ValueError("CoupledSolverEntryCfg.name must be non-empty.")
         if len(set(names)) != len(names):
             raise ValueError(f"Coupled solver entry names must be unique, got {names!r}.")
+        for entry in entries:
+            if entry.config.substeps < 1:
+                raise ValueError(f"Coupled entry {entry.config.name!r} substeps must be >= 1.")
 
         cls._validate_ownership(model, entries, "bodies", int(model.body_count), require_complete=True)
         cls._validate_ownership(model, entries, "particles", int(model.particle_count), require_complete=True)

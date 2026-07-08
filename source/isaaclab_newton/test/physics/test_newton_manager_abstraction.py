@@ -390,17 +390,24 @@ def test_mpm_project_outside_colliders_gates_projection(project_outside):
 
 
 @pytest.mark.parametrize(
-    "grid_type, expected",
+    "grid_type, advertised, expected",
     [
-        ("fixed", True),
-        ("sparse", False),
-        ("dense", False),
+        ("fixed", True, True),
+        ("fixed", False, False),
+        ("sparse", True, True),
+        ("sparse", False, False),
+        ("dense", False, False),
     ],
 )
-def test_mpm_cuda_graph_capture_supports_only_fixed_grid(monkeypatch, grid_type, expected):
-    """Newton implicit MPM is CUDA-graph capturable only with a fixed grid."""
+def test_mpm_cuda_graph_capture_uses_solver_capability(monkeypatch, grid_type, advertised, expected):
+    """The concrete MPM solver owns validation of its resolved graph configuration."""
 
-    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace(grid_type=grid_type), raising=False)
+    monkeypatch.setattr(
+        NewtonManager,
+        "_solver",
+        SimpleNamespace(grid_type=grid_type, supports_cuda_graph_capture=advertised),
+        raising=False,
+    )
 
     assert NewtonMPMManager._supports_cuda_graph_capture() is expected
 
@@ -451,11 +458,153 @@ def test_cuda_graph_capture_uses_simulation_device(monkeypatch):
     monkeypatch.setattr(NewtonManager, "_is_all_graphable", classmethod(lambda cls: False))
     monkeypatch.setattr(NewtonManager, "_simulate_physics_only", classmethod(lambda cls: None))
     monkeypatch.setattr(wp, "ScopedCapture", FakeScopedCapture)
+    monkeypatch.setattr(wp, "capture_instantiate", lambda graph: None, raising=False)
 
     NewtonManager._capture_or_defer_graph()
 
     assert captured_devices == ["cuda:1"]
     assert NewtonManager._graph is captured_graph
+
+
+def test_cuda_graph_capture_prepares_solver_before_recording(monkeypatch):
+    """Capture-persistent solver resources are materialized before recording."""
+    from isaaclab.physics import PhysicsManager
+
+    events = []
+    contacts = object()
+
+    class FakeScopedCapture:
+        graph = object()
+
+        def __init__(self, device=None):
+            events.append(("capture", device))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    solver = SimpleNamespace(
+        supports_cuda_graph_capture=True,
+        prepare_cuda_graph_capture=lambda received: events.append(("prepare", received)),
+    )
+    monkeypatch.setattr(PhysicsManager, "_cfg", SimpleNamespace(use_cuda_graph=True), raising=False)
+    monkeypatch.setattr(PhysicsManager, "_device", "cuda:0", raising=False)
+    monkeypatch.setattr(NewtonManager, "_solver", solver, raising=False)
+    monkeypatch.setattr(NewtonManager, "_contacts", contacts, raising=False)
+    monkeypatch.setattr(NewtonManager, "_usdrt_stage", None, raising=False)
+    monkeypatch.setattr(NewtonManager, "_is_all_graphable", classmethod(lambda cls: False))
+    monkeypatch.setattr(
+        NewtonManager, "_simulate_physics_only", classmethod(lambda cls: events.append(("record", None)))
+    )
+    monkeypatch.setattr(wp, "ScopedCapture", FakeScopedCapture)
+    monkeypatch.setattr(wp, "capture_instantiate", lambda graph: events.append(("instantiate", graph)), raising=False)
+
+    NewtonManager._capture_or_defer_graph()
+
+    assert events == [
+        ("prepare", contacts),
+        ("capture", "cuda:0"),
+        ("record", None),
+        ("instantiate", FakeScopedCapture.graph),
+    ]
+
+
+def test_solver_status_hook_is_optional_and_forwarded(monkeypatch):
+    """The host boundary forwards a callable status hook and tolerates legacy solvers."""
+    calls = []
+    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace(check_status=lambda: calls.append("status")))
+    NewtonManager.check_solver_status()
+    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace())
+    NewtonManager.check_solver_status()
+    assert calls == ["status"]
+
+
+@pytest.mark.parametrize("graph, expected", [(None, False), (object(), True)])
+def test_cuda_graph_active_reports_recorded_manager_graph(monkeypatch, graph, expected):
+    monkeypatch.setattr(NewtonManager, "_graph", graph, raising=False)
+
+    assert NewtonManager.is_cuda_graph_active() is expected
+
+
+def test_reset_solver_state_resets_distinct_buffers_and_deduplicates_aliases(monkeypatch):
+    """Selective resets cannot revive stale history after a state-buffer swap."""
+    calls = []
+    state_0 = object()
+    state_1 = object()
+    world_mask = object()
+    solver = SimpleNamespace(reset=lambda state, *, world_mask, flags: calls.append((state, world_mask, flags)))
+    monkeypatch.setattr(NewtonManager, "_solver", solver, raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_0", state_0, raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_1", state_1, raising=False)
+
+    NewtonManager.reset_solver_state(world_mask=world_mask, flags=17)
+    assert calls == [(state_1, world_mask, 17), (state_0, world_mask, 17)]
+
+    calls.clear()
+    monkeypatch.setattr(NewtonManager, "_state_1", state_0, raising=False)
+    NewtonManager.reset_solver_state()
+    assert calls == [(state_0, None, None)]
+
+
+def test_builder_world_hook_registration_is_public_and_idempotent(monkeypatch):
+    """Tasks can add solver-only geometry without mutating manager internals."""
+
+    def hook(builder, env_id, position, quaternion):
+        pass
+
+    monkeypatch.setattr(NewtonManager, "_per_world_builder_hooks", [], raising=False)
+    NewtonManager.register_builder_world_hook(hook)
+    NewtonManager.register_builder_world_hook(hook)
+    assert NewtonManager._per_world_builder_hooks == [hook]
+
+    NewtonManager.unregister_builder_world_hook(hook)
+    NewtonManager.unregister_builder_world_hook(hook)
+    assert NewtonManager._per_world_builder_hooks == []
+
+
+def test_clone_prototype_builder_detaches_mutable_state_and_geometry(monkeypatch):
+    """Auxiliary IK finalization cannot mutate the retained or live prototype."""
+
+    class FakeGeometry:
+        def __init__(self, name):
+            self.name = name
+
+        def copy(self):
+            return FakeGeometry(f"{self.name}-copy")
+
+    class FakeBuilder:
+        def __init__(self):
+            self.values = [1]
+            self.mapping = {"rows": [2]}
+            self.array = np.asarray([3.0], dtype=np.float32)
+            self.shape_source = [FakeGeometry("mesh"), None]
+
+        def finalize(self, device):
+            self.values.append(4)
+            self.mapping["rows"].append(5)
+            self.array[0] = 6.0
+            return SimpleNamespace(device=device, shape_source=self.shape_source)
+
+    prototype = FakeBuilder()
+    monkeypatch.setattr(NewtonManager, "_model", SimpleNamespace(device="cuda:0"), raising=False)
+    monkeypatch.setattr(NewtonManager, "_cl_protos", {"/World/envs/env_0": prototype}, raising=False)
+
+    builder = NewtonManager.get_clone_prototype_builder("/World/envs/env_0")
+    model = NewtonManager.get_clone_prototype_builder("/World/envs/env_0").finalize(device="cuda:1")
+
+    assert builder is not prototype
+    assert builder.values == [1]
+    assert builder.mapping == {"rows": [2]}
+    assert builder.array == pytest.approx([3.0])
+    assert builder.shape_source[0].name == "mesh-copy"
+    assert builder.shape_source[0] is not prototype.shape_source[0]
+    assert model.device == "cuda:1"
+    assert model.shape_source[0].name == "mesh-copy"
+    assert prototype.values == [1]
+    assert prototype.mapping == {"rows": [2]}
+    assert prototype.array == pytest.approx([3.0])
 
 
 # ---------------------------------------------------------------------------
