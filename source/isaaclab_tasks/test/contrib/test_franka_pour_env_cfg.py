@@ -411,7 +411,7 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert media.solver_cfg.max_active_cell_count > 0
     assert media.solver_cfg.solver == "jacobi"
     assert media.solver_cfg.max_iterations == 24
-    assert cfg.sim.physics.use_cuda_graph is False
+    assert cfg.sim.physics.use_cuda_graph is True
 
     proxies = solver.proxies
     assert len(proxies) == 1
@@ -1328,7 +1328,7 @@ def test_sparse_capacity_rejects_nonpositive_alignment():
         _resolve_mpm_cell_cap(cfg)
 
 
-def test_mpm_uses_s2_colliders_and_bounded_200_env_capacity():
+def test_mpm_uses_pic27_colliders_and_bounded_200_env_capacity():
     cfg = FrankaPourEnvCfg()
     cfg.scene.num_envs = 200
     play_cfg = FrankaPourEnvCfg_PLAY().finalize()
@@ -1337,14 +1337,13 @@ def test_mpm_uses_s2_colliders_and_bounded_200_env_capacity():
     upper_capacity = _resolve_mpm_upper_node_cap(cfg)
     solver_cfg = _media_entry(cfg.finalize()).solver_cfg
 
-    # Diagnose source-cup containment with Newton's higher-order collider basis while retaining
-    # the compact Q1 velocity solve. S2 currently runs eagerly because its edge topology is not
-    # available in the graph-capturable sparse-grid path.
+    # PIC27 bounds collider nodes by particle samples rather than the sparse-grid cell reserve,
+    # while Q1 keeps the captured velocity solve compact.
     assert solver_cfg.velocity_basis == "Q1"
-    assert solver_cfg.collider_basis == "S2"
+    assert solver_cfg.collider_basis == "pic27"
     assert solver_cfg.project_outside_colliders is False
-    assert _media_entry(play_cfg).solver_cfg.collider_basis == "S2"
-    assert play_cfg.sim.physics.use_cuda_graph is False
+    assert _media_entry(play_cfg).solver_cfg.collider_basis == "pic27"
+    assert play_cfg.sim.physics.use_cuda_graph is True
     assert solver_cfg.max_upper_node_count == upper_capacity
     assert capacity == _aligned_particle_capacity(cfg) * cfg.scene.num_envs
     assert upper_capacity == 64

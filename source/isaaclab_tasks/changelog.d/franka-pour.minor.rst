@@ -55,9 +55,8 @@ Changed
   prefers an open-arm IK branch, collision-screens the complete grasp-through-tilt path with its
   authored finger states, includes a mid-insertion pose, and grips the side wall 83 mm above the
   table instead of descending over the rim.
-* Temporarily restored Franka Pour MPM collider sampling to the higher-order ``S2`` basis while
-  retaining the compact Q1 velocity solve, and disabled outer CUDA graph capture for this
-  source-cup containment comparison.
+* Changed Franka Pour MPM collider sampling to the particle-bounded ``pic27`` basis while retaining
+  the compact Q1 velocity solve and outer CUDA graph capture.
 * Changed the receiving cup to one scene-owned rigid body proxied into MPM, so rendering, rigid
   contacts, particle collision, and randomized resets share one authoritative pose.
 * Shortened Franka Pour training episodes from 12 seconds to 5 seconds so failed attempts recycle
@@ -67,7 +66,7 @@ Fixed
 ^^^^^
 
 * Fixed the coupled solver manager ignoring the opt-in ``project_outside_colliders`` MPM setting.
-  The setting remains disabled by default and Franka Pour relies on its normal S2 grid collision.
+  The setting remains disabled by default and Franka Pour relies on its normal grid collision.
 * Fixed the source cup's rigid grasp proxy to match the visible cup instead of extending above its
   rim and creating phantom contacts.
 * Fixed Franka Pour startup memory scaling by deriving sparse-grid capacity from its fixed particle

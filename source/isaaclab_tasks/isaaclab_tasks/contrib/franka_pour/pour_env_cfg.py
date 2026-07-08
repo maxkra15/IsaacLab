@@ -727,9 +727,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     num_substeps: int = 2
     proxy_iterations: int = 1
     proxy_mass_scale: float = 1.0
-    # S2 collider sampling currently requires eager sparse-grid topology updates.
-    # Keep capture disabled while comparing its source-cup containment with PIC27.
-    use_cuda_graph: bool = False
+    use_cuda_graph: bool = True
     # Warp FEM partitions topology by environment ID, so isolated worlds need not occupy distinct
     # physical coordinates. Colocating headless-scale batches avoids float32 cancellation in MPM
     # and contact calculations; smaller interactive layouts retain visible environment spacing.
@@ -822,10 +820,10 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                             strain_basis="P0",
                             transfer_scheme="apic",
                             max_iterations=self.mpm_iterations,
-                            # Keep the compact Q1 velocity solve while temporarily restoring the
-                            # higher-order S2 collider basis for a containment comparison.
+                            # PIC27 bounds collider work by particle samples and is compatible with
+                            # rebuildable sparse topology inside the outer CUDA graph.
                             velocity_basis="Q1",
-                            collider_basis="S2",
+                            collider_basis="pic27",
                             # "forward": the moving cup carries its media ("backward" drains it).
                             collider_velocity_mode="forward",
                             # Jacobi is the validated nonlinear path for outer capture. Combined
