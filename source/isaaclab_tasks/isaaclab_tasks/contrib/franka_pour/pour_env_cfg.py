@@ -726,7 +726,11 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     mpm_upper_node_cap_override: int | None = None
     num_substeps: int = 2
     proxy_iterations: int = 1
-    proxy_mass_scale: float = 1.0
+    # This scales only the virtual cup inertia inside the destination MPM solve. The rigid solver
+    # retains the authored cup mass and receives the harvested MPM reaction wrench. A stiff proxy
+    # prevents split-step cup yielding from letting resting media creep through its floor while
+    # retaining one inexpensive two-way coupling pass.
+    proxy_mass_scale: float = 100.0
     use_cuda_graph: bool = True
     # Warp FEM partitions topology by environment ID, so isolated worlds need not occupy distinct
     # physical coordinates. Colocating headless-scale batches avoids float32 cancellation in MPM

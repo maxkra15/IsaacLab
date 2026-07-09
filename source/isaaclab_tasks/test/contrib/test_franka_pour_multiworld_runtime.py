@@ -1448,13 +1448,15 @@ def test_franka_pour_scene_owned_cups_use_public_state_and_leave_caller_cfg_unmo
 
 
 @pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
-def test_franka_pour_offset_world_tables_support_both_cups():
-    """Each rigid world collides with its own finite table at production spacing."""
+def test_franka_pour_offset_world_tables_support_both_cups_without_reset():
+    """Supported cups retain their media beyond the former delayed-leak horizon."""
     _require_sparse_capture_stack()
     sim_utils.create_new_stage()
     env = None
     try:
-        env = gym.make(_TASK_ID, cfg=_make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5))
+        runtime_cfg = _make_runtime_cfg(use_cuda_graph=True, env_spacing=2.5, mpm_iterations=24)
+        runtime_cfg.num_substeps = 2
+        env = gym.make(_TASK_ID, cfg=runtime_cfg)
         task = env.unwrapped
         task.sim._app_control_on_stop_handle = None
         env.reset()
@@ -1467,12 +1469,20 @@ def test_franka_pour_offset_world_tables_support_both_cups():
 
         actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
         actions[:, -1] = 1.0  # keep the gripper open so this tests table support only
-        for _ in range(30):
-            env.step(actions)
+        for step in range(180):
+            _, _, terminated, truncated, _ = env.step(actions)
+            done = terminated | truncated
+            assert not bool(torch.any(done)), (
+                f"A resting environment reset at step {step}: "
+                f"terminated={terminated.tolist()}, truncated={truncated.tolist()}"
+            )
 
         wp.synchronize_device(NewtonManager.get_model().device)
         cup_z = task.cup_pose_e()[:, 2]
         assert bool(torch.all(cup_z > -0.02)), f"A source cup fell through its local table: z={cup_z.tolist()}"
+        expected_count = torch.full_like(task.count_in_source(), task.particle_pos_e().shape[1])
+        torch.testing.assert_close(task.count_in_source(), expected_count, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(task.count_spilled(), torch.zeros_like(expected_count), rtol=0.0, atol=0.0)
         torch.testing.assert_close(cup_z[0], cup_z[1], rtol=0.0, atol=2.0e-3)
         source_fraction = task.count_in_source() / float(task.num_particles)
         assert bool(torch.all(source_fraction >= 0.99)), (

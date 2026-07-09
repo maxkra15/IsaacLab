@@ -417,6 +417,8 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert len(proxies) == 1
     assert proxies[0].source == "arm" and proxies[0].destination == "media"
     assert proxies[0].bodies == [SceneEntityCfg("source_cup"), SceneEntityCfg("target_cup")]
+    assert proxies[0].mass_scale == pytest.approx(cfg.proxy_mass_scale)
+    assert cfg.proxy_mass_scale == pytest.approx(100.0)
     assert solver.iterations == cfg.proxy_iterations
     assert not hasattr(pour_env_cfg, "CUP_LABEL_PATTERN")
     assert all(
@@ -1341,6 +1343,7 @@ def test_mpm_uses_pic27_colliders_and_bounded_200_env_capacity():
     # while Q1 keeps the captured velocity solve compact.
     assert solver_cfg.velocity_basis == "Q1"
     assert solver_cfg.collider_basis == "pic27"
+    assert solver_cfg.collider_velocity_mode == "forward"
     assert solver_cfg.project_outside_colliders is False
     assert _media_entry(play_cfg).solver_cfg.collider_basis == "pic27"
     assert play_cfg.sim.physics.use_cuda_graph is True

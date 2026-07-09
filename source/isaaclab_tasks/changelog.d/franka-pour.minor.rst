@@ -65,6 +65,8 @@ Changed
 Fixed
 ^^^^^
 
+* Fixed Franka Pour media settling through a supported source cup by stabilizing the cup's virtual
+  MPM proxy inertia without changing its physical rigid-body mass or enabling particle projection.
 * Fixed the coupled solver manager ignoring the opt-in ``project_outside_colliders`` MPM setting.
   The setting remains disabled by default and Franka Pour relies on its normal grid collision.
 * Fixed the source cup's rigid grasp proxy to match the visible cup instead of extending above its
