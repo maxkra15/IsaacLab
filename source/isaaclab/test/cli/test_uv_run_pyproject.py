@@ -97,9 +97,11 @@ def test_version_single_source_matches_literal_pins():
     for package in ("torch", "torchvision", "torchaudio"):
         assert f"{package}=={versions[package]}" in overrides
 
-    # Newton git commit is pinned via a uv override; warp-lang is a core dependency.
+    # Newton and Warp source commits are pinned via uv overrides; Warp is also a core dependency.
     assert any(dep.endswith(f"newton.git@{versions['newton']}") for dep in overrides)
-    assert f"warp-lang=={versions['warp']}" in dependencies
+    warp_requirement_suffix = f"warp.git@{versions['warp_commit']}"
+    assert any(dep.endswith(warp_requirement_suffix) for dep in dependencies)
+    assert any(dep.endswith(warp_requirement_suffix) for dep in overrides)
 
 
 def test_uv_run_isaacsim_extra_is_conflict_forked():

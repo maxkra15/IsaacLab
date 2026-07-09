@@ -1,5 +1,5 @@
 Changed
 ^^^^^^^
 
-* Updated the ``newton[sim]`` dependency to Newton main commit
-  ``b24dc255392126fe42a609ea6c4e4c8dca8009cc``.
+* Updated the ``newton[sim]`` and ``warp-lang`` source revisions for
+  rebuildable sparse multi-world MPM and eager CUDA graph instantiation.
