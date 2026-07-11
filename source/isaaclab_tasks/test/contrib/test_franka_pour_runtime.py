@@ -31,12 +31,12 @@ if _RUNTIME_AVAILABLE:
 
     import isaaclab.sim as sim_utils
     import isaaclab.utils.math as math_utils
-    from isaaclab.envs.mdp.terminations import time_out
 
     import isaaclab_tasks  # noqa: F401
     from isaaclab_tasks.contrib.franka_pour.mdp.terminations import (
-        nonterminating_stable_pour_success,
         source_grasp_milestones,
+        stable_pour_success,
+        unsuccessful_time_out,
     )
     from isaaclab_tasks.contrib.franka_pour.pour_env_cfg import MPM_ENTRY, PANDA_ARM_JOINT_LIMITS
     from isaaclab_tasks.contrib.franka_pour.reset_utils import (
@@ -246,10 +246,9 @@ def test_franka_pour_reset_mixture_uses_filtered_binary_gripper_targets(monkeypa
         assert task.action_manager.total_action_dim == 7
         assert observations["policy"].shape == (4, 305)
         assert observations["privileged"].shape == (4, 20)
-        assert task.termination_manager.get_term_cfg("success").func is nonterminating_stable_pour_success
-        assert task.termination_manager.get_term_cfg("time_out").func is time_out
-        assert task.cfg.actions.gripper_action.alpha == pytest.approx(1.0 - 0.8 ** (1.0 / 3.0))
-        assert 1.0 - (1.0 - task.cfg.actions.gripper_action.alpha) ** 3 == pytest.approx(0.2)
+        assert task.termination_manager.get_term_cfg("success").func is stable_pour_success
+        assert task.termination_manager.get_term_cfg("time_out").func is unsuccessful_time_out
+        assert task.cfg.actions.gripper_action.alpha == pytest.approx(0.2)
 
         env_ids = torch.arange(4, device=task.device)
         task.reset_region_id.copy_(env_ids)

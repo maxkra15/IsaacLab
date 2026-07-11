@@ -352,7 +352,7 @@ class ResetMixtureRewardsCfg:
     # Particle distances span only a few decimetres; this preserves useful transfer contrast
     # while retaining the same task-independent tanh form used by OmniReset.
     goal_distance = RewTerm(func=mdp.media_target_distance_tanh, weight=0.1, params={"std": 0.2})
-    success = RewTerm(func=mdp.sustained_pour_success, weight=1.0, params={"dwell_time_s": 0.15})
+    success = RewTerm(func=mdp.pour_success_bonus, weight=1.0)
 
     # Smoothness is one semantic reward group, kept as separate standard terms for diagnostics.
     action_magnitude = RewTerm(func=mdp.action_l2, weight=-1.0e-4)
@@ -366,7 +366,7 @@ class ResetMixtureRewardsCfg:
         },
     )
 
-    # Ordinary fixed-horizon completion is neutral. Match OmniReset's effective one-time
+    # Ordinary time-limit completion is neutral. Match OmniReset's effective one-time
     # abnormal-state cost without penalizing an ordinary timeout.
     failure = RewTerm(func=mdp.terminal_failure, weight=-10.0, params={"include_time_out": False})
 
@@ -1991,13 +1991,13 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
     curriculum_randomized_min_reset_variants_per_source: int = 1
     curriculum_independent_sample_attempts: int = 16
 
-    # Ordered as reaching, near-object, grasped, and near-goal. Uniform episode lengths below make
-    # these reset probabilities also the expected PPO transition fractions.
-    reset_mixture_probabilities: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
+    # Ordered as reaching, near-object, grasped, and near-goal. Bias the episode sampler toward the
+    # full reaching problem while retaining dense backward value propagation from easier regions.
+    reset_mixture_probabilities: tuple[float, float, float, float] = (0.40, 0.25, 0.20, 0.15)
     # Concentrate open Near-Object resets near the screened grasp while retaining a small share of
     # earlier approach states; preloaded grasps bridge contact discovery for the binary gripper.
-    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.05, 0.05, 0.90)
-    reset_mixture_near_object_preloaded_probability: float = 0.50
+    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.25, 0.35, 0.40)
+    reset_mixture_near_object_preloaded_probability: float = 0.15
     reset_mixture_statistics_window_size: int = 4096
 
     def __post_init__(self):
@@ -2019,16 +2019,13 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
                 joint_limit_avoidance_gain=0.05,
                 joint_limit_avoidance_margin=0.25,
             ),
-            # Preserve the proven 10 Hz command rate after moving the actor to 30 Hz: each policy
-            # step applies one third of the prior Cartesian increment.
-            scale=(0.02 / 3.0, 0.02 / 3.0, 0.02 / 3.0, 0.10 / 3.0, 0.10 / 3.0, 0.10 / 3.0),
+            scale=(0.02, 0.02, 0.02, 0.10, 0.10, 0.10),
         )
         # OmniReset uses one region-independent binary gripper action. Keep the existing moving-
-        # average filter to damp IID exploration chatter without accumulating stale open commands;
-        # the adjusted coefficient preserves the original filter response per physical second.
+        # average filter to damp IID exploration chatter without accumulating stale open commands.
         self.actions.gripper_action.use_incremental_target = False
         self.actions.gripper_action.binary_threshold = 0.0
-        self.actions.gripper_action.alpha = 1.0 - 0.8 ** (1.0 / 3.0)
+        self.actions.gripper_action.alpha = 0.2
         super().__post_init__()
         # Run the reset-mixture policy at 30 Hz over the 120 Hz simulation. Five actor frames cover
         # 0.167 s of contact/slip history and a 32-step PPO rollout spans 1.067 s.
@@ -2037,12 +2034,12 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
         self.episode_length_s = 16.0
         self.observations.policy.history_length = 5
         self.is_finite_horizon = False
-        # Keep every region active for the same fixed horizon. Terminating easy successful regions
-        # would make the nominally uniform reset mixture strongly Reaching-biased in PPO samples.
-        self.terminations.success.func = mdp.nonterminating_stable_pour_success
+        # Recycle successful attempts immediately so the positive terminal signal remains dense
+        # and the reset mixture keeps presenting fresh interaction states.
+        self.terminations.success.func = mdp.stable_pour_success
         self.terminations.lost_grasp.params["terminate"] = False
         self.terminations.spill.params["terminate"] = False
-        self.terminations.time_out.func = mdp.time_out
+        self.terminations.time_out.func = mdp.unsuccessful_time_out
 
     def _validate_arm_action_cfg(self) -> None:
         """Validate the reset mixture's relative Cartesian IK contract."""
@@ -2066,7 +2063,7 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
 
     def _configure_reward_cfg(self, max_gripper_command: float, *, initialize_stage_gates: bool) -> None:
         """Keep the general reward independent of curriculum and grasp thresholds."""
-        self.rewards.success.params["dwell_time_s"] = self.success_dwell_time_s
+        pass
 
     def _validate_reward_cfg(self, stage_count: int) -> None:
         """Validate the general reward without introducing reset-stage dependencies."""

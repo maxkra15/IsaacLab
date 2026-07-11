@@ -16,7 +16,7 @@ from isaaclab_tasks.contrib.franka_pour.pour_env import FrankaPourEnv
 
 
 def test_near_object_bank_preserves_open_and_preloaded_population_mass(monkeypatch):
-    preload_probability = 0.4
+    preload_probability = 0.15
     source_count = 8
     source_x = torch.arange(source_count, dtype=torch.float32) * 0.01 + 0.45
     source_positions = torch.stack((source_x, torch.zeros_like(source_x), torch.zeros_like(source_x)), dim=-1)
@@ -38,7 +38,7 @@ def test_near_object_bank_preserves_open_and_preloaded_population_mass(monkeypat
         target_cup_inner_depth=0.10,
         target_cup_wall_thickness=0.005,
         target_cup_reset_pos=(0.5, -0.2, 0.0),
-        reset_mixture_near_object_open_phase_probabilities=(0.05, 0.05, 0.90),
+        reset_mixture_near_object_open_phase_probabilities=(0.25, 0.35, 0.40),
         reset_mixture_near_object_preloaded_probability=preload_probability,
         cup_grasp_height=0.05,
         gripper_open_pos=0.04,
@@ -222,7 +222,7 @@ class _RobotRecorder:
     def __init__(self):
         self.position_writes = []
         self.position_targets = []
-        self.data = SimpleNamespace(body_link_pose_w=torch.empty(0))
+        self.data = _PoseDataRecorder()
 
     def write_joint_position_to_sim_index(self, *, position, **_kwargs):
         self.position_writes.append(position.clone())
@@ -237,6 +237,7 @@ class _RobotRecorder:
 class _RigidRecorder:
     def __init__(self):
         self.root_pose = None
+        self.data = _PoseDataRecorder()
 
     def write_root_pose_to_sim_index(self, *, root_pose, **_kwargs):
         self.root_pose = root_pose.clone()
@@ -253,10 +254,21 @@ class _MediaRecorder:
         pass
 
 
+class _PoseDataRecorder:
+    def __init__(self):
+        self.body_link_pose_reads = 0
+
+    @property
+    def body_link_pose_w(self):
+        self.body_link_pose_reads += 1
+        return torch.empty(0)
+
+
 def test_preloaded_near_object_mask_sets_contact_fingers_and_drive_target(monkeypatch):
     near_object = RESET_MIXTURE_REGION_NAMES.index("near_object")
     robot = _RobotRecorder()
     source_cup = _RigidRecorder()
+    target_cup = _RigidRecorder()
     gripper_targets = []
     gripper_action = SimpleNamespace(
         set_reset_position=lambda target, **_kwargs: gripper_targets.append(target.clone())
@@ -302,7 +314,7 @@ def test_preloaded_near_object_mask_sets_contact_fingers_and_drive_target(monkey
         env_origins=torch.zeros((2, 3)),
         _desired_grasp_tcp_quat_c=torch.tensor(((0.0, 0.0, 0.0, 1.0),) * 2),
         _source_cup=source_cup,
-        _target_cup=_RigidRecorder(),
+        _target_cup=target_cup,
         _media=_MediaRecorder(),
         _particle_region_cache=object(),
         _particle_region_cache_step=1,
@@ -319,10 +331,20 @@ def test_preloaded_near_object_mask_sets_contact_fingers_and_drive_target(monkey
     env.tcp_pose_e = lambda: torch.tensor(((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),) * 2)
     env._sample_cup_media = lambda cup_pos, _cup_quat: torch.zeros((cup_pos.shape[0], 1, 3))
     monkeypatch.setattr(torch, "multinomial", lambda *_args, **_kwargs: torch.tensor((0, 1)))
-    monkeypatch.setattr(pour_env_module.NewtonManager, "reset_solver_state", lambda **_kwargs: None)
+    solver_resets = []
+    monkeypatch.setattr(
+        pour_env_module.NewtonManager,
+        "reset_solver_state",
+        lambda **kwargs: solver_resets.append(kwargs),
+    )
     FrankaPourEnv.reset_pour_scene(env, torch.arange(2))
 
     torch.testing.assert_close(robot.position_writes[1], torch.tensor(((0.04, 0.04), (0.03, 0.03))))
     torch.testing.assert_close(robot.position_targets[1], torch.tensor(((0.04, 0.04), (0.024, 0.024))))
     torch.testing.assert_close(gripper_targets[0], torch.tensor(((0.04,), (0.024,))))
     torch.testing.assert_close(source_cup.root_pose[:, :3], torch.tensor(((0.5, 0.0, 0.0),) * 2))
+    assert robot.data.body_link_pose_reads == 0
+    assert source_cup.data.body_link_pose_reads == 1
+    assert target_cup.data.body_link_pose_reads == 0
+    assert len(solver_resets) == 1
+    assert solver_resets[0]["flags"] == pour_env_module.newton.StateFlags.PARTICLE

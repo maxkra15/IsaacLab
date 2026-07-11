@@ -69,10 +69,9 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
     class ExplorationDistributionCfg(RslRlMLPModelCfg.HeteroscedasticGaussianDistributionCfg):
         """State-dependent exploration bounded for independently sampled action noise."""
 
-        # Keep both fresh and resumed policies strictly inside the hard log-standard-deviation
-        # clamp. The upper bound still contains runaway exploration, while retaining the range
-        # used by the successful reset-mixture lineage instead of pinning the head near std=1.
-        std_range: tuple[float, float] = (0.05, 2.5)
+        # Bound independent per-step noise for the contact-sensitive pour while retaining enough
+        # state-dependent exploration to bridge the four reset regions.
+        std_range: tuple[float, float] = (0.05, 1.05)
 
     # Keep at least one second of temporal context: 32 transitions span 1.067 s at 30 Hz.
     num_steps_per_env = 32
@@ -92,7 +91,7 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         # but use the standard Isaac Lab entropy scale below so independently sampled noise does
         # not grow merely because the environment clips actions.
         distribution_cfg=ExplorationDistributionCfg(
-            init_std=1.0,
+            init_std=0.8,
             std_type="log",
         ),
     )
@@ -105,18 +104,13 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=6.0e-3,
+        entropy_coef=1.0e-3,
         num_learning_epochs=5,
-        # At 2,048 environments per rank, eight splits preserve the proven
-        # 1,024-env run's 8,192 samples per rank and optimizer minibatch.
-        num_mini_batches=8,
+        num_mini_batches=4,
         learning_rate=1.0e-4,
-        # A KL-triggered rate spike destabilized the first captured multi-world run. A fixed rate
-        # preserves the proven Franka update scale while the broader std head provides exploration.
-        schedule="fixed",
-        # Preserve the earlier 10 Hz policy's discount and GAE horizon per physical second.
-        gamma=0.99 ** (1.0 / 3.0),
-        lam=0.95 ** (1.0 / 3.0),
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
     )

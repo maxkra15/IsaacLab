@@ -1127,9 +1127,9 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     agent = FrankaPourResetMixturePPORunnerCfg()
 
     assert cfg.curriculum.reset_mixture.func is mdp.PourResetMixture
-    assert cfg.reset_mixture_probabilities == pytest.approx((0.25, 0.25, 0.25, 0.25))
-    assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.05, 0.05, 0.90))
-    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.50)
+    assert cfg.reset_mixture_probabilities == pytest.approx((0.40, 0.25, 0.20, 0.15))
+    assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.25, 0.35, 0.40))
+    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.15)
     assert cfg.curriculum_randomization_extent_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_arm_fraction_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_target_fraction_levels == pytest.approx((0.0, 1.0))
@@ -1157,9 +1157,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.actions.arm_action.body_name == cfg.tcp_body_name
     assert cfg.actions.arm_action.body_offset.pos == pytest.approx(cfg.tcp_offset_pos)
     assert cfg.actions.arm_action.body_offset.rot == pytest.approx(cfg.tcp_offset_rot)
-    assert cfg.actions.arm_action.scale == pytest.approx(
-        (0.02 / 3.0, 0.02 / 3.0, 0.02 / 3.0, 0.10 / 3.0, 0.10 / 3.0, 0.10 / 3.0)
-    )
+    assert cfg.actions.arm_action.scale == pytest.approx((0.02, 0.02, 0.02, 0.10, 0.10, 0.10))
     assert cfg.actions.arm_action.controller.command_type == "pose"
     assert cfg.actions.arm_action.controller.use_relative_mode is True
     assert cfg.actions.arm_action.controller.ik_method == "adaptive_dls"
@@ -1167,8 +1165,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.actions.arm_action.controller.joint_limit_avoidance_margin == pytest.approx(0.25)
     assert cfg.actions.gripper_action.use_incremental_target is False
     assert cfg.actions.gripper_action.binary_threshold == pytest.approx(0.0)
-    assert cfg.actions.gripper_action.alpha == pytest.approx(1.0 - 0.8 ** (1.0 / 3.0))
-    assert 1.0 - (1.0 - cfg.actions.gripper_action.alpha) ** 3 == pytest.approx(0.2)
+    assert cfg.actions.gripper_action.alpha == pytest.approx(0.2)
     assert eval_cfg.reset_mixture_probabilities == pytest.approx((1.0, 0.0, 0.0, 0.0))
     assert eval_cfg.curriculum_randomization_extent_levels[-1] == pytest.approx(1.0)
     reward_names = {name for name, term_cfg in vars(cfg.rewards).items() if isinstance(term_cfg, RewardTermCfg)}
@@ -1187,9 +1184,9 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.rewards.goal_distance.func is mdp.media_target_distance_tanh
     assert cfg.rewards.goal_distance.weight == pytest.approx(0.1)
     assert cfg.rewards.goal_distance.params["std"] == pytest.approx(0.2)
-    assert cfg.rewards.success.func is mdp.sustained_pour_success
+    assert cfg.rewards.success.func is mdp.pour_success_bonus
     assert cfg.rewards.success.weight == pytest.approx(1.0)
-    assert cfg.rewards.success.params["dwell_time_s"] == pytest.approx(cfg.success_dwell_time_s)
+    assert cfg.rewards.success.params == {}
     assert cfg.rewards.action_magnitude.func is mdp.action_l2
     assert cfg.rewards.action_magnitude.weight == pytest.approx(-1.0e-4)
     assert cfg.rewards.action_rate.func is mdp.action_rate_l2
@@ -1199,11 +1196,11 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.rewards.failure.func is mdp.terminal_failure
     assert cfg.rewards.failure.weight == pytest.approx(-10.0)
     assert cfg.rewards.failure.params == {"include_time_out": False}
-    assert cfg.terminations.success.func is mdp.nonterminating_stable_pour_success
+    assert cfg.terminations.success.func is mdp.stable_pour_success
     assert cfg.terminations.success.params["dwell_time_s"] == pytest.approx(cfg.success_dwell_time_s)
     assert cfg.terminations.lost_grasp.params["terminate"] is False
     assert cfg.terminations.spill.params["terminate"] is False
-    assert cfg.terminations.time_out.func is mdp.time_out
+    assert cfg.terminations.time_out.func is mdp.unsuccessful_time_out
     assert cfg.terminations.time_out.time_out is True
     assert eval_cfg.terminations.success.func is mdp.stable_pour_success
     assert eval_cfg.terminations.time_out.func is mdp.unsuccessful_time_out
@@ -1229,11 +1226,9 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     finalized = cfg.finalize()
     assert isinstance(finalized.rewards, pour_env_cfg.ResetMixtureRewardsCfg)
     assert isinstance(finalized.actions.arm_action, mdp.DifferentialInverseKinematicsActionCfg)
-    assert finalized.actions.arm_action.scale == pytest.approx(
-        (0.02 / 3.0, 0.02 / 3.0, 0.02 / 3.0, 0.10 / 3.0, 0.10 / 3.0, 0.10 / 3.0)
-    )
+    assert finalized.actions.arm_action.scale == pytest.approx((0.02, 0.02, 0.02, 0.10, 0.10, 0.10))
     assert finalized.actions.gripper_action.binary_threshold == pytest.approx(0.0)
-    assert finalized.actions.gripper_action.alpha == pytest.approx(1.0 - 0.8 ** (1.0 / 3.0))
+    assert finalized.actions.gripper_action.alpha == pytest.approx(0.2)
 
     overridden = FrankaPourEnvCfg_RESET_MIXTURE()
     overridden.tcp_offset_pos = (0.0, 0.0, 0.10)
@@ -1278,12 +1273,13 @@ def test_reset_mixture_semantics_do_not_change_reverse_curriculum_defaults():
     mixture = FrankaPourEnvCfg_RESET_MIXTURE()
     reverse = FrankaPourEnvCfg()
 
-    assert mixture.rewards.success.func is mdp.sustained_pour_success
+    assert mixture.rewards.success.func is mdp.pour_success_bonus
+    assert mixture.rewards.success.params == {}
     assert mixture.rewards.failure.params == {"include_time_out": False}
-    assert mixture.terminations.success.func is mdp.nonterminating_stable_pour_success
+    assert mixture.terminations.success.func is mdp.stable_pour_success
     assert mixture.terminations.lost_grasp.params["terminate"] is False
     assert mixture.terminations.spill.params["terminate"] is False
-    assert mixture.terminations.time_out.func is mdp.time_out
+    assert mixture.terminations.time_out.func is mdp.unsuccessful_time_out
     assert isinstance(mixture.actions.arm_action, mdp.DifferentialInverseKinematicsActionCfg)
     assert mixture.actions.gripper_action.use_incremental_target is False
     assert mixture.actions.gripper_action.binary_threshold == pytest.approx(0.0)
@@ -1314,21 +1310,21 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     assert mixture.actor.obs_normalization is True
     assert mixture.critic.obs_normalization is True
     assert mixture.actor.distribution_cfg.class_name == "HeteroscedasticGaussianDistribution"
-    assert mixture.actor.distribution_cfg.init_std == pytest.approx(1.0)
-    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 2.5))
+    assert mixture.actor.distribution_cfg.init_std == pytest.approx(0.8)
+    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 1.05))
     assert (
         mixture.actor.distribution_cfg.std_range[0]
         < mixture.actor.distribution_cfg.init_std
         < mixture.actor.distribution_cfg.std_range[1]
     )
     assert mixture.actor.distribution_cfg.std_type == "log"
-    assert mixture.algorithm.entropy_coef == pytest.approx(6.0e-3)
-    assert mixture.algorithm.gamma == pytest.approx(0.99 ** (1.0 / 3.0))
-    assert mixture.algorithm.lam == pytest.approx(0.95 ** (1.0 / 3.0))
+    assert mixture.algorithm.entropy_coef == pytest.approx(1.0e-3)
+    assert mixture.algorithm.gamma == pytest.approx(0.99)
+    assert mixture.algorithm.lam == pytest.approx(0.95)
     assert mixture.algorithm.num_learning_epochs == 5
-    assert mixture.algorithm.num_mini_batches == 8
+    assert mixture.algorithm.num_mini_batches == 4
     assert mixture.algorithm.learning_rate == pytest.approx(1.0e-4)
-    assert mixture.algorithm.schedule == "fixed"
+    assert mixture.algorithm.schedule == "adaptive"
 
     assert reverse.num_steps_per_env == 32
     assert reverse.actor.hidden_dims == [256, 128, 64]
@@ -1983,8 +1979,22 @@ def test_task_reset_uses_public_asset_writers_and_manager_lifecycle():
     assert "reset_solver_state" in call_names
     assert {"eval_fk", "get_state_0", "get_state_1"}.isdisjoint(call_names)
 
-    reset_attributes = {node.attr for node in ast.walk(reset) if isinstance(node, ast.Attribute)}
+    reset_attribute_nodes = [node for node in ast.walk(reset) if isinstance(node, ast.Attribute)]
+    reset_attributes = {node.attr for node in reset_attribute_nodes}
     assert "body_link_pose_w" in reset_attributes
+    assert sum(node.attr == "body_link_pose_w" for node in reset_attribute_nodes) == 1
+    reset_source = ast.unparse(reset)
+    source_pose_refresh = "self._source_cup.data.body_link_pose_w"
+    assert reset_source.count(source_pose_refresh) == 1
+    assert "self._robot.data.body_link_pose_w" not in reset_source
+    assert "self.tcp_pose_e()[env_ids]" in reset_source
+    assert (
+        reset_source.index("self._source_cup.write_root_pose_to_sim_index")
+        < reset_source.index(source_pose_refresh)
+        < reset_source.index("self._media.write_particle_pos_to_sim_index")
+    )
+    assert "flags=newton.StateFlags.PARTICLE" in reset_source
+    assert "newton.StateFlags.BODY" not in reset_source
 
     manager_forward_calls = [
         node

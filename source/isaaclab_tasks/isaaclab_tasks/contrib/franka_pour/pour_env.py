@@ -2976,12 +2976,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             env_ids=env_ids,
         )
 
-        # Public root/joint writers invalidate FK. Reading a public body-pose view consumes
-        # the accumulated articulation mask, making all dirtied body poses authoritative
-        # before solver caches and source-cup proxy transforms are refreshed. Priming the
-        # robot view also prevents its next observation from issuing a redundant FK launch.
-        _ = self._robot.data.body_link_pose_w
-
         tcp_pose_e = self.tcp_pose_e()[env_ids]
         lifted_stage = stage < self._grasp_stage_index
         held_source_quat = math_utils.quat_mul(
@@ -3009,6 +3003,9 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             root_velocity=target_pose.new_zeros((n, 6)),
             env_ids=env_ids,
         )
+        # Consume the root-pose invalidation before rebuilding MPM collider history so the reset
+        # sees the newly authored cup transforms rather than the preceding episode's poses.
+        _ = self._source_cup.data.body_link_pose_w
 
         new_p = self._sample_cup_media(cup_world, source_quat)
         self._media.write_particle_pos_to_sim_index(new_p, env_ids=env_ids)
@@ -3018,7 +3015,7 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         # so graph replay cannot restore strain from the previous episode.
         NewtonManager.reset_solver_state(
             world_mask=None if self.num_envs == 1 else wp.from_torch(world_mask, dtype=wp.bool),
-            flags=newton.StateFlags.BODY | newton.StateFlags.PARTICLE,
+            flags=newton.StateFlags.PARTICLE,
         )
         self._particle_region_cache = None
         self._particle_region_cache_step = -1
