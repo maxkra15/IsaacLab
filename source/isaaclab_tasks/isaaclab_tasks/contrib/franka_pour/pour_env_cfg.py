@@ -2139,10 +2139,13 @@ class FrankaPourEnvCfg_RESET_MIXTURE_PLAY(FrankaPourEnvCfg_RESET_MIXTURE_EVAL):
         # cost of the base viewer's much larger emergency workspace.
         mpm_solver_cfg.grid_padding = 128
         mpm_solver_cfg.max_active_cell_count = 1024
-        # Retain the base view direction while moving the camera about one metre closer.
+        # Retain the base view direction while moving the camera about one metre closer. Widen the
+        # close view slightly so the complete broad-reset tabletop remains visible.
         self.viewer.eye = (0.9, 0.65, 0.5)
+        self.viewer.focal_length = 10.0
         self.sim.default_visualizer_cfg.eye = self.viewer.eye
         self.sim.default_visualizer_cfg.lookat = self.viewer.lookat
+        self.sim.default_visualizer_cfg.focal_length = self.viewer.focal_length
 
 
 @configclass

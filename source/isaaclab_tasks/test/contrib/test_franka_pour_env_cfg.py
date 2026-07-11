@@ -1262,6 +1262,8 @@ def test_reset_mixture_play_preserves_policy_abi_with_captured_fixed_grid():
     assert play_solver_cfg.grid_padding == 128
     assert play_solver_cfg.max_active_cell_count == 1024
     assert play_cfg.sim.physics.use_cuda_graph is True
+    assert play_cfg.viewer.focal_length == pytest.approx(10.0)
+    assert play_cfg.sim.default_visualizer_cfg.focal_length == pytest.approx(play_cfg.viewer.focal_length)
     assert play_cfg.terminations.success.func is eval_cfg.terminations.success.func
     assert play_cfg.terminations.success.params == eval_cfg.terminations.success.params
     assert play_cfg.viewer.lookat == pytest.approx(eval_cfg.viewer.lookat)
