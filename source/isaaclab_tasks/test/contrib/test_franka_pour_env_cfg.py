@@ -1191,7 +1191,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.rewards.goal_distance.weight == pytest.approx(0.1)
     assert cfg.rewards.goal_distance.params["std"] == pytest.approx(0.2)
     assert cfg.rewards.success.func is mdp.pour_success_bonus
-    assert cfg.rewards.success.weight == pytest.approx(1.0)
+    assert cfg.rewards.success.weight == pytest.approx(10.0)
     assert cfg.rewards.success.params == {}
     assert cfg.rewards.action_magnitude.func is mdp.action_l2
     assert cfg.rewards.action_magnitude.weight == pytest.approx(-1.0e-4)
@@ -1205,7 +1205,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.terminations.success.func is mdp.stable_pour_success
     assert cfg.terminations.success.params["dwell_time_s"] == pytest.approx(cfg.success_dwell_time_s)
     assert cfg.terminations.lost_grasp.params["terminate"] is False
-    assert cfg.terminations.spill.params["terminate"] is True
+    assert cfg.terminations.spill.params["terminate"] is False
     assert cfg.terminations.time_out.func is mdp.unsuccessful_time_out
     assert cfg.terminations.time_out.time_out is True
     assert eval_cfg.terminations.success.func is mdp.stable_pour_success
@@ -1288,7 +1288,7 @@ def test_reset_mixture_semantics_do_not_change_reverse_curriculum_defaults():
     assert mixture.rewards.failure.params == {"include_time_out": False}
     assert mixture.terminations.success.func is mdp.stable_pour_success
     assert mixture.terminations.lost_grasp.params["terminate"] is False
-    assert mixture.terminations.spill.params["terminate"] is True
+    assert mixture.terminations.spill.params["terminate"] is False
     assert mixture.terminations.time_out.func is mdp.unsuccessful_time_out
     assert isinstance(mixture.actions.arm_action, mdp.DifferentialInverseKinematicsActionCfg)
     assert mixture.actions.gripper_action.use_incremental_target is False
@@ -1320,8 +1320,8 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     assert mixture.actor.obs_normalization is True
     assert mixture.critic.obs_normalization is True
     assert mixture.actor.distribution_cfg.class_name == "HeteroscedasticGaussianDistribution"
-    assert mixture.actor.distribution_cfg.init_std == pytest.approx(0.4)
-    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 0.6))
+    assert mixture.actor.distribution_cfg.init_std == pytest.approx(0.8)
+    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 1.0))
     assert (
         mixture.actor.distribution_cfg.std_range[0]
         < mixture.actor.distribution_cfg.init_std

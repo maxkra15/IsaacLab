@@ -352,7 +352,9 @@ class ResetMixtureRewardsCfg:
     # Particle distances span only a few decimetres; this preserves useful transfer contrast
     # while retaining the same task-independent tanh form used by OmniReset.
     goal_distance = RewTerm(func=mdp.media_target_distance_tanh, weight=0.1, params={"std": 0.2})
-    success = RewTerm(func=mdp.pour_success_bonus, weight=1.0)
+    # A terminating success produces one unit-integral pulse. Weight ten approximates the return
+    # from holding the prior nonterminating unit reward for the remainder of a solved episode.
+    success = RewTerm(func=mdp.pour_success_bonus, weight=10.0)
 
     # Smoothness is one semantic reward group, kept as separate standard terms for diagnostics.
     action_magnitude = RewTerm(func=mdp.action_l2, weight=-1.0e-4)
@@ -2043,9 +2045,9 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
         # and the reset mixture keeps presenting fresh interaction states.
         self.terminations.success.func = mdp.stable_pour_success
         self.terminations.lost_grasp.params["terminate"] = False
-        # More than ten percent spill is irreversible. Recycling the attempt supplies the general
-        # terminal-failure signal and avoids spending most of a rollout on an unrecoverable state.
-        self.terminations.spill.params["terminate"] = True
+        # Spilled particles already lose all goal-distance credit. Keep spill diagnostic-only so
+        # early exploration is not dominated by the -10 abnormal-state terminal penalty.
+        self.terminations.spill.params["terminate"] = False
         self.terminations.time_out.func = mdp.unsuccessful_time_out
 
     def _validate_arm_action_cfg(self) -> None:

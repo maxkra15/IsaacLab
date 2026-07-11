@@ -69,10 +69,10 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
     class ExplorationDistributionCfg(RslRlMLPModelCfg.HeteroscedasticGaussianDistributionCfg):
         """State-dependent exploration bounded for independently sampled action noise."""
 
-        # RSL-RL samples this noise independently at every 30 Hz policy step. Keep it near the
-        # successful policy's converged standard deviation without allowing the state-dependent
-        # head to saturate at unit noise during contact-rich resets.
-        std_range: tuple[float, float] = (0.05, 0.6)
+        # RSL-RL samples this noise independently at every 30 Hz policy step. The task-side FIR
+        # suppresses high-frequency chatter while retaining the exploration range that discovered
+        # the grasp-and-pour transition in the proven 10 Hz run.
+        std_range: tuple[float, float] = (0.05, 1.0)
 
     # Keep at least one second of temporal context: 32 transitions span 1.067 s at 30 Hz.
     num_steps_per_env = 32
@@ -92,7 +92,7 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         # but use the standard Isaac Lab entropy scale below so independently sampled noise does
         # not grow merely because the environment clips actions.
         distribution_cfg=ExplorationDistributionCfg(
-            init_std=0.4,
+            init_std=0.8,
             std_type="log",
         ),
     )
