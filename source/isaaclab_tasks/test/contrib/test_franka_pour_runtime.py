@@ -124,7 +124,7 @@ def _make_runtime_cfg(
     cfg.sim.render_interval = 1
 
     entries = {entry.name: entry for entry in cfg.sim.physics.solver_cfg.entries}
-    assert not entries[MPM_ENTRY].in_place
+    assert entries[MPM_ENTRY].in_place
     return cfg
 
 
@@ -248,7 +248,7 @@ def test_franka_pour_reset_mixture_uses_filtered_binary_gripper_targets(monkeypa
         assert observations["privileged"].shape == (4, 20)
         assert task.termination_manager.get_term_cfg("success").func is stable_pour_success
         assert task.termination_manager.get_term_cfg("time_out").func is unsuccessful_time_out
-        assert task.cfg.actions.gripper_action.alpha == pytest.approx(0.2)
+        assert task.cfg.actions.gripper_action.alpha == pytest.approx(1.0 - 0.8 ** (1.0 / 3.0))
 
         env_ids = torch.arange(4, device=task.device)
         task.reset_region_id.copy_(env_ids)
@@ -351,7 +351,7 @@ def test_franka_pour_reset_mixture_uses_filtered_binary_gripper_targets(monkeypa
         env.step(motion_actions)
         torch.testing.assert_close(
             arm_action.processed_actions[:, 0],
-            torch.full((4,), 0.5 * task.cfg.actions.arm_action.scale[0], device=task.device),
+            torch.full((4,), 0.5 * task.cfg.actions.arm_action.scale[0] / 3.0, device=task.device),
             rtol=0.0,
             atol=0.0,
         )

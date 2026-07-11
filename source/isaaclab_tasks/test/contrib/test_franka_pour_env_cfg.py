@@ -401,7 +401,7 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert media.bodies == [r".*/SpillFloor$"]
     assert media.include_static_shapes is False
     assert media.substeps == 1
-    assert media.in_place is False
+    assert media.in_place is True
     assert media.solver_cfg.grid_type == "sparse"
     assert media.solver_cfg.grid_padding == 0
     assert media.solver_cfg.max_active_cell_count == 2 * 256

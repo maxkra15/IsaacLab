@@ -998,9 +998,9 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         bodies=[SPILL_FLOOR_LABEL_PATTERN],
                         include_static_shapes=False,
                         include_child_joints=False,
-                        # Keep a distinct MPM output state. In-place state reuse can retain stale
-                        # per-world data across the asynchronous masked resets used during RL.
-                        in_place=False,
+                        # Implicit MPM carries constitutive state in its namespaced state arrays;
+                        # keep one authoritative entry state across coupled steps and masked resets.
+                        in_place=True,
                     ),
                 ],
                 proxies=[
