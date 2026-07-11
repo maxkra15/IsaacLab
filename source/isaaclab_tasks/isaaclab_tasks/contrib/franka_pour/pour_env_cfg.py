@@ -1005,7 +1005,9 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         destination=MPM_ENTRY,
                         bodies=[SceneEntityCfg("source_cup"), SceneEntityCfg("target_cup")],
                         mass_scale=self.proxy_mass_scale,
-                        mode="lagged",
+                        # Give MPM the rigid solver's end pose. The lagged begin pose destabilizes
+                        # the stiff moving-cup proxy with the current multi-world MPM stepping.
+                        mode="staggered",
                         # Implicit MPM resolves its proxy colliders internally; the shared outer
                         # pipeline is only needed for rigid MJWarp contacts.
                         collision_pipeline=lambda _model: None,

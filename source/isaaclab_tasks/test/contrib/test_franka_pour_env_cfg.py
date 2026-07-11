@@ -420,6 +420,7 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert proxies[0].collision_pipeline is not None
     assert proxies[0].collision_pipeline(None) is None
     assert proxies[0].mass_scale == pytest.approx(cfg.proxy_mass_scale)
+    assert proxies[0].mode == "staggered"
     assert cfg.proxy_mass_scale == pytest.approx(1000.0)
     assert solver.iterations == cfg.proxy_iterations
     assert not hasattr(pour_env_cfg, "CUP_LABEL_PATTERN")
