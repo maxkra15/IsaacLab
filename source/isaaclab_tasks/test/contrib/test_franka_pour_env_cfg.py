@@ -49,6 +49,7 @@ from isaaclab_tasks.contrib.franka_pour.reset_utils import (
     boolean_selection_mask,
     randomization_extent_index_pools,
     sample_index_pools,
+    symmetric_local_pose_samples,
     target_xy_behind_source,
 )
 
@@ -62,6 +63,43 @@ def test_boolean_selection_mask_preserves_device_shape_and_dtype():
     assert mask.dtype == torch.bool
     assert mask.shape == (6,)
     assert mask.tolist() == [False, True, False, True, True, False]
+
+
+def test_symmetric_local_pose_samples_cover_axes_and_complementary_pairs():
+    position_half_range = (0.02, 0.015, 0.01)
+    rotation_half_range = (math.pi / 16.0, math.pi / 20.0, math.pi / 24.0)
+
+    samples = symmetric_local_pose_samples(position_half_range, rotation_half_range, 25)
+
+    half_range = torch.tensor((*position_half_range, *rotation_half_range))
+    assert samples.shape == (25, 6)
+    torch.testing.assert_close(samples[0], torch.zeros(6))
+    torch.testing.assert_close(samples[1:7], torch.diag(half_range))
+    torch.testing.assert_close(samples[7:13], -torch.diag(half_range))
+    torch.testing.assert_close(samples[13::2], -samples[14::2])
+    assert bool(torch.all(samples.abs() <= half_range + 1.0e-7))
+    assert torch.unique(samples, dim=0).shape[0] == samples.shape[0]
+
+
+@pytest.mark.parametrize(
+    "position_half_range, rotation_half_range, sample_count, message",
+    [
+        ((0.02, 0.02), (0.1, 0.1, 0.1), 25, "three values"),
+        ((0.02, -0.01, 0.02), (0.1, 0.1, 0.1), 25, "finite positive"),
+        ((0.02, 0.0, 0.02), (0.1, 0.1, 0.1), 25, "finite positive"),
+        ((0.02, 0.02, 0.02), (0.1, 0.0, 0.1), 25, "finite positive"),
+        ((0.02, 0.02, 0.02), (math.pi, 0.1, 0.1), 25, "pi / 2"),
+        ((0.02, 0.02, 0.02), (0.1, 0.1, 0.1), 12, "odd integer"),
+    ],
+)
+def test_symmetric_local_pose_samples_reject_invalid_design(
+    position_half_range,
+    rotation_half_range,
+    sample_count,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        symmetric_local_pose_samples(position_half_range, rotation_half_range, sample_count)
 
 
 def test_franka_pour_config_import_does_not_preload_usd_before_kit():
@@ -1131,6 +1169,9 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.reset_mixture_probabilities == pytest.approx((0.25, 0.25, 0.25, 0.25))
     assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.05, 0.05, 0.90))
     assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.50)
+    assert cfg.reset_mixture_near_object_local_position_half_range == pytest.approx((0.02, 0.02, 0.02))
+    assert cfg.reset_mixture_near_object_local_rotation_half_range == pytest.approx((math.pi / 16.0,) * 3)
+    assert cfg.reset_mixture_near_object_local_sample_count == 25
     assert cfg.curriculum_randomization_extent_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_arm_fraction_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_target_fraction_levels == pytest.approx((0.0, 1.0))
@@ -1331,7 +1372,7 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     assert mixture.algorithm.entropy_coef == pytest.approx(1.0e-3)
     assert mixture.algorithm.gamma == pytest.approx(0.99 ** (1.0 / 3.0))
     assert mixture.algorithm.lam == pytest.approx(0.95 ** (1.0 / 3.0))
-    assert mixture.algorithm.num_learning_epochs == 5
+    assert mixture.algorithm.num_learning_epochs == 1
     assert mixture.algorithm.num_mini_batches == 24
     assert mixture.algorithm.learning_rate == pytest.approx(1.0e-4)
     assert mixture.algorithm.schedule == "fixed"
@@ -1361,6 +1402,17 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
         ("reset_mixture_near_object_preloaded_probability", 1.1, "lie in \\[0, 1\\]"),
         ("reset_mixture_near_object_preloaded_probability", float("nan"), "finite"),
         ("reset_mixture_near_object_preloaded_probability", False, "finite"),
+        ("reset_mixture_near_object_local_position_half_range", 0.02, "three values"),
+        ("reset_mixture_near_object_local_position_half_range", (0.02, 0.02), "three values"),
+        ("reset_mixture_near_object_local_position_half_range", (0.02, -0.01, 0.02), "finite positive"),
+        ("reset_mixture_near_object_local_position_half_range", (0.02, 0.0, 0.02), "finite positive"),
+        ("reset_mixture_near_object_local_rotation_half_range", (0.1, 0.1), "three values"),
+        ("reset_mixture_near_object_local_rotation_half_range", (0.1, float("nan"), 0.1), "finite positive"),
+        ("reset_mixture_near_object_local_rotation_half_range", (0.1, 0.0, 0.1), "finite positive"),
+        ("reset_mixture_near_object_local_rotation_half_range", (math.pi, 0.1, 0.1), "pi / 2"),
+        ("reset_mixture_near_object_local_sample_count", 12, "odd integer"),
+        ("reset_mixture_near_object_local_sample_count", 15.0, "odd integer"),
+        ("reset_mixture_near_object_local_sample_count", False, "odd integer"),
         ("reset_mixture_statistics_window_size", 0, "must be positive"),
         ("reset_mixture_statistics_window_size", 0.5, "must be positive"),
     ],

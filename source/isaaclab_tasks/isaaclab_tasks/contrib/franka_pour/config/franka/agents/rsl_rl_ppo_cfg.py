@@ -110,7 +110,9 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,
         entropy_coef=1.0e-3,
-        num_learning_epochs=5,
+        # Each rank already collects 196,608 transitions per rollout. One pass avoids repeatedly
+        # fitting the same contact trajectories, which erased the transferred broad-reset skill.
+        num_learning_epochs=1,
         # At 2,048 environments per rank, 24 splits retain 8,192 samples per optimizer minibatch
         # after restoring the three-times-longer physical rollout.
         num_mini_batches=24,

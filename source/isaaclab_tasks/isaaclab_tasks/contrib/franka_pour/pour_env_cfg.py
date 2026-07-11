@@ -2005,6 +2005,9 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
     # Split open and preloaded hands evenly so contact acquisition and transport remain connected.
     reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.05, 0.05, 0.90)
     reset_mixture_near_object_preloaded_probability: float = 0.50
+    reset_mixture_near_object_local_position_half_range: tuple[float, float, float] = (0.02, 0.02, 0.02)
+    reset_mixture_near_object_local_rotation_half_range: tuple[float, float, float] = (math.pi / 16.0,) * 3
+    reset_mixture_near_object_local_sample_count: int = 25
     reset_mixture_statistics_window_size: int = 4096
 
     def __post_init__(self):
@@ -2037,8 +2040,8 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
         self.actions.gripper_action.binary_threshold = 0.0
         self.actions.gripper_action.alpha = 1.0 - 0.8 ** (1.0 / 3.0)
         super().__post_init__()
-        # Run the reset-mixture policy at 30 Hz over the 120 Hz simulation. Five actor frames cover
-        # 0.167 s of contact/slip history; the agent's 96-step PPO rollout spans 3.2 s.
+        # Run the reset-mixture policy at 30 Hz over the 120 Hz simulation. Five actor frames span
+        # 0.133 s from oldest to newest; the agent's 96-step PPO rollout spans 3.2 s.
         self.decimation = 4
         self.sim.render_interval = self.decimation
         self.episode_length_s = 16.0
@@ -2110,6 +2113,25 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
             or not 0.0 <= preload_probability <= 1.0
         ):
             raise ValueError("reset_mixture_near_object_preloaded_probability must be finite and lie in [0, 1].")
+        for name in (
+            "reset_mixture_near_object_local_position_half_range",
+            "reset_mixture_near_object_local_rotation_half_range",
+        ):
+            half_range = getattr(self, name)
+            if not isinstance(half_range, tuple | list) or len(half_range) != 3:
+                raise ValueError(f"{name} must contain three values.")
+            if any(not math.isfinite(value) or value <= 0.0 for value in half_range):
+                raise ValueError(f"{name} must contain finite positive values.")
+        if any(value > math.pi / 2.0 for value in self.reset_mixture_near_object_local_rotation_half_range):
+            raise ValueError("reset_mixture_near_object_local_rotation_half_range must not exceed pi / 2.")
+        local_sample_count = self.reset_mixture_near_object_local_sample_count
+        if (
+            isinstance(local_sample_count, bool)
+            or not isinstance(local_sample_count, int)
+            or local_sample_count < 13
+            or local_sample_count % 2 == 0
+        ):
+            raise ValueError("reset_mixture_near_object_local_sample_count must be an odd integer of at least 13.")
         if (
             not isinstance(self.reset_mixture_statistics_window_size, int)
             or isinstance(self.reset_mixture_statistics_window_size, bool)

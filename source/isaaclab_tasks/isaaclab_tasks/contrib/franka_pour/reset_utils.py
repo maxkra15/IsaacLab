@@ -326,6 +326,93 @@ def reset_rotation_vector_samples(
     return axes * angles.unsqueeze(-1)
 
 
+def symmetric_local_pose_samples(
+    position_half_range: tuple[float, float, float] | torch.Tensor,
+    rotation_half_range: tuple[float, float, float] | torch.Tensor,
+    sample_count: int,
+    *,
+    device: str | torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Return deterministic symmetric Cartesian pose perturbations.
+
+    The first row is zero, the next twelve rows are the positive and negative extrema of each
+    Cartesian coordinate, and the remaining rows are low-discrepancy complementary pairs. The
+    rotation coordinates are XYZ Euler angles applied in the local TCP frame.
+
+    Args:
+        position_half_range: Positive XYZ translation half-ranges [m].
+        rotation_half_range: Positive roll, pitch, and yaw half-ranges [rad]. Each value must
+            not exceed pi / 2 radians.
+        sample_count: Odd number of samples. Must be at least thirteen.
+        device: Optional output device. A tensor bound supplies the default; otherwise CPU is used.
+        dtype: Optional floating-point output dtype. A tensor bound supplies the default; otherwise
+            the default floating-point dtype is used.
+
+    Returns:
+        Local pose perturbations, shape ``(sample_count, 6)``. Translation is in the first three
+        columns [m], followed by XYZ Euler angles [rad].
+    """
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 13
+        or sample_count % 2 == 0
+    ):
+        raise ValueError("sample_count must be an odd integer of at least thirteen.")
+
+    tensor_inputs = tuple(
+        value for value in (position_half_range, rotation_half_range) if isinstance(value, torch.Tensor)
+    )
+    if device is None:
+        if len(tensor_inputs) == 2 and tensor_inputs[0].device != tensor_inputs[1].device:
+            raise ValueError("Tensor pose half-ranges must use the same device unless device is specified.")
+        resolved_device = tensor_inputs[0].device if tensor_inputs else torch.device("cpu")
+    else:
+        resolved_device = torch.device(device)
+    if dtype is None:
+        if len(tensor_inputs) == 2 and tensor_inputs[0].dtype != tensor_inputs[1].dtype:
+            raise ValueError("Tensor pose half-ranges must use the same dtype unless dtype is specified.")
+        resolved_dtype = tensor_inputs[0].dtype if tensor_inputs else torch.get_default_dtype()
+    else:
+        resolved_dtype = dtype
+    if not torch.empty((), dtype=resolved_dtype).is_floating_point():
+        raise ValueError("Pose half-ranges and the output must use a floating-point dtype.")
+
+    position = torch.as_tensor(position_half_range, device=resolved_device, dtype=resolved_dtype)
+    rotation = torch.as_tensor(rotation_half_range, device=resolved_device, dtype=resolved_dtype)
+    if position.shape != (3,) or rotation.shape != (3,):
+        raise ValueError(
+            "position_half_range and rotation_half_range must each contain three values; "
+            f"got {tuple(position.shape)} and {tuple(rotation.shape)}."
+        )
+    if (
+        not bool(torch.isfinite(position).all())
+        or not bool(torch.isfinite(rotation).all())
+        or bool(torch.any(position <= 0.0))
+        or bool(torch.any(rotation <= 0.0))
+    ):
+        raise ValueError("Pose half-ranges must contain finite positive values.")
+    if bool(torch.any(rotation > math.pi / 2.0)):
+        raise ValueError("rotation_half_range values must not exceed pi / 2 radians.")
+
+    half_range = torch.cat((position, rotation))
+    axis_samples = torch.diag(half_range)
+    samples = [half_range.new_zeros((1, 6)), axis_samples, -axis_samples]
+    pair_count = (sample_count - 13) // 2
+    if pair_count:
+        pair_index = torch.arange(pair_count, device=resolved_device, dtype=resolved_dtype) + 0.5
+        # A six-dimensional Kronecker sequence provides deterministic interior coverage. Explicit
+        # negative partners keep the finite cloud exactly centered at the authored grasp.
+        multipliers = half_range.new_tensor(
+            (0.754877666, 0.569840296, 0.438447187, 0.328173353, 0.245122334, 0.184709246)
+        )
+        directions = 2.0 * torch.frac(pair_index[:, None] * multipliers[None, :]) - 1.0
+        interior = directions * half_range
+        samples.append(torch.stack((interior, -interior), dim=1).reshape(-1, 6))
+    return torch.cat(samples, dim=0)
+
+
 def boolean_selection_mask(count: int, selected: torch.Tensor) -> torch.Tensor:
     """Return a fixed-size boolean mask selecting the supplied indices."""
     if count < 0:
