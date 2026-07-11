@@ -1927,7 +1927,19 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
             resolved.cup_reset_pos,
             (0.0, 0.0, 0.0, 1.0),
         )
-        _mpm_solver_cfg(resolved).max_active_cell_count = _resolve_mpm_cell_cap(resolved)
+        mpm_solver_cfg = _mpm_solver_cfg(resolved)
+        mpm_solver_cfg.max_active_cell_count = _resolve_mpm_cell_cap(resolved)
+        if mpm_solver_cfg.grid_type == "sparse":
+            # Newton's automatic hierarchy is estimated from the compact initial fill. During an
+            # RL step, however, a numerically launched particle can occupy a new upper NanoVDB
+            # region before the manager observes the workspace failure and resets that world.
+            # Bound the hierarchy for the configured workspace plus the distance a velocity-clamped
+            # particle can travel before the manager observes the failure. Sixteen lower nodes and
+            # half an upper node per world round that geometric bound up with useful allocator
+            # headroom; the small floor keeps single-world/debug configurations hierarchy-valid.
+            world_count = int(resolved.scene.num_envs)
+            mpm_solver_cfg.max_lower_node_count = max(32, 16 * world_count)
+            mpm_solver_cfg.max_upper_node_count = max(32, (world_count + 1) // 2)
         resolved.sim.physics.solver_cfg.scene_cfg = resolved.scene
         return resolved
 

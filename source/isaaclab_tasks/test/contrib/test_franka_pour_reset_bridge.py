@@ -319,6 +319,7 @@ def test_preloaded_near_object_mask_sets_contact_fingers_and_drive_target(monkey
     env.tcp_pose_e = lambda: torch.tensor(((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),) * 2)
     env._sample_cup_media = lambda cup_pos, _cup_quat: torch.zeros((cup_pos.shape[0], 1, 3))
     monkeypatch.setattr(torch, "multinomial", lambda *_args, **_kwargs: torch.tensor((0, 1)))
+    monkeypatch.setattr(pour_env_module.NewtonManager, "reset_solver_state", lambda **_kwargs: None)
     FrankaPourEnv.reset_pour_scene(env, torch.arange(2))
 
     torch.testing.assert_close(robot.position_writes[1], torch.tensor(((0.04, 0.04), (0.03, 0.03))))

@@ -405,7 +405,8 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert media.solver_cfg.grid_type == "sparse"
     assert media.solver_cfg.grid_padding == 0
     assert media.solver_cfg.max_active_cell_count == 2 * 256
-    assert media.solver_cfg.max_upper_node_count == -1
+    assert media.solver_cfg.max_lower_node_count == 32
+    assert media.solver_cfg.max_upper_node_count == 32
     assert media.solver_cfg.separate_worlds is True
     assert media.solver_cfg.solver == "jacobi"
     assert media.solver_cfg.warmstart_mode == "none"
@@ -1313,21 +1314,21 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     assert mixture.actor.obs_normalization is True
     assert mixture.critic.obs_normalization is True
     assert mixture.actor.distribution_cfg.class_name == "HeteroscedasticGaussianDistribution"
-    assert mixture.actor.distribution_cfg.init_std == pytest.approx(0.8)
-    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 1.05))
+    assert mixture.actor.distribution_cfg.init_std == pytest.approx(1.0)
+    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 2.5))
     assert (
         mixture.actor.distribution_cfg.std_range[0]
         < mixture.actor.distribution_cfg.init_std
         < mixture.actor.distribution_cfg.std_range[1]
     )
     assert mixture.actor.distribution_cfg.std_type == "log"
-    assert mixture.algorithm.entropy_coef == pytest.approx(1.0e-3)
+    assert mixture.algorithm.entropy_coef == pytest.approx(6.0e-3)
     assert mixture.algorithm.gamma == pytest.approx(0.99 ** (1.0 / 3.0))
     assert mixture.algorithm.lam == pytest.approx(0.95 ** (1.0 / 3.0))
     assert mixture.algorithm.num_learning_epochs == 5
     assert mixture.algorithm.num_mini_batches == 8
     assert mixture.algorithm.learning_rate == pytest.approx(1.0e-4)
-    assert mixture.algorithm.schedule == "adaptive"
+    assert mixture.algorithm.schedule == "fixed"
 
     assert reverse.num_steps_per_env == 32
     assert reverse.actor.hidden_dims == [256, 128, 64]
@@ -1722,7 +1723,8 @@ def test_sparse_training_reserves_capturable_isolated_grid_capacity(num_envs):
     assert _media_entry(resolved).solver_cfg.grid_type == "sparse"
     solver_cfg = _media_entry(resolved).solver_cfg
     assert _media_capacity(resolved) == 256 * num_envs
-    assert solver_cfg.max_upper_node_count == -1
+    assert solver_cfg.max_lower_node_count == max(32, 16 * num_envs)
+    assert solver_cfg.max_upper_node_count == max(32, (num_envs + 1) // 2)
     assert solver_cfg.separate_worlds is True
     assert resolved.scene.env_spacing == pytest.approx(cfg.scene.env_spacing)
     assert resolved.sim.physics.use_cuda_graph is True
@@ -1760,7 +1762,8 @@ def test_mpm_uses_sparse_training_and_fixed_captured_play_configs():
     assert solver_cfg.project_outside_colliders is False
     assert solver_cfg.grid_type == "sparse"
     assert solver_cfg.max_active_cell_count == 200 * 256
-    assert solver_cfg.max_upper_node_count == -1
+    assert solver_cfg.max_lower_node_count == 16 * 200
+    assert solver_cfg.max_upper_node_count == 100
     assert solver_cfg.separate_worlds is True
     assert play_solver_cfg.collider_basis == "pic27"
     assert play_solver_cfg.grid_type == "fixed"
@@ -1782,7 +1785,8 @@ def test_coarse_voxel_resolution_finalizes_without_manual_hierarchy_overrides():
     assert solver_cfg.voxel_size == pytest.approx(0.03)
     assert solver_cfg.grid_type == "sparse"
     assert solver_cfg.max_active_cell_count == 256
-    assert solver_cfg.max_upper_node_count == -1
+    assert solver_cfg.max_lower_node_count == 32
+    assert solver_cfg.max_upper_node_count == 32
 
 
 def test_particle_workspace_bounds_contain_every_curriculum_reset():
