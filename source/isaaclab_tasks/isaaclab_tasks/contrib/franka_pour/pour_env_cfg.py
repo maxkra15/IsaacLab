@@ -1993,13 +1993,13 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
     curriculum_randomized_min_reset_variants_per_source: int = 1
     curriculum_independent_sample_attempts: int = 16
 
-    # Ordered as reaching, near-object, grasped, and near-goal. Bias the episode sampler toward the
-    # full reaching problem while retaining dense backward value propagation from easier regions.
-    reset_mixture_probabilities: tuple[float, float, float, float] = (0.40, 0.25, 0.20, 0.15)
-    # Concentrate open Near-Object resets near the screened grasp while retaining a small share of
-    # earlier approach states; preloaded grasps bridge contact discovery for the binary gripper.
-    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.25, 0.35, 0.40)
-    reset_mixture_near_object_preloaded_probability: float = 0.15
+    # Ordered as reaching, near-object, grasped, and near-goal. Sample the four OmniReset regions
+    # uniformly; successful episodes still recycle immediately through the termination manager.
+    reset_mixture_probabilities: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
+    # Keep the open Near-Object population concentrated at the final screened approach pose. Exact
+    # preloaded grasps supply the contact bridge needed by the task's binary gripper action.
+    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.05, 0.05, 0.90)
+    reset_mixture_near_object_preloaded_probability: float = 0.50
     reset_mixture_statistics_window_size: int = 4096
 
     def __post_init__(self):
@@ -2021,13 +2021,16 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
                 joint_limit_avoidance_gain=0.05,
                 joint_limit_avoidance_margin=0.25,
             ),
-            scale=(0.02, 0.02, 0.02, 0.10, 0.10, 0.10),
+            # Preserve the proven 10 Hz command rate after moving the actor to 30 Hz: each policy
+            # step applies one third of the prior Cartesian increment.
+            scale=(0.02 / 3.0, 0.02 / 3.0, 0.02 / 3.0, 0.10 / 3.0, 0.10 / 3.0, 0.10 / 3.0),
         )
         # OmniReset uses one region-independent binary gripper action. Keep the existing moving-
-        # average filter to damp IID exploration chatter without accumulating stale open commands.
+        # average filter to damp IID exploration chatter without accumulating stale open commands;
+        # the adjusted coefficient preserves the original filter response per physical second.
         self.actions.gripper_action.use_incremental_target = False
         self.actions.gripper_action.binary_threshold = 0.0
-        self.actions.gripper_action.alpha = 0.2
+        self.actions.gripper_action.alpha = 1.0 - 0.8 ** (1.0 / 3.0)
         super().__post_init__()
         # Run the reset-mixture policy at 30 Hz over the 120 Hz simulation. Five actor frames cover
         # 0.167 s of contact/slip history and a 32-step PPO rollout spans 1.067 s.

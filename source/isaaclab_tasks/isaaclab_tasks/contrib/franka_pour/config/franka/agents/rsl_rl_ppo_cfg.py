@@ -69,9 +69,9 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
     class ExplorationDistributionCfg(RslRlMLPModelCfg.HeteroscedasticGaussianDistributionCfg):
         """State-dependent exploration bounded for independently sampled action noise."""
 
-        # Bound independent per-step noise for the contact-sensitive pour while retaining enough
-        # state-dependent exploration to bridge the four reset regions.
-        std_range: tuple[float, float] = (0.05, 1.05)
+        # Match the range used by the successful warm-start policy while keeping independently
+        # sampled 30 Hz exploration bounded for contact-sensitive motion.
+        std_range: tuple[float, float] = (0.05, 1.0)
 
     # Keep at least one second of temporal context: 32 transitions span 1.067 s at 30 Hz.
     num_steps_per_env = 32
@@ -106,11 +106,15 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         clip_param=0.2,
         entropy_coef=1.0e-3,
         num_learning_epochs=5,
-        num_mini_batches=4,
+        # At 2,048 environments per rank, eight splits preserve the proven 1,024-environment
+        # run's 8,192 samples per optimizer minibatch.
+        num_mini_batches=8,
         learning_rate=1.0e-4,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
+        # Adaptive KL scheduling caused repeated learning-rate spikes in the 30 Hz run. Keep the
+        # update scale fixed and preserve the earlier 10 Hz discount horizons per physical second.
+        schedule="fixed",
+        gamma=0.99 ** (1.0 / 3.0),
+        lam=0.95 ** (1.0 / 3.0),
         desired_kl=0.01,
         max_grad_norm=1.0,
     )

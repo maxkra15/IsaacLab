@@ -1128,9 +1128,9 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     agent = FrankaPourResetMixturePPORunnerCfg()
 
     assert cfg.curriculum.reset_mixture.func is mdp.PourResetMixture
-    assert cfg.reset_mixture_probabilities == pytest.approx((0.40, 0.25, 0.20, 0.15))
-    assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.25, 0.35, 0.40))
-    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.15)
+    assert cfg.reset_mixture_probabilities == pytest.approx((0.25, 0.25, 0.25, 0.25))
+    assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.05, 0.05, 0.90))
+    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.50)
     assert cfg.curriculum_randomization_extent_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_arm_fraction_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_target_fraction_levels == pytest.approx((0.0, 1.0))
@@ -1158,7 +1158,9 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.actions.arm_action.body_name == cfg.tcp_body_name
     assert cfg.actions.arm_action.body_offset.pos == pytest.approx(cfg.tcp_offset_pos)
     assert cfg.actions.arm_action.body_offset.rot == pytest.approx(cfg.tcp_offset_rot)
-    assert cfg.actions.arm_action.scale == pytest.approx((0.02, 0.02, 0.02, 0.10, 0.10, 0.10))
+    assert cfg.actions.arm_action.scale == pytest.approx(
+        (0.02 / 3.0, 0.02 / 3.0, 0.02 / 3.0, 0.10 / 3.0, 0.10 / 3.0, 0.10 / 3.0)
+    )
     assert cfg.actions.arm_action.controller.command_type == "pose"
     assert cfg.actions.arm_action.controller.use_relative_mode is True
     assert cfg.actions.arm_action.controller.ik_method == "adaptive_dls"
@@ -1166,7 +1168,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.actions.arm_action.controller.joint_limit_avoidance_margin == pytest.approx(0.25)
     assert cfg.actions.gripper_action.use_incremental_target is False
     assert cfg.actions.gripper_action.binary_threshold == pytest.approx(0.0)
-    assert cfg.actions.gripper_action.alpha == pytest.approx(0.2)
+    assert cfg.actions.gripper_action.alpha == pytest.approx(1.0 - 0.8 ** (1.0 / 3.0))
     assert eval_cfg.reset_mixture_probabilities == pytest.approx((1.0, 0.0, 0.0, 0.0))
     assert eval_cfg.curriculum_randomization_extent_levels[-1] == pytest.approx(1.0)
     reward_names = {name for name, term_cfg in vars(cfg.rewards).items() if isinstance(term_cfg, RewardTermCfg)}
@@ -1227,9 +1229,11 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     finalized = cfg.finalize()
     assert isinstance(finalized.rewards, pour_env_cfg.ResetMixtureRewardsCfg)
     assert isinstance(finalized.actions.arm_action, mdp.DifferentialInverseKinematicsActionCfg)
-    assert finalized.actions.arm_action.scale == pytest.approx((0.02, 0.02, 0.02, 0.10, 0.10, 0.10))
+    assert finalized.actions.arm_action.scale == pytest.approx(
+        (0.02 / 3.0, 0.02 / 3.0, 0.02 / 3.0, 0.10 / 3.0, 0.10 / 3.0, 0.10 / 3.0)
+    )
     assert finalized.actions.gripper_action.binary_threshold == pytest.approx(0.0)
-    assert finalized.actions.gripper_action.alpha == pytest.approx(0.2)
+    assert finalized.actions.gripper_action.alpha == pytest.approx(1.0 - 0.8 ** (1.0 / 3.0))
 
     overridden = FrankaPourEnvCfg_RESET_MIXTURE()
     overridden.tcp_offset_pos = (0.0, 0.0, 0.10)
@@ -1312,7 +1316,7 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     assert mixture.critic.obs_normalization is True
     assert mixture.actor.distribution_cfg.class_name == "HeteroscedasticGaussianDistribution"
     assert mixture.actor.distribution_cfg.init_std == pytest.approx(0.8)
-    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 1.05))
+    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 1.0))
     assert (
         mixture.actor.distribution_cfg.std_range[0]
         < mixture.actor.distribution_cfg.init_std
@@ -1320,12 +1324,12 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     )
     assert mixture.actor.distribution_cfg.std_type == "log"
     assert mixture.algorithm.entropy_coef == pytest.approx(1.0e-3)
-    assert mixture.algorithm.gamma == pytest.approx(0.99)
-    assert mixture.algorithm.lam == pytest.approx(0.95)
+    assert mixture.algorithm.gamma == pytest.approx(0.99 ** (1.0 / 3.0))
+    assert mixture.algorithm.lam == pytest.approx(0.95 ** (1.0 / 3.0))
     assert mixture.algorithm.num_learning_epochs == 5
-    assert mixture.algorithm.num_mini_batches == 4
+    assert mixture.algorithm.num_mini_batches == 8
     assert mixture.algorithm.learning_rate == pytest.approx(1.0e-4)
-    assert mixture.algorithm.schedule == "adaptive"
+    assert mixture.algorithm.schedule == "fixed"
 
     assert reverse.num_steps_per_env == 32
     assert reverse.actor.hidden_dims == [256, 128, 64]
