@@ -56,7 +56,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 from isaaclab.visualizers import VisualizerCfg
 
-from isaaclab_contrib.coupling import CoupledProxyCfg, CoupledProxySolverCfg, CoupledSolverEntryCfg
+from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 
 from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 
@@ -935,10 +935,10 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         self._apply_robot_cfg()
 
         self.sim.physics = NewtonCfg(
-            solver_cfg=CoupledProxySolverCfg(
+            solver_cfg=CouplerProxyCfg(
                 scene_cfg=self.scene,
                 entries=[
-                    CoupledSolverEntryCfg(
+                    CouplerEntryCfg(
                         name=RIGID_ENTRY,
                         # Proxy coupling keeps the MPM stable, so the arm integrator can be the faster
                         # "implicitfast" (unlike base coupling, which needed "euler"). The cup is a
@@ -955,7 +955,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         include_static_shapes=True,
                         substeps=self.rigid_substeps,
                     ),
-                    CoupledSolverEntryCfg(
+                    CouplerEntryCfg(
                         name=MPM_ENTRY,
                         solver_cfg=MPMSolverCfg(
                             voxel_size=self.voxel_size,
@@ -983,7 +983,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                     ),
                 ],
                 proxies=[
-                    CoupledProxyCfg(
+                    CouplerProxyMappingCfg(
                         source=RIGID_ENTRY,
                         destination=MPM_ENTRY,
                         bodies=[SceneEntityCfg("source_cup"), SceneEntityCfg("target_cup")],
@@ -991,7 +991,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         mode="lagged",
                         # Implicit MPM resolves its proxy colliders internally; the shared outer
                         # pipeline is only needed for rigid MJWarp contacts.
-                        collision_pipeline_factory=lambda _model: None,
+                        collision_pipeline=lambda _model: None,
                     )
                 ],
                 iterations=self.proxy_iterations,

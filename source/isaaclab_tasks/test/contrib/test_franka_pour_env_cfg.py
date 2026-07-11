@@ -23,7 +23,7 @@ from isaaclab.managers import CurriculumTermCfg, RewardTermCfg, SceneEntityCfg, 
 from isaaclab.sim.schemas import MassCfg, UsdPhysicsCollisionCfg, UsdPhysicsRigidBodyCfg
 from isaaclab.sim.spawners.materials import RigidBodyMaterialBaseCfg
 
-from isaaclab_contrib.coupling import CoupledProxySolverCfg, NewtonCoupledSolverManager
+from isaaclab_contrib.coupling import CouplerProxyCfg, NewtonCoupler
 
 import isaaclab_tasks.contrib.franka_pour as franka_pour
 import isaaclab_tasks.contrib.franka_pour.config.franka  # noqa: F401
@@ -383,7 +383,7 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     solver = cfg.sim.physics.solver_cfg
     entries = {entry.name: entry for entry in solver.entries}
     assert set(entries) == {"arm", "media"}
-    assert isinstance(solver, CoupledProxySolverCfg)
+    assert isinstance(solver, CouplerProxyCfg)
 
     arm = entries["arm"]
     media = entries["media"]
@@ -414,8 +414,8 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert len(proxies) == 1
     assert proxies[0].source == "arm" and proxies[0].destination == "media"
     assert proxies[0].bodies == [SceneEntityCfg("source_cup"), SceneEntityCfg("target_cup")]
-    assert proxies[0].collision_pipeline_factory is not None
-    assert proxies[0].collision_pipeline_factory(None) is None
+    assert proxies[0].collision_pipeline is not None
+    assert proxies[0].collision_pipeline(None) is None
     assert proxies[0].mass_scale == pytest.approx(cfg.proxy_mass_scale)
     assert cfg.proxy_mass_scale == pytest.approx(1000.0)
     assert solver.iterations == cfg.proxy_iterations
@@ -450,7 +450,7 @@ def test_finalize_propagates_post_init_solver_overrides():
     assert entries["arm"].substeps == 5
     assert resolved.sim.physics.num_substeps == 3
     assert resolved.sim.physics.use_cuda_graph is False
-    assert isinstance(coupled_cfg, CoupledProxySolverCfg)
+    assert isinstance(coupled_cfg, CouplerProxyCfg)
     assert coupled_cfg.iterations == 4
     assert proxy.mass_scale == pytest.approx(0.25)
 
@@ -1839,7 +1839,7 @@ def test_media_selector_includes_spill_floor_without_unrelated_shapes():
         particle_count=3,
     )
 
-    resolved = NewtonCoupledSolverManager._resolve_entry(model, media, cfg.scene)
+    resolved = NewtonCoupler._resolve_entry(model, media, cfg.scene)
 
     assert resolved.bodies == [1]
     assert resolved.shapes == [1]
@@ -1892,7 +1892,7 @@ def test_task_source_does_not_traverse_private_solver_state():
         if isinstance(node, ast.Attribute)
         and node.attr.startswith("_")
         and isinstance(node.value, ast.Name)
-        and node.value.id in {"NewtonManager", "NewtonCoupledSolverManager"}
+        and node.value.id in {"NewtonManager", "NewtonCoupler"}
     }
     assert private_manager_attrs == set()
 
