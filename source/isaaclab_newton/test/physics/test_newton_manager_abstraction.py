@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import warp as wp
+from isaaclab_newton.cloner import copy_newton_source_builder, newton_builder_world_hook
 from isaaclab_newton.physics import (
     FeatherstoneSolverCfg,
     KaminoSolverCfg,
@@ -473,6 +474,111 @@ def test_cuda_graph_capture_uses_simulation_device(monkeypatch):
 
     assert captured_devices == ["cuda:1"]
     assert NewtonManager._graph is captured_graph
+
+
+def test_forward_publishes_reset_fk_to_fabric(monkeypatch):
+    """A public forward call must publish reset joint poses before returning."""
+    events = []
+    world_mask = SimpleNamespace(zero_=lambda: events.append("clear_world"))
+    fk_mask = SimpleNamespace(zero_=lambda: events.append("clear_fk"))
+
+    monkeypatch.setattr(NewtonManager, "_world_reset_mask", world_mask, raising=False)
+    monkeypatch.setattr(NewtonManager, "_fk_reset_mask", fk_mask, raising=False)
+    monkeypatch.setattr(NewtonManager, "_usdrt_stage", object(), raising=False)
+    monkeypatch.setattr(
+        NewtonManager,
+        "_reset_solver_internals",
+        classmethod(lambda cls, mask: events.append(("reset", mask))),
+    )
+    monkeypatch.setattr(
+        NewtonManager,
+        "_eval_fk",
+        classmethod(lambda cls, worlds, articulations: events.append(("fk", worlds, articulations))),
+    )
+    monkeypatch.setattr(
+        NewtonManager,
+        "_mark_transforms_dirty",
+        classmethod(lambda cls: events.append("mark_transforms")),
+    )
+    monkeypatch.setattr(
+        NewtonManager,
+        "sync_transforms_to_usd",
+        classmethod(lambda cls: events.append("sync_transforms")),
+    )
+
+    NewtonManager.forward()
+
+    assert events == [
+        ("reset", world_mask),
+        ("fk", world_mask, fk_mask),
+        "mark_transforms",
+        "sync_transforms",
+        "clear_fk",
+        "clear_world",
+    ]
+
+
+def test_newton_builder_world_hook_is_scoped_and_preserves_existing_registration(monkeypatch):
+    def existing(*args):
+        pass
+
+    def added(*args):
+        pass
+
+    hooks = [existing]
+    monkeypatch.setattr(NewtonManager, "_per_world_builder_hooks", hooks, raising=False)
+
+    with newton_builder_world_hook(added):
+        assert hooks == [existing, added]
+    assert hooks == [existing]
+
+    with newton_builder_world_hook(existing):
+        assert hooks == [existing]
+    assert hooks == [existing]
+
+
+def test_newton_builder_world_hook_cleans_up_after_error(monkeypatch):
+    def hook(*args):
+        pass
+
+    hooks = []
+    monkeypatch.setattr(NewtonManager, "_per_world_builder_hooks", hooks, raising=False)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        with newton_builder_world_hook(hook):
+            raise RuntimeError("stop")
+
+    assert hooks == []
+
+
+def test_copy_newton_source_builder_detaches_mutable_state_and_geometry(monkeypatch):
+    geometry = SimpleNamespace(name="mesh", copy=lambda: SimpleNamespace(name="mesh-copy"))
+    prototype = SimpleNamespace(
+        values=[1],
+        mapping={"rows": [2]},
+        array=np.asarray([3.0], dtype=np.float32),
+        shape_source=[geometry, None],
+    )
+    monkeypatch.setattr(NewtonManager, "_cl_protos", {"/World/envs/env_0": prototype}, raising=False)
+
+    builder = copy_newton_source_builder("/World/envs/env_0")
+    builder.values.append(4)
+    builder.mapping["rows"].append(5)
+    builder.array[0] = 6.0
+
+    assert builder is not prototype
+    assert builder.shape_source[0].name == "mesh-copy"
+    assert builder.shape_source[0] is not prototype.shape_source[0]
+    assert prototype.values == [1]
+    assert prototype.mapping == {"rows": [2]}
+    assert prototype.array == pytest.approx([3.0])
+
+
+def test_copy_newton_source_builder_rejects_unknown_source(monkeypatch):
+    monkeypatch.setattr(NewtonManager, "_cl_protos", {"/World/known": object()}, raising=False)
+
+    with pytest.raises(RuntimeError, match="/World/missing.*Available: /World/known"):
+        copy_newton_source_builder("/World/missing")
 
 
 # ---------------------------------------------------------------------------
