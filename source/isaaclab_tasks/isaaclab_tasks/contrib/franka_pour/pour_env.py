@@ -32,6 +32,7 @@ from isaaclab_newton.cloner import copy_newton_source_builder, newton_builder_wo
 from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKJointLimitObjectiveCfg, NewtonIKPoseObjectiveCfg
 from isaaclab_newton.ik.newton_ik_solver import NewtonIKSolver
 from isaaclab_newton.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
+from isaaclab_newton.physics import NewtonManager
 
 import isaaclab.sim as sim_utils
 from isaaclab.cloner import resolve_clone_plan_source
@@ -53,6 +54,7 @@ from .reset_utils import (
     asymmetric_reset_offset_samples,
     balanced_cyclic_permutations,
     balanced_reset_triples,
+    boolean_selection_mask,
     hierarchical_reset_sampling_weights,
     polar_workspace_cells,
     reset_rotation_vector_samples,
@@ -2865,6 +2867,7 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         env_ids = env_ids.to(device=self.device, dtype=torch.long)
         if env_ids.numel() == 0:
             return
+        world_mask = boolean_selection_mask(self.num_envs, env_ids)
         n = env_ids.numel()
         stage = self.curriculum_stage[env_ids]
         arm_q = self._curriculum_arm_q_t[stage].clone()
@@ -3010,6 +3013,13 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         new_p = self._sample_cup_media(cup_world, source_quat)
         self._media.write_particle_pos_to_sim_index(new_p, env_ids=env_ids)
         self._media.write_particle_velocity_to_sim_index(torch.zeros_like(new_p), env_ids=env_ids)
+        # The public particle writers author q/qd in both manager buffers, while implicit MPM also
+        # owns constitutive and collider history. Reset that history for only the rewritten worlds
+        # so graph replay cannot restore strain from the previous episode.
+        NewtonManager.reset_solver_state(
+            world_mask=None if self.num_envs == 1 else wp.from_torch(world_mask, dtype=wp.bool),
+            flags=newton.StateFlags.BODY | newton.StateFlags.PARTICLE,
+        )
         self._particle_region_cache = None
         self._particle_region_cache_step = -1
         self.episode_succeeded[env_ids] = False

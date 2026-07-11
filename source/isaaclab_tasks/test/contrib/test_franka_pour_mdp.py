@@ -460,6 +460,39 @@ def test_stable_success_is_directly_reusable_as_a_state_reward():
     assert env.episode_succeeded.tolist() == [True, True, True, True]
 
 
+def test_nonterminating_success_context_tracks_state_and_remains_replay_discoverable():
+    env = FakeEnv()
+    env._cup[:, 2] = 0.06
+    env._tcp[:] = env._grasp
+    env._width[:] = env.gripper_grasp_width
+    env._gripper_command[:] = 0.0
+    env._tgt[:] = 950.0
+
+    first = terminations.nonterminating_stable_pour_success(env, dwell_time_s=2.0 * env.step_dt)
+    env.common_step_counter += 1
+    second = terminations.nonterminating_stable_pour_success(env, dwell_time_s=2.0 * env.step_dt)
+
+    assert not bool(torch.any(first))
+    assert not bool(torch.any(second))
+    assert env.episode_succeeded.tolist() == [True, True, True, True]
+    assert rewards.sustained_pour_success(env, dwell_time_s=2.0 * env.step_dt).tolist() == [1.0, 1.0, 1.0, 1.0]
+
+    # Record/replay tools remove the managed term before invoking its configured callable.
+    env.termination_manager._terms.pop("success")
+    replay_success = terminations.nonterminating_stable_pour_success(env, dwell_time_s=2.0 * env.step_dt)
+    assert bool(torch.all(replay_success))
+
+
+def test_sustained_success_reward_is_current_unit_state_not_terminal_pulse():
+    env = FakeEnv()
+    env._success_dwell_count[:] = torch.tensor([0, 1, 2, 3])
+
+    success = rewards.sustained_pour_success(env, dwell_time_s=2.0 * env.step_dt)
+
+    assert success.tolist() == [0.0, 0.0, 1.0, 1.0]
+    assert float(success.max()) == 1.0
+
+
 def test_unsuccessful_timeout_excludes_same_step_success():
     env = SimpleNamespace(
         episode_length_buf=torch.tensor([10, 10, 9, 10]),

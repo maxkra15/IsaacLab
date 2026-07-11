@@ -107,11 +107,14 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         clip_param=0.2,
         entropy_coef=1.0e-3,
         num_learning_epochs=5,
-        num_mini_batches=4,
+        # At 2,048 environments per rank, eight splits preserve the proven
+        # 1,024-env run's 8,192 samples per rank and optimizer minibatch.
+        num_mini_batches=8,
         learning_rate=1.0e-4,
         schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
+        # Preserve the earlier 10 Hz policy's discount and GAE horizon per physical second.
+        gamma=0.99 ** (1.0 / 3.0),
+        lam=0.95 ** (1.0 / 3.0),
         desired_kl=0.01,
         max_grad_norm=1.0,
     )

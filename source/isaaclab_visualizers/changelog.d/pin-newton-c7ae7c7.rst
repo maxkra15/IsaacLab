@@ -2,5 +2,5 @@ Changed
 ^^^^^^^
 
 * Changed the ``newton[sim]`` dependency pin of the visualizer extras to Newton
-  commit ``c7ae7c7648cd0717df39e5c94b95d5a02c997320`` and added the
-  ``newton-usd-schemas`` dependency required by Newton's USD parsing.
+  commit ``b691d94db1a03c514de03bfdaf27cb9136fc766f`` and required
+  ``newton-usd-schemas>=0.4.0`` for Newton's USD parsing.

@@ -1021,3 +1021,11 @@ def pour_success_bonus(env: FrankaPourEnv) -> torch.Tensor:
     """Reward exactly the managed stable-success termination."""
     success = _success_terminal(env)
     return success.float() / max(float(env.step_dt), 1.0e-6)
+
+
+def sustained_pour_success(env: FrankaPourEnv, dwell_time_s: float = 0.15) -> torch.Tensor:
+    """Reward the current dwell-qualified success state without a terminal pulse."""
+    if not math.isfinite(dwell_time_s) or dwell_time_s <= 0.0:
+        raise ValueError("dwell_time_s must be finite and positive.")
+    dwell_steps = max(1, math.ceil(float(dwell_time_s) / max(float(env.step_dt), 1.0e-6)))
+    return (env._success_dwell_count >= dwell_steps).float()

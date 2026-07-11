@@ -43,7 +43,7 @@ dependencies = [
     "pytetwild==0.2.3 ; platform_machine in 'x86_64 AMD64'",
     "transformers==4.57.6",
     "einops",
-    "warp-lang==1.15.0.dev20260626",
+    "warp-lang==1.16.0.dev20260708",
     "matplotlib>=3.10.3",
     "pillow==12.1.1",  # keep consistent with isaac sim
     "botocore",  # omni.replicator.core S3 backend
@@ -161,8 +161,8 @@ torchaudio = "2.11.0"
 ovphysx = "0.5.2+head.f62c22207c"
 ovrtx = ">=0.3.0,<0.4.0"
 # Newton git commit + matching warp-lang prerelease (upgraded together).
-newton = "c7ae7c7648cd0717df39e5c94b95d5a02c997320"
-warp = "1.15.0.dev20260626"
+newton = "b691d94db1a03c514de03bfdaf27cb9136fc766f"
+warp = "1.16.0.dev20260708"
 
 [tool.ruff]
 line-length = 120
@@ -328,9 +328,9 @@ prerelease = "allow"
 # the CUDA indexes via [tool.uv.sources]. Values mirror [tool.isaaclab.versions] above.
 override-dependencies = [
     "numpy>=2",
-    "newton[sim] @ git+https://github.com/newton-physics/newton.git@c7ae7c7648cd0717df39e5c94b95d5a02c997320",
+    "newton[sim] @ git+https://github.com/newton-physics/newton.git@b691d94db1a03c514de03bfdaf27cb9136fc766f",
     # Force the Newton-matched schemas over isaacsim's ==0.2.0 pin.
-    "newton-usd-schemas>=0.3.1",
+    "newton-usd-schemas>=0.4.0",
     "torch==2.11.0",
     "torchvision==0.26.0",
     "torchaudio==2.11.0",
