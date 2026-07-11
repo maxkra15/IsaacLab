@@ -998,7 +998,9 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         bodies=[SPILL_FLOOR_LABEL_PATTERN],
                         include_static_shapes=False,
                         include_child_joints=False,
-                        in_place=True,
+                        # Keep a distinct MPM output state. In-place state reuse can retain stale
+                        # per-world data across the asynchronous masked resets used during RL.
+                        in_place=False,
                     ),
                 ],
                 proxies=[
@@ -1998,9 +2000,9 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
     # Ordered as reaching, near-object, grasped, and near-goal. Sample the four OmniReset regions
     # uniformly; successful episodes still recycle immediately through the termination manager.
     reset_mixture_probabilities: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
-    # Cover the collision-screened approach, alignment bridge, and local grasp neighborhood. With
-    # one quarter of Near-Object states preloaded below, these open-state masses produce a combined
-    # 18.75/26.25/55% split instead of collapsing the distribution onto exact grasps.
+    # Cover the collision-screened approach, alignment bridge, and local grasp neighborhood. Keep
+    # three quarters of Near-Object states open for grasp acquisition; collision screening reports
+    # the realized early/bridge/local phase masses at startup.
     reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.25, 0.35, 0.40)
     reset_mixture_near_object_preloaded_probability: float = 0.25
     reset_mixture_statistics_window_size: int = 4096

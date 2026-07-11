@@ -124,7 +124,7 @@ def _make_runtime_cfg(
     cfg.sim.render_interval = 1
 
     entries = {entry.name: entry for entry in cfg.sim.physics.solver_cfg.entries}
-    assert entries[MPM_ENTRY].in_place
+    assert not entries[MPM_ENTRY].in_place
     return cfg
 
 
