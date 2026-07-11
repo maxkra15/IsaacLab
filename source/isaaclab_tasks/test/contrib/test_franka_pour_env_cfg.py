@@ -1129,8 +1129,8 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
 
     assert cfg.curriculum.reset_mixture.func is mdp.PourResetMixture
     assert cfg.reset_mixture_probabilities == pytest.approx((0.25, 0.25, 0.25, 0.25))
-    assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.25, 0.35, 0.40))
-    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.25)
+    assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.05, 0.05, 0.90))
+    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.50)
     assert cfg.curriculum_randomization_extent_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_arm_fraction_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_target_fraction_levels == pytest.approx((0.0, 1.0))
@@ -1186,7 +1186,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     }
     assert cfg.rewards.reach.func is mdp.tcp_cup_distance_tanh
     assert cfg.rewards.reach.weight == pytest.approx(0.1)
-    assert cfg.rewards.reach.params["std"] == pytest.approx(0.3)
+    assert cfg.rewards.reach.params["std"] == pytest.approx(1.0)
     assert cfg.rewards.goal_distance.func is mdp.media_target_distance_tanh
     assert cfg.rewards.goal_distance.weight == pytest.approx(0.1)
     assert cfg.rewards.goal_distance.params["std"] == pytest.approx(0.2)
@@ -1246,7 +1246,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert overridden.sim.render_interval == 6
     assert agent.experiment_name == "franka_pour_reset_mixture_diffik"
     assert agent.run_name == "omnireset_diffik"
-    assert agent.num_steps_per_env == 32
+    assert agent.num_steps_per_env == 96
 
 
 def test_reset_mixture_play_preserves_policy_abi_with_captured_fixed_grid():
@@ -1312,7 +1312,7 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     mixture = FrankaPourResetMixturePPORunnerCfg()
     reverse = FrankaPourPPORunnerCfg()
 
-    assert mixture.num_steps_per_env == 32
+    assert mixture.num_steps_per_env == 96
     assert mixture.save_interval == 25
     assert mixture.resume is False
     assert mixture.actor.hidden_dims == [512, 256, 128, 64]
@@ -1320,7 +1320,7 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     assert mixture.actor.obs_normalization is True
     assert mixture.critic.obs_normalization is True
     assert mixture.actor.distribution_cfg.class_name == "HeteroscedasticGaussianDistribution"
-    assert mixture.actor.distribution_cfg.init_std == pytest.approx(0.8)
+    assert mixture.actor.distribution_cfg.init_std == pytest.approx(0.4)
     assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 1.0))
     assert (
         mixture.actor.distribution_cfg.std_range[0]
@@ -1332,7 +1332,7 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     assert mixture.algorithm.gamma == pytest.approx(0.99 ** (1.0 / 3.0))
     assert mixture.algorithm.lam == pytest.approx(0.95 ** (1.0 / 3.0))
     assert mixture.algorithm.num_learning_epochs == 5
-    assert mixture.algorithm.num_mini_batches == 8
+    assert mixture.algorithm.num_mini_batches == 24
     assert mixture.algorithm.learning_rate == pytest.approx(1.0e-4)
     assert mixture.algorithm.schedule == "fixed"
 

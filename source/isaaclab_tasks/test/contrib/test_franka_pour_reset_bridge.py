@@ -38,7 +38,7 @@ def test_near_object_bank_preserves_open_and_preloaded_population_mass(monkeypat
         target_cup_inner_depth=0.10,
         target_cup_wall_thickness=0.005,
         target_cup_reset_pos=(0.5, -0.2, 0.0),
-        reset_mixture_near_object_open_phase_probabilities=(0.25, 0.35, 0.40),
+        reset_mixture_near_object_open_phase_probabilities=(0.05, 0.05, 0.90),
         reset_mixture_near_object_preloaded_probability=preload_probability,
         cup_grasp_height=0.05,
         gripper_open_pos=0.04,

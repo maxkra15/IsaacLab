@@ -348,7 +348,7 @@ class ResetMixtureRewardsCfg:
     # Task rewards: generic reach and goal-set distance plus strict particle success.
     # The broad kernel remains informative across full-workspace reaching while the reset mixture
     # supplies close-contact precision without adding a task-specific grasp trajectory.
-    reach = RewTerm(func=mdp.tcp_cup_distance_tanh, weight=0.1, params={"std": 0.3})
+    reach = RewTerm(func=mdp.tcp_cup_distance_tanh, weight=0.1, params={"std": 1.0})
     # Particle distances span only a few decimetres; this preserves useful transfer contrast
     # while retaining the same task-independent tanh form used by OmniReset.
     goal_distance = RewTerm(func=mdp.media_target_distance_tanh, weight=0.1, params={"std": 0.2})
@@ -2000,11 +2000,11 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
     # Ordered as reaching, near-object, grasped, and near-goal. Sample the four OmniReset regions
     # uniformly; successful episodes still recycle immediately through the termination manager.
     reset_mixture_probabilities: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
-    # Cover the collision-screened approach, alignment bridge, and local grasp neighborhood. Keep
-    # three quarters of Near-Object states open for grasp acquisition; collision screening reports
-    # the realized early/bridge/local phase masses at startup.
-    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.25, 0.35, 0.40)
-    reset_mixture_near_object_preloaded_probability: float = 0.25
+    # Keep Near-Object concentrated on the sampled grasp neighborhood, matching OmniReset's local
+    # grasp perturbations while retaining a small collision-screened approach/alignment bridge.
+    # Split open and preloaded hands evenly so contact acquisition and transport remain connected.
+    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.05, 0.05, 0.90)
+    reset_mixture_near_object_preloaded_probability: float = 0.50
     reset_mixture_statistics_window_size: int = 4096
 
     def __post_init__(self):
@@ -2038,7 +2038,7 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
         self.actions.gripper_action.alpha = 1.0 - 0.8 ** (1.0 / 3.0)
         super().__post_init__()
         # Run the reset-mixture policy at 30 Hz over the 120 Hz simulation. Five actor frames cover
-        # 0.167 s of contact/slip history and a 32-step PPO rollout spans 1.067 s.
+        # 0.167 s of contact/slip history; the agent's 96-step PPO rollout spans 3.2 s.
         self.decimation = 4
         self.sim.render_interval = self.decimation
         self.episode_length_s = 16.0
@@ -2048,8 +2048,8 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
         # and the reset mixture keeps presenting fresh interaction states.
         self.terminations.success.func = mdp.stable_pour_success
         self.terminations.lost_grasp.params["terminate"] = False
-        # Spilled particles already lose all goal-distance credit. Keep spill diagnostic-only so
-        # early exploration is not dominated by the -10 abnormal-state terminal penalty.
+        # Keep spill diagnostic-only during exploration. Immediate spill termination overwhelms
+        # the local grasp regions with terminal failures and removes recovery/bridge trajectories.
         self.terminations.spill.params["terminate"] = False
         self.terminations.time_out.func = mdp.unsuccessful_time_out
 
