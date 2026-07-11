@@ -1998,9 +1998,10 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
     # Ordered as reaching, near-object, grasped, and near-goal. Sample the four OmniReset regions
     # uniformly; successful episodes still recycle immediately through the termination manager.
     reset_mixture_probabilities: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
-    # Keep the open Near-Object population concentrated at the final screened approach pose. Exact
-    # preloaded grasps supply the contact bridge needed by the task's binary gripper action.
-    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.05, 0.05, 0.90)
+    # Cover the collision-screened approach, alignment bridge, and local grasp neighborhood. With
+    # half of all Near-Object states preloaded below, these open-state masses produce a combined
+    # 12.5/17.5/70% split instead of collapsing almost the entire distribution onto exact grasps.
+    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.25, 0.35, 0.40)
     reset_mixture_near_object_preloaded_probability: float = 0.50
     reset_mixture_statistics_window_size: int = 4096
 
