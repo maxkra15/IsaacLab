@@ -3,10 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Configuration classes for Newton coupled solvers.
+"""Configuration classes for the Newton coupler.
 
 The configurations describe named solver entries and the interfaces that
-couple them. A manager turns each entry's ownership selectors into a Newton
+couple them. A coupler turns each entry's ownership selectors into a Newton
 ``ModelView`` and dispatches to the selected experimental coupled solver.
 """
 
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 @configclass
-class CoupledSolverEntryCfg:
+class CouplerEntryCfg:
     """Configuration for one named sub-solver and its model ownership.
 
     Bodies are selected by scene entity or full Newton body-label regex.
@@ -83,7 +83,7 @@ class CoupledSolverEntryCfg:
 
 
 @configclass
-class CoupledProxyCfg:
+class CouplerProxyMappingCfg:
     """Configuration for one directed virtual-proxy mapping."""
 
     source: str = MISSING
@@ -96,7 +96,7 @@ class CoupledProxyCfg:
     """Source bodies exposed as proxies in the destination entry.
 
     Selectors use the same scene-entity and full-label-regex semantics as
-    :attr:`CoupledSolverEntryCfg.bodies`.
+    :attr:`CouplerEntryCfg.bodies`.
     """
 
     particles: list[int] = field(default_factory=list)
@@ -109,13 +109,13 @@ class CoupledProxyCfg:
     """Scale applied to proxy effective mass and inertia in the destination view."""
 
     collide_interval: int | None = None
-    """Collision refresh interval when :attr:`collision_pipeline_factory` is set.
+    """Collision refresh interval when :attr:`collision_pipeline` is set.
 
     ``None`` refreshes contacts on every proxy pass. Explicit values must be
     positive integers.
     """
 
-    collision_pipeline_factory: Callable[[ModelView], CollisionPipeline | None] | None = None
+    collision_pipeline: Callable[[ModelView], CollisionPipeline | None] | None = None
     """Optional factory for the proxy destination's collision pipeline."""
 
     shape_material_ke: float | None = None
@@ -135,19 +135,18 @@ class CoupledProxyCfg:
 
 
 @configclass
-class CoupledSolverCfg(NewtonModelSolverCfg):
+class CouplerCfg(NewtonModelSolverCfg):
     """Base configuration for a Newton experimental coupled solver.
 
-    Every body and particle in the parent model must have one unambiguous
-    owner among :attr:`entries`. Joint and shape ownership is also unique, but
-    may intentionally omit constraints or collision geometry from all views.
-    Use a concrete subclass to configure the coupling interfaces.
+    Bodies, particles, joints, and shapes may be assigned to at most one
+    entry. Unassigned model elements remain outside the nested solvers. Use a
+    concrete subclass to configure the coupling interfaces.
     """
 
-    class_type: type[NewtonManager] | str = "{DIR}.coupled_manager:NewtonCoupledSolverManager"
-    """Manager class for the coupled solver."""
+    class_type: type[NewtonManager] | str = "{DIR}.coupler:NewtonCoupler"
+    """Coupler implementation class."""
 
-    entries: list[CoupledSolverEntryCfg] = field(default_factory=list)
+    entries: list[CouplerEntryCfg] = field(default_factory=list)
     """Ordered named sub-solver entries and their ownership selectors."""
 
     scene_cfg: InteractiveSceneCfg | None = None
@@ -157,10 +156,10 @@ class CoupledSolverCfg(NewtonModelSolverCfg):
 
 
 @configclass
-class CoupledProxySolverCfg(CoupledSolverCfg):
+class CouplerProxyCfg(CouplerCfg):
     """Configuration for Newton's lagged-impulse virtual-proxy coupling."""
 
-    proxies: list[CoupledProxyCfg] = field(default_factory=list)
+    proxies: list[CouplerProxyMappingCfg] = field(default_factory=list)
     """Directed proxy mappings between named solver entries."""
 
     iterations: int = 1
@@ -168,10 +167,21 @@ class CoupledProxySolverCfg(CoupledSolverCfg):
 
 
 @configclass
-class CoupledAdmmSolverCfg(CoupledSolverCfg):
+class CouplerAdmmContactPairCfg:
+    """Configuration for one symmetric ADMM contact interface."""
+
+    source: str = MISSING
+    """Name of one solver entry."""
+
+    destination: str = MISSING
+    """Name of the other solver entry."""
+
+
+@configclass
+class CouplerAdmmCfg(CouplerCfg):
     """Configuration for Newton's linearized ADMM coupling."""
 
-    contact_pairs: list[tuple[str, str]] | None = None
+    contact_pairs: list[CouplerAdmmContactPairCfg] | None = None
     """Symmetric contact interfaces between named solver entries.
 
     ``None`` asks Newton to detect every distinct entry pair automatically.
