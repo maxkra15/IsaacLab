@@ -1130,7 +1130,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.curriculum.reset_mixture.func is mdp.PourResetMixture
     assert cfg.reset_mixture_probabilities == pytest.approx((0.25, 0.25, 0.25, 0.25))
     assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.25, 0.35, 0.40))
-    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.50)
+    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.25)
     assert cfg.curriculum_randomization_extent_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_arm_fraction_levels == pytest.approx((0.0, 1.0))
     assert cfg.curriculum_independent_target_fraction_levels == pytest.approx((0.0, 1.0))

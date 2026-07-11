@@ -1999,10 +1999,10 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
     # uniformly; successful episodes still recycle immediately through the termination manager.
     reset_mixture_probabilities: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
     # Cover the collision-screened approach, alignment bridge, and local grasp neighborhood. With
-    # half of all Near-Object states preloaded below, these open-state masses produce a combined
-    # 12.5/17.5/70% split instead of collapsing almost the entire distribution onto exact grasps.
+    # one quarter of Near-Object states preloaded below, these open-state masses produce a combined
+    # 18.75/26.25/55% split instead of collapsing the distribution onto exact grasps.
     reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.25, 0.35, 0.40)
-    reset_mixture_near_object_preloaded_probability: float = 0.50
+    reset_mixture_near_object_preloaded_probability: float = 0.25
     reset_mixture_statistics_window_size: int = 4096
 
     def __post_init__(self):
