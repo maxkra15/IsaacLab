@@ -25,6 +25,7 @@ from .actions import (  # noqa: F401
     CurriculumGripperPositionActionCfg,
     CurriculumJointPositionAction,
     CurriculumJointPositionActionCfg,
+    DifferentialInverseKinematicsActionMovingAverageCfg,
     TrajectoryJointPositionAction,
     TrajectoryJointPositionActionCfg,
 )

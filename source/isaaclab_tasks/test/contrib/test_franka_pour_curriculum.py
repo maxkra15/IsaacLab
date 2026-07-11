@@ -10,7 +10,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from isaaclab.envs.mdp.actions.task_space_actions import DifferentialInverseKinematicsAction
 from isaaclab.managers import CurriculumTermCfg
+from isaaclab.utils.modifiers import DigitalFilter, DigitalFilterCfg
 
 from isaaclab_tasks.contrib.franka_pour import pour_env as pour_env_module
 from isaaclab_tasks.contrib.franka_pour.mdp.actions import (
@@ -20,6 +22,9 @@ from isaaclab_tasks.contrib.franka_pour.mdp.actions import (
     _bilateral_gripper_preload,
 )
 from isaaclab_tasks.contrib.franka_pour.mdp.curriculums import PourCurriculum
+from isaaclab_tasks.contrib.franka_pour.mdp.task_space_actions import (
+    DifferentialInverseKinematicsActionMovingAverage,
+)
 from isaaclab_tasks.contrib.franka_pour.pour_env import FrankaPourEnv
 
 _STAGE_NAMES = (
@@ -682,6 +687,61 @@ def test_curriculum_joint_action_smooths_targets_and_reset_clears_history():
     action.reset(torch.tensor([1]))
     torch.testing.assert_close(action.processed_actions[1], torch.tensor([0.3, 0.4]))
     torch.testing.assert_close(action._previous_target[1], torch.tensor([0.3, 0.4]))
+
+
+def test_diffik_moving_average_filters_controller_input_but_preserves_raw_actions(monkeypatch):
+    action = DifferentialInverseKinematicsActionMovingAverage.__new__(DifferentialInverseKinematicsActionMovingAverage)
+    action._raw_actions = torch.zeros((2, 6))
+    action._action_filter = DigitalFilter(
+        DigitalFilterCfg(A=[0.0], B=[1.0 / 3.0] * 3),
+        data_dim=action._raw_actions.shape,
+        device="cpu",
+    )
+    controller_inputs = []
+
+    def process_actions_base(self, actions):
+        controller_inputs.append(actions.clone())
+        self._raw_actions.copy_(actions)
+
+    monkeypatch.setattr(DifferentialInverseKinematicsAction, "process_actions", process_actions_base)
+    raw = torch.tensor(((3.0,) * 6, (-3.0,) * 6))
+
+    action.process_actions(raw)
+    torch.testing.assert_close(controller_inputs[-1], raw / 3.0)
+    torch.testing.assert_close(action._raw_actions, raw)
+    action.process_actions(raw)
+    torch.testing.assert_close(controller_inputs[-1], 2.0 * raw / 3.0)
+    torch.testing.assert_close(action._raw_actions, raw)
+    action.process_actions(raw)
+    torch.testing.assert_close(controller_inputs[-1], raw)
+    torch.testing.assert_close(action._raw_actions, raw)
+
+
+def test_diffik_moving_average_partial_reset_clears_only_selected_history(monkeypatch):
+    action = DifferentialInverseKinematicsActionMovingAverage.__new__(DifferentialInverseKinematicsActionMovingAverage)
+    action._raw_actions = torch.zeros((2, 6))
+    action._action_filter = DigitalFilter(
+        DigitalFilterCfg(A=[0.0], B=[1.0 / 3.0] * 3),
+        data_dim=action._raw_actions.shape,
+        device="cpu",
+    )
+    controller_inputs = []
+
+    def process_actions_base(self, actions):
+        controller_inputs.append(actions.clone())
+        self._raw_actions.copy_(actions)
+
+    monkeypatch.setattr(DifferentialInverseKinematicsAction, "process_actions", process_actions_base)
+    raw = torch.tensor(((3.0,) * 6, (6.0,) * 6))
+    action.process_actions(raw)
+    action.process_actions(raw)
+
+    action.reset(torch.tensor([0]))
+    action.process_actions(torch.zeros_like(raw))
+
+    torch.testing.assert_close(controller_inputs[-1][0], torch.zeros(6))
+    torch.testing.assert_close(controller_inputs[-1][1], torch.full((6,), 4.0))
+    torch.testing.assert_close(action._raw_actions, torch.zeros_like(raw))
 
 
 def test_curriculum_joint_action_projects_only_early_stage_onto_validated_segment():

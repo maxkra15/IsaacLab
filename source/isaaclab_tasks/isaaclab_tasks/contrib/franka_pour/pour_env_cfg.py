@@ -2006,7 +2006,7 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
         # Match OmniReset's task-space interface while retaining the existing high-PD position
         # drives. DiffIK removes inverse kinematics from the policy without requiring OSC effort
         # control or any Newton-side changes.
-        self.actions.arm_action = mdp.DifferentialInverseKinematicsActionCfg(
+        self.actions.arm_action = mdp.DifferentialInverseKinematicsActionMovingAverageCfg(
             asset_name="robot",
             joint_names=[f"panda_joint{i}" for i in range(1, 8)],
             body_name=self.tcp_body_name,
@@ -2043,7 +2043,9 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
         # and the reset mixture keeps presenting fresh interaction states.
         self.terminations.success.func = mdp.stable_pour_success
         self.terminations.lost_grasp.params["terminate"] = False
-        self.terminations.spill.params["terminate"] = False
+        # More than ten percent spill is irreversible. Recycling the attempt supplies the general
+        # terminal-failure signal and avoids spending most of a rollout on an unrecoverable state.
+        self.terminations.spill.params["terminate"] = True
         self.terminations.time_out.func = mdp.unsuccessful_time_out
 
     def _validate_arm_action_cfg(self) -> None:

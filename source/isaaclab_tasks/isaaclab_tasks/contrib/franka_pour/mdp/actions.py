@@ -10,15 +10,28 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import MISSING
+from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
+from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg, JointPositionActionCfg
 from isaaclab.envs.mdp.actions.joint_actions import JointPositionAction
 from isaaclab.managers import ActionTerm, ActionTermCfg
 from isaaclab.utils.configclass import configclass
 
+if TYPE_CHECKING:
+    from .task_space_actions import DifferentialInverseKinematicsActionMovingAverage
+
 _GRIPPER_POSITION_TOLERANCE = 1.0e-6
+
+
+@configclass
+class DifferentialInverseKinematicsActionMovingAverageCfg(DifferentialInverseKinematicsActionCfg):
+    """Configuration for :class:`DifferentialInverseKinematicsActionMovingAverage`."""
+
+    class_type: type[DifferentialInverseKinematicsActionMovingAverage] | str = (
+        "{DIR}.task_space_actions:DifferentialInverseKinematicsActionMovingAverage"
+    )
 
 
 def _bilateral_gripper_preload(
