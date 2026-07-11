@@ -16,6 +16,7 @@ from isaaclab_tasks.contrib.franka_pour.reset_utils import (
     reset_rotation_vector_samples,
     sample_index_pools,
     scale_randomization_rows_by_extent,
+    target_xy_separated_from_source,
 )
 
 
@@ -160,6 +161,55 @@ def test_polar_workspace_cells_centers_azimuth_on_nonzero_nominal_bearing():
     )
 
 
+def test_polar_workspace_cells_clamp_each_ring_to_asymmetric_table_y_bounds():
+    grid_size = 5
+    y_range = (-0.19, 0.50)
+    cells = polar_workspace_cells(
+        (0.5, 0.0, 0.0),
+        radius_range=(0.40, 0.82),
+        azimuth_half_range=math.radians(55.0),
+        grid_size=grid_size,
+        y_range=y_range,
+        dtype=torch.float64,
+    )
+
+    rings = cells.reshape(grid_size, grid_size, 3)
+    radii = torch.linalg.vector_norm(rings[:, :, :2], dim=-1)
+    azimuth = torch.atan2(rings[:, :, 1], rings[:, :, 0])
+    torch.testing.assert_close(radii, radii[:, :1].expand_as(radii))
+    assert bool(torch.all(rings[:, :, 1] >= y_range[0] - 1.0e-12))
+    assert bool(torch.all(rings[:, :, 1] <= y_range[1] + 1.0e-12))
+    torch.testing.assert_close(rings[:, grid_size // 2, 1], torch.zeros(grid_size, dtype=torch.float64))
+    assert float(rings[0, 0, 1]) == pytest.approx(y_range[0])
+    assert float(rings[0, -1, 1]) == pytest.approx(0.40 * math.sin(math.radians(55.0)))
+    assert float(rings[-1, 0, 1]) == pytest.approx(y_range[0])
+    assert float(rings[-1, -1, 1]) == pytest.approx(y_range[1])
+    assert float(abs(azimuth[0, 0])) < math.radians(55.0)
+    assert float(azimuth[0, -1]) == pytest.approx(math.radians(55.0))
+    assert torch.unique(cells, dim=0).shape[0] == cells.shape[0]
+
+
+@pytest.mark.parametrize(
+    "nominal, y_range, message",
+    [
+        ((0.5, 0.0, 0.0), (-0.2,), "two values"),
+        ((0.5, 0.0, 0.0), (-0.2, float("nan")), "finite values"),
+        ((0.5, 0.0, 0.0), (0.2, -0.2), "strictly increasing"),
+        ((0.5, 0.0, 0.0), (0.0, 0.2), "strictly contain"),
+        ((0.5, 0.1, 0.0), (-0.2, 0.2), "positive X axis"),
+    ],
+)
+def test_polar_workspace_cells_reject_invalid_table_y_bounds(nominal, y_range, message):
+    with pytest.raises(ValueError, match=message):
+        polar_workspace_cells(
+            nominal,
+            radius_range=(0.4, 0.8),
+            azimuth_half_range=0.3,
+            grid_size=3,
+            y_range=y_range,
+        )
+
+
 @pytest.mark.parametrize(
     "nominal_radius, nominal_ring",
     [
@@ -230,6 +280,52 @@ def test_polar_workspace_cells_rejects_nonfloating_tensor_nominal():
             azimuth_half_range=0.2,
             grid_size=3,
         )
+
+
+def test_target_xy_separated_from_source_samples_both_table_sides():
+    source_xy = torch.tensor(((0.4, -0.1), (0.5, 0.0), (0.6, 0.1)), dtype=torch.float64)
+    separation = torch.tensor((0.16, 0.16, 0.16), dtype=torch.float64)
+    unit_samples = torch.tensor(((0.0, 0.0), (0.5, 0.45), (1.0, 1.0)), dtype=torch.float64)
+
+    target_xy = target_xy_separated_from_source(
+        source_xy,
+        target_center=(0.515, 0.0),
+        target_half_range=(0.265, 0.33),
+        minimum_y_separation=separation,
+        unit_samples=unit_samples,
+    )
+
+    assert target_xy[:, 0].tolist() == pytest.approx([0.25, 0.515, 0.78])
+    assert bool(torch.all(torch.abs(target_xy[:, 1] - source_xy[:, 1]) >= separation - 1.0e-12))
+    assert float(target_xy[0, 1]) < float(source_xy[0, 1])
+    assert float(target_xy[-1, 1]) > float(source_xy[-1, 1])
+    assert bool(torch.all(target_xy[:, 1] >= -0.33 - 1.0e-12))
+    assert bool(torch.all(target_xy[:, 1] <= 0.33 + 1.0e-12))
+
+
+def test_target_xy_separated_from_source_rejects_fully_excluded_range():
+    with pytest.raises(ValueError, match="No target y-position"):
+        target_xy_separated_from_source(
+            torch.tensor(((0.5, 0.0),)),
+            target_center=(0.5, 0.0),
+            target_half_range=(0.1, 0.1),
+            minimum_y_separation=0.11,
+            unit_samples=torch.tensor(((0.5, 0.5),)),
+        )
+
+
+def test_target_xy_separated_from_source_skips_an_empty_lower_interval():
+    source_xy = torch.tensor(((0.5, -0.30),))
+    target_xy = target_xy_separated_from_source(
+        source_xy,
+        target_center=(0.5, 0.0),
+        target_half_range=(0.25, 0.33),
+        minimum_y_separation=0.16,
+        unit_samples=torch.tensor(((0.5, 0.0),)),
+    )
+
+    assert float(target_xy[0, 1]) == pytest.approx(-0.14)
+    assert float(target_xy[0, 1] - source_xy[0, 1]) >= 0.16 - 1.0e-6
 
 
 def test_asymmetric_reset_offsets_include_bounds_zero_and_antithetic_interior():

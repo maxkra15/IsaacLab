@@ -271,28 +271,3 @@ def stable_pour_success(
     success = candidate & (env._success_dwell_count >= dwell_steps)
     env.episode_succeeded |= success
     return success
-
-
-def nonterminating_stable_pour_success(
-    env: FrankaPourEnv,
-    dwell_time_s: float = 0.15,
-    min_lift_height: float = 0.05,
-    max_tcp_distance: float = 0.015,
-    max_gripper_width_error: float = 0.012,
-    max_gripper_command: float = 0.025,
-) -> torch.Tensor:
-    """Track stable success without ending training episodes, while remaining replay-compatible."""
-    success = stable_pour_success(
-        env,
-        dwell_time_s=dwell_time_s,
-        min_lift_height=min_lift_height,
-        max_tcp_distance=max_tcp_distance,
-        max_gripper_width_error=max_gripper_width_error,
-        max_gripper_command=max_gripper_command,
-    )
-    # Standard record/replay tools temporarily remove the managed success term and invoke this
-    # configured function directly. Return the real predicate in that context; suppress only the
-    # live TerminationManager's done signal used by fixed-horizon reset-mixture training.
-    if "success" not in env.termination_manager.active_terms:
-        return success
-    return torch.zeros_like(success)

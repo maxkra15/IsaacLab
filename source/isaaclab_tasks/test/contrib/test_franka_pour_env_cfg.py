@@ -246,6 +246,8 @@ def test_finalize_builds_scene_assets_without_mutating_the_caller():
     assert isinstance(resolved.scene.source_cup, RigidObjectCfg)
     assert isinstance(resolved.scene.target_cup, RigidObjectCfg)
     assert isinstance(resolved.scene.media, MPMObjectCfg)
+    assert resolved.scene.media.spawn.visible is True
+    assert resolved.sim.default_visualizer_cfg.show_particles is True
     assert resolved is not original
     assert resolved.scene is not original.scene
     assert resolved.sim.physics.solver_cfg.scene_cfg is resolved.scene
@@ -391,10 +393,14 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert cfg.sim.physics.collision_cfg.soft_contact_max == 0
     assert arm.include_static_shapes is True
     assert arm.bodies == [SceneEntityCfg("robot"), SceneEntityCfg("source_cup"), SceneEntityCfg("target_cup")]
-    assert arm.substeps == cfg.num_substeps
+    assert cfg.num_substeps == 1
+    assert cfg.rigid_substeps == 4
+    assert cfg.sim.physics.num_substeps == cfg.num_substeps
+    assert arm.substeps == cfg.rigid_substeps
     assert media.all_particles is True
     assert media.bodies == [r".*/SpillFloor$"]
     assert media.include_static_shapes is False
+    assert media.substeps == 1
     assert media.in_place is True
     assert media.solver_cfg.grid_type == "sparse"
     assert media.solver_cfg.grid_padding == 0
@@ -411,7 +417,7 @@ def test_cfg_routes_each_body_to_exactly_one_solver():
     assert proxies[0].collision_pipeline_factory is not None
     assert proxies[0].collision_pipeline_factory(None) is None
     assert proxies[0].mass_scale == pytest.approx(cfg.proxy_mass_scale)
-    assert cfg.proxy_mass_scale == pytest.approx(100.0)
+    assert cfg.proxy_mass_scale == pytest.approx(1000.0)
     assert solver.iterations == cfg.proxy_iterations
     assert not hasattr(pour_env_cfg, "CUP_LABEL_PATTERN")
     assert all(
@@ -424,6 +430,7 @@ def test_finalize_propagates_post_init_solver_overrides():
     cfg.mpm_iterations = 48
     cfg.voxel_size = 0.02
     cfg.num_substeps = 3
+    cfg.rigid_substeps = 5
     cfg.use_cuda_graph = False
     cfg.proxy_iterations = 4
     cfg.proxy_mass_scale = 0.25
@@ -440,7 +447,7 @@ def test_finalize_propagates_post_init_solver_overrides():
 
     assert entries["media"].solver_cfg.max_iterations == 48
     assert entries["media"].solver_cfg.voxel_size == pytest.approx(0.02)
-    assert entries["arm"].substeps == 3
+    assert entries["arm"].substeps == 5
     assert resolved.sim.physics.num_substeps == 3
     assert resolved.sim.physics.use_cuda_graph is False
     assert isinstance(coupled_cfg, CoupledProxySolverCfg)
@@ -763,6 +770,7 @@ def test_polar_source_workspace_defaults_cover_a_broad_base_centered_sector():
 
     assert cfg.curriculum_randomized_source_radius_range == pytest.approx((0.40, 0.78))
     assert cfg.curriculum_randomized_source_azimuth_range == pytest.approx(math.radians(35.0))
+    assert cfg.curriculum_randomized_source_y_range is None
     assert cfg.curriculum_randomized_source_xy_correlation == pytest.approx(0.0)
 
     minimum_radius, maximum_radius = cfg.curriculum_randomized_source_radius_range
@@ -1071,6 +1079,7 @@ def test_backward_curriculum_config_is_complete_and_play_uses_randomized_task():
     assert cfg.curriculum_randomized_source_yaw_range == pytest.approx(math.radians(30.0))
     assert cfg.curriculum_randomized_target_center_xy == pytest.approx((0.50, -0.18))
     assert cfg.curriculum_randomized_target_position_range == pytest.approx((0.15, 0.44))
+    assert cfg.curriculum_randomized_target_behind_source is True
     assert cfg.curriculum_randomized_cup_clearance == pytest.approx(0.04)
     assert cfg.curriculum_grasp_descent_overshoot == pytest.approx(0.0)
     assert cfg.curriculum_randomized_reset_tcp_standoff == pytest.approx((-0.12, 0.0, 0.0))
@@ -1115,9 +1124,28 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     agent = FrankaPourResetMixturePPORunnerCfg()
 
     assert cfg.curriculum.reset_mixture.func is mdp.PourResetMixture
-    assert cfg.reset_mixture_probabilities == pytest.approx((0.25, 0.25, 0.25, 0.25))
-    assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.05, 0.05, 0.90))
-    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.5)
+    assert cfg.reset_mixture_probabilities == pytest.approx((0.40, 0.25, 0.20, 0.15))
+    assert cfg.reset_mixture_near_object_open_phase_probabilities == pytest.approx((0.25, 0.35, 0.40))
+    assert cfg.reset_mixture_near_object_preloaded_probability == pytest.approx(0.15)
+    assert cfg.curriculum_randomization_extent_levels == pytest.approx((0.0, 1.0))
+    assert cfg.curriculum_independent_arm_fraction_levels == pytest.approx((0.0, 1.0))
+    assert cfg.curriculum_independent_target_fraction_levels == pytest.approx((0.0, 1.0))
+    assert cfg.curriculum_randomized_source_position_range == pytest.approx((0.32, 0.50))
+    assert cfg.curriculum_randomized_source_radius_range == pytest.approx((0.40, 0.82))
+    assert cfg.curriculum_randomized_source_azimuth_range == pytest.approx(math.radians(55.0))
+    assert cfg.curriculum_randomized_source_y_range == pytest.approx((-0.19, 0.50))
+    assert cfg.curriculum_randomized_target_center_xy == pytest.approx((0.575, 0.175))
+    assert cfg.curriculum_randomized_target_position_range == pytest.approx((0.225, 0.325))
+    assert cfg.curriculum_randomized_target_behind_source is False
+    assert cfg.curriculum_randomized_reset_tcp_offset_lower == pytest.approx((-0.20, -0.22, 0.0))
+    assert cfg.curriculum_randomized_reset_tcp_offset_upper == pytest.approx((0.03, 0.22, 0.35))
+    assert cfg.curriculum_randomized_reset_tcp_rotation_angle_range == pytest.approx(
+        (math.radians(10.0), math.radians(85.0))
+    )
+    assert cfg.curriculum_randomized_reset_ik_grid_size == 9
+    assert cfg.curriculum_randomized_reset_ik_samples_per_source == 15
+    assert cfg.curriculum_randomized_min_reset_variants_per_source == 1
+    assert cfg.curriculum_independent_sample_attempts == 16
     assert cfg.curriculum_target_frac == pytest.approx((0.30,) * len(cfg.curriculum_stage_names))
     assert cfg.pour_target_frac == pytest.approx(0.30)
     assert cfg.reset_mixture_statistics_window_size == 4096
@@ -1152,9 +1180,9 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.rewards.goal_distance.func is mdp.media_target_distance_tanh
     assert cfg.rewards.goal_distance.weight == pytest.approx(0.1)
     assert cfg.rewards.goal_distance.params["std"] == pytest.approx(0.2)
-    assert cfg.rewards.success.func is mdp.sustained_pour_success
+    assert cfg.rewards.success.func is mdp.pour_success_bonus
     assert cfg.rewards.success.weight == pytest.approx(1.0)
-    assert cfg.rewards.success.params["dwell_time_s"] == pytest.approx(cfg.success_dwell_time_s)
+    assert cfg.rewards.success.params == {}
     assert cfg.rewards.action_magnitude.func is mdp.action_l2
     assert cfg.rewards.action_magnitude.weight == pytest.approx(-1.0e-4)
     assert cfg.rewards.action_rate.func is mdp.action_rate_l2
@@ -1164,17 +1192,24 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert cfg.rewards.failure.func is mdp.terminal_failure
     assert cfg.rewards.failure.weight == pytest.approx(-10.0)
     assert cfg.rewards.failure.params == {"include_time_out": False}
-    assert cfg.terminations.success.func is mdp.nonterminating_stable_pour_success
+    assert cfg.terminations.success.func is mdp.stable_pour_success
+    assert cfg.terminations.success.params["dwell_time_s"] == pytest.approx(cfg.success_dwell_time_s)
     assert cfg.terminations.lost_grasp.params["terminate"] is False
     assert cfg.terminations.spill.params["terminate"] is False
-    assert cfg.terminations.time_out.func is mdp.time_out
+    assert cfg.terminations.time_out.func is mdp.unsuccessful_time_out
     assert cfg.terminations.time_out.time_out is True
     assert cfg.episode_length_s == pytest.approx(16.0)
     assert cfg.is_finite_horizon is False
-    assert cfg.decimation == 12
+    assert cfg.sim.dt == pytest.approx(1.0 / 120.0)
+    assert cfg.decimation == 4
+    assert cfg.num_substeps == 1
+    assert cfg.rigid_substeps == 4
+    assert cfg.decimation * cfg.sim.physics.num_substeps == 4
+    arm_entry = next(entry for entry in cfg.sim.physics.solver_cfg.entries if entry.name == "arm")
+    assert cfg.decimation * cfg.sim.physics.num_substeps * arm_entry.substeps == 16
     assert cfg.sim.render_interval == cfg.decimation
     assert cfg.observations.policy.history_length == 5
-    assert round(cfg.episode_length_s / (cfg.sim.dt * cfg.decimation)) == 160
+    assert round(cfg.episode_length_s / (cfg.sim.dt * cfg.decimation)) == 480
     assert not any(
         "stage" in parameter
         for term_cfg in vars(cfg.rewards).values()
@@ -1196,6 +1231,7 @@ def test_reset_mixture_config_keeps_one_goal_and_full_amplitude_evaluation():
     assert overridden.sim.render_interval == 6
     assert agent.experiment_name == "franka_pour_reset_mixture_diffik"
     assert agent.run_name == "omnireset_diffik"
+    assert agent.num_steps_per_env == 32
 
 
 def test_reset_mixture_play_preserves_policy_abi_with_captured_fixed_grid():
@@ -1211,11 +1247,11 @@ def test_reset_mixture_play_preserves_policy_abi_with_captured_fixed_grid():
     assert eval_cfg.sim.physics.use_cuda_graph is False
     play_solver_cfg = _media_entry(play_cfg).solver_cfg
     assert play_solver_cfg.grid_type == "fixed"
-    assert play_solver_cfg.grid_padding == 64
+    assert play_solver_cfg.grid_padding == 128
     assert play_solver_cfg.max_active_cell_count == 1024
     assert play_cfg.sim.physics.use_cuda_graph is True
-    assert play_cfg.terminations.success.func is mdp.stable_pour_success
-    assert play_cfg.terminations.success.params["dwell_time_s"] == pytest.approx(1.0)
+    assert play_cfg.terminations.success.func is eval_cfg.terminations.success.func
+    assert play_cfg.terminations.success.params == eval_cfg.terminations.success.params
     assert play_cfg.viewer.lookat == pytest.approx(eval_cfg.viewer.lookat)
     assert play_cfg.viewer.eye == pytest.approx((0.9, 0.65, 0.5))
     eval_distance = math.dist(eval_cfg.viewer.eye, eval_cfg.viewer.lookat)
@@ -1223,18 +1259,19 @@ def test_reset_mixture_play_preserves_policy_abi_with_captured_fixed_grid():
     assert eval_distance - play_distance == pytest.approx(1.0, abs=0.02)
     assert play_cfg.sim.default_visualizer_cfg.eye == pytest.approx(play_cfg.viewer.eye)
     assert play_cfg.sim.default_visualizer_cfg.lookat == pytest.approx(play_cfg.viewer.lookat)
+    assert play_cfg.sim.default_visualizer_cfg.show_particles is True
 
 
 def test_reset_mixture_semantics_do_not_change_reverse_curriculum_defaults():
     mixture = FrankaPourEnvCfg_RESET_MIXTURE()
     reverse = FrankaPourEnvCfg()
 
-    assert mixture.rewards.success.func is mdp.sustained_pour_success
+    assert mixture.rewards.success.func is mdp.pour_success_bonus
     assert mixture.rewards.failure.params == {"include_time_out": False}
-    assert mixture.terminations.success.func is mdp.nonterminating_stable_pour_success
+    assert mixture.terminations.success.func is mdp.stable_pour_success
     assert mixture.terminations.lost_grasp.params["terminate"] is False
     assert mixture.terminations.spill.params["terminate"] is False
-    assert mixture.terminations.time_out.func is mdp.time_out
+    assert mixture.terminations.time_out.func is mdp.unsuccessful_time_out
     assert isinstance(mixture.actions.arm_action, mdp.DifferentialInverseKinematicsActionCfg)
     assert mixture.actions.gripper_action.use_incremental_target is False
     assert mixture.actions.gripper_action.binary_threshold == pytest.approx(0.0)

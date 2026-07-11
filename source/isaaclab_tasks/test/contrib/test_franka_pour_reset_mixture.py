@@ -296,6 +296,7 @@ def test_reset_mixture_bank_samples_reaching_atomically_and_keeps_nonreaching_co
     env._randomized_source_pos_bank_t = torch.arange(9, dtype=torch.float32).reshape(3, 3) + 10.0
     env._randomized_source_quat_bank_t = torch.arange(12, dtype=torch.float32).reshape(3, 4) + 20.0
     env._randomized_target_pos_bank_t = torch.arange(9, dtype=torch.float32).reshape(3, 3) + 30.0
+    env._reset_mixture_reaching_target_pos_t = env._randomized_target_pos_bank_t.clone()
     env._randomized_grasp_arm_q_bank_t = torch.arange(21, dtype=torch.float32).reshape(3, 7) + 40.0
     env._reset_mixture_near_object_arm_q_t = torch.stack(
         (

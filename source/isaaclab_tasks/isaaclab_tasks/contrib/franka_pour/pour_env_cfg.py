@@ -127,6 +127,14 @@ def _resolve_mpm_cell_cap(cfg: FrankaPourEnvCfg) -> int:
 
 
 @configclass
+class PourVisualizerDefaultsCfg(VisualizerCfg):
+    """Visualizer defaults shared by every Franka Pour preset."""
+
+    show_particles: bool = True
+    """Show the MPM media when the selected visualizer supports particle rendering."""
+
+
+@configclass
 class PourSceneCfg(InteractiveSceneCfg):
     """Lift-task scene assets plus resolved cups and MPM media."""
 
@@ -325,14 +333,14 @@ class RewardsCfg:
 class ResetMixtureRewardsCfg:
     """Stage-independent OmniReset-style reward groups for the reset-mixture ablation."""
 
-    # Task rewards: generic reach and goal-set distance plus the strict particle success state.
+    # Task rewards: generic reach and goal-set distance plus strict particle success.
     # The broad kernel remains informative across full-workspace reaching while the reset mixture
     # supplies close-contact precision without adding a task-specific grasp trajectory.
     reach = RewTerm(func=mdp.tcp_cup_distance_tanh, weight=0.1, params={"std": 0.3})
     # Particle distances span only a few decimetres; this preserves useful transfer contrast
     # while retaining the same task-independent tanh form used by OmniReset.
     goal_distance = RewTerm(func=mdp.media_target_distance_tanh, weight=0.1, params={"std": 0.2})
-    success = RewTerm(func=mdp.sustained_pour_success, weight=1.0, params={"dwell_time_s": 0.15})
+    success = RewTerm(func=mdp.pour_success_bonus, weight=1.0)
 
     # Smoothness is one semantic reward group, kept as separate standard terms for diagnostics.
     action_magnitude = RewTerm(func=mdp.action_l2, weight=-1.0e-4)
@@ -649,6 +657,9 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     # thresholds. Lower curriculum levels interpolate these cells from the authored pose.
     curriculum_randomized_source_radius_range: tuple[float, float] | None = (0.40, 0.78)
     curriculum_randomized_source_azimuth_range: float = math.radians(35.0)
+    # Optionally narrow each radial ring independently on its two sides to keep every source center
+    # within an asymmetric table-Y interval. ``None`` preserves a constant angular sector.
+    curriculum_randomized_source_y_range: tuple[float, float] | None = None
     # Retained for rectangular downstream presets. Zero means a full two-dimensional rectangle;
     # it is ignored by the polar Franka Pour preset.
     curriculum_randomized_source_xy_correlation: float = 0.0
@@ -665,6 +676,9 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     # source/receiver bank pairing.
     curriculum_randomized_target_center_xy: tuple[float, float] = (0.50, -0.18)
     curriculum_randomized_target_position_range: tuple[float, float] = (0.15, 0.44)
+    # The reverse curriculum keeps its authored one-way pour layout. Reset-Mixture overrides this
+    # to sample the receiver from both separated sides of the source.
+    curriculum_randomized_target_behind_source: bool = True
     curriculum_randomized_cup_clearance: float = 0.04
     # The randomized stage starts 12 cm behind the glass along cup -X. The runtime rotates this
     # cup-local offset and jitter by the source yaw, preserving the horizontal approach geometry.
@@ -813,13 +827,20 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     particles_per_cell: float = 2.0
     mpm_iterations: int = 24
     mpm_cell_cap_override: int | None = None
-    num_substeps: int = 2
+    # Advance the coupled system once per 120 Hz physics tick. The MPM entry already performs its
+    # nonlinear solve internally, so repeating the complete coupled step only rerasterizes every
+    # collider and doubles the dominant training cost.
+    num_substeps: int = 1
+    # Preserve the previous rigid integration interval: the old 2 outer x 2 local layout advanced
+    # MJWarp at 480 Hz. Four local substeps inside the single coupled step retain that rate while
+    # MPM advances only once at 120 Hz.
+    rigid_substeps: int = 4
     proxy_iterations: int = 1
     # This scales only the virtual cup inertia inside the destination MPM solve. The rigid solver
     # retains the authored cup mass and receives the harvested MPM reaction wrench. A stiff proxy
     # prevents split-step cup yielding from letting resting media creep through its floor while
     # retaining one inexpensive two-way coupling pass.
-    proxy_mass_scale: float = 100.0
+    proxy_mass_scale: float = 1000.0
     # Sparse topology rebuilds eagerly; only the PLAY fixed-grid preset enables capture.
     use_cuda_graph: bool = False
 
@@ -904,6 +925,10 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         self.viewer.lookat = (0.5, 0.0, 0.1)
         self.viewer.origin_type = "env"
         self.viewer.env_index = 0
+        self.sim.default_visualizer_cfg = PourVisualizerDefaultsCfg(
+            eye=self.viewer.eye,
+            lookat=self.viewer.lookat,
+        )
 
         self._validate_curriculum_cfg()
         self._validate_particle_workspace_cfg()
@@ -928,7 +953,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                             SceneEntityCfg("target_cup"),
                         ],
                         include_static_shapes=True,
-                        substeps=self.num_substeps,
+                        substeps=self.rigid_substeps,
                     ),
                     CoupledSolverEntryCfg(
                         name=MPM_ENTRY,
@@ -1341,7 +1366,29 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
             azimuth = self.curriculum_randomized_source_azimuth_range
             minimum_x = min_radius * math.cos(azimuth)
             maximum_x = max_radius
-            maximum_abs_y = max_radius * math.sin(azimuth)
+            sector_maximum_abs_y = max_radius * math.sin(azimuth)
+            minimum_y = self.cup_reset_pos[1] - sector_maximum_abs_y
+            maximum_y = self.cup_reset_pos[1] + sector_maximum_abs_y
+            source_y_range = self.curriculum_randomized_source_y_range
+            if source_y_range is not None:
+                if (
+                    len(source_y_range) != 2
+                    or any(not math.isfinite(value) for value in source_y_range)
+                    or source_y_range[0] >= source_y_range[1]
+                ):
+                    raise ValueError(
+                        "curriculum_randomized_source_y_range must contain two finite values in increasing order."
+                    )
+                if not source_y_range[0] < self.cup_reset_pos[1] < source_y_range[1]:
+                    raise ValueError(
+                        "curriculum_randomized_source_y_range must strictly contain the nominal source y-position."
+                    )
+                minimum_y = max(minimum_y, source_y_range[0])
+                maximum_y = min(maximum_y, source_y_range[1])
+            maximum_abs_y = max(
+                abs(minimum_y - self.cup_reset_pos[1]),
+                abs(maximum_y - self.cup_reset_pos[1]),
+            )
             required_half_range = (
                 max(abs(minimum_x - self.cup_reset_pos[0]), abs(maximum_x - self.cup_reset_pos[0])),
                 maximum_abs_y,
@@ -1358,8 +1405,13 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                     "curriculum_randomized_source_position_range must contain the configured polar workspace; "
                     f"required at least {required_half_range}."
                 )
-        elif not math.isfinite(self.curriculum_randomized_source_azimuth_range):
-            raise ValueError("curriculum_randomized_source_azimuth_range must be finite.")
+        else:
+            if not math.isfinite(self.curriculum_randomized_source_azimuth_range):
+                raise ValueError("curriculum_randomized_source_azimuth_range must be finite.")
+            if self.curriculum_randomized_source_y_range is not None:
+                raise ValueError(
+                    "curriculum_randomized_source_y_range requires curriculum_randomized_source_radius_range."
+                )
         if any(
             carry_range > source_range
             for carry_range, source_range in zip(
@@ -1376,6 +1428,8 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
             not math.isfinite(value) for value in self.curriculum_randomized_target_center_xy
         ):
             raise ValueError("curriculum_randomized_target_center_xy must contain two finite values.")
+        if not isinstance(self.curriculum_randomized_target_behind_source, bool):
+            raise ValueError("curriculum_randomized_target_behind_source must be a bool.")
         if (
             not math.isfinite(self.curriculum_randomized_source_yaw_range)
             or self.curriculum_randomized_source_yaw_range < 0.0
@@ -1571,17 +1625,44 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         if self.curriculum_randomized_source_radius_range is None:
             minimum_source_y = self.cup_reset_pos[1] - self.curriculum_randomized_source_position_range[1]
         else:
-            minimum_source_y = -self.curriculum_randomized_source_radius_range[1] * math.sin(
-                self.curriculum_randomized_source_azimuth_range
+            minimum_source_y = (
+                max(
+                    self.curriculum_randomized_source_y_range[0],
+                    self.cup_reset_pos[1]
+                    - self.curriculum_randomized_source_radius_range[1]
+                    * math.sin(self.curriculum_randomized_source_azimuth_range),
+                )
+                if self.curriculum_randomized_source_y_range is not None
+                else -self.curriculum_randomized_source_radius_range[1]
+                * math.sin(self.curriculum_randomized_source_azimuth_range)
             )
-        minimum_target_y = (
-            self.curriculum_randomized_target_center_xy[1] - self.curriculum_randomized_target_position_range[1]
-        )
-        if minimum_source_y - minimum_separation < minimum_target_y - 1.0e-6:
+        if self.curriculum_randomized_target_behind_source:
+            minimum_target_y = (
+                self.curriculum_randomized_target_center_xy[1] - self.curriculum_randomized_target_position_range[1]
+            )
+            if minimum_source_y - minimum_separation < minimum_target_y - 1.0e-6:
+                raise ValueError(
+                    "curriculum_randomized_target_position_range leaves no collision-free target y-position "
+                    "at the minimum randomized source y-position."
+                )
+            return
+
+        if self.curriculum_randomized_target_position_range[1] <= minimum_separation:
             raise ValueError(
-                "curriculum_randomized_target_position_range leaves no collision-free target y-position "
-                "at the minimum randomized source y-position."
+                "Two-sided target sampling requires its y half-range to exceed the maximum cup separation."
             )
+        source_half_x = source_outer_half_x
+        target_half_x = self.target_cup_inner_width / 2.0 + self.target_cup_wall_thickness
+        nominal_delta_x = abs(self.target_cup_reset_pos[0] - self.cup_reset_pos[0])
+        nominal_delta_y = abs(self.target_cup_reset_pos[1] - self.cup_reset_pos[1])
+        nominal_clearance_x = nominal_delta_x - (
+            source_half_x + target_half_x + self.curriculum_randomized_cup_clearance
+        )
+        nominal_clearance_y = nominal_delta_y - (
+            source_outer_half_y + target_outer_half_y + self.curriculum_randomized_cup_clearance
+        )
+        if max(nominal_clearance_x, nominal_clearance_y) < -1.0e-6:
+            raise ValueError("The nominal source and target poses overlap the configured cup-clearance region.")
 
     def _validate_curriculum_arm_configs(self) -> None:
         """Validate authored arm waypoints against the action limits."""
@@ -1733,7 +1814,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         mpm_solver_cfg = _mpm_solver_cfg(self)
         mpm_solver_cfg.voxel_size = self.voxel_size
         mpm_solver_cfg.max_iterations = self.mpm_iterations
-        arm_entries[0].substeps = self.num_substeps
+        arm_entries[0].substeps = self.rigid_substeps
         self.sim.physics.num_substeps = self.num_substeps
         self.sim.physics.use_cuda_graph = self.use_cuda_graph
         coupled_cfg.iterations = self.proxy_iterations
@@ -1841,16 +1922,55 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
     curriculum: ResetMixtureCurriculumCfg = ResetMixtureCurriculumCfg()
     rewards: ResetMixtureRewardsCfg = ResetMixtureRewardsCfg()
     curriculum_early_target_frac: tuple[float, ...] = (0.30,) * 14
-    # Ordered as reaching, near-object, grasped, and near-goal. The final region is a fully
-    # refilled, pour-ready state rather than a partially transferred particle snapshot.
-    reset_mixture_probabilities: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
-    # Concentrate the open-hand portion of Near-Object on the final screened grasp neighborhood
-    # while retaining small early/bridge support and every source-row marginal.
-    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.05, 0.05, 0.90)
-    # Split Near-Object between open-hand approach states and exact table grasps whose fingers
-    # start at contact with a preload drive target. This bridges fresh binary-gripper learning
-    # without changing the policy interface or moving the authored cup off the table.
-    reset_mixture_near_object_preloaded_probability: float = 0.5
+
+    # Reset-Mixture consumes only the nominal continuity anchor and the complete distribution. Do
+    # not build the seven intermediate reverse-curriculum banks that this static sampler never uses.
+    curriculum_randomization_extent_levels: tuple[float, ...] = (0.0, 1.0)
+    curriculum_independent_arm_fraction_levels: tuple[float, ...] = (0.0, 1.0)
+    curriculum_independent_target_fraction_levels: tuple[float, ...] = (0.0, 1.0)
+
+    # Cover the reachable tabletop instead of a narrow fixed-angle sector. The SeattleLab table is
+    # rotated in this scene, so its world-Y support is asymmetric: outer rings are clipped to keep
+    # the source and its worst-yaw footprint supported on both edges.
+    curriculum_randomized_source_position_range: tuple[float, float] = (0.32, 0.50)
+    curriculum_randomized_source_radius_range: tuple[float, float] | None = (0.40, 0.82)
+    curriculum_randomized_source_azimuth_range: float = math.radians(55.0)
+    curriculum_randomized_source_y_range: tuple[float, float] | None = (-0.19, 0.50)
+
+    # The 158 mm receiver remains fully supported within x=[0.35, 0.80], y=[-0.15, 0.50]. These are
+    # verified fixed-orientation pour/tilt reach bounds, not merely the larger tabletop footprint.
+    # At full amplitude it may lie on either side of the source; the exact nominal pose remains the
+    # zero anchor, and every generated pair retains the configured cup clearance.
+    curriculum_randomized_target_center_xy: tuple[float, float] = (0.575, 0.175)
+    curriculum_randomized_target_position_range: tuple[float, float] = (0.225, 0.325)
+    curriculum_randomized_target_behind_source: bool = False
+
+    # Expand the open-hand reset family from 539 to 1,215 full-amplitude rows. The TCP spans 9--32 cm
+    # behind the grasp plane, +/-22 cm laterally, 8.3--43.3 cm above the table, and broad orientation
+    # errors. Newton IK plus exact path/collision screening still decides which rows enter training.
+    curriculum_randomized_reset_tcp_offset_lower: tuple[float, float, float] | None = (-0.20, -0.22, 0.0)
+    curriculum_randomized_reset_tcp_offset_upper: tuple[float, float, float] | None = (0.03, 0.22, 0.35)
+    curriculum_randomized_reset_tcp_rotation_angle_range: tuple[float, float] = (
+        math.radians(10.0),
+        math.radians(85.0),
+    )
+    curriculum_randomized_reset_ik_grid_size: int = 9
+    curriculum_randomized_reset_ik_samples_per_source: int = 15
+    # One complete correlated path is enough to admit a source cell: Reaching subsequently mixes
+    # its independently screened source, arm, and receiver rows. Requiring two paths with the same
+    # correlated receiver would discard safe table-edge source cells for the wrong reason.
+    curriculum_randomized_min_reset_variants_per_source: int = 1
+    curriculum_independent_sample_attempts: int = 16
+
+    # Ordered as reaching, near-object, grasped, and near-goal. Bias toward the genuinely independent
+    # full task while retaining every backward-reachable interaction mode.
+    reset_mixture_probabilities: tuple[float, float, float, float] = (0.40, 0.25, 0.20, 0.15)
+    # Spread open Near-Object resets across the complete screened approach instead of concentrating
+    # almost all of them in the final two centimetres.
+    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.25, 0.35, 0.40)
+    # Exact preloaded table grasps remain a bridge for binary-gripper learning, but no longer make up
+    # half of Near-Object resets.
+    reset_mixture_near_object_preloaded_probability: float = 0.15
     reset_mixture_statistics_window_size: int = 4096
 
     def __post_init__(self):
@@ -1878,25 +1998,23 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
         )
         # OmniReset uses one region-independent binary gripper action. Keep the existing moving-
         # average filter to damp IID exploration chatter without accumulating stale open commands;
-        # at 10 Hz it reaches contact in roughly four close decisions (0.4 s).
+        # at 30 Hz it reaches contact in roughly four close decisions (0.13 s).
         self.actions.gripper_action.use_incremental_target = False
         self.actions.gripper_action.binary_threshold = 0.0
         super().__post_init__()
-        # Match OmniReset's 10 Hz, 16-second lifecycle. Five actor frames then represent 0.5 s of
-        # contact and slip history, while 32 PPO steps cover the same 3.2-second rollout window.
-        self.decimation = 12
+        # Run the reset-mixture policy at 30 Hz over the 120 Hz simulation. Five actor frames cover
+        # 0.167 s of contact/slip history and a 32-step PPO rollout spans 1.067 s.
+        self.decimation = 4
         self.sim.render_interval = self.decimation
         self.episode_length_s = 16.0
         self.observations.policy.history_length = 5
         self.is_finite_horizon = False
-        # OmniReset treats success as a state reward and collects every reset region for the full
-        # horizon. Keep its managed predicate as a replay-discoverable, nonterminating context;
-        # the reward reads the current dwell-qualified state that context updates. Track dropped
-        # grasps without terminating so policies can retry, matching OmniReset's task lifecycle.
-        self.terminations.success.func = mdp.nonterminating_stable_pour_success
+        # End dwell-qualified successes so productive states are immediately recycled through the
+        # static reset mixture. Keep dropped grasps and spills nonterminal so policies can retry.
+        self.terminations.success.func = mdp.stable_pour_success
         self.terminations.lost_grasp.params["terminate"] = False
         self.terminations.spill.params["terminate"] = False
-        self.terminations.time_out.func = mdp.time_out
+        self.terminations.time_out.func = mdp.unsuccessful_time_out
 
     def _validate_arm_action_cfg(self) -> None:
         """Validate the reset mixture's relative Cartesian IK contract."""
@@ -1920,7 +2038,7 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
 
     def _configure_reward_cfg(self, max_gripper_command: float, *, initialize_stage_gates: bool) -> None:
         """Keep the general reward independent of curriculum and grasp thresholds."""
-        self.rewards.success.params["dwell_time_s"] = self.success_dwell_time_s
+        pass
 
     def _validate_reward_cfg(self, stage_count: int) -> None:
         """Validate the general reward without introducing reset-stage dependencies."""
@@ -1974,8 +2092,6 @@ class FrankaPourEnvCfg_RESET_MIXTURE_EVAL(FrankaPourEnvCfg_RESET_MIXTURE):
 class FrankaPourEnvCfg_RESET_MIXTURE_PLAY(FrankaPourEnvCfg_RESET_MIXTURE_EVAL):
     """Single-environment reset-mixture playback with a captured fixed MPM grid."""
 
-    success_dwell_time_s: float = 1.0
-
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 1
@@ -1983,15 +2099,15 @@ class FrankaPourEnvCfg_RESET_MIXTURE_PLAY(FrankaPourEnvCfg_RESET_MIXTURE_EVAL):
         self.sim.physics.use_cuda_graph = True
         mpm_solver_cfg = _mpm_solver_cfg(self)
         mpm_solver_cfg.grid_type = "fixed"
-        # The retained Reaching bank spans 0.37--0.76 m in x and -0.39--0.31 m in y.
-        # Sixty-four 1 cm cells cover those resets, the receiver, and the normal lifted pour path
-        # without the cost of the base viewer's much larger emergency workspace.
-        mpm_solver_cfg.grid_padding = 64
+        # The broad table reset can place source and receiver almost 1 m apart. One hundred twenty-eight
+        # 1 cm cells keep their complete transfer path inside the captured single-world grid without the
+        # cost of the base viewer's much larger emergency workspace.
+        mpm_solver_cfg.grid_padding = 128
         mpm_solver_cfg.max_active_cell_count = 1024
-        self.terminations.success.func = mdp.stable_pour_success
         # Retain the base view direction while moving the camera about one metre closer.
         self.viewer.eye = (0.9, 0.65, 0.5)
-        self.sim.default_visualizer_cfg = VisualizerCfg(eye=self.viewer.eye, lookat=self.viewer.lookat)
+        self.sim.default_visualizer_cfg.eye = self.viewer.eye
+        self.sim.default_visualizer_cfg.lookat = self.viewer.lookat
 
 
 @configclass

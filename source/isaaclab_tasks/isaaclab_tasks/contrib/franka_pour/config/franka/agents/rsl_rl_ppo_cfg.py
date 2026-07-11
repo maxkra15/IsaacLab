@@ -71,7 +71,7 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
 
         std_range: tuple[float, float] = (0.05, 1.0)
 
-    # The environment runs at 10 Hz, so 32 transitions reproduce OmniReset's 3.2-second rollout.
+    # Keep at least one second of temporal context: 32 transitions span 1.067 s at 30 Hz.
     num_steps_per_env = 32
     save_interval = 25
     # Keep incompatible 7-action, history-stacked checkpoints separate from the earlier direct-
