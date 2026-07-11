@@ -1302,8 +1302,13 @@ def test_reset_mixture_ppo_is_calibrated_without_changing_reverse_curriculum():
     assert mixture.actor.obs_normalization is True
     assert mixture.critic.obs_normalization is True
     assert mixture.actor.distribution_cfg.class_name == "HeteroscedasticGaussianDistribution"
-    assert mixture.actor.distribution_cfg.init_std == pytest.approx(1.0)
-    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 1.0))
+    assert mixture.actor.distribution_cfg.init_std == pytest.approx(0.8)
+    assert mixture.actor.distribution_cfg.std_range == pytest.approx((0.05, 1.05))
+    assert (
+        mixture.actor.distribution_cfg.std_range[0]
+        < mixture.actor.distribution_cfg.init_std
+        < mixture.actor.distribution_cfg.std_range[1]
+    )
     assert mixture.actor.distribution_cfg.std_type == "log"
     assert mixture.algorithm.entropy_coef == pytest.approx(1.0e-3)
     assert mixture.algorithm.gamma == pytest.approx(0.99)

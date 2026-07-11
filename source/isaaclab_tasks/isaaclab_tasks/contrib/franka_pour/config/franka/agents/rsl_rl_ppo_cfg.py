@@ -69,7 +69,10 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
     class ExplorationDistributionCfg(RslRlMLPModelCfg.HeteroscedasticGaussianDistributionCfg):
         """State-dependent exploration bounded for independently sampled action noise."""
 
-        std_range: tuple[float, float] = (0.05, 1.0)
+        # Keep both fresh and resumed policies strictly inside the hard log-standard-deviation
+        # clamp. Initializing at the upper bound can leave the state-dependent standard-deviation
+        # head with zero gradient, while the small headroom also lets std=1 checkpoints recover.
+        std_range: tuple[float, float] = (0.05, 1.05)
 
     # Keep at least one second of temporal context: 32 transitions span 1.067 s at 30 Hz.
     num_steps_per_env = 32
@@ -89,7 +92,7 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         # but use the standard Isaac Lab entropy scale below so independently sampled noise does
         # not grow merely because the environment clips actions.
         distribution_cfg=ExplorationDistributionCfg(
-            init_std=1.0,
+            init_std=0.8,
             std_type="log",
         ),
     )
