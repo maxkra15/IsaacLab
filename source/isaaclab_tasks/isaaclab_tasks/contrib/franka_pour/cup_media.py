@@ -116,7 +116,6 @@ def build_media_object_cfg(cfg: FrankaPourEnvCfg, cup_pos, cup_quat_xyzw) -> MPM
     return MPMObjectCfg(
         prim_path="{ENV_REGEX_NS}/Media",
         spawn=MPMPointsCfg(
-            visible=True,
             positions=world_points.tolist(),
             mass=mass,
             radius=radius,

@@ -60,9 +60,7 @@ from .reset_utils import (
     reset_rotation_vector_samples,
     sample_index_pools,
     scale_randomization_rows_by_extent,
-    symmetric_local_pose_samples,
     target_xy_behind_source,
-    target_xy_separated_from_source,
 )
 
 logger = logging.getLogger(__name__)
@@ -703,8 +701,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
     def _build_reset_mixture_banks(
         self,
         prototype_builder: newton.ModelBuilder,
-        model: newton.Model,
-        hand_id: int,
         seed: torch.Tensor,
         arm_q: torch.Tensor,
         randomized_rows: torch.Tensor,
@@ -722,7 +718,7 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         reset_q[:, finger_coordinate_ids] = float(self.cfg.gripper_open_pos)
         final_pool = self._randomized_extent_index_pools[-1]
         candidates = balanced_reset_triples(final_pool, int(self.cfg.curriculum_independent_sample_attempts))
-        source_indices, arm_indices, _ = candidates.unbind(dim=1)
+        source_indices, arm_indices, target_indices = candidates.unbind(dim=1)
 
         grasp_offset = torch.zeros((candidates.shape[0], 3), device=self.device)
         grasp_offset[:, 2] = float(self.cfg.cup_grasp_height)
@@ -733,67 +729,24 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             self._randomized_tcp_pos_bank_t[arm_indices] - grasp_positions,
             dim=-1,
         )
-        # Reaching needs only an exact-safe initial state, not a pre-solved carry/pour/tilt tail.
-        # Sample its receiver directly over the verified table domain so complete-path IK does not
-        # silently collapse the initial-state distribution back toward the authored pour pose.
-        reaching_target_anchors = grasp_positions.new_tensor(
-            (
-                (0.50, 0.50),
-                (0.02, 0.50),
-                (0.98, 0.50),
-                (0.50, 0.02),
-                (0.50, 0.98),
-                (0.02, 0.25),
-                (0.02, 0.75),
-                (0.98, 0.25),
-                (0.98, 0.75),
-                (0.25, 0.02),
-                (0.75, 0.02),
-                (0.25, 0.98),
-                (0.75, 0.98),
-                (0.25, 0.50),
-                (0.75, 0.50),
-                (0.50, 0.25),
-            )
+        target_clearance = self._independent_target_clearance(
+            source_indices,
+            target_indices.unsqueeze(-1),
+        ).squeeze(-1)
+        geometric_valid = (tcp_distance >= float(self.cfg.curriculum_independent_arm_min_tcp_distance) - 1.0e-6) & (
+            target_clearance >= 0.0
         )
-        attempt_count = int(self.cfg.curriculum_independent_sample_attempts)
-        anchor_ids = torch.arange(candidates.shape[0], device=self.device).remainder(attempt_count)
-        anchor_ids = anchor_ids.remainder(reaching_target_anchors.shape[0])
-        source_yaws = self._randomized_source_yaw_bank_t[source_indices]
-        source_outer_half_x = self.cfg.source_cup_inner_width / 2.0 + self.cfg.source_cup_wall_thickness
-        source_outer_half_y = self.cfg.source_cup_inner_depth / 2.0 + self.cfg.source_cup_wall_thickness
-        target_outer_half_y = self.cfg.target_cup_inner_depth / 2.0 + self.cfg.target_cup_wall_thickness
-        minimum_y_separation = (
-            source_outer_half_x * torch.abs(torch.sin(source_yaws))
-            + source_outer_half_y * torch.abs(torch.cos(source_yaws))
-            + target_outer_half_y
-            + float(self.cfg.curriculum_randomized_cup_clearance)
-        )
-        reaching_target_xy = target_xy_separated_from_source(
-            self._randomized_source_pos_bank_t[source_indices, :2],
-            target_center=self.cfg.curriculum_randomized_target_center_xy,
-            target_half_range=self.cfg.curriculum_randomized_target_position_range,
-            minimum_y_separation=minimum_y_separation,
-            unit_samples=reaching_target_anchors[anchor_ids],
-        )
-        reaching_target_positions = torch.as_tensor(self.cfg.target_cup_reset_pos, device=self.device).repeat(
-            candidates.shape[0], 1
-        )
-        reaching_target_positions[:, :2] = reaching_target_xy
-        geometric_valid = tcp_distance >= float(self.cfg.curriculum_independent_arm_min_tcp_distance) - 1.0e-6
         candidates = candidates[geometric_valid]
-        reaching_target_positions = reaching_target_positions[geometric_valid]
-        anchor_ids = anchor_ids[geometric_valid]
         if candidates.numel() == 0:
             raise RuntimeError("Reset-mixture reaching has no candidates after geometric clearance screening.")
 
-        source_indices, arm_indices, _ = candidates.unbind(dim=1)
+        source_indices, arm_indices, target_indices = candidates.unbind(dim=1)
         collision_free = collision_free_reset_candidates(
             prototype_builder,
             reset_q[arm_indices],
             self._randomized_source_pos_bank_t[source_indices],
             self._randomized_source_quat_bank_t[source_indices],
-            reaching_target_positions,
+            self._randomized_target_pos_bank_t[target_indices],
             source_box_half=self.cfg.cup_grasp_box_half,
             target_vertices=self._target_vertices,
             target_indices=self._target_indices,
@@ -801,11 +754,8 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             device=self.device,
         )
         triples = candidates[collision_free]
-        reaching_target_positions = reaching_target_positions[collision_free]
-        anchor_ids = anchor_ids[collision_free]
         if triples.numel() == 0:
             raise RuntimeError("Exact collision screening removed every reset-mixture reaching candidate.")
-        triples[:, 2] = torch.arange(triples.shape[0], device=self.device)
 
         final_level_offset = (len(self._randomized_extent_index_pools) - 1) * rows_per_extent
         source_rows = torch.unique(triples[:, 0], sorted=True)
@@ -823,28 +773,13 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             )
         minimum_mixed_rows = minimum_cells * minimum_variants
         retained_arm_rows = torch.unique(triples[:, 1]).numel()
-        retained_target_rows = reaching_target_positions.shape[0]
+        retained_target_rows = torch.unique(triples[:, 2]).numel()
         if retained_arm_rows < minimum_mixed_rows or retained_target_rows < minimum_mixed_rows:
             raise RuntimeError(
                 "Exact reset-mixture reaching screening lost mixed arm/target diversity: "
                 f"arm rows={retained_arm_rows}/{minimum_mixed_rows}, "
                 f"target rows={retained_target_rows}/{minimum_mixed_rows}."
             )
-        if attempt_count >= reaching_target_anchors.shape[0]:
-            target_lower = reaching_target_positions[:, :2].amin(dim=0)
-            target_upper = reaching_target_positions[:, :2].amax(dim=0)
-            if not bool(
-                (target_lower[0] <= 0.37)
-                & (target_upper[0] >= 0.79)
-                & (target_lower[1] <= -0.13)
-                & (target_upper[1] >= 0.47)
-            ):
-                raise RuntimeError(
-                    "Exact reset-mixture reaching screening lost receiver workspace boundary coverage: "
-                    f"lower={target_lower.tolist()}, upper={target_upper.tolist()}."
-                )
-            if torch.unique(anchor_ids).numel() != reaching_target_anchors.shape[0]:
-                raise RuntimeError("Exact reset-mixture reaching screening removed an entire receiver anchor family.")
         if self.cfg.curriculum_randomized_source_radius_range is not None:
             radial_rings = torch.unique(
                 torch.div(retained_cells, grid_size, rounding_mode="floor"),
@@ -864,7 +799,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
 
         triple_cell_ids = (triples[:, 0] - final_level_offset) // samples_per_source
         self._reset_mixture_reaching_triples_t = triples
-        self._reset_mixture_reaching_target_pos_t = reaching_target_positions
         self._reset_mixture_reaching_weights_t = hierarchical_reset_sampling_weights(triples[:, 0], triple_cell_ids)
         logger.info(
             "Reset-mixture reaching bank retained %d/%d candidates across %d source, %d arm, and %d target rows.",
@@ -924,248 +858,56 @@ class FrankaPourEnv(ManagerBasedRLEnv):
                 )
             )
         approach_collision_free_t = torch.cat(approach_collision_free)
-        exact_grasp_mask = approach_collision_free_t & (approach_phase_ids == phase_count - 1)
-        exact_grasp_source_rows = approach_source_rows[exact_grasp_mask]
-        exact_grasp_robot_q = approach_robot_q[exact_grasp_mask]
-        exact_grasp_arm_q = approach_arm_q[exact_grasp_mask]
-        if exact_grasp_source_rows.numel() == 0:
-            raise RuntimeError("Exact collision screening removed every reset-mixture near-object grasp.")
-        if torch.unique(exact_grasp_source_rows).numel() != exact_grasp_source_rows.numel():
-            raise RuntimeError("Near-object exact grasps must contain exactly one anchor per source row.")
-        exact_grasp_order = torch.argsort(exact_grasp_source_rows)
-        exact_grasp_source_rows = exact_grasp_source_rows[exact_grasp_order]
-        exact_grasp_robot_q = exact_grasp_robot_q[exact_grasp_order]
-        exact_grasp_arm_q = exact_grasp_arm_q[exact_grasp_order]
-
-        # The conditional early/bridge/local mixture requires every retained source row to expose
-        # both approach groups. Discard a source as one unit instead of silently changing its group
-        # probabilities when an isolated approach endpoint fails scene collision screening.
-        provisional_exact_safe = approach_collision_free_t & torch.isin(approach_source_rows, exact_grasp_source_rows)
-        provisional_open = provisional_exact_safe & (approach_phase_ids < phase_count - 3)
-        provisional_source_slots = torch.searchsorted(
-            exact_grasp_source_rows,
-            approach_source_rows[provisional_open],
-        )
-        provisional_groups = (approach_phase_ids[provisional_open] >= 2 * _RESET_PATH_SEGMENT_SUBDIVISIONS).long()
-        provisional_source_groups = 2 * provisional_source_slots + provisional_groups
-        provisional_group_counts = torch.bincount(
-            provisional_source_groups,
-            minlength=2 * exact_grasp_source_rows.numel(),
-        ).reshape(exact_grasp_source_rows.numel(), 2)
-        complete_approach_group = torch.all(provisional_group_counts > 0, dim=-1)
-        exact_grasp_source_rows = exact_grasp_source_rows[complete_approach_group]
-        exact_grasp_robot_q = exact_grasp_robot_q[complete_approach_group]
-        exact_grasp_arm_q = exact_grasp_arm_q[complete_approach_group]
-        if exact_grasp_source_rows.numel() == 0:
-            raise RuntimeError("Near-object screening removed every source with a complete approach bridge.")
-
-        # Phases 22--24 are aligned along a single insertion ray. Replace them with OmniReset's
-        # Cartesian grasp neighborhood while retaining phases 0--21 as a small approach bridge.
-        exact_safe_path = approach_collision_free_t & torch.isin(approach_source_rows, exact_grasp_source_rows)
-        approach_open_mask = exact_safe_path & (approach_phase_ids < phase_count - 3)
-        bridge_source_rows = approach_source_rows[approach_open_mask]
-        bridge_phase_ids = approach_phase_ids[approach_open_mask]
-        bridge_arm_q = approach_arm_q[approach_open_mask]
-        bridge_groups = (bridge_phase_ids >= 2 * _RESET_PATH_SEGMENT_SUBDIVISIONS).long()
-
-        local_pose_samples = symmetric_local_pose_samples(
-            self.cfg.reset_mixture_near_object_local_position_half_range,
-            self.cfg.reset_mixture_near_object_local_rotation_half_range,
-            int(self.cfg.reset_mixture_near_object_local_sample_count),
-            device=self.device,
-            dtype=exact_grasp_arm_q.dtype,
-        )
-        local_sample_count = local_pose_samples.shape[0]
-        nonzero_sample_count = local_sample_count - 1
-        exact_source_positions = self._randomized_source_pos_bank_t[exact_grasp_source_rows]
-        exact_source_quaternions = self._randomized_source_quat_bank_t[exact_grasp_source_rows]
-        grasp_offset_c = exact_source_positions.new_zeros((exact_grasp_source_rows.numel(), 3))
-        grasp_offset_c[:, 2] = float(self.cfg.cup_grasp_height)
-        exact_tcp_positions = exact_source_positions + math_utils.quat_apply(exact_source_quaternions, grasp_offset_c)
-        grasp_tcp_quat_c = torch.as_tensor(
-            self.cfg.cup_grasp_tcp_quat_c,
-            device=self.device,
-            dtype=exact_grasp_arm_q.dtype,
-        )
-        exact_tcp_quaternions = math_utils.quat_mul(
-            exact_source_quaternions,
-            grasp_tcp_quat_c.expand(exact_grasp_source_rows.numel(), -1),
-        )
-        nonzero_samples = local_pose_samples[1:].repeat(exact_grasp_source_rows.numel(), 1)
-        delta_quaternions = math_utils.quat_from_euler_xyz(
-            nonzero_samples[:, 3],
-            nonzero_samples[:, 4],
-            nonzero_samples[:, 5],
-        )
-        local_target_positions, local_target_quaternions = math_utils.combine_frame_transforms(
-            exact_tcp_positions.repeat_interleave(nonzero_sample_count, dim=0),
-            exact_tcp_quaternions.repeat_interleave(nonzero_sample_count, dim=0),
-            nonzero_samples[:, :3],
-            delta_quaternions,
-        )
-        local_target_name = "near_object_local_tcp"
-        local_solver = NewtonIKSolver(
-            NewtonIKSolverCfg(
-                optimizer="lm",
-                jacobian_mode="analytic",
-                sampler="none",
-                n_seeds=1,
-                iterations=int(self.cfg.curriculum_randomized_reset_ik_iterations),
-                lambda_initial=0.1,
-            ),
-            model=model,
-            num_envs=local_target_positions.shape[0],
-            device=str(model.device),
-            objectives=[
-                NewtonIKPoseObjectiveCfg(
-                    body_name=self.cfg.tcp_body_name,
-                    name=local_target_name,
-                    body_offset_pos=self.cfg.tcp_offset_pos,
-                    body_offset_rot=self.cfg.tcp_offset_rot,
-                    position_weight=100.0,
-                    rotation_weight=5.0,
-                ),
-                NewtonIKJointLimitObjectiveCfg(weight=1.0),
-            ],
-            link_resolver=lambda body_name: hand_id,
-        )
-        local_pose_objective = local_solver.objectives_by_name[local_target_name]
-        local_pose_objective.position_objective.set_target_positions(
-            wp.from_torch(local_target_positions.contiguous(), dtype=wp.vec3)
-        )
-        local_pose_objective.rotation_objective.set_target_rotations(
-            wp.from_torch(local_target_quaternions.contiguous(), dtype=wp.vec4)
-        )
-        local_seed_q = exact_grasp_robot_q.repeat_interleave(nonzero_sample_count, dim=0)
-        solved_local_q = wp.to_torch(
-            local_solver.solve(wp.from_torch(local_seed_q.contiguous(), dtype=wp.float32))
-        ).reshape(local_seed_q.shape[0], -1)
-        solved_local_q = solved_local_q.clone()
-        local_costs = wp.to_torch(local_solver.costs).reshape(-1).clone()
-        solved_local_q[:, finger_coordinate_ids] = float(self.cfg.gripper_open_pos)
-        local_arm_limits = self._joint_pos_limits_t[0, self._arm_joint_ids]
-        solved_local_arm_q = solved_local_q[:, arm_coordinate_ids]
-        local_joint_margin = torch.minimum(
-            solved_local_arm_q - local_arm_limits[:, 0],
-            local_arm_limits[:, 1] - solved_local_arm_q,
-        ).amin(dim=-1)
-        solved_local_valid = (
-            torch.isfinite(solved_local_q).all(dim=-1)
-            & torch.isfinite(local_costs)
-            & (local_costs <= float(self.cfg.curriculum_randomized_reset_ik_max_cost))
-            & (local_joint_margin >= float(self.cfg.curriculum_randomized_reset_ik_joint_margin))
-        )
-        solved_local_q = torch.where(solved_local_valid.unsqueeze(-1), solved_local_q, local_seed_q)
-        wp.synchronize_device(model.device)
-        del local_pose_objective, local_solver
-
-        local_robot_q = exact_grasp_robot_q[:, None].repeat(1, local_sample_count, 1)
-        local_robot_q[:, 1:] = solved_local_q.reshape(exact_grasp_source_rows.numel(), nonzero_sample_count, -1)
-        local_robot_q = local_robot_q.flatten(end_dim=1)
-        local_seed_path_q = exact_grasp_robot_q[:, None].expand(-1, local_sample_count, -1).flatten(end_dim=1)
-        local_valid = torch.ones(
-            (exact_grasp_source_rows.numel(), local_sample_count),
-            device=self.device,
-            dtype=torch.bool,
-        )
-        local_valid[:, 1:] = solved_local_valid.reshape(exact_grasp_source_rows.numel(), nonzero_sample_count)
-        local_valid = local_valid.flatten()
-        local_source_rows = exact_grasp_source_rows.repeat_interleave(local_sample_count)
-
-        # Sample zero is the original exact grasp that passed the complete reset-path and scene
-        # screens above. Preserve that proven anchor verbatim; only new perturbations need another
-        # exact-to-perturbed path and endpoint collision screen.
-        local_collision_free = torch.ones_like(local_valid)
-        local_sample_ids = torch.arange(local_sample_count, device=self.device).repeat(exact_grasp_source_rows.numel())
-        # Do not spend collision-pipeline builds on failed IK rows: they already carry a false
-        # validity bit and their sanitized seed exists only to keep downstream kernels finite.
-        local_nonzero_indices = torch.nonzero(local_valid & (local_sample_ids != 0), as_tuple=False).flatten()
-        for start in range(0, local_nonzero_indices.numel(), 512):
-            candidate_indices = local_nonzero_indices[start : start + 512]
-            candidate_sources = local_source_rows[candidate_indices]
-            path_collision_free = self._collision_free_ik_candidates(
-                prototype_builder,
-                (
-                    local_seed_path_q[candidate_indices, None, :],
-                    local_robot_q[candidate_indices, None, :],
-                ),
-            ).squeeze(-1)
-            scene_collision_free = collision_free_reset_candidates(
-                prototype_builder,
-                local_robot_q[candidate_indices],
-                self._randomized_source_pos_bank_t[candidate_sources],
-                self._randomized_source_quat_bank_t[candidate_sources],
-                self._randomized_target_pos_bank_t[candidate_sources],
-                source_box_half=self.cfg.cup_grasp_box_half,
-                target_vertices=self._target_vertices,
-                target_indices=self._target_indices,
-                collider_margin=self._collider_margin,
-                device=self.device,
-            )
-            local_collision_free[candidate_indices] = path_collision_free & scene_collision_free
-        local_valid &= local_collision_free
-        source_has_local_perturbation = local_valid.reshape(-1, local_sample_count)[:, 1:].any(dim=1)
-        if not bool(torch.all(source_has_local_perturbation)):
-            # Offline validation owns the reset distribution: discard a deficient source as one
-            # unit instead of assigning its local mass to the unconditional zero anchor.
-            retained_local_sources = exact_grasp_source_rows[source_has_local_perturbation]
-            if retained_local_sources.numel() == 0:
-                raise RuntimeError("Near-object local screening removed every perturbed source row.")
-            retained_bridge = torch.isin(bridge_source_rows, retained_local_sources)
-            bridge_source_rows = bridge_source_rows[retained_bridge]
-            bridge_arm_q = bridge_arm_q[retained_bridge]
-            bridge_groups = bridge_groups[retained_bridge]
-            local_valid &= source_has_local_perturbation.repeat_interleave(local_sample_count)
-            exact_grasp_source_rows = retained_local_sources
-            exact_grasp_arm_q = exact_grasp_arm_q[source_has_local_perturbation]
-        local_source_rows = local_source_rows[local_valid]
-        local_arm_q = local_robot_q[local_valid][:, arm_coordinate_ids]
-        if not torch.equal(torch.unique(local_source_rows, sorted=True), exact_grasp_source_rows):
-            raise RuntimeError("Near-object local screening removed an exact zero grasp anchor.")
-
-        # Re-check the final bank after local IK/collision pruning; coverage before this point can
-        # overstate the actual reset distribution when a whole source row loses its perturbations.
-        exact_grasp_cells = (exact_grasp_source_rows - final_level_offset) // samples_per_source
-        retained_approach_cells, exact_variants_per_cell = torch.unique(
-            exact_grasp_cells,
-            sorted=True,
-            return_counts=True,
-        )
-        if retained_approach_cells.numel() < minimum_cells or int(exact_variants_per_cell.min()) < minimum_variants:
-            raise RuntimeError(
-                "Final near-object local screening retained too little source-cell coverage: "
-                f"cells={retained_approach_cells.numel()}/{minimum_cells}, "
-                f"minimum variants={int(exact_variants_per_cell.min())}/{minimum_variants}."
-            )
-        if self.cfg.curriculum_randomized_source_radius_range is not None:
-            approach_rings = torch.unique(
-                torch.div(retained_approach_cells, grid_size, rounding_mode="floor"),
-                sorted=True,
-            )
-            approach_azimuth_slots = torch.unique(retained_approach_cells.remainder(grid_size), sorted=True)
-            center_azimuth = grid_size // 2
-            if (
-                not torch.equal(approach_rings, torch.arange(grid_size, device=self.device))
-                or not bool(
-                    (approach_azimuth_slots[0] < center_azimuth) & (approach_azimuth_slots[-1] > center_azimuth)
-                )
-                or not bool(approach_azimuth_slots[-1] - approach_azimuth_slots[0] >= center_azimuth)
-            ):
-                raise RuntimeError("Final near-object local screening lost required polar radial/azimuth coverage.")
-
-        safe_source_rows = torch.cat((bridge_source_rows, local_source_rows))
-        safe_arm_q = torch.cat((bridge_arm_q, local_arm_q))
-        phase_groups = torch.cat((bridge_groups, torch.full_like(local_source_rows, 2)))
+        safe_source_rows = approach_source_rows[approach_collision_free_t]
+        safe_phase_ids = approach_phase_ids[approach_collision_free_t]
+        if safe_source_rows.numel() == 0:
+            raise RuntimeError("Exact collision screening removed every reset-mixture near-object candidate.")
+        expected_approach_cells = torch.unique((final_pool - final_level_offset) // samples_per_source, sorted=True)
         safe_source_rows_unique, source_inverse, candidates_per_source = torch.unique(
             safe_source_rows,
             sorted=True,
             return_inverse=True,
             return_counts=True,
         )
-        if not torch.equal(safe_source_rows_unique, exact_grasp_source_rows):
-            raise RuntimeError("Near-object open and exact-grasp source rows diverged after screening.")
-        safe_cell_ids = (safe_source_rows - final_level_offset) // samples_per_source
-        base_weights = hierarchical_reset_sampling_weights(safe_source_rows, safe_cell_ids)
+        safe_approach_cells = (safe_source_rows_unique - final_level_offset) // samples_per_source
+        retained_approach_cells, approach_variants_per_cell = torch.unique(
+            safe_approach_cells,
+            sorted=True,
+            return_counts=True,
+        )
+        if (
+            not torch.equal(retained_approach_cells, expected_approach_cells)
+            or int(approach_variants_per_cell.min()) < minimum_variants
+        ):
+            raise RuntimeError(
+                "Exact near-object screening did not preserve source-cell coverage: "
+                f"cells={retained_approach_cells.numel()}/{expected_approach_cells.numel()}, "
+                f"minimum variants={int(approach_variants_per_cell.min())}/{minimum_variants}."
+            )
+        approach_cell_ids = (safe_source_rows - final_level_offset) // samples_per_source
+        phase_cell_pairs = torch.unique(torch.stack((safe_phase_ids, approach_cell_ids), dim=-1), dim=0)
+        cells_per_phase = torch.bincount(phase_cell_pairs[:, 0], minlength=phase_count)
+        candidates_per_phase = torch.bincount(safe_phase_ids, minlength=phase_count)
+        minimum_phase_candidates = minimum_cells * minimum_variants
+        if int(cells_per_phase.min()) < minimum_cells or int(candidates_per_phase.min()) < minimum_phase_candidates:
+            raise RuntimeError(
+                "Exact near-object screening did not preserve per-phase workspace coverage: "
+                f"minimum cells={int(cells_per_phase.min())}/{minimum_cells}, "
+                f"minimum candidates={int(candidates_per_phase.min())}/{minimum_phase_candidates}."
+            )
+
+        base_weights = hierarchical_reset_sampling_weights(
+            safe_source_rows,
+            approach_cell_ids,
+        )
+        # OmniReset concentrates Near-Object resets in the local grasp neighborhood. Preserve the
+        # complete approach bridge, but allocate most samples to the capturable final 2 cm while
+        # retaining the existing source-cell and source-row marginals exactly.
+        phase_groups = torch.where(
+            safe_phase_ids >= phase_count - 3,
+            2,
+            torch.where(safe_phase_ids >= 2 * _RESET_PATH_SEGMENT_SUBDIVISIONS, 1, 0),
+        )
         configured_group_mass = self.cfg.reset_mixture_near_object_open_phase_probabilities
         configured_group_mass_sum = sum(configured_group_mass)
         group_mass = base_weights.new_tensor(
@@ -1178,37 +920,71 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             source_groups,
             minlength=candidates_per_source.numel() * group_mass.numel(),
         ).reshape(candidates_per_source.numel(), group_mass.numel())
-        if not bool(torch.all(candidates_per_source_group > 0)):
-            raise RuntimeError("Near-object screening must retain early, bridge, and local candidates per source row.")
-        conditional_open_weights = (
+        available_mass = ((candidates_per_source_group > 0) * group_mass).sum(dim=1)
+        near_object_weights = (
             base_weights
             * candidates_per_source[source_inverse]
             * group_mass[phase_groups]
             / candidates_per_source_group.flatten()[source_groups]
+            / available_mass[source_inverse]
         )
-        source_base_mass = torch.zeros_like(candidates_per_source, dtype=base_weights.dtype).scatter_add_(
-            0, source_inverse, base_weights
+        source_base_mass = torch.zeros_like(available_mass).scatter_add_(0, source_inverse, base_weights)
+        source_weighted_mass = torch.zeros_like(available_mass).scatter_add_(
+            0,
+            source_inverse,
+            near_object_weights,
         )
-        source_open_mass = torch.zeros_like(source_base_mass).scatter_add_(0, source_inverse, conditional_open_weights)
-        if not torch.allclose(source_open_mass, source_base_mass, rtol=1.0e-5, atol=1.0e-7):
+        if not torch.allclose(source_weighted_mass, source_base_mass, rtol=1.0e-5, atol=1.0e-7):
             raise RuntimeError("Near-object phase weighting changed a source-row sampling marginal.")
-        realized_open_group_mass = torch.zeros_like(group_mass).scatter_add_(0, phase_groups, conditional_open_weights)
-        if not torch.allclose(realized_open_group_mass, group_mass, rtol=1.0e-5, atol=1.0e-7):
-            raise RuntimeError("Near-object phase weighting changed the configured open-phase masses.")
-
+        safe_arm_q = approach_arm_q[approach_collision_free_t]
+        exact_grasp = safe_phase_ids == phase_count - 1
+        exact_grasp_source_rows = safe_source_rows[exact_grasp]
         preload_probability = float(self.cfg.reset_mixture_near_object_preloaded_probability)
-        open_weights = conditional_open_weights * (1.0 - preload_probability)
         exact_grasp_source_slots = torch.searchsorted(safe_source_rows_unique, exact_grasp_source_rows)
-        exact_grasp_weights = source_base_mass[exact_grasp_source_slots] * preload_probability
+        exact_grasps_per_source = torch.bincount(
+            exact_grasp_source_slots,
+            minlength=safe_source_rows_unique.numel(),
+        )
+        exact_grasp_available = exact_grasps_per_source > 0
+        preload_capacity = source_base_mass[exact_grasp_available].sum()
+        if (preload_probability == 1.0 and not bool(torch.all(exact_grasp_available))) or (
+            preload_probability < 1.0 and preload_probability > float(preload_capacity) + 1.0e-7
+        ):
+            raise RuntimeError(
+                "Near-object preload probability exceeds the exact-grasp source marginal retained by "
+                f"collision screening: requested={preload_probability:.6f}, maximum={float(preload_capacity):.6f}."
+            )
+
+        # Exact grasps can be screened out for only some source rows. Allocate preload mass
+        # proportionally across the eligible rows, then remove the same mass from each row's open
+        # candidates. This honors the configured population split without changing the combined
+        # source-row (and therefore source-cell) marginal.
+        preload_source_mass = torch.zeros_like(source_base_mass)
+        if preload_probability == 1.0:
+            preload_source_mass.copy_(source_base_mass)
+        elif preload_probability > 0.0:
+            preload_source_mass[exact_grasp_available] = (
+                source_base_mass[exact_grasp_available] * preload_probability / preload_capacity
+            )
+        open_source_mass = torch.clamp_min(source_base_mass - preload_source_mass, 0.0)
+        open_weights = near_object_weights * open_source_mass[source_inverse] / source_base_mass[source_inverse]
+        exact_grasp_weights = (
+            preload_source_mass[exact_grasp_source_slots] / exact_grasps_per_source[exact_grasp_source_slots]
+        )
         self._reset_mixture_near_object_source_rows_t = torch.cat((safe_source_rows, exact_grasp_source_rows))
-        self._reset_mixture_near_object_arm_q_t = torch.cat((safe_arm_q, exact_grasp_arm_q))
+        self._reset_mixture_near_object_arm_q_t = torch.cat((safe_arm_q, safe_arm_q[exact_grasp]))
         self._reset_mixture_near_object_preloaded_t = torch.cat(
             (
                 torch.zeros_like(safe_source_rows, dtype=torch.bool),
                 torch.ones_like(exact_grasp_source_rows, dtype=torch.bool),
             )
         )
-        self._reset_mixture_near_object_weights_t = torch.cat((open_weights, exact_grasp_weights))
+        self._reset_mixture_near_object_weights_t = torch.cat(
+            (
+                open_weights,
+                exact_grasp_weights,
+            )
+        )
         if not bool(
             torch.all(
                 torch.isfinite(self._reset_mixture_near_object_weights_t)
@@ -1216,8 +992,8 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             )
         ):
             raise RuntimeError("Near-object preload weighting produced a non-finite or negative sampling weight.")
-        open_mass = open_weights.sum()
-        preload_mass = exact_grasp_weights.sum()
+        open_mass = self._reset_mixture_near_object_weights_t[~self._reset_mixture_near_object_preloaded_t].sum()
+        preload_mass = self._reset_mixture_near_object_weights_t[self._reset_mixture_near_object_preloaded_t].sum()
         expected_mass = self._reset_mixture_near_object_weights_t.new_tensor(
             (1.0 - preload_probability, preload_probability)
         )
@@ -1225,73 +1001,35 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             raise RuntimeError("Near-object preload weighting changed the configured population masses.")
         combined_source_slots = torch.cat((source_inverse, exact_grasp_source_slots))
         combined_source_mass = torch.zeros_like(source_base_mass).scatter_add_(
-            0, combined_source_slots, self._reset_mixture_near_object_weights_t
+            0,
+            combined_source_slots,
+            self._reset_mixture_near_object_weights_t,
         )
         if not torch.allclose(combined_source_mass, source_base_mass, rtol=1.0e-5, atol=1.0e-7):
             raise RuntimeError("Near-object preload weighting changed a combined source-row sampling marginal.")
+        combined_phase_groups = torch.cat(
+            (phase_groups, torch.full_like(exact_grasp_source_rows, group_mass.numel() - 1))
+        )
+        realized_group_mass = torch.zeros_like(group_mass).scatter_add_(
+            0,
+            combined_phase_groups,
+            self._reset_mixture_near_object_weights_t,
+        )
         logger.info(
-            "Reset-mixture near-object bank retained %d bridge and %d/%d local open candidates plus %d "
-            "exact preloaded anchors across %d source rows (open early/bridge/local mass %.3f/%.3f/%.3f; "
-            "open/preloaded mass %.3f/%.3f).",
-            bridge_source_rows.numel(),
-            local_source_rows.numel(),
-            exact_grasp_source_rows.numel() * local_sample_count,
+            "Reset-mixture near-object bank retained %d/%d open candidates and duplicated %d exact grasps "
+            "across %d source rows and %d phases (minimum %d cells and %d candidates per phase; "
+            "combined early/bridge/local mass %.3f/%.3f/%.3f; open/preloaded mass %.3f/%.3f).",
+            safe_source_rows.numel(),
+            approach_source_rows.numel(),
             exact_grasp_source_rows.numel(),
             safe_source_rows_unique.numel(),
-            *realized_open_group_mass.tolist(),
+            torch.unique(safe_phase_ids).numel(),
+            int(cells_per_phase.min()),
+            int(candidates_per_phase.min()),
+            *realized_group_mass.tolist(),
             float(open_mass),
             float(preload_mass),
         )
-
-    def _build_randomized_target_xy_bank(
-        self,
-        source_positions: torch.Tensor,
-        minimum_y_separation: torch.Tensor,
-        unit_samples: torch.Tensor,
-        extent_levels: tuple[float, ...],
-        rows_per_extent: int,
-    ) -> torch.Tensor:
-        """Build receiver positions for every randomized-reset extent [m]."""
-        target_range = torch.as_tensor(
-            self.cfg.curriculum_randomized_target_position_range,
-            device=self.device,
-        )
-        nominal_target = torch.as_tensor(self.cfg.target_cup_reset_pos, device=self.device)
-        target_center = torch.as_tensor(
-            self.cfg.curriculum_randomized_target_center_xy,
-            device=self.device,
-        )
-        full_target_lower = target_center - target_range
-        full_target_upper = target_center + target_range
-        target_xy_parts = []
-        for level, extent in enumerate(extent_levels):
-            rows = slice(level * rows_per_extent, (level + 1) * rows_per_extent)
-            if self.cfg.curriculum_randomized_target_behind_source:
-                target_xy_parts.append(
-                    target_xy_behind_source(
-                        source_positions[rows, :2],
-                        target_center=self.cfg.curriculum_randomized_target_center_xy,
-                        target_half_range=target_range * extent,
-                        minimum_y_separation=minimum_y_separation[rows],
-                        unit_samples=unit_samples,
-                    )
-                )
-                continue
-            if extent == 0.0:
-                target_xy_parts.append(nominal_target[:2].expand(rows_per_extent, -1))
-                continue
-            level_lower = torch.lerp(nominal_target[:2], full_target_lower, extent)
-            level_upper = torch.lerp(nominal_target[:2], full_target_upper, extent)
-            target_xy_parts.append(
-                target_xy_separated_from_source(
-                    source_positions[rows, :2],
-                    target_center=0.5 * (level_lower + level_upper),
-                    target_half_range=0.5 * (level_upper - level_lower),
-                    minimum_y_separation=minimum_y_separation[rows],
-                    unit_samples=unit_samples,
-                )
-            )
-        return torch.cat(target_xy_parts, dim=0)
 
     def _build_randomized_reset_bank(self) -> None:
         """Build a small Newton-IK bank for collision-safe randomized pre-grasp resets."""
@@ -1410,7 +1148,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
                 radius_range=self.cfg.curriculum_randomized_source_radius_range,
                 azimuth_half_range=float(self.cfg.curriculum_randomized_source_azimuth_range),
                 grid_size=grid_size,
-                y_range=self.cfg.curriculum_randomized_source_y_range,
             )
             radial_facing = True
 
@@ -1763,38 +1500,19 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             solve_candidate_waypoint(carry_target_pose, grasp_candidates)
         )
 
-        if self.cfg.curriculum_randomized_target_behind_source:
-            # The reverse curriculum keeps receiver geometry fixed across the arm-start variants
-            # of one source cell. Two low-discrepancy coordinates cover the receiver region while
-            # the projection below keeps it safely behind the source.
-            cell_index = torch.arange(source_cell_count, device=self.device, dtype=torch.float32)
-            center_cell = float(nominal_source_cell)
-            base_unit_samples = torch.stack(
-                (
-                    torch.remainder((cell_index - center_cell) * 0.754877666 + 0.5, 1.0),
-                    torch.remainder((cell_index - center_cell) * 0.569840296 + 0.5, 1.0),
-                ),
-                dim=-1,
-            ).repeat_interleave(samples_per_source, dim=0)
-        else:
-            # A full-table receiver cannot have one lucky pairing decide whether an otherwise safe
-            # source cell survives. Give every source cell the same low-discrepancy receiver
-            # marginal, cyclically paired with its arm variants; exact IK/collision screening then
-            # retains reachable combinations without shrinking either configured workspace.
-            variant_index = torch.arange(samples_per_source, device=self.device, dtype=torch.float32)
-            variant_index -= float(zero_jitter_slot)
-            target_unit_samples = torch.stack(
-                (
-                    torch.remainder(variant_index * 0.754877666 + 0.5, 1.0),
-                    torch.remainder(variant_index * 0.569840296 + 0.5, 1.0),
-                ),
-                dim=-1,
-            )
-            target_sample_ids = balanced_cyclic_permutations(
-                torch.arange(samples_per_source, device=self.device),
-                source_cell_count,
-            )
-            base_unit_samples = target_unit_samples[target_sample_ids].reshape(-1, 2)
+        # Keep receiver geometry fixed across the arm-start variants of one source cell. Two
+        # low-discrepancy coordinates cover the receiver region while the geometric projection
+        # below keeps it safely behind the source. Centering both sequences on the nominal source
+        # cell makes the zero-amplitude frontier exactly reproduce the authored task.
+        cell_index = torch.arange(source_cell_count, device=self.device, dtype=torch.float32)
+        center_cell = float(nominal_source_cell)
+        base_unit_samples = torch.stack(
+            (
+                torch.remainder((cell_index - center_cell) * 0.754877666 + 0.5, 1.0),
+                torch.remainder((cell_index - center_cell) * 0.569840296 + 0.5, 1.0),
+            ),
+            dim=-1,
+        ).repeat_interleave(samples_per_source, dim=0)
         source_outer_half_x = self.cfg.source_cup_inner_width / 2.0 + self.cfg.source_cup_wall_thickness
         source_outer_half_y = self.cfg.source_cup_inner_depth / 2.0 + self.cfg.source_cup_wall_thickness
         target_outer_half_y = self.cfg.target_cup_inner_depth / 2.0 + self.cfg.target_cup_wall_thickness
@@ -1804,14 +1522,23 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             + target_outer_half_y
             + float(self.cfg.curriculum_randomized_cup_clearance)
         )
-        target_xy = self._build_randomized_target_xy_bank(
-            source_positions,
-            minimum_y_separation,
-            base_unit_samples,
-            extent_levels,
-            rows_per_extent,
+        target_range = torch.as_tensor(
+            self.cfg.curriculum_randomized_target_position_range,
+            device=self.device,
         )
-        nominal_target = torch.as_tensor(self.cfg.target_cup_reset_pos, device=self.device)
+        target_xy_parts = []
+        for level, extent in enumerate(extent_levels):
+            rows = slice(level * rows_per_extent, (level + 1) * rows_per_extent)
+            target_xy_parts.append(
+                target_xy_behind_source(
+                    source_positions[rows, :2],
+                    target_center=self.cfg.curriculum_randomized_target_center_xy,
+                    target_half_range=target_range * extent,
+                    minimum_y_separation=minimum_y_separation[rows],
+                    unit_samples=base_unit_samples,
+                )
+            )
+        target_xy = torch.cat(target_xy_parts, dim=0)
         target_positions = torch.as_tensor(self.cfg.target_cup_reset_pos, device=self.device).repeat(
             source_positions.shape[0], 1
         )
@@ -1868,6 +1595,7 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             )
             return raw_solved_full, solved_arm, solved_costs, solved_margin, solved_valid
 
+        nominal_target = torch.as_tensor(self.cfg.target_cup_reset_pos, device=self.device)
         target_delta = target_positions - nominal_target
 
         pour_target_pose = nominal_pour_tcp_pose.repeat(bank_size, 1)
@@ -2446,8 +2174,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         self._reach_collision_free_candidate_count_t = collision_free_count[reach_indices]
         self._build_reset_mixture_banks(
             prototype_builder,
-            model,
-            hand_id,
             seed,
             arm_q,
             randomized_rows,
@@ -2906,7 +2632,7 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             arm_q[reaching_rows] = self._randomized_arm_q_bank_t[arm_indices]
             cup_pos_e[reaching_rows] = self._randomized_source_pos_bank_t[source_indices]
             source_quat[reaching_rows] = self._randomized_source_quat_bank_t[source_indices]
-            target_pos_e[reaching_rows] = self._reset_mixture_reaching_target_pos_t[target_indices]
+            target_pos_e[reaching_rows] = self._randomized_target_pos_bank_t[target_indices]
             self._last_source_bank_index[reaching_env_ids] = source_indices
             self._last_arm_bank_index[reaching_env_ids] = arm_indices
             self._last_target_bank_index[reaching_env_ids] = target_indices
@@ -3117,6 +2843,12 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             env_ids=env_ids,
         )
 
+        # Public root/joint writers invalidate FK. Reading a public body-pose view consumes
+        # the accumulated articulation mask, making all dirtied body poses authoritative
+        # before solver caches and source-cup proxy transforms are refreshed. Priming the
+        # robot view also prevents its next observation from issuing a redundant FK launch.
+        _ = self._robot.data.body_link_pose_w
+
         tcp_pose_e = self.tcp_pose_e()[env_ids]
         lifted_stage = stage < self._grasp_stage_index
         held_source_quat = math_utils.quat_mul(
@@ -3144,19 +2876,15 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             root_velocity=target_pose.new_zeros((n, 6)),
             env_ids=env_ids,
         )
-        # Consume the root-pose invalidation before rebuilding MPM collider history so the reset
-        # sees the newly authored cup transforms rather than the preceding episode's poses.
-        _ = self._source_cup.data.body_link_pose_w
 
         new_p = self._sample_cup_media(cup_world, source_quat)
         self._media.write_particle_pos_to_sim_index(new_p, env_ids=env_ids)
         self._media.write_particle_velocity_to_sim_index(torch.zeros_like(new_p), env_ids=env_ids)
-        # The public particle writers author q/qd in both manager buffers, while implicit MPM also
-        # owns constitutive and collider history. Reset that history for only the rewritten worlds
-        # so graph replay cannot restore strain from the previous episode.
+        # Particle writers restore q/qd in both state buffers. Reset constitutive and collider
+        # history for the same worlds so a captured replay cannot retain the previous episode.
         NewtonManager.reset_solver_state(
             world_mask=None if self.num_envs == 1 else wp.from_torch(world_mask, dtype=wp.bool),
-            flags=newton.StateFlags.PARTICLE,
+            flags=newton.StateFlags.BODY | newton.StateFlags.PARTICLE,
         )
         self._particle_region_cache = None
         self._particle_region_cache_step = -1

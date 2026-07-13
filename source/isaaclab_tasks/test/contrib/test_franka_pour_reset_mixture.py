@@ -49,12 +49,8 @@ class FakeTerminationManager:
         self.terminated = torch.zeros(num_envs, dtype=torch.bool)
         self.time_outs = torch.zeros(num_envs, dtype=torch.bool)
         self._terms = {
-            "failure": torch.zeros(num_envs, dtype=torch.bool),
-            "extreme_rigid_state": torch.zeros(num_envs, dtype=torch.bool),
-            "particle_out_of_bounds": torch.zeros(num_envs, dtype=torch.bool),
             "spill": torch.zeros(num_envs, dtype=torch.bool),
             "lost_grasp": torch.zeros(num_envs, dtype=torch.bool),
-            "success": torch.zeros(num_envs, dtype=torch.bool),
         }
 
     def get_term(self, name: str) -> torch.Tensor:
@@ -192,37 +188,6 @@ def test_reset_mixture_attributes_outcomes_before_sampling_next_regions(monkeypa
     ]
 
 
-def test_reset_mixture_attributes_abnormal_causes_and_episode_age_by_region(monkeypatch):
-    env = FakeResetMixtureEnv()
-    term = _term(env)
-    monkeypatch.setattr(torch, "multinomial", lambda *_args, **_kwargs: torch.arange(env.num_envs))
-    term(env, torch.arange(env.num_envs))
-
-    env.episode_length_buf[:] = torch.tensor([4, 8, 9, 12])
-    env.termination_manager.terminated[:] = True
-    env.termination_manager.get_term("failure")[0] = True
-    env.termination_manager.get_term("extreme_rigid_state")[1] = True
-    env.termination_manager.get_term("particle_out_of_bounds")[2] = True
-    env.termination_manager.get_term("success")[3] = True
-    env._success_dwell_count[3] = 9
-
-    metrics = term(env, torch.arange(env.num_envs))
-
-    assert metrics["reaching_nonfinite_failure_rate"] == 1.0
-    assert metrics["reaching_abnormal_completion_rate"] == 1.0
-    assert metrics["reaching_early_abnormal_completion_rate"] == 1.0
-    assert metrics["reaching_mean_abnormal_episode_length_steps"] == 4.0
-    assert metrics["near_object_extreme_rigid_state_rate"] == 1.0
-    assert metrics["near_object_early_abnormal_completion_rate"] == 1.0
-    assert metrics["near_object_mean_abnormal_episode_length_steps"] == 8.0
-    assert metrics["grasped_particle_out_of_bounds_rate"] == 1.0
-    assert metrics["grasped_early_abnormal_completion_rate"] == 0.0
-    assert metrics["grasped_mean_abnormal_episode_length_steps"] == 9.0
-    assert metrics["near_goal_success_termination_rate"] == 1.0
-    assert metrics["near_goal_abnormal_completion_rate"] == 0.0
-    assert metrics["near_goal_mean_abnormal_episode_length_steps"] == 0.0
-
-
 def test_reset_mixture_statistics_window_evicts_oldest_outcome(monkeypatch):
     env = FakeResetMixtureEnv(statistics_window_size=2)
     term = _term(env)
@@ -331,7 +296,6 @@ def test_reset_mixture_bank_samples_reaching_atomically_and_keeps_nonreaching_co
     env._randomized_source_pos_bank_t = torch.arange(9, dtype=torch.float32).reshape(3, 3) + 10.0
     env._randomized_source_quat_bank_t = torch.arange(12, dtype=torch.float32).reshape(3, 4) + 20.0
     env._randomized_target_pos_bank_t = torch.arange(9, dtype=torch.float32).reshape(3, 3) + 30.0
-    env._reset_mixture_reaching_target_pos_t = env._randomized_target_pos_bank_t.clone()
     env._randomized_grasp_arm_q_bank_t = torch.arange(21, dtype=torch.float32).reshape(3, 7) + 40.0
     env._reset_mixture_near_object_arm_q_t = torch.stack(
         (

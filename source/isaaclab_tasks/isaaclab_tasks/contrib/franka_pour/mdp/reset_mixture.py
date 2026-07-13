@@ -26,8 +26,6 @@ RESET_MIXTURE_REGION_NAMES = ("reaching", "near_object", "grasped", "near_goal")
 RESET_MIXTURE_STAGE_NAMES = ("randomized", "grasp", "carry", "tilt")
 """Curriculum stages carrying the reward/action semantics for each reset region."""
 
-_EARLY_ABNORMAL_COMPLETION_STEPS = 8
-
 
 class PourResetMixture(ManagerTermBase):
     """Sample a static reset mixture and report outcomes for each reset region.
@@ -64,7 +62,7 @@ class PourResetMixture(ManagerTermBase):
         self._window_count = torch.zeros(region_count, dtype=torch.long)
         self._window_position = torch.zeros(region_count, dtype=torch.long)
         self._outcome_window = torch.zeros(
-            (region_count, self._statistics_window_size, 16),
+            (region_count, self._statistics_window_size, 10),
             dtype=torch.float64,
         )
 
@@ -93,14 +91,6 @@ class PourResetMixture(ManagerTermBase):
                 final_lost_grasp = env._lost_grasp_dwell_count[completed_ids] >= self._lost_grasp_dwell_steps
                 spill_fraction = env.spilled_fraction()[completed_ids]
                 final_spill = spill_fraction > float(env.cfg.max_spill_fraction)
-                nonfinite_failure = env.termination_manager.get_term("failure")[completed_ids]
-                extreme_rigid_state = env.termination_manager.get_term("extreme_rigid_state")[completed_ids]
-                particle_out_of_bounds = env.termination_manager.get_term("particle_out_of_bounds")[completed_ids]
-                success_termination = env.termination_manager.get_term("success")[completed_ids]
-                abnormal_completion = nonfinite_failure | extreme_rigid_state | particle_out_of_bounds
-                early_abnormal_completion = abnormal_completion & (
-                    env.episode_length_buf[completed_ids] <= _EARLY_ABNORMAL_COMPLETION_STEPS
-                )
                 outcomes = (
                     torch.stack(
                         (
@@ -115,12 +105,6 @@ class PourResetMixture(ManagerTermBase):
                             spill_fraction,
                             env.episode_succeeded[completed_ids],
                             env.ep_max_target_frac[completed_ids] >= self._target_fraction,
-                            nonfinite_failure,
-                            extreme_rigid_state,
-                            particle_out_of_bounds,
-                            success_termination,
-                            abnormal_completion,
-                            early_abnormal_completion,
                         ),
                         dim=-1,
                     )
@@ -166,7 +150,7 @@ class PourResetMixture(ManagerTermBase):
         window_means = tuple(
             self._outcome_window[region, : int(self._window_count[region])].mean(dim=0)
             if int(self._window_count[region]) > 0
-            else self._outcome_window.new_zeros(16)
+            else self._outcome_window.new_zeros(10)
             for region in range(len(RESET_MIXTURE_REGION_NAMES))
         )
         transition_mass = tuple(
@@ -177,11 +161,6 @@ class PourResetMixture(ManagerTermBase):
         for region, name in enumerate(RESET_MIXTURE_REGION_NAMES):
             window_count = int(self._window_count[region])
             means = window_means[region]
-            window = self._outcome_window[region, :window_count]
-            abnormal_rows = window[:, 14] > 0.5
-            mean_abnormal_episode_length = (
-                float(window[abnormal_rows, 5].mean()) if bool(torch.any(abnormal_rows)) else 0.0
-            )
             metrics.update(
                 {
                     f"{name}_configured_probability": self._probability_values[region],
@@ -200,13 +179,6 @@ class PourResetMixture(ManagerTermBase):
                     f"{name}_mean_spill_fraction": float(means[7]),
                     f"{name}_ever_success_rate": float(means[8]),
                     f"{name}_raw_peak_target_rate": float(means[9]),
-                    f"{name}_nonfinite_failure_rate": float(means[10]),
-                    f"{name}_extreme_rigid_state_rate": float(means[11]),
-                    f"{name}_particle_out_of_bounds_rate": float(means[12]),
-                    f"{name}_success_termination_rate": float(means[13]),
-                    f"{name}_abnormal_completion_rate": float(means[14]),
-                    f"{name}_early_abnormal_completion_rate": float(means[15]),
-                    f"{name}_mean_abnormal_episode_length_steps": mean_abnormal_episode_length,
                 }
             )
         return metrics

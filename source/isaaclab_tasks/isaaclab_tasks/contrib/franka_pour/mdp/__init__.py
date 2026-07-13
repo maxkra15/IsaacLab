@@ -25,7 +25,6 @@ from .actions import (  # noqa: F401
     CurriculumGripperPositionActionCfg,
     CurriculumJointPositionAction,
     CurriculumJointPositionActionCfg,
-    DifferentialInverseKinematicsActionMovingAverageCfg,
     TrajectoryJointPositionAction,
     TrajectoryJointPositionActionCfg,
 )
@@ -79,6 +78,7 @@ from .rewards import (  # noqa: F401
     particles_in_source,
     particles_in_target,
     pour_success_bonus,
+    sustained_pour_success,
     reach_cup,
     spilled_particles,
     terminal_failure,
@@ -94,6 +94,7 @@ from .terminations import (  # noqa: F401
     excessive_spill,
     extreme_rigid_state,
     lost_lifted_grasp,
+    nonterminating_stable_pour_success,
     nonfinite_failure,
     particle_out_of_bounds,
     stable_pour_success,

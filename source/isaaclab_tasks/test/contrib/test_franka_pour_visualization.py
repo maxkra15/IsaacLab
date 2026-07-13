@@ -63,12 +63,12 @@ def _make_visualization_cfg():
     cfg.curriculum_freeze = True
     cfg.scene.env_spacing = 2.5
     cfg.decimation = 1
-    cfg.num_substeps = 1
-    cfg.rigid_substeps = 4
+    cfg.num_substeps = 2
     cfg.mpm_iterations = 2
     cfg.use_cuda_graph = False
     cfg.sim.render_interval = 1
-    # Retain the production coupled/rigid stepping ratio while keeping the MPM solve cheap.
+    # Keep the eager double-buffered manager on an even substep count, matching
+    # the production configuration's stable public state bindings.
     cfg.sim.visualizer_cfgs = [
         KitVisualizerCfg(headless=True, randomly_sample_visible_envs=False),
         NewtonVisualizerCfg(

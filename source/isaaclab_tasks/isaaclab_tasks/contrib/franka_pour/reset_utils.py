@@ -16,7 +16,6 @@ def polar_workspace_cells(
     radius_range: tuple[float, float] | torch.Tensor,
     azimuth_half_range: float,
     grid_size: int,
-    y_range: tuple[float, float] | torch.Tensor | None = None,
     device: str | torch.device | None = None,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
@@ -26,9 +25,9 @@ def polar_workspace_cells(
     radius is strictly inside the configured range, radial samples are piecewise linear from the
     lower bound through the nominal radius to the upper bound. When the nominal radius is either
     endpoint, a single linear grid spans the range without duplicating a radial sample. Azimuth
-    samples are symmetric about the nominal XY bearing unless asymmetric Y limits clip them. The
-    result is flattened radius-major with azimuth varying fastest; sampling rows uniformly therefore
-    samples discrete rings uniformly rather than sampling the sector uniformly by area.
+    samples are symmetric about the nominal XY bearing. The result is flattened radius-major with
+    azimuth varying fastest; sampling rows uniformly therefore samples discrete rings uniformly
+    rather than sampling the sector uniformly by area.
 
     Args:
         nominal_position: Authored nominal source position ``(x, y, z)`` [m]. Its XY bearing
@@ -39,10 +38,6 @@ def polar_workspace_cells(
         azimuth_half_range: Positive angular half-range about the nominal bearing [rad]. Must be
             less than pi radians.
         grid_size: Odd number of radial samples and azimuth samples. Must be at least three.
-        y_range: Optional increasing lower and upper world-Y limits [m]. When set, each radial ring
-            independently clips its negative and positive azimuth spans to these limits while
-            preserving a zero-azimuth sample. This option requires the nominal position to lie on
-            the positive X axis and strictly inside the Y interval.
         device: Optional output device. Tensor inputs are converted to this device. When omitted,
             the device of ``nominal_position`` is preserved, or CPU is used for tuple input.
         dtype: Optional floating-point output dtype. When omitted, the dtype of a tensor
@@ -116,58 +111,18 @@ def polar_workspace_cells(
         radial_samples = torch.cat((lower_radii, upper_radii))
         nominal_radius_index = half_size
     nominal_azimuth = torch.atan2(nominal[1], nominal[0])
-    if y_range is None:
-        azimuth_offsets = torch.linspace(
-            -azimuth_half_range,
-            azimuth_half_range,
-            grid_size,
-            device=resolved_device,
-            dtype=resolved_dtype,
-        )
-        radius_grid, azimuth_grid = torch.meshgrid(
-            radial_samples,
-            nominal_azimuth + azimuth_offsets,
-            indexing="ij",
-        )
-    else:
-        if azimuth_half_range >= math.pi / 2.0:
-            raise ValueError("y_range requires azimuth_half_range to lie in (0, pi / 2).")
-        y_bounds = torch.as_tensor(y_range, device=resolved_device, dtype=resolved_dtype)
-        if y_bounds.shape != (2,):
-            raise ValueError(f"y_range must contain two values, got shape {tuple(y_bounds.shape)}.")
-        if not bool(torch.isfinite(y_bounds).all()):
-            raise ValueError("y_range must contain finite values.")
-        y_lower, y_upper = y_bounds.unbind()
-        if not bool(y_lower < y_upper):
-            raise ValueError("y_range must contain values in strictly increasing order.")
-        if not bool((nominal[0] > 0.0) & (nominal[1] == 0.0)):
-            raise ValueError("y_range requires nominal_position to lie on the positive X axis.")
-        if not bool((y_lower < nominal[1]) & (nominal[1] < y_upper)):
-            raise ValueError("y_range must strictly contain the nominal source y-position.")
-
-        azimuth_limit = radial_samples.new_tensor(azimuth_half_range)
-        ring_lower_angles = torch.maximum(
-            -azimuth_limit,
-            torch.asin(torch.clamp(y_lower / radial_samples, min=-1.0, max=1.0)),
-        )
-        ring_upper_angles = torch.minimum(
-            azimuth_limit,
-            torch.asin(torch.clamp(y_upper / radial_samples, min=-1.0, max=1.0)),
-        )
-        if not bool(torch.all((ring_lower_angles < 0.0) & (ring_upper_angles > 0.0))):
-            raise ValueError("y_range must leave nonzero azimuth coverage on both sides of the nominal bearing.")
-
-        negative_scale = torch.linspace(1.0, 0.0, half_size + 1, device=resolved_device, dtype=resolved_dtype)[:-1]
-        positive_scale = torch.linspace(0.0, 1.0, half_size + 1, device=resolved_device, dtype=resolved_dtype)
-        azimuth_offsets = torch.cat(
-            (
-                ring_lower_angles[:, None] * negative_scale[None, :],
-                ring_upper_angles[:, None] * positive_scale[None, :],
-            ),
-            dim=1,
-        )
-        radius_grid = radial_samples[:, None].expand(-1, grid_size)
-        azimuth_grid = nominal_azimuth + azimuth_offsets
+    azimuth_offsets = torch.linspace(
+        -azimuth_half_range,
+        azimuth_half_range,
+        grid_size,
+        device=resolved_device,
+        dtype=resolved_dtype,
+    )
+    radius_grid, azimuth_grid = torch.meshgrid(
+        radial_samples,
+        nominal_azimuth + azimuth_offsets,
+        indexing="ij",
+    )
     cells = torch.stack(
         (
             radius_grid * torch.cos(azimuth_grid),
@@ -324,93 +279,6 @@ def reset_rotation_vector_samples(
         angles[0] = lower
         angles[-1] = upper
     return axes * angles.unsqueeze(-1)
-
-
-def symmetric_local_pose_samples(
-    position_half_range: tuple[float, float, float] | torch.Tensor,
-    rotation_half_range: tuple[float, float, float] | torch.Tensor,
-    sample_count: int,
-    *,
-    device: str | torch.device | None = None,
-    dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Return deterministic symmetric Cartesian pose perturbations.
-
-    The first row is zero, the next twelve rows are the positive and negative extrema of each
-    Cartesian coordinate, and the remaining rows are low-discrepancy complementary pairs. The
-    rotation coordinates are XYZ Euler angles applied in the local TCP frame.
-
-    Args:
-        position_half_range: Positive XYZ translation half-ranges [m].
-        rotation_half_range: Positive roll, pitch, and yaw half-ranges [rad]. Each value must
-            not exceed pi / 2 radians.
-        sample_count: Odd number of samples. Must be at least thirteen.
-        device: Optional output device. A tensor bound supplies the default; otherwise CPU is used.
-        dtype: Optional floating-point output dtype. A tensor bound supplies the default; otherwise
-            the default floating-point dtype is used.
-
-    Returns:
-        Local pose perturbations, shape ``(sample_count, 6)``. Translation is in the first three
-        columns [m], followed by XYZ Euler angles [rad].
-    """
-    if (
-        isinstance(sample_count, bool)
-        or not isinstance(sample_count, int)
-        or sample_count < 13
-        or sample_count % 2 == 0
-    ):
-        raise ValueError("sample_count must be an odd integer of at least thirteen.")
-
-    tensor_inputs = tuple(
-        value for value in (position_half_range, rotation_half_range) if isinstance(value, torch.Tensor)
-    )
-    if device is None:
-        if len(tensor_inputs) == 2 and tensor_inputs[0].device != tensor_inputs[1].device:
-            raise ValueError("Tensor pose half-ranges must use the same device unless device is specified.")
-        resolved_device = tensor_inputs[0].device if tensor_inputs else torch.device("cpu")
-    else:
-        resolved_device = torch.device(device)
-    if dtype is None:
-        if len(tensor_inputs) == 2 and tensor_inputs[0].dtype != tensor_inputs[1].dtype:
-            raise ValueError("Tensor pose half-ranges must use the same dtype unless dtype is specified.")
-        resolved_dtype = tensor_inputs[0].dtype if tensor_inputs else torch.get_default_dtype()
-    else:
-        resolved_dtype = dtype
-    if not torch.empty((), dtype=resolved_dtype).is_floating_point():
-        raise ValueError("Pose half-ranges and the output must use a floating-point dtype.")
-
-    position = torch.as_tensor(position_half_range, device=resolved_device, dtype=resolved_dtype)
-    rotation = torch.as_tensor(rotation_half_range, device=resolved_device, dtype=resolved_dtype)
-    if position.shape != (3,) or rotation.shape != (3,):
-        raise ValueError(
-            "position_half_range and rotation_half_range must each contain three values; "
-            f"got {tuple(position.shape)} and {tuple(rotation.shape)}."
-        )
-    if (
-        not bool(torch.isfinite(position).all())
-        or not bool(torch.isfinite(rotation).all())
-        or bool(torch.any(position <= 0.0))
-        or bool(torch.any(rotation <= 0.0))
-    ):
-        raise ValueError("Pose half-ranges must contain finite positive values.")
-    if bool(torch.any(rotation > math.pi / 2.0)):
-        raise ValueError("rotation_half_range values must not exceed pi / 2 radians.")
-
-    half_range = torch.cat((position, rotation))
-    axis_samples = torch.diag(half_range)
-    samples = [half_range.new_zeros((1, 6)), axis_samples, -axis_samples]
-    pair_count = (sample_count - 13) // 2
-    if pair_count:
-        pair_index = torch.arange(pair_count, device=resolved_device, dtype=resolved_dtype) + 0.5
-        # A six-dimensional Kronecker sequence provides deterministic interior coverage. Explicit
-        # negative partners keep the finite cloud exactly centered at the authored grasp.
-        multipliers = half_range.new_tensor(
-            (0.754877666, 0.569840296, 0.438447187, 0.328173353, 0.245122334, 0.184709246)
-        )
-        directions = 2.0 * torch.frac(pair_index[:, None] * multipliers[None, :]) - 1.0
-        interior = directions * half_range
-        samples.append(torch.stack((interior, -interior), dim=1).reshape(-1, 6))
-    return torch.cat(samples, dim=0)
 
 
 def boolean_selection_mask(count: int, selected: torch.Tensor) -> torch.Tensor:
@@ -717,65 +585,4 @@ def target_xy_behind_source(
 
     target_x = lower[0] + unit_samples[:, 0] * (upper[0] - lower[0])
     target_y = lower[1] + unit_samples[:, 1] * (allowed_y_upper - lower[1])
-    return torch.stack((target_x, target_y), dim=-1)
-
-
-def target_xy_separated_from_source(
-    source_xy: torch.Tensor,
-    *,
-    target_center: tuple[float, float] | torch.Tensor,
-    target_half_range: tuple[float, float] | torch.Tensor,
-    minimum_y_separation: float | torch.Tensor,
-    unit_samples: torch.Tensor,
-) -> torch.Tensor:
-    """Map unit-square samples across both target-table regions separated from each source [m].
-
-    Target X spans the complete configured interval. Target Y samples uniformly by interval length
-    from the union below and above the source's exclusion interval. This keeps the receiver on either
-    side of the source without rejection or a preferred pour direction.
-    """
-    if source_xy.ndim != 2 or source_xy.shape[-1] != 2:
-        raise ValueError(f"source_xy must have shape (N, 2), got {tuple(source_xy.shape)}.")
-    if unit_samples.shape != source_xy.shape:
-        raise ValueError(
-            f"unit_samples must match source_xy shape {tuple(source_xy.shape)}, got {tuple(unit_samples.shape)}."
-        )
-    if bool(torch.any((unit_samples < 0.0) | (unit_samples > 1.0))):
-        raise ValueError("unit_samples must lie in [0, 1].")
-
-    center = torch.as_tensor(target_center, device=source_xy.device, dtype=source_xy.dtype)
-    half_range = torch.as_tensor(target_half_range, device=source_xy.device, dtype=source_xy.dtype)
-    if center.shape != (2,) or half_range.shape != (2,):
-        raise ValueError("target_center and target_half_range must each contain two coordinates.")
-    if bool(torch.any(~torch.isfinite(center))) or bool(torch.any(~torch.isfinite(half_range))):
-        raise ValueError("Target randomization bounds must be finite.")
-    if bool(torch.any(half_range < 0.0)):
-        raise ValueError("target_half_range must be nonnegative.")
-
-    separation = torch.as_tensor(minimum_y_separation, device=source_xy.device, dtype=source_xy.dtype)
-    if separation.ndim == 0:
-        separation = separation.expand(source_xy.shape[0])
-    elif separation.shape != (source_xy.shape[0],):
-        raise ValueError("minimum_y_separation must be a scalar or contain one value per source row.")
-    if bool(torch.any(~torch.isfinite(separation))) or bool(torch.any(separation < 0.0)):
-        raise ValueError("minimum_y_separation must be finite and nonnegative.")
-
-    lower = center - half_range
-    upper = center + half_range
-    lower_end = torch.minimum(upper[1], source_xy[:, 1] - separation)
-    lower_available = lower_end >= lower[1]
-    lower_length = torch.clamp(lower_end - lower[1], min=0.0)
-    upper_start = torch.maximum(lower[1], source_xy[:, 1] + separation)
-    upper_length = torch.clamp(upper[1] - upper_start, min=0.0)
-    available_length = lower_length + upper_length
-    if bool(torch.any(available_length <= 0.0)):
-        raise ValueError("No target y-position satisfies the configured range and source-cup separation.")
-
-    target_x = lower[0] + unit_samples[:, 0] * (upper[0] - lower[0])
-    y_distance = unit_samples[:, 1] * available_length
-    target_y = torch.where(
-        lower_available & (y_distance <= lower_length),
-        lower[1] + y_distance,
-        upper_start + y_distance - lower_length,
-    )
     return torch.stack((target_x, target_y), dim=-1)

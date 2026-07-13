@@ -33,11 +33,7 @@ if _RUNTIME_AVAILABLE:
     import isaaclab.utils.math as math_utils
 
     import isaaclab_tasks  # noqa: F401
-    from isaaclab_tasks.contrib.franka_pour.mdp.terminations import (
-        source_grasp_milestones,
-        stable_pour_success,
-        unsuccessful_time_out,
-    )
+    from isaaclab_tasks.contrib.franka_pour.mdp.terminations import source_grasp_milestones
     from isaaclab_tasks.contrib.franka_pour.pour_env_cfg import MPM_ENTRY, PANDA_ARM_JOINT_LIMITS
     from isaaclab_tasks.contrib.franka_pour.reset_utils import (
         asymmetric_reset_offset_samples,
@@ -118,7 +114,6 @@ def _make_runtime_cfg(
     cfg.scene.env_spacing = env_spacing
     cfg.decimation = 1
     cfg.num_substeps = 1
-    cfg.rigid_substeps = 1
     cfg.mpm_iterations = mpm_iterations
     cfg.use_cuda_graph = use_cuda_graph
     cfg.sim.render_interval = 1
@@ -215,40 +210,10 @@ def test_franka_pour_reset_mixture_uses_filtered_binary_gripper_targets(monkeypa
         task.sim._app_control_on_stop_handle = None
         observations, _ = env.reset()
 
-        reaching_triples = task._reset_mixture_reaching_triples_t
-        source_rows, arm_rows, target_rows = reaching_triples.unbind(dim=1)
-        assert bool(torch.any(source_rows != arm_rows))
-        assert bool(torch.any(source_rows != target_rows))
-        assert bool(torch.all(torch.isfinite(task._reset_mixture_reaching_weights_t)))
-        assert bool(torch.all(task._reset_mixture_reaching_weights_t > 0.0))
-
-        unique_source_rows = torch.unique(source_rows)
-        unique_arm_rows = torch.unique(arm_rows)
-        unique_target_rows = torch.unique(target_rows)
-        source_positions = task._randomized_source_pos_bank_t[unique_source_rows]
-        target_positions = task._reset_mixture_reaching_target_pos_t[unique_target_rows]
-        assert float(source_positions[:, 1].amin()) < -0.10
-        assert float(source_positions[:, 1].amax()) > 0.10
-        assert float(target_positions[:, 0].amin()) <= 0.37
-        assert float(target_positions[:, 0].amax()) >= 0.79
-        assert float(target_positions[:, 1].amin()) <= -0.13
-        assert float(target_positions[:, 1].amax()) >= 0.45
-
-        reset_arm_q = task._randomized_arm_q_bank_t[unique_arm_rows]
-        arm_span = reset_arm_q.amax(dim=0) - reset_arm_q.amin(dim=0)
-        assert int(torch.linalg.matrix_rank(reset_arm_q - reset_arm_q.mean(dim=0), tol=1.0e-4)) == 7
-        assert int((arm_span > 0.4).sum()) >= 5
-        reset_tcp_positions = task._randomized_tcp_pos_bank_t[unique_arm_rows]
-        tcp_span = reset_tcp_positions.amax(dim=0) - reset_tcp_positions.amin(dim=0)
-        assert bool(torch.all(tcp_span > torch.tensor((0.20, 0.20, 0.15), device=task.device)))
-
         assert task.action_manager.action_term_dim == [6, 1]
         assert task.action_manager.total_action_dim == 7
         assert observations["policy"].shape == (4, 305)
         assert observations["privileged"].shape == (4, 20)
-        assert task.termination_manager.get_term_cfg("success").func is stable_pour_success
-        assert task.termination_manager.get_term_cfg("time_out").func is unsuccessful_time_out
-        assert task.cfg.actions.gripper_action.alpha == pytest.approx(1.0 - 0.8 ** (1.0 / 3.0))
 
         env_ids = torch.arange(4, device=task.device)
         task.reset_region_id.copy_(env_ids)
@@ -351,7 +316,7 @@ def test_franka_pour_reset_mixture_uses_filtered_binary_gripper_targets(monkeypa
         env.step(motion_actions)
         torch.testing.assert_close(
             arm_action.processed_actions[:, 0],
-            torch.full((4,), 0.5 * task.cfg.actions.arm_action.scale[0] / 3.0, device=task.device),
+            torch.full((4,), 0.01, device=task.device),
             rtol=0.0,
             atol=0.0,
         )
@@ -377,7 +342,7 @@ def test_franka_pour_direct_arm_action_moves_without_hidden_reference():
         cfg.curriculum_start_stage = full_stage
         cfg.curriculum_freeze = True
         cfg.decimation = 2
-        cfg.rigid_substeps = 4
+        cfg.num_substeps = 2
         env = gym.make(_TASK_ID, cfg=cfg)
         task = env.unwrapped
         task.sim._app_control_on_stop_handle = None
@@ -507,7 +472,6 @@ def test_franka_pour_randomized_stage_builds_safe_ik_resets_and_resets_selected_
             radius_range=task.cfg.curriculum_randomized_source_radius_range,
             azimuth_half_range=task.cfg.curriculum_randomized_source_azimuth_range,
             grid_size=grid_size,
-            y_range=task.cfg.curriculum_randomized_source_y_range,
         )
         full_reset_offsets = asymmetric_reset_offset_samples(
             reset_offset_lower,
@@ -1362,8 +1326,8 @@ def test_franka_pour_scene_owned_cups_use_public_state_and_leave_caller_cfg_unmo
     sim_utils.create_new_stage()
     env = None
     caller_cfg = _make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5)
-    # Exercise the production one-outer/four-rigid stepping layout.
-    caller_cfg.rigid_substeps = 4
+    # Keep public views on the authoritative state after the eager step below.
+    caller_cfg.num_substeps = 2
     assert caller_cfg.scene.source_cup is None
     assert caller_cfg.scene.target_cup is None
     assert caller_cfg.scene.media is None
@@ -1425,7 +1389,7 @@ def test_franka_pour_offset_world_tables_support_both_cups_without_reset():
     env = None
     try:
         runtime_cfg = _make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5, mpm_iterations=24)
-        runtime_cfg.rigid_substeps = 4
+        runtime_cfg.num_substeps = 2
         env = gym.make(_TASK_ID, cfg=runtime_cfg)
         task = env.unwrapped
         task.sim._app_control_on_stop_handle = None

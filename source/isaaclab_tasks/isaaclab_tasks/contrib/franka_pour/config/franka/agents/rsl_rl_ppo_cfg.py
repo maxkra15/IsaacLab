@@ -69,14 +69,10 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
     class ExplorationDistributionCfg(RslRlMLPModelCfg.HeteroscedasticGaussianDistributionCfg):
         """State-dependent exploration bounded for independently sampled action noise."""
 
-        # RSL-RL samples this noise independently at every 30 Hz policy step. The task-side FIR
-        # suppresses high-frequency chatter while retaining the exploration range that discovered
-        # the grasp-and-pour transition in the proven 10 Hz run.
         std_range: tuple[float, float] = (0.05, 1.0)
 
-    # Match OmniReset's 3.2-second physical PPO horizon while retaining 30 Hz control. Reach,
-    # align, close, and lift transitions routinely cross the former 1.067-second rollout boundary.
-    num_steps_per_env = 96
+    # The environment runs at 10 Hz, so 32 transitions reproduce OmniReset's 3.2-second rollout.
+    num_steps_per_env = 32
     save_interval = 25
     # Keep incompatible 7-action, history-stacked checkpoints separate from the earlier direct-
     # joint experiment so automatic checkpoint discovery cannot warm-start across semantics.
@@ -93,10 +89,7 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         # but use the standard Isaac Lab entropy scale below so independently sampled noise does
         # not grow merely because the environment clips actions.
         distribution_cfg=ExplorationDistributionCfg(
-            # Mainline RSL-RL samples this head independently at every 30 Hz step, unlike
-            # OmniReset's temporally correlated gSDE. Start near the proven policy's learned
-            # 0.43 standard deviation instead of injecting 0.8-IID contact chatter.
-            init_std=0.4,
+            init_std=1.0,
             std_type="log",
         ),
     )
@@ -110,18 +103,12 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,
         entropy_coef=1.0e-3,
-        # Each rank already collects 196,608 transitions per rollout. One pass avoids repeatedly
-        # fitting the same contact trajectories, which erased the transferred broad-reset skill.
-        num_learning_epochs=1,
-        # At 2,048 environments per rank, 24 splits retain 8,192 samples per optimizer minibatch
-        # after restoring the three-times-longer physical rollout.
-        num_mini_batches=24,
+        num_learning_epochs=5,
+        num_mini_batches=4,
         learning_rate=1.0e-4,
-        # Adaptive KL scheduling caused repeated learning-rate spikes in the 30 Hz run. Keep the
-        # update scale fixed and preserve the earlier 10 Hz discount horizons per physical second.
-        schedule="fixed",
-        gamma=0.99 ** (1.0 / 3.0),
-        lam=0.95 ** (1.0 / 3.0),
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
