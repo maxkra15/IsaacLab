@@ -33,6 +33,7 @@ Guidelines for modifications:
 * James Tigue
 * Kelly (Yunrong) Guo
 * Matthew Trepte
+* Maximilian Krause
 * Mayank Mittal
 * Mike Yan Michelis
 * Mikhail Yurasov
@@ -133,7 +134,6 @@ Guidelines for modifications:
 * Mateo Guaman Castro
 * Matthew Taylor
 * Maurice Rahme
-* Maximilian Krause
 * Michael Gussert
 * Michael Lin
 * Michael Noseworthy
