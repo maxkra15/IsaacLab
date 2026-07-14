@@ -17,6 +17,7 @@ from dataclasses import MISSING, field
 from typing import TYPE_CHECKING, Literal
 
 from isaaclab_newton.physics import NewtonSolverCfg
+from newton import CollisionPipeline
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
@@ -25,7 +26,7 @@ from ..deformable.newton_manager_cfg import NewtonModelSolverCfg
 
 if TYPE_CHECKING:
     from isaaclab_newton.physics import NewtonManager
-    from newton import CollisionPipeline, ModelView
+    from newton import ModelView
 
     from isaaclab.scene import InteractiveSceneCfg
 
@@ -92,11 +93,13 @@ class CouplerProxyMappingCfg:
     destination: str = MISSING
     """Name of the entry that receives the proxy bodies."""
 
-    bodies: list[SceneEntityCfg | str] = field(default_factory=list)
+    bodies: list[SceneEntityCfg | str | int] = field(default_factory=list)
     """Source bodies exposed as proxies in the destination entry.
 
     Selectors use the same scene-entity and full-label-regex semantics as
-    :attr:`CouplerEntryCfg.bodies`.
+    :attr:`CouplerEntryCfg.bodies`, and raw Newton body ids may be given directly
+    as integers. The coupler resolves selectors to body ids in place, so after
+    build this list holds only integers.
     """
 
     particles: list[int] = field(default_factory=list)
@@ -115,23 +118,13 @@ class CouplerProxyMappingCfg:
     positive integers.
     """
 
-    collision_pipeline: Callable[[ModelView], CollisionPipeline | None] | None = None
-    """Optional factory for the proxy destination's collision pipeline."""
+    collision_pipeline: Callable[[ModelView], CollisionPipeline | None] | None = lambda model_view: CollisionPipeline(
+        model_view, broad_phase="explicit"
+    )
+    """Optional factory for the proxy destination's collision pipeline.
 
-    shape_material_ke: float | None = None
-    """Optional contact-stiffness override for shapes on selected proxy bodies [N/m]."""
-
-    shape_material_kd: float | None = None
-    """Optional contact-damping override for shapes on selected proxy bodies [N*s/m]."""
-
-    shape_material_mu: float | None = None
-    """Optional friction override for shapes on selected proxy bodies."""
-
-    shape_margin: float | None = None
-    """Optional contact-margin override for shapes on selected proxy bodies [m]."""
-
-    shape_gap: float | None = None
-    """Optional contact-gap override for shapes on selected proxy bodies [m]."""
+    Defaults to a pipeline with ``broad_phase="explicit"``.
+    """
 
 
 @configclass

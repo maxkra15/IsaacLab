@@ -7,10 +7,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
 from isaaclab_newton.physics import (
     KaminoSolverCfg,
     MJWarpSolverCfg,
@@ -19,7 +18,7 @@ from isaaclab_newton.physics import (
 )
 from isaaclab_newton.physics.mpm_manager import NewtonMPMManager
 from isaaclab_newton.physics.newton_manager import NewtonManager
-from newton import CollisionPipeline, Model, ModelBuilder, ShapeFlags
+from newton import Model, ModelBuilder, ShapeFlags
 from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
 
 from isaaclab.managers import SceneEntityCfg
@@ -52,14 +51,6 @@ class NewtonCouplerManager(NewtonVBDManager):
         joints: list[int]
         shapes: list[int]
 
-    @dataclass
-    class _ResolvedProxy:
-        """Proxy configuration with source selectors resolved to indices."""
-
-        config: CouplerProxyMappingCfg
-        bodies: list[int]
-        particles: list[int]
-
     @staticmethod
     def _requires_external_contacts(solver_cfg: NewtonSolverCfg) -> bool:
         """Return whether a sub-solver expects contacts from Newton's collision pipeline."""
@@ -81,7 +72,7 @@ class NewtonCouplerManager(NewtonVBDManager):
             proxies = [cls._resolve_proxy(model, proxy, scene_cfg) for proxy in solver_cfg.proxies]
             cls._validate_no_cross_entry_proxy_joints(model, {entry.config.name: entry for entry in resolved_entries})
             NewtonManager._solver = cls._build_proxy_coupled_solver(model, entries, proxies, solver_cfg)
-            proxy_destinations = {proxy.config.destination for proxy in proxies}
+            proxy_destinations = {proxy.destination for proxy in proxies}
             needs_collision_pipeline = any(
                 entry.config.name not in proxy_destinations and cls._requires_external_contacts(entry.config.solver_cfg)
                 for entry in resolved_entries
@@ -190,8 +181,8 @@ class NewtonCouplerManager(NewtonVBDManager):
         model: Model,
         proxy_cfg: CouplerProxyMappingCfg,
         scene_cfg: InteractiveSceneCfg | None,
-    ) -> _ResolvedProxy:
-        """Resolve one proxy mapping's body selectors to collidable body ids."""
+    ) -> CouplerProxyMappingCfg:
+        """Resolve a proxy mapping's selectors to collidable body ids, writing them into the config in place."""
         selected = cls._resolve_entities_to_body_ids(
             model, proxy_cfg.bodies, scene_cfg, f"proxy {proxy_cfg.source!r}->{proxy_cfg.destination!r}"
         )
@@ -207,24 +198,27 @@ class NewtonCouplerManager(NewtonVBDManager):
                 f"CouplerProxyMappingCfg {proxy_cfg.source!r}->{proxy_cfg.destination!r} selected no bodies "
                 "with ShapeFlags.COLLIDE_SHAPES."
             )
-        return cls._ResolvedProxy(
-            config=proxy_cfg,
-            bodies=bodies,
-            particles=list(dict.fromkeys(map(int, proxy_cfg.particles))),
-        )
+        proxy_cfg.bodies = bodies
+        proxy_cfg.particles = list(dict.fromkeys(map(int, proxy_cfg.particles)))
+        return proxy_cfg
 
     @classmethod
     def _resolve_entities_to_body_ids(
         cls,
         model: Model,
-        specs: list[SceneEntityCfg | str],
+        specs: list[SceneEntityCfg | str | int],
         scene_cfg: InteractiveSceneCfg | None,
         field: str,
     ) -> list[int]:
-        """Resolve scene entities or body-label regexes to unique, order-preserving body ids."""
+        """Resolve scene entities, body-label regexes, or raw body ids to unique, order-preserving body ids."""
         labels = list(model.body_label)
         body_ids: list[int] = []
         for spec in specs:
+            if isinstance(spec, int):
+                if not 0 <= spec < len(labels):
+                    raise ValueError(f"CouplerCfg {field}: body id {spec} is out of range [0, {len(labels)}).")
+                body_ids.append(spec)
+                continue
             if isinstance(spec, str):
                 matched, _ = resolve_matching_names(f"(?:{spec})(?:/.*)?", labels, raise_when_no_match=False)
                 if not matched:
@@ -274,37 +268,17 @@ class NewtonCouplerManager(NewtonVBDManager):
             in_place=entry_cfg.in_place,
         )
 
-    @staticmethod
-    def _matching_config_values(target_type: type, config) -> dict:
-        """Return config values whose names match a target dataclass."""
-        return {field.name: getattr(config, field.name) for field in fields(target_type) if hasattr(config, field.name)}
-
     @classmethod
     def _build_proxy_coupled_solver(
         cls,
         model: Model,
         entries: list[SolverCoupled.Entry],
-        proxies: list[_ResolvedProxy],
+        proxy_cfgs: list[CouplerProxyMappingCfg],
         solver_cfg: CouplerProxyCfg,
     ) -> SolverCoupledProxy:
-        cls._apply_proxy_shape_overrides(model, proxies)
-        proxy_mappings = []
-        for proxy in proxies:
-            values = cls._matching_config_values(SolverCoupledProxy.Proxy, proxy.config)
-            values.update(
-                bodies=proxy.bodies,
-                particles=proxy.particles,
-                collision_pipeline=proxy.config.collision_pipeline
-                or (lambda model_view: CollisionPipeline(model_view, broad_phase="explicit")),
-            )
-            proxy_mappings.append(SolverCoupledProxy.Proxy(**values))
-        coupling_values = cls._matching_config_values(SolverCoupledProxy.Config, solver_cfg)
-        coupling_values["proxies"] = proxy_mappings
-        return SolverCoupledProxy(
-            model=model,
-            entries=entries,
-            coupling=SolverCoupledProxy.Config(**coupling_values),
-        )
+        proxies = [SolverCoupledProxy.Proxy(**vars(proxy_cfg)) for proxy_cfg in proxy_cfgs]
+        coupling = SolverCoupledProxy.Config(proxies=proxies, iterations=solver_cfg.iterations)
+        return SolverCoupledProxy(model=model, entries=entries, coupling=coupling)
 
     @classmethod
     def _build_admm_coupled_solver(
@@ -313,7 +287,7 @@ class NewtonCouplerManager(NewtonVBDManager):
         entries: list[SolverCoupled.Entry],
         solver_cfg: CouplerAdmmCfg,
     ) -> SolverCoupledADMM:
-        values = cls._matching_config_values(SolverCoupledADMM.Config, solver_cfg)
+        values = cls._filter_solver_kwargs(SolverCoupledADMM.Config, solver_cfg)
         if solver_cfg.contact_pairs is None:
             values["contact_pairs"] = SolverCoupledADMM.auto_detect_contact_pairs(entries)
         else:
@@ -338,17 +312,3 @@ class NewtonCouplerManager(NewtonVBDManager):
                     f"{parent_owner!r} and {child_owner!r}; keep the articulation in one entry "
                     "or use ADMM coupling."
                 )
-
-    @classmethod
-    def _apply_proxy_shape_overrides(cls, model: Model, proxies: list[_ResolvedProxy]) -> None:
-        shape_bodies = model.shape_body.numpy()
-        for proxy in proxies:
-            body_set = set(proxy.bodies)
-            shape_ids = [shape for shape, body in enumerate(shape_bodies) if int(body) in body_set]
-            for name in ("shape_material_ke", "shape_material_kd", "shape_material_mu", "shape_margin", "shape_gap"):
-                value = getattr(proxy.config, name)
-                array = getattr(model, name, None)
-                if value is not None and shape_ids and array is not None:
-                    values = array.numpy()
-                    values[np.asarray(shape_ids, dtype=np.int32)] = float(value)
-                    array.assign(values)
