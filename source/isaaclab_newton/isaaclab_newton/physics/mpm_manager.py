@@ -112,7 +112,6 @@ class NewtonMPMManager(NewtonManager):
         NewtonManager._solver = cls._create_solver(model, solver_cfg)
         NewtonManager._use_single_state = True
         NewtonManager._needs_collision_pipeline = False
-        NewtonManager._needs_fk_before_step = True
         cls._project_outside_colliders = solver_cfg.project_outside_colliders
 
     @classmethod
