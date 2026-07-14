@@ -40,6 +40,10 @@ parser.add_argument(
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
 parser.add_argument(
+    "--max_steps", type=int, default=0, help="Optional teleop loop bound. Set to 0 to run until closed."
+)
+parser.add_argument("--debug_teleop", action="store_true", help="Print periodic teleop command diagnostics.")
+parser.add_argument(
     "--cloudxr_env",
     type=str,
     default="cloudxrjs",
@@ -64,6 +68,12 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, remaining_args = parser.parse_known_args()
+
+# Newton waterhose XR is a GPU workload. Preserve explicit user device choices.
+if "Waterhose" in (args_cli.task or ""):
+    from isaaclab_teleop.cloudxr import prefer_cuda_for_xr
+
+    prefer_cuda_for_xr(args_cli)
 
 app_launcher_args = vars(args_cli)
 
@@ -329,14 +339,18 @@ def main() -> None:
 
         stack_name = "IsaacTeleop" if use_isaac_teleop else "native"
         print(f"{stack_name} teleoperation started. Press 'R' to reset the environment.")
+        step_count = 0
 
         # simulate environment
         while simulation_app.is_running():
             try:
                 # run everything in inference mode
                 with torch.inference_mode():
+                    if args_cli.max_steps > 0 and step_count >= args_cli.max_steps:
+                        break
                     # get device command
                     action = teleop_interface.advance()
+                    step_count += 1
 
                     if use_isaac_teleop:
                         ctrl = poll_control_events(teleop_interface)
@@ -350,6 +364,9 @@ def main() -> None:
                     if action is None:
                         env.sim.render()
                     elif teleoperation_active:
+                        if args_cli.debug_teleop and step_count % 15 == 0:
+                            values = action.detach().flatten().cpu().tolist()
+                            print("teleop action:", " ".join(f"{value:+.3f}" for value in values), flush=True)
                         # process actions
                         actions = action.repeat(env.num_envs, 1)
                         # apply actions

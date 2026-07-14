@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import sys
 from pathlib import Path
@@ -18,6 +19,23 @@ _WEBSOCKETS_MODULE_NAMES = (
     "websockets.client",
     "websockets.server",
 )
+
+
+def prefer_cuda_for_xr(args_cli: argparse.Namespace) -> bool:
+    """Select ``cuda:0`` for an XR workload unless the user chose a device.
+
+    AppLauncher intentionally defaults implicit XR launches to CPU. Newton-backed
+    XR tasks that require GPU execution can call this helper before constructing
+    AppLauncher while still respecting an explicit ``--device`` selection.
+
+    Returns:
+        Whether the device selection was changed.
+    """
+    if not bool(getattr(args_cli, "xr", False)) or bool(getattr(args_cli, "device_explicit", False)):
+        return False
+    args_cli.device = "cuda:0"
+    args_cli.device_explicit = True
+    return True
 
 
 def _module_path(module: ModuleType) -> Path:

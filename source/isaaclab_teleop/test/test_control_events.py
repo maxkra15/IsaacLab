@@ -519,6 +519,8 @@ class TestExtractCommand:
 class TestClassifyCommand:
     def test_exact_words(self):
         assert _classify_command("start") == "start"
+        assert _classify_command("play") == "start"
+        assert _classify_command("run") == "start"
         assert _classify_command("stop") == "stop"
         assert _classify_command("reset") == "reset"
 
@@ -538,6 +540,7 @@ class TestClassifyCommand:
 
     def test_case_insensitive(self):
         assert _classify_command("START") == "start"
+        assert _classify_command("Play") == "start"
         assert _classify_command("Stop Teleop") == "stop"
         assert _classify_command("RESET NOW") == "reset"
 

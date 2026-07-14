@@ -60,6 +60,9 @@ parser.add_argument(
     "--num_demos", type=int, default=0, help="Number of demonstrations to record. Set to 0 for infinite."
 )
 parser.add_argument(
+    "--max_steps", type=int, default=0, help="Optional recording loop bound. Set to 0 to run until closed."
+)
+parser.add_argument(
     "--num_success_steps",
     type=int,
     default=10,
@@ -102,6 +105,12 @@ args_cli, remaining_args = parser.parse_known_args()
 # Validate required arguments
 if args_cli.task is None:
     parser.error("--task is required")
+
+# Newton waterhose XR is a GPU workload. Preserve explicit user device choices.
+if "Waterhose" in args_cli.task:
+    from isaaclab_teleop.cloudxr import prefer_cuda_for_xr
+
+    prefer_cuda_for_xr(args_cli)
 
 app_launcher_args = vars(args_cli)
 
@@ -295,7 +304,8 @@ def create_environment_config(
     env_cfg.terminations.time_out = None
     env_cfg.observations.policy.concatenate_terms = False
 
-    env_cfg.recorders: ActionStateRecorderManagerCfg = ActionStateRecorderManagerCfg()
+    recorder_cfg_factory = getattr(env_cfg, "make_recorder_manager_cfg", None)
+    env_cfg.recorders = recorder_cfg_factory() if callable(recorder_cfg_factory) else ActionStateRecorderManagerCfg()
     env_cfg.recorders.dataset_export_dir_path = output_dir
     env_cfg.recorders.dataset_filename = output_file_name
     env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
@@ -571,10 +581,14 @@ def run_simulation_loop(
         if use_isaac_teleop:
             from isaaclab_teleop import poll_control_events
 
+        step_count = 0
         with contextlib.suppress(KeyboardInterrupt), torch.inference_mode():
             while simulation_app.is_running():
+                if args_cli.max_steps > 0 and step_count >= args_cli.max_steps:
+                    break
                 # Get teleop command (may be None while waiting for session start)
                 action = teleop_interface.advance()
+                step_count += 1
 
                 if use_isaac_teleop:
                     ctrl = poll_control_events(teleop_interface)

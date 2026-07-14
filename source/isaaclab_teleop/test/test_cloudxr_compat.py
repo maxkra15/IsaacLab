@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from isaaclab_teleop import preload_cloudxr_websockets
+from isaaclab_teleop.cloudxr import prefer_cuda_for_xr
 
 _WEBSOCKETS_MODULE_NAMES = (
     "websockets.asyncio.client",
@@ -19,6 +21,20 @@ _WEBSOCKETS_MODULE_NAMES = (
     "websockets.client",
     "websockets.server",
 )
+
+
+def test_xr_cuda_preference_updates_only_implicit_device_selection() -> None:
+    implicit = SimpleNamespace(xr=True, device="cpu", device_explicit=False)
+    explicit = SimpleNamespace(xr=True, device="cpu", device_explicit=True)
+    desktop = SimpleNamespace(xr=False, device="cpu", device_explicit=False)
+
+    assert prefer_cuda_for_xr(implicit) is True
+    assert implicit.device == "cuda:0"
+    assert implicit.device_explicit is True
+    assert prefer_cuda_for_xr(explicit) is False
+    assert explicit.device == "cpu"
+    assert prefer_cuda_for_xr(desktop) is False
+    assert desktop.device == "cpu"
 
 
 def test_preload_cloudxr_websockets_is_consistent_and_idempotent() -> None:

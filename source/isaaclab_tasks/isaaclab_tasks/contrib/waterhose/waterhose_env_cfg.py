@@ -102,14 +102,9 @@ _FRIDGE_COLLISION_PROXY_USD = str(_LOCAL_ASSETS_DIR / "fridge_clearanced_collisi
 _SKY_HDR = str(_LOCAL_ASSETS_DIR / "skies" / "kloofendal_43d_clear_puresky_4k.hdr")
 _GROUND_USD = str(_LOCAL_ASSETS_DIR / "ground" / "default_environment.usd")
 
-# Initial visualizer cameras, defined in the task config so the --visualizer/--viz path uses
-# these starting views. KitVisualizer uses eye/lookat; the Kit lookat is one meter along the
-# camera-local -Z from the authored Kit transform translate=(-0.9, 0.6, 0.3),
-# rotateXYZ=(73.32259, 0, -112.30437).
-_KIT_CAMERA_EYE = (-0.9, 0.6, 0.3)
-_KIT_CAMERA_LOOKAT = (-0.013736291, 0.236437794, 0.013017143)
-_NEWTON_CAMERA_EYE = (-2.55, -7.1, 2.3)
-_NEWTON_CAMERA_LOOKAT = (0.55, -0.42, 0.9)
+# Wide scene-fit camera shared by the environment controller and every visualizer.
+_SCENE_CAMERA_EYE = (-2.55, -7.1, 2.3)
+_SCENE_CAMERA_LOOKAT = (0.55, -0.42, 0.9)
 _ROBOT_BASE_PRIM_PATH_ENV0 = "/World/envs/env_0/Robot/Geometry/origin"
 _FRIDGE_ROBOT_COLLISION_PATTERN = r".*/FridgeRobotCollision/Housing.*"
 _FRIDGE_CABLE_COLLISION_PATTERN = r".*/FridgeCableCollision/Housing.*"
@@ -169,6 +164,7 @@ _VBD_SOFT_CONTACT_FRICTION = 0.6
 # Tune up if the grip still slips during INSERT, down if the seated plug flips at HOLD_INSERTED.
 _VBD_GRIPPER_PROXY_FRICTION = 2.0e1
 _VBD_GRIPPER_PROXY_MARGIN = 0.001
+_PROXY_RIGID_CONTACT_MAX = 30000
 _RIGHT_GRIPPER_JOINT_NAMES = [
     "right_gripper_finger_joint_1",
     "right_gripper_left_finger_joint",
@@ -309,12 +305,17 @@ def _make_proxy_collision_pipeline(model):
         model,
         broad_phase="explicit",
         shape_pairs_filtered=shape_pairs_filtered,
-        rigid_contact_max=30000,
+        rigid_contact_max=_PROXY_RIGID_CONTACT_MAX,
         # "sticky" replays previous-frame contact geometry; that is useful for
         # hard-contact demos, but makes the hose feel glued to the fingers here.
         contact_matching="latest",
         contact_matching_pos_threshold=0.005,
         contact_matching_normal_dot_threshold=0.95,
+        # Newton #3262's water-tight path generates contacts from a soft mesh's edges
+        # and faces. This hose is a rigid-capsule rod graph, and SolverCoupledProxy
+        # cannot yet harvest full-surface VBD forces, so enabling it here would add no
+        # hose contacts and latest Newton intentionally rejects that combination.
+        enable_rigid_soft_full_surface_contact=False,
     )
 
 
@@ -611,19 +612,20 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.render_interval = self.decimation
         self.sim.gravity = (0.0, 0.0, -9.81)
 
-        kit_view = dict(
-            eye=_KIT_CAMERA_EYE,
-            lookat=_KIT_CAMERA_LOOKAT,
+        visualizer_view = dict(
+            eye=_SCENE_CAMERA_EYE,
+            lookat=_SCENE_CAMERA_LOOKAT,
             window_width=1600,
             window_height=1600,
         )
-        newton_view = dict(
-            eye=_NEWTON_CAMERA_EYE,
-            lookat=_NEWTON_CAMERA_LOOKAT,
-            window_width=1600,
-            window_height=1600,
-        )
-        self.sim.visualizer_cfgs = [KitVisualizerCfg(**kit_view), NewtonVisualizerCfg(**newton_view)]
+        self.sim.visualizer_cfgs = [KitVisualizerCfg(**visualizer_view), NewtonVisualizerCfg(**visualizer_view)]
+
+        # ManagerBasedEnv's ViewportCameraController applies ViewerCfg to every active visualizer.
+        # Keep its pose aligned with the visualizer configs so startup order cannot change the view.
+        self.viewer.eye = _SCENE_CAMERA_EYE
+        self.viewer.lookat = _SCENE_CAMERA_LOOKAT
+        self.viewer.origin_type = "world"
+        self.viewer.resolution = (1600, 1000)
 
         # Resolution of `--video` recordings (independent of the on-screen visualizer windows above).
         self.video_recorder.window_width = 1600
@@ -740,6 +742,9 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                 iterations=1,
             ),
             num_substeps=substeps,
+            # This explicit capacity is visible before SolverVBD construction. Keep it
+            # at least as large as the proxy pipeline so rigid-contact history can be
+            # allocated before CUDA graph capture on current Newton.
             collision_cfg=NewtonCollisionPipelineCfg(rigid_contact_max=65536),
             model_cfg=NewtonModelCfg(
                 shape_material_ke=_VBD_CONTACT_STIFFNESS,

@@ -58,6 +58,25 @@ def test_waterhose_proxy_uses_authored_finger_inertia():
     assert entries["mjc"].use_solver_effective_mass is False
 
 
+def test_waterhose_preallocates_proxy_contact_history_before_cuda_capture():
+    cfg = waterhose_env_cfg.WaterhoseEnvCfg()
+    entries = {entry.name: entry for entry in cfg.sim.physics.solver_cfg.entries}
+
+    assert cfg.sim.physics.use_cuda_graph is True
+    assert entries["vbd"].solver_cfg.rigid_contact_history is True
+    assert cfg.sim.physics.collision_cfg.rigid_contact_max >= waterhose_env_cfg._PROXY_RIGID_CONTACT_MAX
+
+
+def test_waterhose_active_visualizers_share_the_environment_camera_view():
+    cfg = waterhose_env_cfg.WaterhoseEnvCfg()
+
+    assert {visualizer.visualizer_type for visualizer in cfg.sim.visualizer_cfgs} == {"kit", "newton"}
+    for visualizer in cfg.sim.visualizer_cfgs:
+        assert tuple(visualizer.eye) == tuple(cfg.viewer.eye)
+        assert tuple(visualizer.lookat) == tuple(cfg.viewer.lookat)
+    assert cfg.viewer.origin_type == "world"
+
+
 def test_waterhose_admm_disables_unmatched_vbd_contact_history():
     cfg = waterhose_env_cfg.WaterhoseAdmmIkEnvCfg()
     entries = {entry.name: entry for entry in cfg.sim.physics.solver_cfg.entries}

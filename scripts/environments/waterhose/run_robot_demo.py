@@ -15,6 +15,9 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
+# Render authored USD materials instead of replacing every Newton shape with a
+# generated debug color. This also avoids the replacement warning on startup.
+os.environ.setdefault("ISAACLAB_REPLACE_NEWTON_SHAPE_COLORS", "0")
 
 from isaaclab.app import AppLauncher
 
