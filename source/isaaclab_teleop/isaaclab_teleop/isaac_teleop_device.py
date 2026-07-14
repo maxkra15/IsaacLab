@@ -255,12 +255,14 @@ class IsaacTeleopDevice:
                 When ``None`` and
                 :attr:`~IsaacTeleopCfg.target_frame_prim_path` is set, the
                 transform is computed automatically by reading the prim's
-                world matrix from Fabric and inverting it.
+                world matrix from Fabric and inverting it.  If that configured
+                frame cannot be read, no action is emitted until it resolves.
 
         Returns:
             A flattened action :class:`torch.Tensor` ready for the Isaac Lab
-            environment, or ``None`` if the session has not started yet
-            (e.g. still waiting for the user to start AR).
+            environment, or ``None`` if the session has not started yet (e.g.
+            still waiting for the user to start AR) or a configured target
+            frame is not currently readable.
 
         Raises:
             RuntimeError: If called outside of a context manager.
@@ -268,6 +270,10 @@ class IsaacTeleopDevice:
         # Auto-compute target_T_world from config if not explicitly provided
         if target_T_world is None and self._cfg.target_frame_prim_path is not None:
             target_T_world = self._get_target_frame_T_world()
+            if target_T_world is None:
+                # A configured frame is part of the action contract.  Falling
+                # back to no transform would silently emit world-frame poses.
+                return None
 
         # Step the session (handles lazy start and action extraction)
         action = self._session_lifecycle.step(

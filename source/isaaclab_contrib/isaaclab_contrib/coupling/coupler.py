@@ -20,7 +20,13 @@ from isaaclab_newton.physics import (
 from isaaclab_newton.physics.mpm_manager import NewtonMPMManager
 from isaaclab_newton.physics.newton_manager import NewtonManager
 from newton import CollisionPipeline, Model, ModelBuilder, ShapeFlags
-from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
+from newton.solvers import SolverBase
+from newton.solvers.experimental.coupled import (
+    CouplingInterface,
+    SolverCoupled,
+    SolverCoupledADMM,
+    SolverCoupledProxy,
+)
 
 from isaaclab.physics import PhysicsManager
 from isaaclab.utils.string import resolve_matching_names
@@ -35,6 +41,46 @@ from .coupler_cfg import (
 )
 
 
+class _GenericEffectiveMassSolver(CouplingInterface):
+    """Use model-view inertia while delegating every other coupling operation."""
+
+    def __init__(self, solver: SolverBase):
+        self._solver = solver
+
+    def __getattr__(self, name):
+        return getattr(self._solver, name)
+
+    def coupling_eval_effective_mass(self, *args, **kwargs):
+        return CouplingInterface.coupling_eval_effective_mass(self, *args, **kwargs)
+
+    def coupling_eval_effective_mass_block(self, *args, **kwargs):
+        return CouplingInterface.coupling_eval_effective_mass_block(self, *args, **kwargs)
+
+    def coupling_notify_input_state_update(self, *args, **kwargs):
+        return self._solver.coupling_notify_input_state_update(*args, **kwargs)
+
+    def coupling_supports_inertial_property_refresh(self, *args, **kwargs):
+        return self._solver.coupling_supports_inertial_property_refresh(*args, **kwargs)
+
+    def coupling_eval_gravity_acceleration(self, *args, **kwargs):
+        return self._solver.coupling_eval_gravity_acceleration(*args, **kwargs)
+
+    def coupling_rewind_proxy_body(self, *args, **kwargs):
+        return self._solver.coupling_rewind_proxy_body(*args, **kwargs)
+
+    def coupling_rewind_proxy_particle(self, *args, **kwargs):
+        return self._solver.coupling_rewind_proxy_particle(*args, **kwargs)
+
+    def coupling_harvest_proxy_wrenches(self, *args, **kwargs):
+        return self._solver.coupling_harvest_proxy_wrenches(*args, **kwargs)
+
+    def coupling_harvest_proxy_particle_forces(self, *args, **kwargs):
+        return self._solver.coupling_harvest_proxy_particle_forces(*args, **kwargs)
+
+    def coupling_prepare_proxy_contacts(self, *args, **kwargs):
+        return self._solver.coupling_prepare_proxy_contacts(*args, **kwargs)
+
+
 class NewtonCouplerManager(NewtonVBDManager):
     """Couple named Newton solver entries through proxy or ADMM interfaces."""
 
@@ -47,6 +93,12 @@ class NewtonCouplerManager(NewtonVBDManager):
         particles: list[int]
         joints: list[int]
         shapes: list[int]
+
+    # Manager-owned lifecycle metadata used by solver-specialized services such
+    # as VBD's generic-FK ownership filter. Do not attach this to Newton's
+    # SolverCoupled implementation: it is Isaac Lab selector state, and keeping
+    # it here avoids coupling Newton internals to the adapter.
+    _resolved_entries_by_name: dict[str, _ResolvedEntry] = {}
 
     @classmethod
     def _create_solver(cls, model: Model, solver_cfg: CouplerCfg):
@@ -79,6 +131,7 @@ class NewtonCouplerManager(NewtonVBDManager):
 
         cls._validate_config(solver_cfg)
         resolved_entries = [cls._resolve_entry(model, entry) for entry in solver_cfg.entries]
+        cls._resolved_entries_by_name = {entry.config.name: entry for entry in resolved_entries}
         proxies: list[CouplerProxyMappingCfg] = []
         active_proxy_destinations: set[str] = set()
         if isinstance(solver_cfg, CouplerProxyCfg):
@@ -115,6 +168,12 @@ class NewtonCouplerManager(NewtonVBDManager):
         NewtonManager._needs_fk_before_step = any(
             isinstance(entry.config.solver_cfg, MPMSolverCfg) for entry in resolved_entries
         )
+
+    @classmethod
+    def _solver_specific_clear(cls) -> None:
+        """Clear coupler ownership metadata and inherited VBD builder state."""
+        cls._resolved_entries_by_name = {}
+        super()._solver_specific_clear()
 
     @classmethod
     def _validate_config(cls, solver_cfg: CouplerCfg) -> None:
@@ -332,9 +391,13 @@ class NewtonCouplerManager(NewtonVBDManager):
     @classmethod
     def _build_entry(cls, entry: _ResolvedEntry) -> SolverCoupled.Entry:
         entry_cfg = entry.config
+        use_solver_effective_mass = entry_cfg.use_solver_effective_mass
 
         def solver_factory(model_view):
-            return entry_cfg.solver_cfg.class_type._create_solver(model_view, entry_cfg.solver_cfg)
+            solver = entry_cfg.solver_cfg.class_type._create_solver(model_view, entry_cfg.solver_cfg)
+            if not use_solver_effective_mass:
+                solver = _GenericEffectiveMassSolver(solver)
+            return solver
 
         return SolverCoupled.Entry(
             name=entry_cfg.name,

@@ -38,6 +38,30 @@ SCENE_CONFIG_COUPLED_TASKS = {
 SCENE_CONFIG_SCRIPTED_TASKS = set(SCENE_CONFIG_COUPLED_TASKS)
 
 
+class _WallClockRateLimiter:
+    """Pace a rollout to its configured simulation step without accumulating drift."""
+
+    def __init__(self, step_dt: float):
+        if step_dt <= 0.0:
+            raise ValueError(f"Expected a positive simulation step, got {step_dt}.")
+        self._step_dt = step_dt
+        self._next_step_time = time.perf_counter()
+
+    def sleep(self) -> None:
+        """Wait until one simulation step has elapsed in wall-clock time."""
+        self._next_step_time += self._step_dt
+        now = time.perf_counter()
+        remaining = self._next_step_time - now
+        if remaining > 0.0:
+            time.sleep(remaining)
+            return
+
+        # Do not try to replay missed wall-clock deadlines after a debugger pause,
+        # window move, or temporarily slow render. Resume pacing from the present.
+        if remaining < -4.0 * self._step_dt:
+            self._next_step_time = now
+
+
 def _debug_runner(message: str) -> None:
     if os.getenv("WATERHOSE_DEBUG_RUNNER", "").lower() in {"1", "true", "yes", "on"}:
         print(f"[waterhose-runner] {message}", file=sys.__stderr__, flush=True)
@@ -169,15 +193,15 @@ def _set_scene_config_visualizer_intent(args_cli: argparse.Namespace) -> None:
 def _coupled_task_needs_kit(args_cli: argparse.Namespace) -> bool:
     """Whether a scene-config coupled task must boot Omniverse Kit.
 
-    The coupled tasks run on ``CoupledNewtonCfg`` (a kitless Newton backend) with no Kit-renderer
-    camera, so they can run Kit-free under a kitless visualizer. Kit is required when:
+    The coupled tasks run on ``NewtonCfg`` with a coupler solver, so they can run Kit-free under a
+    kitless visualizer. Kit is required when:
 
-    * the Kit visualizer is explicitly requested (``--viz kit``), or
+    * the Kit visualizer is explicitly requested (``--visualizer kit``), or
     * livestreaming is enabled (it needs a Kit viewport to produce video), or
     * no visualizer is requested on the command line. The task config installs both a Kit and a
       Newton visualizer, so with no CLI override the Newton runtime resolves Kit rendering as active
       and sets up Fabric/usdrt sync (Kit-only). Booting Kit keeps that default working; pass an
-      explicit kitless visualizer (``--viz newton``/``rerun``/``viser``/``none``) to skip Kit.
+      explicit kitless visualizer (``--visualizer newton``/``rerun``/``viser``/``none``) to skip Kit.
 
     With an explicit kitless visualizer, the run goes through :func:`~isaaclab.app.launch_simulation`,
     which skips Kit entirely for this Newton-backed, camera-free task.
@@ -216,6 +240,15 @@ parser.add_argument(
     "--debug_script", action="store_true", help="Print phase transitions for scene-config scripted IK demos."
 )
 parser.add_argument("--profile", action="store_true", help="Print rollout timing after the run.")
+parser.add_argument(
+    "--realtime",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help=(
+        "Pace the rollout to simulation time. This is enabled by default for visible Kit/Newton runs;"
+        " use --no-realtime for an unpaced benchmark."
+    ),
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 _install_faulthandler()
@@ -224,6 +257,8 @@ if args_cli.num_envs < 1:
     parser.error("--num_envs must be at least 1.")
 
 startup_visualizers = _startup_visualizer_types(args_cli)
+if args_cli.realtime is None:
+    args_cli.realtime = bool({"kit", "newton"} & startup_visualizers)
 _prefer_cuda_for_waterhose_xr(args_cli)
 if "kit" in startup_visualizers and os.getenv("WATERHOSE_KIT_MULTI_GPU", "").lower() not in {"1", "true", "yes", "on"}:
     args_cli.multi_gpu = False
@@ -281,8 +316,11 @@ def _run_env(env_cfg) -> None:
     start = time.perf_counter()
     rollout_start = start
     scripted_state = None
+    connector_retained_mask = None
+    scripted_completed = False
     control_graph_captured = False
     done_linger_steps = None
+    rate_limiter = None
     try:
         _debug_runner("gym_make:start")
         env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
@@ -290,10 +328,19 @@ def _run_env(env_cfg) -> None:
         _debug_runner("reset:start")
         env.reset()
         _debug_runner("reset:done")
+        if args_cli.realtime:
+            rate_limiter = _WallClockRateLimiter(float(env.step_dt))
+            print(
+                f"[INFO]: Playing the visible waterhose demo in real time at"
+                f" {1.0 / float(env.step_dt):.1f} Hz (--no-realtime disables pacing).",
+                flush=True,
+            )
+            _debug_runner(f"real-time pacing enabled at {1.0 / float(env.step_dt):.1f} Hz")
         actions = torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device)
         task_name = args_cli.task.split(":")[-1]
         if task_name in SCENE_CONFIG_SCRIPTED_TASKS:
             from isaaclab_tasks.contrib.waterhose.scripted_state_machine import (  # noqa: PLC0415
+                connector_retained_mask,
                 create_scripted_policy,
             )
 
@@ -344,13 +391,29 @@ def _run_env(env_cfg) -> None:
                 else:
                     is_done = bool((scripted_state.phase == scripted_state.DONE).all().item())
                 if is_done:
+                    if not bool(connector_retained_mask(env).all().item()):
+                        raise RuntimeError("Scripted waterhose reached DONE without a retained connector.")
                     done_linger_steps = max(1, int(round(1.0 / env.step_dt)))
                     _debug_runner(f"scripted demo DONE at step={step}; closing after {done_linger_steps} linger steps")
             if done_linger_steps is not None:
+                if not bool(connector_retained_mask(env).all().item()):
+                    raise RuntimeError("Waterhose connector was lost during the final retention check.")
                 done_linger_steps -= 1
                 if done_linger_steps <= 0:
+                    scripted_completed = True
                     break
             step += 1
+            if rate_limiter is not None:
+                rate_limiter.sleep()
+        if (
+            scripted_state is not None
+            and not args_cli.profile
+            and step >= args_cli.max_steps
+            and not scripted_completed
+        ):
+            raise RuntimeError(
+                f"Scripted waterhose did not complete a retained insertion within {args_cli.max_steps} steps."
+            )
         _debug_runner(f"loop:done steps={step} running={_simulation_is_running(env)}")
     except BaseException as exc:
         _debug_runner(f"exception type={type(exc).__name__} value={exc!r}")
@@ -403,7 +466,7 @@ def main() -> None:
         return
 
     # Kitless-capable path. Non-coupled tasks always use it; the coupled tasks join it whenever
-    # Kit is not required (e.g. ``--viz newton`` or headless). launch_simulation walks the config
+    # Kit is not required (e.g. ``--visualizer newton`` or headless). launch_simulation walks the config
     # and skips Kit entirely for this Newton-backed, camera-free task, so the Newton viewer runs
     # without Omniverse. The pxr-binding ordering constraint above does not apply when Kit never boots.
     env_cfg = _parse_configured_env_cfg()

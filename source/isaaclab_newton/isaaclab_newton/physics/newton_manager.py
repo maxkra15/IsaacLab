@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import warp as wp
 
@@ -153,6 +154,16 @@ def _scatter_reset_masks_from_ids(
     fk_mask[articulation_ids[world, arti]] = True
 
 
+@wp.kernel(enable_backward=False)
+def _and_fk_mask_with_filter(
+    fk_mask: wp.array(dtype=wp.bool),
+    articulation_filter: wp.array(dtype=wp.bool),
+):
+    """Remove solver-owned articulations from a pending generic-FK mask."""
+    articulation = wp.tid()
+    fk_mask[articulation] = fk_mask[articulation] and articulation_filter[articulation]
+
+
 class NewtonSceneDataBackend(SceneDataBackend):
     """Scene data backend that reads rigid body transforms from Newton's simulation state.
 
@@ -260,6 +271,9 @@ class NewtonManager(PhysicsManager):
     # Collision and contacts
     _contacts: Contacts | None = None
     _needs_collision_pipeline: bool = False
+    # Compatibility state for solver managers that still declare an eager-FK requirement. Forward
+    # kinematics now runs at every derived-state boundary, so this flag is informational only.
+    _needs_fk_before_step: bool = False
     _collision_pipeline = None
     _collision_cfg: NewtonCollisionPipelineCfg | None = None
     _newton_contact_sensors: dict = {}  # Maps sensor_key to NewtonContactSensor
@@ -273,8 +287,14 @@ class NewtonManager(PhysicsManager):
     # Per-world reset masks (allocated in start_simulation, consumed in step/forward).
     _world_reset_mask: wp.array | None = None  # (num_envs,) wp.bool — for SolverKamino.reset(world_mask=...)
     _fk_reset_mask: wp.array | None = None  # (articulation_count,) wp.bool — for eval_fk(mask=...)
+    _fk_articulation_filter: wp.array | None = None
+    """Persistent allow-mask for articulations whose body poses are owned by generic FK."""
+    _state_teleport_pending: bool = False
+    """Whether authored state needs one solver-history reset after FK materialization."""
     # Solver-specialized FK delegate. Bound in initialize_solver() to the active subclass's choice of FK implementation.
     _eval_fk: Callable[[wp.array | None, wp.array | None], None] = _eval_fk_unbound
+    _reset_solver: Callable[[wp.array | None], None] | None = None
+    """Bound solver-specialized reset hook, callable even through the base manager."""
 
     # Newton actuator adapter (owns actuators and double-buffered states)
     _adapter: NewtonActuatorAdapter | None = None
@@ -298,8 +318,11 @@ class NewtonManager(PhysicsManager):
     _newton_particle_offset_attr = "newton:particleOffset"
     _newton_particle_count_attr = "newton:particleCount"
     _particle_visual_prims: dict[str, _ParticleVisualPrim] = {}
+    _usd_xform_ops: dict[str, object] = {}
 
-    # cubric GPU transform hierarchy (replaces CPU update_world_xforms)
+    # Cubric propagates body world matrices through instance proxies and notifies
+    # Kit's Fabric Scene Delegate. The public IFabricHierarchy update does not
+    # currently cross those instance boundaries.
     _cubric = None
     _cubric_adapter: int | None = None
     _cubric_bound_fabric_id: int | None = None
@@ -341,6 +364,8 @@ class NewtonManager(PhysicsManager):
     _deformable_registry: list = []
     _per_world_builder_hooks: list[Callable[[ModelBuilder, int, list[float], list[float]], None]] = []
     _post_replicate_hooks: list[Callable[[ModelBuilder], None]] = []
+    _pre_render_callbacks: dict[str, Callable[[], None]] = {}
+    _post_solver_init_callbacks: dict[str, Callable[[], None]] = {}
 
     @classmethod
     def initialize(cls, sim_context: SimulationContext) -> None:
@@ -413,8 +438,11 @@ class NewtonManager(PhysicsManager):
         data layer invokes ``NewtonManager.forward()`` on the base class, where ``cls`` is the
         base ``NewtonManager``; the bound delegate dispatches to the concrete subclass override.
         """
-        cls._reset_solver_internals(cls._world_reset_mask)
-        cls._eval_fk(cls._world_reset_mask, cls._fk_reset_mask)
+        cls._eval_fk(cls._world_reset_mask, cls._filtered_fk_mask(cls._fk_reset_mask))
+        if cls._state_teleport_pending:
+            reset_solver = cls._reset_solver or cls._reset_solver_internals
+            reset_solver(cls._world_reset_mask)
+            NewtonManager._state_teleport_pending = False
         if cls._fk_reset_mask is not None:
             cls._fk_reset_mask.zero_()
         if cls._world_reset_mask is not None:
@@ -427,12 +455,40 @@ class NewtonManager(PhysicsManager):
             cls.forward()
             if NewtonManager._transforms_may_change_on_graph_replay:
                 NewtonManager._transforms_dirty = True
+        for name, callback in list(cls._pre_render_callbacks.items()):
+            try:
+                callback()
+            except Exception:
+                logger.exception("[NewtonManager] pre-render callback %s failed; deregistering", name)
+                NewtonManager._pre_render_callbacks.pop(name, None)
         cls.sync_transforms_to_usd()
         cls.sync_particles_to_usd()
 
     @classmethod
+    def register_pre_render_callback(cls, name: str, callback: Callable[[], None]) -> None:
+        """Register a named callback that runs before Newton render-state synchronization."""
+        NewtonManager._pre_render_callbacks[name] = callback
+
+    @classmethod
+    def deregister_pre_render_callback(cls, name: str) -> None:
+        """Remove a named pre-render callback."""
+        NewtonManager._pre_render_callbacks.pop(name, None)
+
+    @classmethod
+    def register_post_solver_init_callback(cls, name: str, callback: Callable[[], None]) -> None:
+        """Register a one-shot callback after solver and contact initialization.
+
+        If the solver already exists, the callback runs immediately. Otherwise it runs before
+        initial forward kinematics and CUDA graph capture, then is discarded.
+        """
+        if NewtonManager._solver is not None:
+            callback()
+            return
+        NewtonManager._post_solver_init_callbacks[name] = callback
+
+    @classmethod
     def sync_transforms_to_usd(cls) -> None:
-        """Write Newton body_q to USD Fabric world matrices for Kit viewport / RTX rendering.
+        """Write Newton body poses to USD/Fabric for Kit viewport and RTX rendering.
 
         No-op when ``_usdrt_stage`` is None (i.e. Kit visualizer is not active)
         or when transforms have not changed since the last sync.
@@ -443,15 +499,12 @@ class NewtonManager(PhysicsManager):
         so that the expensive Fabric hierarchy update only runs once per render
         frame rather than after every physics step.
 
-        Uses ``wp.fabricarray`` directly (no ``isaacsim.physics.newton`` extension needed).
-        The Warp kernel reads ``state_0.body_q[newton_index[i]]`` and writes the
-        corresponding ``mat44d`` to ``omni:fabric:worldMatrix`` for each prim.
-
-        When cubric is available the method mirrors PhysX's ``DirectGpuHelper``
-        pattern: pause Fabric change tracking, write transforms, resume tracking,
-        then call ``IAdapter::compute`` on the GPU to propagate the hierarchy and
-        notify the Fabric Scene Delegate.  Otherwise it falls back to the CPU
-        ``update_world_xforms()`` path.
+        The authored USD xform mirror is intentional: RBY1's render geometry is
+        instanceable, and Kit's geometry-streaming path observes those USD xforms.
+        Fabric body world matrices are updated in parallel for RTX consumers.
+        Cubric then propagates them through instance-proxy descendants and notifies
+        the Fabric Scene Delegate. If Cubric is unavailable, the public CPU
+        hierarchy update remains a safe fallback.
         """
         if cls._usdrt_stage is None or cls._model is None or cls._state_0 is None:
             return
@@ -460,8 +513,12 @@ class NewtonManager(PhysicsManager):
         try:
             import usdrt
 
-            # Lazy adapter creation: deferred from initialize_solver() to avoid
-            # startup-ordering issues with the cubric plugin.
+            body_paths = getattr(cls._model, "body_label", None) or getattr(cls._model, "body_key", None)
+            if body_paths is not None:
+                cls._sync_transforms_to_usd_xform_ops(body_paths)
+
+            # Adapter creation is lazy because omni.cubric is not guaranteed to be
+            # ready at solver initialization time.
             if cls._cubric is not None and cls._cubric.available and cls._cubric_adapter is None:
                 NewtonManager._cubric_adapter = cls._cubric.create_adapter()
                 if cls._cubric_adapter is not None:
@@ -471,20 +528,14 @@ class NewtonManager(PhysicsManager):
                     NewtonManager._cubric = None
 
             use_cubric = cls._cubric is not None and cls._cubric_adapter is not None
-
             fabric_hierarchy = None
             if hasattr(usdrt, "hierarchy"):
                 fabric_hierarchy = usdrt.hierarchy.IFabricHierarchy().get_fabric_hierarchy(
                     cls._usdrt_stage.GetFabricId(), cls._usdrt_stage.GetStageIdAsStageId()
                 )
 
-            # Pause hierarchy change tracking BEFORE SelectPrims.
-            # SelectPrims with ReadWrite access calls getAttributeArrayGpu
-            # internally, which marks Fabric buffers dirty.  If tracking is
-            # still active at that point the hierarchy records the change and
-            # Kit's updateWorldXforms will do an expensive connectivity
-            # rebuild every frame.  PhysX avoids this via ScopedUSDRT which
-            # pauses tracking before any Fabric writes.
+            # Mirror PhysX's DirectGpuHelper ordering: pause change tracking before
+            # acquiring writable Fabric arrays, then let Cubric rebuild/propagate.
             if use_cubric and fabric_hierarchy is not None:
                 fabric_hierarchy.track_world_xform_changes(False)
                 fabric_hierarchy.track_local_xform_changes(False)
@@ -501,6 +552,8 @@ class NewtonManager(PhysicsManager):
                     NewtonManager._transforms_dirty = False
                     return
 
+                # Required to invalidate the render delegate's cached buffers.
+                selection.PrepareForReuse()
                 fabric_transforms = wp.fabricarray(selection, "omni:fabric:worldMatrix")
                 newton_indices = wp.fabricarray(selection, cls._newton_index_attr)
                 wp.launch(
@@ -510,7 +563,6 @@ class NewtonManager(PhysicsManager):
                     device=PhysicsManager._device,
                 )
                 wp.synchronize_device(PhysicsManager._device)
-
                 NewtonManager._transforms_dirty = False
 
                 if use_cubric and fabric_hierarchy is not None:
@@ -692,8 +744,6 @@ class NewtonManager(PhysicsManager):
         if sim is None or not sim.is_playing():
             return
 
-        cls._reset_solver_internals(cls._world_reset_mask)
-
         # Notify solver of model changes
         if cls._model_changes:
             with wp.ScopedDevice(PhysicsManager._device):
@@ -811,7 +861,11 @@ class NewtonManager(PhysicsManager):
         NewtonManager._control = None
         NewtonManager._contacts = None
         NewtonManager._needs_collision_pipeline = False
+        NewtonManager._needs_fk_before_step = False
+        NewtonManager._fk_articulation_filter = None
+        NewtonManager._state_teleport_pending = False
         NewtonManager._eval_fk = _eval_fk_unbound
+        NewtonManager._reset_solver = None
         NewtonManager._collision_pipeline = None
         NewtonManager._collision_cfg = None
         NewtonManager._newton_contact_sensors = {}
@@ -821,6 +875,8 @@ class NewtonManager(PhysicsManager):
         NewtonManager._supports_contact_sensors = True
         NewtonManager._adapter = None
         NewtonManager._post_actuator_callbacks = []
+        NewtonManager._pre_render_callbacks = {}
+        NewtonManager._post_solver_init_callbacks = {}
         # Set by an articulation that took the ``use_newton_actuators=True``
         # branch in ``_process_actuators_cfg``.  Together with the adapter
         # check, this gates whether the decimation loop can be captured into
@@ -838,6 +894,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._transforms_may_change_on_graph_replay = False
         NewtonManager._particles_dirty = False
         NewtonManager._particle_visual_prims = {}
+        NewtonManager._usd_xform_ops = {}
         NewtonManager._mpm_object_registry = []
         NewtonManager._deformable_registry = []
         NewtonManager._per_world_builder_hooks = []
@@ -918,6 +975,11 @@ class NewtonManager(PhysicsManager):
         builder data before :meth:`ModelBuilder.finalize` allocates model arrays.
         The default implementation is a no-op.
         """
+
+    @classmethod
+    def _configure_fk_articulation_filter(cls) -> None:
+        """Configure which articulation poses may be refreshed by generic FK."""
+        NewtonManager._set_fk_articulation_filter(None)
 
     @classmethod
     def cl_register_site(cls, body_pattern: str | None, xform: wp.transform, *, per_world: bool = False) -> str:
@@ -1125,6 +1187,8 @@ class NewtonManager(PhysicsManager):
         if cls._world_reset_mask is None or cls._fk_reset_mask is None:
             return
 
+        NewtonManager._state_teleport_pending = True
+
         if articulation_ids is not None and env_mask is not None:
             wp.launch(
                 _or_reset_masks_from_mask,
@@ -1145,6 +1209,137 @@ class NewtonManager(PhysicsManager):
             # Fallback: no topology info — mark everything dirty
             NewtonManager._world_reset_mask.fill_(True)
             NewtonManager._fk_reset_mask.fill_(True)
+
+    @classmethod
+    def _sync_transforms_to_usd_xform_ops(cls, body_paths: Sequence[str]) -> None:
+        """Author Newton world poses as local USD xform ops for Kit rendering.
+
+        Kit's geometry-streaming path does not reliably inherit Fabric-only body
+        updates across USD instance proxies. This authored mirror exposes the
+        transforms to Hydra while Cubric updates the Fabric hierarchy used by RTX.
+        """
+        try:
+            from pxr import Gf, Sdf, UsdGeom, Vt  # noqa: PLC0415
+        except Exception:
+            return
+
+        stage = get_current_stage()
+        if stage is None:
+            return
+
+        try:
+            body_q = cls._state_0.body_q.numpy()
+        except Exception:
+            return
+
+        world_mats: dict[str, object] = {}
+        for body_id, prim_path in enumerate(body_paths):
+            if not isinstance(prim_path, str) or not prim_path.startswith("/") or body_id >= body_q.shape[0]:
+                continue
+            pose = body_q[body_id]
+            quat = np.asarray(pose[3:7], dtype=np.float64)
+            norm = float(np.linalg.norm(quat))
+            if not np.isfinite(norm) or norm <= 1.0e-12:
+                continue
+            quat /= norm
+
+            world_mat = Gf.Matrix4d(1.0)
+            world_mat.SetRotateOnly(Gf.Quatd(float(quat[3]), Gf.Vec3d(float(quat[0]), float(quat[1]), float(quat[2]))))
+            world_mat.SetTranslateOnly(Gf.Vec3d(float(pose[0]), float(pose[1]), float(pose[2])))
+            world_mats[prim_path] = world_mat
+
+        if not world_mats:
+            return
+
+        xform_cache = UsdGeom.XformCache()
+        xform_attr_name = "xformOp:transform:newton"
+        for prim_path, world_mat in world_mats.items():
+            prim = stage.GetPrimAtPath(prim_path)
+            if not prim.IsValid() or prim.IsInstanceProxy():
+                continue
+
+            parent = prim.GetParent()
+            parent_path = str(parent.GetPath()) if parent and parent.IsValid() else ""
+            parent_world = world_mats.get(parent_path)
+            if parent_world is None:
+                parent_world = (
+                    xform_cache.GetLocalToWorldTransform(parent) if parent and parent.IsValid() else Gf.Matrix4d(1.0)
+                )
+            local_mat = world_mat * parent_world.GetInverse()
+
+            transform_attr = NewtonManager._usd_xform_ops.get(prim_path)
+            if transform_attr is not None:
+                try:
+                    if (
+                        not transform_attr.IsValid()
+                        or transform_attr.GetPrim() != prim
+                        or transform_attr.GetName() != xform_attr_name
+                        or transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d
+                    ):
+                        transform_attr = None
+                except Exception:
+                    transform_attr = None
+            if transform_attr is None:
+                transform_attr = prim.GetAttribute(xform_attr_name)
+                if transform_attr.IsValid() and transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d:
+                    transform_attr.SetTypeName(Sdf.ValueTypeNames.Matrix4d)
+                if not transform_attr.IsValid() or transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d:
+                    transform_attr = prim.CreateAttribute(xform_attr_name, Sdf.ValueTypeNames.Matrix4d, False)
+
+                order_attr = prim.GetAttribute("xformOpOrder")
+                if order_attr.IsValid() and order_attr.GetTypeName() != Sdf.ValueTypeNames.TokenArray:
+                    order_attr.SetTypeName(Sdf.ValueTypeNames.TokenArray)
+                if not order_attr.IsValid():
+                    order_attr = prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray, False)
+                order_attr.Set(Vt.TokenArray([xform_attr_name]))
+                NewtonManager._usd_xform_ops[prim_path] = transform_attr
+            transform_attr.Set(local_mat)
+
+    @classmethod
+    def _set_fk_articulation_filter(cls, mask: Sequence[bool] | None) -> None:
+        """Set the persistent allow-mask used by generic forward kinematics.
+
+        Coupled solvers use this ownership boundary for articulations whose body poses
+        are advanced directly by an entry solver and must not be reconstructed from
+        joint coordinates.
+
+        Args:
+            mask: One boolean per model articulation, where ``True`` permits generic FK.
+                Pass ``None`` to allow every articulation.
+        """
+        if mask is None:
+            NewtonManager._fk_articulation_filter = None
+            return
+
+        values = list(map(bool, mask))
+        articulation_count = int(cls._model.articulation_count)
+        if len(values) != articulation_count:
+            raise ValueError(
+                f"FK articulation filter length {len(values)} does not match articulation_count={articulation_count}."
+            )
+        device = cls._fk_reset_mask.device if cls._fk_reset_mask is not None else PhysicsManager._device
+        NewtonManager._fk_articulation_filter = wp.array(values, dtype=wp.bool, device=device)
+
+    @classmethod
+    def _filtered_fk_mask(cls, fk_mask: wp.array | None) -> wp.array | None:
+        """Return the pending FK mask after enforcing persistent solver ownership."""
+        articulation_filter = cls._fk_articulation_filter
+        if articulation_filter is None:
+            return fk_mask
+        if fk_mask is None:
+            return articulation_filter
+        if fk_mask.shape != articulation_filter.shape:
+            raise ValueError(
+                f"FK reset mask shape {fk_mask.shape} does not match ownership filter shape "
+                f"{articulation_filter.shape}."
+            )
+        wp.launch(
+            _and_fk_mask_with_filter,
+            dim=fk_mask.shape[0],
+            inputs=[fk_mask, articulation_filter],
+            device=fk_mask.device,
+        )
+        return fk_mask
 
     @classmethod
     def start_simulation(cls) -> None:
@@ -1237,20 +1432,22 @@ class NewtonManager(PhysicsManager):
     def _initialize_fabric_body_prims(stage, fabric_hierarchy, usdrt, body_bindings: Sequence[tuple[str, int]]) -> None:
         """Initialize Fabric body prims used by Newton transform sync."""
         for prim_path, body_index in body_bindings:
+            # Builder hooks can create simulation-only bodies with no authored
+            # USD prim (for example, waterhose cable segments). They have no
+            # renderable geometry and must not become synthetic Fabric Xforms:
+            # doing so pollutes the rendered Fabric hierarchy.
+            if not isinstance(prim_path, str) or not prim_path.startswith("/"):
+                continue
             prim = stage.GetPrimAtPath(prim_path)
-            if prim.IsValid():
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.SetWorldXformFromUsd()
-            else:
-                prim = stage.DefinePrim(prim_path, "Xform")
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.CreateFabricHierarchyWorldMatrixAttr()
+            if not prim.IsValid():
+                continue
+            xformable_prim = usdrt.Rt.Xformable(prim)
+            xformable_prim.SetWorldXformFromUsd()
 
             prim.CreateAttribute(NewtonManager._newton_index_attr, usdrt.Sdf.ValueTypeNames.UInt, custom=True)
             prim.GetAttribute(NewtonManager._newton_index_attr).Set(body_index)
-            # Tag with PhysicsRigidBodyAPI so cubric's eRigidBody mode applies
-            # Inverse propagation (preserves Newton's world transforms and derives
-            # local) instead of Forward.
+            # Cubric's rigid-body mode preserves the world transform written by
+            # Newton and derives local/descendant transforms from it.
             prim.AddAppliedSchema("PhysicsRigidBodyAPI")
 
         fabric_hierarchy.update_world_xforms()
@@ -1262,7 +1459,12 @@ class NewtonManager(PhysicsManager):
         for prim_path in prim_paths:
             prim = stage.GetPrimAtPath(prim_path)
             if prim.IsValid():
-                usdrt.Rt.Xformable(prim).SetWorldXformFromUsd()
+                xformable_prim = usdrt.Rt.Xformable(prim)
+                if not xformable_prim.GetFabricHierarchyWorldMatrixAttr().IsValid():
+                    xformable_prim.CreateFabricHierarchyWorldMatrixAttr()
+                if not xformable_prim.GetFabricHierarchyLocalMatrixAttr().IsValid():
+                    xformable_prim.CreateFabricHierarchyLocalMatrixAttr()
+                xformable_prim.SetWorldXformFromUsd()
 
         if prim_paths:
             fabric_hierarchy.update_world_xforms()
@@ -1374,6 +1576,19 @@ class NewtonManager(PhysicsManager):
                 NewtonManager._collision_pipeline = CollisionPipeline(cls._model, broad_phase="explicit")
         if cls._contacts is None:
             NewtonManager._contacts = cls._collision_pipeline.contacts()
+
+    @staticmethod
+    def _seed_rigid_contact_capacity(model: Model, collision_cfg: NewtonCollisionPipelineCfg | None) -> None:
+        """Apply an explicit collision-pipeline capacity before solver construction.
+
+        Solvers such as VBD allocate contact-history storage in their constructors,
+        before :meth:`_initialize_contacts` creates the collision pipeline.  Seeding
+        the finalized model here keeps those allocations consistent with an explicit
+        ``rigid_contact_max`` configured for the pipeline.
+        """
+        if collision_cfg is None or collision_cfg.rigid_contact_max is None:
+            return
+        model.rigid_contact_max = max(int(model.rigid_contact_max), int(collision_cfg.rigid_contact_max))
 
     # ----- Solver construction (subclass contract) ------------------------
 
@@ -1501,6 +1716,7 @@ class NewtonManager(PhysicsManager):
             NewtonManager._solver_dt = cls.get_physics_dt() / cls._num_substeps
             NewtonManager._collision_cfg = cfg.collision_cfg  # type: ignore[union-attr]
 
+            cls._seed_rigid_contact_capacity(cls._model, cls._collision_cfg)
             cls._build_solver(cls._model, cfg.solver_cfg)  # type: ignore[union-attr]
             if NewtonManager._solver is None:
                 raise RuntimeError(
@@ -1508,21 +1724,32 @@ class NewtonManager(PhysicsManager):
                     "Subclasses of NewtonManager must populate NewtonManager._solver, "
                     "NewtonManager._use_single_state, and NewtonManager._needs_collision_pipeline."
                 )
+            cls._configure_fk_articulation_filter()
             cls._initialize_contacts()
+
+        # Asset callbacks registered while the model was being built may depend on
+        # both the solver and its contact storage. Run them once at this boundary,
+        # before initial FK and graph capture, so they can safely finish setup.
+        callbacks = NewtonManager._post_solver_init_callbacks
+        NewtonManager._post_solver_init_callbacks = {}
+        for callback in callbacks.values():
+            callback()
 
         # Bind the solver-specialized FK delegate to the active subclass's _eval_fk_impl so
         # that forward()/step() dispatch correctly even when forward() is invoked through the
         # base class (the data layer imports NewtonManager directly). ``cls`` is the concrete
         # subclass here, since initialize_solver is reached via sim.physics_manager.reset().
         NewtonManager._eval_fk = cls._eval_fk_impl
+        NewtonManager._reset_solver = cls._reset_solver_internals
 
         # Establish the initial kinematically-consistent body state through the
         # solver-specialized FK delegate, now that the solver and the delegate both exist.
         # Runs before graph capture below so the capture warmup sees a valid body_q.
-        cls._eval_fk(None, None)
+        cls._eval_fk(None, cls._filtered_fk_mask(None))
 
         if cls._usdrt_stage is not None:
             cls._setup_cubric_bindings()
+            cls._mark_transforms_dirty()
 
         # Skip the initial graph capture when the Newton actuator fast path is
         # active. Capturing here would use ``cls._decimation`` (still its default
@@ -1539,11 +1766,10 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def _setup_cubric_bindings(cls) -> None:
-        """Initialize cubric ctypes bindings when the Kit viewport is active.
+        """Prepare Cubric's instance-aware Fabric hierarchy adapter.
 
-        Adapter creation itself is deferred to the first
-        :meth:`sync_transforms_to_usd` call to avoid startup-ordering issues
-        with the cubric plugin.
+        Adapter allocation remains lazy in :meth:`sync_transforms_to_usd` to
+        avoid Kit extension startup-order races.
         """
         from isaaclab_newton.physics._cubric import CubricBindings
 

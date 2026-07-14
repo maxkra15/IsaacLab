@@ -7,13 +7,14 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from isaaclab_teleop import preload_cloudxr_websockets
-from isaaclab_teleop.cloudxr import prefer_cuda_for_xr
+from isaaclab_teleop.cloudxr import align_cloudxr_gpu_for_xr, prefer_cuda_for_xr, prefer_single_gpu_for_xr
 
 _WEBSOCKETS_MODULE_NAMES = (
     "websockets.asyncio.client",
@@ -35,6 +36,40 @@ def test_xr_cuda_preference_updates_only_implicit_device_selection() -> None:
     assert explicit.device == "cpu"
     assert prefer_cuda_for_xr(desktop) is False
     assert desktop.device == "cpu"
+
+
+def test_xr_single_gpu_preference_respects_multi_gpu_opt_in() -> None:
+    implicit = SimpleNamespace(xr=True)
+    multi_gpu = SimpleNamespace(xr=True, multi_gpu=True)
+    opted_in = SimpleNamespace(xr=True, multi_gpu=True)
+    desktop = SimpleNamespace(xr=False, multi_gpu=True)
+
+    assert prefer_single_gpu_for_xr(implicit) is True
+    assert implicit.multi_gpu is False
+    assert prefer_single_gpu_for_xr(multi_gpu) is True
+    assert multi_gpu.multi_gpu is False
+    assert prefer_single_gpu_for_xr(opted_in, allow_multi_gpu=True) is False
+    assert opted_in.multi_gpu is True
+    assert prefer_single_gpu_for_xr(desktop) is False
+    assert desktop.multi_gpu is True
+
+
+def test_xr_cloudxr_gpu_matches_explicit_cuda_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The separate CloudXR Vulkan process must use Kit's physical GPU."""
+    monkeypatch.delenv("NV_GPU_INDEX", raising=False)
+
+    assert align_cloudxr_gpu_for_xr(SimpleNamespace(xr=True, device="cuda:1")) is True
+    assert os.environ["NV_GPU_INDEX"] == "1"
+    assert align_cloudxr_gpu_for_xr(SimpleNamespace(xr=True, device="cuda:1")) is False
+
+    assert align_cloudxr_gpu_for_xr(SimpleNamespace(xr=True, device="cuda")) is True
+    assert os.environ["NV_GPU_INDEX"] == "0"
+
+    monkeypatch.delenv("NV_GPU_INDEX")
+    assert align_cloudxr_gpu_for_xr(SimpleNamespace(xr=False, device="cuda:1")) is False
+    assert "NV_GPU_INDEX" not in os.environ
+    assert align_cloudxr_gpu_for_xr(SimpleNamespace(xr=True, device="cpu")) is False
+    assert "NV_GPU_INDEX" not in os.environ
 
 
 def test_preload_cloudxr_websockets_is_consistent_and_idempotent() -> None:

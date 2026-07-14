@@ -326,7 +326,13 @@ Launch Decisions (derived purely from a scan).
 def _has_kit_visualizer(config_scan: Scan, launcher_args: argparse.Namespace | dict | None) -> bool:
     """Return whether the run requests the Kit visualizer through config or CLI."""
     visualizer_types = _get_visualizer_types(launcher_args)
-    return "kit" in visualizer_types or config_scan.visualizer_intent["has_kit_visualizer"]
+    if _get_arg(launcher_args, "headless", False) and _get_arg(launcher_args, "headless_explicit", False):
+        return False
+    if _get_arg(launcher_args, "visualizer_explicit", False):
+        if _get_arg(launcher_args, "visualizer_disable_all", False) or "none" in visualizer_types:
+            return False
+        return "kit" in visualizer_types
+    return config_scan.visualizer_intent["has_kit_visualizer"]
 
 
 def _uses_isaac_sim_runtime(config_scan: Scan, launcher_args: argparse.Namespace | dict | None) -> bool:

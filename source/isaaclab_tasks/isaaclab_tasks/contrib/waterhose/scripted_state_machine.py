@@ -44,6 +44,9 @@ from .geometry import (
     RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW,
     SOCKET_ALIGN_TIP_DEPTH,
     SOCKET_MOUTH_POS,
+    SOCKET_RETAINED_AXIS_COS,
+    SOCKET_RETAINED_DEPTH_TOLERANCE,
+    SOCKET_RETAINED_RADIAL_TOLERANCE,
     SOCKET_ROT_QUAT_XYZW,
     SOCKET_SEATED_TIP_DEPTH,
 )
@@ -67,6 +70,40 @@ _HOLD_INSERTED = 11
 _RELEASE = 12
 _BACKOFF = 13
 _DONE = 14
+
+
+def connector_retained_mask(env) -> torch.Tensor:
+    """Return one boolean per environment indicating a physically retained connector.
+
+    This uses the connector's measured Newton pose rather than the end-effector command. It is
+    intentionally side-effect free so both the controller and demo runner can use the same
+    terminal criterion without changing contact or solver state.
+    """
+
+    connector_position, connector_rotation = env.scene["cable1"].get_connector_pose_w()
+    device = connector_position.device
+    dtype = connector_position.dtype
+    num_envs = connector_position.shape[0]
+    socket_position = torch.tensor(SOCKET_MOUTH_POS, device=device, dtype=dtype).repeat(num_envs, 1)
+    socket_position += env.scene.env_origins.to(device=device, dtype=dtype)
+    socket_rotation = torch.tensor(SOCKET_ROT_QUAT_XYZW, device=device, dtype=dtype).repeat(num_envs, 1)
+    local_axis = torch.tensor((0.0, 0.0, 1.0), device=device, dtype=dtype).repeat(num_envs, 1)
+    local_tip = torch.tensor(CONNECTOR_TIP_LOCAL_POS, device=device, dtype=dtype).repeat(num_envs, 1)
+    socket_axis = normalize(quat_apply(socket_rotation, local_axis))
+    connector_axis = normalize(quat_apply(connector_rotation, local_axis))
+    connector_tip = connector_position + quat_apply(connector_rotation, local_tip)
+    tip_delta = connector_tip - socket_position
+    tip_depth = torch.sum(tip_delta * socket_axis, dim=-1)
+    tip_radial_error = torch.linalg.norm(tip_delta - tip_depth.unsqueeze(-1) * socket_axis, dim=-1)
+    axis_cos = torch.sum(connector_axis * socket_axis, dim=-1)
+    return (
+        torch.isfinite(tip_depth)
+        & torch.isfinite(tip_radial_error)
+        & torch.isfinite(axis_cos)
+        & (torch.abs(tip_depth - SOCKET_SEATED_TIP_DEPTH) <= SOCKET_RETAINED_DEPTH_TOLERANCE)
+        & (tip_radial_error <= SOCKET_RETAINED_RADIAL_TOLERANCE)
+        & (axis_cos >= SOCKET_RETAINED_AXIS_COS)
+    )
 
 
 @wp.func
@@ -192,6 +229,10 @@ def _update_state_machine_wp(
     entry_connector_rotation = wp.transform_get_rotation(entry_connector_tf)
     entry_connector_axis = wp.normalize(wp.quat_rotate(entry_connector_rotation, wp.vec3(0.0, 0.0, 1.0)))
 
+    # Freeze the pick target at phase entry. Chasing small cable motion throughout
+    # APPROACH/ENGAGE shifts the final grasp along the tiny flange and leaves too
+    # little pad overlap to transmit the CARRY rotation. REST provides a dedicated
+    # settling period, so a stable phase-local target is the safer behavior.
     grasp_rotation = wp.normalize(entry_connector_rotation * grasp_orientation_offset)
     grasp_position = entry_connector_position + wp.quat_rotate(entry_connector_rotation, plug_grasp_offset)
 
@@ -293,23 +334,33 @@ def _update_state_machine_wp(
         and wp.abs(position_error[2]) < 0.01
         and _rotation_error_angle_wp(target_rotation, ee_rotation) < 0.2617994
     )
+    tip_delta = connector_tip_position - socket_pos_w
+    tip_depth = wp.dot(tip_delta, insertion_axis)
+    tip_radial_error = wp.length(tip_delta - tip_depth * insertion_axis)
+    axis_cos = wp.dot(connector_axis, insertion_axis)
     if p == _ALIGN:
-        tip_delta = connector_tip_position - socket_pos_w
-        tip_depth = wp.dot(tip_delta, insertion_axis)
-        tip_radial_error = wp.length(tip_delta - tip_depth * insertion_axis)
         align_ready = (
-            wp.dot(connector_axis, insertion_axis) > 0.9995
+            axis_cos > SOCKET_RETAINED_AXIS_COS
             and tip_radial_error < 0.001
             and wp.abs(tip_depth - SOCKET_ALIGN_TIP_DEPTH) < 0.003
         )
         if not align_ready:
             converged = False
+    elif p >= _INSERT and p < _DONE:
+        retained = (
+            axis_cos >= SOCKET_RETAINED_AXIS_COS
+            and tip_radial_error <= SOCKET_RETAINED_RADIAL_TOLERANCE
+            and wp.abs(tip_depth - SOCKET_SEATED_TIP_DEPTH) <= SOCKET_RETAINED_DEPTH_TOLERANCE
+        )
+        if not retained:
+            converged = False
 
     next_time = time + frame_dt
     minimum_time_met = next_time >= durations[p]
     hard_timeout = next_time >= 2.0 * durations[p]
-    # Never force an unaligned connector into the bore. Other phases retain the bounded timeout.
-    timeout_advance = hard_timeout and p != _ALIGN
+    # Timeouts are only safe before the socket corridor. ALIGN and every retained-insertion phase
+    # must complete from measured geometry; otherwise a lost connector can eventually reach DONE.
+    timeout_advance = hard_timeout and p < _ALIGN
     if p < _DONE and minimum_time_met and (converged or timeout_advance):
         phase[env_id] = p + 1
         elapsed[env_id] = 0.0
@@ -466,9 +517,8 @@ class WaterhoseDemoState:
         # Convergence tolerances (generous; combined with the min duration this gives smooth motion).
         self.pos_tolerance = torch.tensor([0.01, 0.01, 0.01], dtype=torch.float32, device=device)
         self.rot_tolerance = 15.0 * torch.pi / 180.0
-        # ALIGN also checks that the connector is coaxial with the bore. The 2x phase timeout remains
-        # the original fallback when contact prevents exact convergence. 0.9995 ~= 1.8 degrees.
-        self.coax_cos_tolerance = 0.9995
+        # Near the socket, phase progress is measured from the connector itself. 0.9995 ~= 1.8 degrees.
+        self.coax_cos_tolerance = SOCKET_RETAINED_AXIS_COS
 
         # Fixed geometric offsets.
         self.plug_grasp_offset = self._vec(PLUG_GRASP_OFFSET)
@@ -578,7 +628,8 @@ class WaterhoseDemoState:
         phase_plug_quat_w = self.phase_plug_quat_w
         entry_connector_axis_w = normalize(quat_apply(phase_plug_quat_w, self.connector_axis_local))
 
-        # EE orientation/position that aligns the gripper with the phase-entry plug pose for the pick.
+        # Freeze the pick target at phase entry so APPROACH/ENGAGE cannot chase
+        # cable motion and move the connector toward the edge of the finger pads.
         grasp_quat_w = normalize(quat_mul(phase_plug_quat_w, self.grasp_orientation_offset))
         grasp_pos_w = phase_plug_pos_w + quat_apply(phase_plug_quat_w, self.plug_grasp_offset)
 
@@ -744,6 +795,13 @@ class WaterhoseDemoState:
             & (torch.abs(tip_depth[:, 0] - self.align_tip_depth) < 0.003)
         )
         converged = converged & (~align_phase | align_ready)
+        retained_phase = (self.phase >= self.INSERT) & (self.phase < self.DONE)
+        retained_ready = (
+            (coax_cos >= SOCKET_RETAINED_AXIS_COS)
+            & (tip_radial_error <= SOCKET_RETAINED_RADIAL_TOLERANCE)
+            & (torch.abs(tip_depth[:, 0] - self.seated_tip_depth) <= SOCKET_RETAINED_DEPTH_TOLERANCE)
+        )
+        converged = converged & (~retained_phase | retained_ready)
 
         if self.debug:
             plug_cos_val = torch.sum(connector_dir * ins_dir, dim=-1)
@@ -752,7 +810,9 @@ class WaterhoseDemoState:
             target_tip_pos_w = target_pos_w + quat_apply(target_quat_w, target_tip_offset)
             target_tip_depth = torch.sum((target_tip_pos_w - socket_pos_w) * ins_dir, dim=-1)
             changed = self.phase != self.last_reported_phase
-            if bool(changed[0].item()):
+            guided_phase = int(self.phase[0].item()) in (self.CARRY, self.ALIGN)
+            periodic_guided_report = guided_phase and self._step_count % 250 == 0
+            if bool(changed[0].item()) or periodic_guided_report:
                 name = self.PHASE_NAMES[int(self.phase[0].item())]
                 print(
                     f"[waterhose_ik] {name}: "
@@ -771,7 +831,7 @@ class WaterhoseDemoState:
         self.elapsed += self.step_dt
         timed_out = self.elapsed >= self.durations[self.phase]
         hard_timeout = self.elapsed >= 2.0 * self.durations[self.phase]
-        timeout_advance = hard_timeout & ~align_phase
+        timeout_advance = hard_timeout & (self.phase < self.ALIGN)
         should_advance = timed_out & (converged | timeout_advance) & (self.phase < self.DONE)
 
         self.phase[should_advance] += 1
@@ -990,14 +1050,19 @@ class WaterhoseGraphDemoState:
 def create_scripted_policy(
     env, *, settle_time: float = 4.0, debug: bool = False
 ) -> WaterhoseDemoState | WaterhoseGraphDemoState:
-    """Create the task-local scripted policy used by the demo launcher."""
+    """Create the task-local scripted policy used by the demo launcher.
+
+    Kit/RTX defers Newton's physics-graph capture until the first physics step. Perform that one
+    setup step here and immediately reset the complete scene so the controller graph can be
+    captured before the timed rollout without retaining any warmup motion.
+    """
 
     if not debug and "cuda" in str(env.device):
         from isaaclab_newton.physics import NewtonManager  # noqa: PLC0415
 
-        # Kit/RTX defers Newton's physics graph until its first step. Keep that
-        # path functional with the eager controller; explicit kitless runs have
-        # the physics graph ready here and use the captured fast path.
+        if NewtonManager._graph is None and NewtonManager._graph_capture_pending:
+            env.sim.step(render=False)
+            env.reset()
         if NewtonManager._graph is not None:
             return WaterhoseGraphDemoState(env, settle_time=settle_time)
     return WaterhoseDemoState(env.num_envs, env.step_dt, env.device, settle_time, debug)

@@ -43,6 +43,7 @@ def isolated_newton_manager(monkeypatch: pytest.MonkeyPatch):
     }
     for name, value in clean_values.items():
         monkeypatch.setattr(NewtonManager, name, value)
+    monkeypatch.setattr(NewtonCouplerManager, "_resolved_entries_by_name", {})
     yield
 
 
@@ -139,6 +140,7 @@ def test_real_coupler_constructs_resets_and_steps(
 
     assert isinstance(solver, expected_solver_type)
     assert solver.entry_names() == ("source", "destination")
+    assert tuple(NewtonCouplerManager._resolved_entries_by_name) == ("source", "destination")
     for name in solver.entry_names():
         nested_solver = solver.solver(name)
         assert isinstance(nested_solver, SolverXPBD)

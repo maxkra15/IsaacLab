@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import MISSING
 
 import newton
@@ -15,6 +16,7 @@ import torch
 import warp as wp
 from isaaclab_newton.physics import NewtonManager
 
+import isaaclab.sim as sim_utils
 from isaaclab.utils.configclass import configclass
 from isaaclab.utils.math import combine_frame_transforms, normalize
 
@@ -58,6 +60,9 @@ class WaterhoseCableObjectCfg(CableObjectCfg):
     connector_gap: float = 0.01
     """Connector contact gap [m]."""
 
+    tail_anchor_prim_path: str = MISSING
+    """Prim path of the static scene marker that anchors the hose tail."""
+
 
 class WaterhoseCableObject(CableObject):
     """Cable whose connector mesh contributes directly to the head mass and inertia."""
@@ -72,9 +77,9 @@ class WaterhoseCableObject(CableObject):
         self._connector_geometry = None
         self._cable_registry_index = NewtonManager._cable_registry.index(self._registry_entry)
 
-        # CableObject installs its rod and attachment hooks during ``super().__init__``.
-        # Append this hook so the connector is added while the matching world is active.
+        # Keep waterhose-only construction outside the generic PR 5641 cable layer.
         NewtonManager._per_world_builder_hooks.append(self._add_connector_to_builder)
+        NewtonManager._per_world_builder_hooks.append(self._add_tail_attachment_to_builder)
 
     def _load_connector_geometry(self):
         if self._connector_geometry is not None:
@@ -143,10 +148,9 @@ class WaterhoseCableObject(CableObject):
             self._connector_head_body_ids = None
             self._connector_local_pose = None
 
-        segments = self._registry_entry.segment_body_indices[world_idx]
-        if not segments:
+        if world_idx >= len(self._registry_entry.body_offsets) or not self._registry_entry.edges:
             raise RuntimeError(f"Waterhose cable has no segment bodies in world {world_idx}.")
-        head_body = int(segments[0])
+        head_body = int(self._registry_entry.body_offsets[world_idx])
         mesh, scale, connector_xform, density, is_solid, color = self._load_connector_geometry()
 
         mass_before = float(builder.body_mass[head_body])
@@ -178,17 +182,53 @@ class WaterhoseCableObject(CableObject):
             raise RuntimeError("Newton did not accumulate the requested connector mass onto the cable head.")
         self._connector_shape_indices.append(int(shape))
 
+    def _add_tail_attachment_to_builder(
+        self,
+        builder: newton.ModelBuilder,
+        world_idx: int,
+        env_position: list[float],
+        env_rotation: list[float] | tuple[float, float, float, float],
+    ) -> None:
+        """Attach the final rod segment to the authored static hose anchor."""
+        if world_idx >= len(self._registry_entry.body_offsets) or not self._registry_entry.edges:
+            raise RuntimeError(f"Waterhose cable has no tail segment in world {world_idx}.")
+
+        anchor_prim = sim_utils.find_first_matching_prim(self.cfg.tail_anchor_prim_path)
+        if anchor_prim is None:
+            raise RuntimeError(f"Could not resolve waterhose tail anchor: {self.cfg.tail_anchor_prim_path!r}.")
+        match = re.match(r"(?P<env>.*/env_\d+)", anchor_prim.GetPath().pathString)
+        env_prim = anchor_prim.GetStage().GetPrimAtPath(match.group("env")) if match else None
+        reference = env_prim if env_prim is not None and env_prim.IsValid() else None
+        anchor_xform = wp.transform(*sim_utils.resolve_prim_pose(anchor_prim, ref_prim=reference))
+        if reference is not None:
+            anchor_xform = wp.transform_multiply(wp.transform(env_position, env_rotation), anchor_xform)
+
+        tail_body = int(self._registry_entry.body_offsets[world_idx]) + len(self._registry_entry.edges) - 1
+        expanded_path = self._registry_entry.prim_path.replace("env_.*", f"env_{world_idx}")
+        joint = builder.add_joint_fixed(
+            parent=-1,
+            child=tail_body,
+            parent_xform=anchor_xform,
+            child_xform=wp.transform_identity(),
+            label=f"{expanded_path}/tail_attachment_w{world_idx}",
+            collision_filter_parent=True,
+            enabled=True,
+        )
+        # The fixed joint is a loop constraint on the existing rod articulation. Register it
+        # separately so the VBD entry includes it without changing the rod's parent tree.
+        builder.add_articulation([joint], label=f"{expanded_path}/tail_attachment_articulation")
+
     def get_connector_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return connector positions and orientations in the world frame."""
 
-        if len(self._connector_shape_indices) != len(self._registry_entry.segment_body_indices):
+        if len(self._connector_shape_indices) != len(self._registry_entry.body_offsets):
             raise RuntimeError("Waterhose connector shapes are unavailable or do not match the number of cable worlds.")
 
         state = NewtonManager.get_state_0()
         body_pose_all = wp.to_torch(state.body_q)
         if self._connector_head_body_ids is None or self._connector_head_body_ids.device != body_pose_all.device:
             self._connector_head_body_ids = torch.tensor(
-                [int(segments[0]) for segments in self._registry_entry.segment_body_indices],
+                [int(body_offset) for body_offset in self._registry_entry.body_offsets],
                 dtype=torch.long,
                 device=body_pose_all.device,
             )
@@ -218,4 +258,4 @@ class WaterhoseCableObject(CableObject):
     def connector_head_body_indices(self) -> tuple[int, ...]:
         """Newton body indices containing each environment's compound connector head."""
 
-        return tuple(int(segments[0]) for segments in self._registry_entry.segment_body_indices)
+        return tuple(int(body_offset) for body_offset in self._registry_entry.body_offsets)

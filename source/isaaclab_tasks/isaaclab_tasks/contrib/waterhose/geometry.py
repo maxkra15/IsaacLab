@@ -20,6 +20,11 @@ def quat_xyzw_from_wxyz(quat_wxyz: tuple[float, float, float, float]) -> tuple[f
 RIGHT_GRIPPER_EE_FRAME_POS = (0.0, 0.0, -0.125)
 RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW = (0.70710677, 0.70710677, 0.0, 0.0)
 
+# Mirrored contact frame on the left gripper. The sign follows the authored
+# ``left_gripper_end_effector`` site in the RBY1 asset.
+LEFT_GRIPPER_EE_FRAME_POS = (0.0, 0.0, -0.125)
+LEFT_GRIPPER_EE_FRAME_QUAT_XYZW = (-0.70710677, 0.70710677, 0.0, 0.0)
+
 # add_rod_graph places each segment's body frame at the edge's start node u
 # (edge (u, v), +Z from u->v).
 FRIDGE_POS = (0.0, 0.0, 0.5)
@@ -46,6 +51,13 @@ SOCKET_ALIGN_TIP_DEPTH = -0.030
 # The physical +Z connector face docks against the near face of the socket SDF (about -3.1 mm).
 # Keep roughly 1 mm of solver/contact clearance instead of driving the 7.2 mm flange into the washer.
 SOCKET_SEATED_TIP_DEPTH = -0.004
+# A physically seated connector settles slightly behind the commanded face-contact depth under
+# compliant VBD contact. The validated coupled trajectory remains around -7.5 mm through gripper
+# release and backoff, so accept that contact equilibrium while still rejecting an uninserted or
+# laterally displaced connector.
+SOCKET_RETAINED_DEPTH_TOLERANCE = 0.005
+SOCKET_RETAINED_RADIAL_TOLERANCE = 0.001
+SOCKET_RETAINED_AXIS_COS = 0.9995
 SOCKET_COLLISION_XFORM_SUFFIX = "/Cable008/SocketCollision"
 SOCKET_COLLISION_MESH_SUFFIX = f"{SOCKET_COLLISION_XFORM_SUFFIX}/Cable008_SocketCollision"
 SOCKET_COLLISION_MESH_PATTERN = rf".*/Fridge{SOCKET_COLLISION_MESH_SUFFIX}.*"

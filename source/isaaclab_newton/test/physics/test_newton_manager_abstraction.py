@@ -189,6 +189,61 @@ def test_newton_shape_cfg_defaults_match_newton_shape_config():
     assert shape_cfg.mu == upstream.mu
 
 
+def test_rigid_contact_capacity_is_seeded_before_solver_construction():
+    """An explicit collision capacity is available to solver constructors."""
+    import newton
+
+    model = newton.ModelBuilder().finalize(device="cpu")
+    original_capacity = int(model.rigid_contact_max)
+    requested_capacity = original_capacity + 17
+
+    NewtonManager._seed_rigid_contact_capacity(
+        model,
+        NewtonCollisionPipelineCfg(rigid_contact_max=requested_capacity),
+    )
+
+    assert int(model.rigid_contact_max) == requested_capacity
+
+
+def test_pre_render_callbacks_run_before_usd_sync(monkeypatch):
+    """Procedural visuals update before rigid and particle render synchronization."""
+    call_order = []
+    monkeypatch.setattr(NewtonManager, "_fk_reset_mask", None)
+    monkeypatch.setattr(NewtonManager, "_pre_render_callbacks", {})
+    monkeypatch.setattr(
+        NewtonManager,
+        "sync_transforms_to_usd",
+        classmethod(lambda cls: call_order.append("transforms")),
+    )
+    monkeypatch.setattr(
+        NewtonManager,
+        "sync_particles_to_usd",
+        classmethod(lambda cls: call_order.append("particles")),
+    )
+
+    NewtonManager.register_pre_render_callback("cable", lambda: call_order.append("cable"))
+    NewtonManager.pre_render()
+
+    assert call_order == ["cable", "transforms", "particles"]
+
+
+def test_post_solver_init_callbacks_queue_then_run_immediately(monkeypatch):
+    """Assets can finish setup both before and after solver initialization."""
+    calls = []
+    monkeypatch.setattr(NewtonManager, "_solver", None)
+    monkeypatch.setattr(NewtonManager, "_post_solver_init_callbacks", {})
+
+    NewtonManager.register_post_solver_init_callback("queued", lambda: calls.append("queued"))
+    assert calls == []
+    assert list(NewtonManager._post_solver_init_callbacks) == ["queued"]
+
+    monkeypatch.setattr(NewtonManager, "_solver", object())
+    NewtonManager.register_post_solver_init_callback("immediate", lambda: calls.append("immediate"))
+
+    assert calls == ["immediate"]
+    assert list(NewtonManager._post_solver_init_callbacks) == ["queued"]
+
+
 def test_mpm_solver_cfg_maps_only_newton_solver_fields():
     """MPM config forwarding ignores Isaac Lab metadata fields explicitly."""
 
@@ -486,16 +541,21 @@ def test_forward_consumes_existing_reset_masks(monkeypatch):
     fk_mask = wp.array([True, False], dtype=wp.bool, device="cpu")
     observed: list[tuple[list[bool], list[bool]]] = []
     solver_resets: list[list[bool]] = []
+    call_order: list[str] = []
 
     def record_fk(worlds, articulations):
+        call_order.append("fk")
         observed.append((worlds.numpy().tolist(), articulations.numpy().tolist()))
 
     class _RecordingSolver:
         def reset(self, state, world_mask=None, flags=0):
+            call_order.append("reset")
             solver_resets.append(world_mask.numpy().tolist())
 
     monkeypatch.setattr(NewtonManager, "_world_reset_mask", world_mask, raising=False)
     monkeypatch.setattr(NewtonManager, "_fk_reset_mask", fk_mask, raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_teleport_pending", True, raising=False)
+    monkeypatch.setattr(NewtonManager, "_reset_solver", None, raising=False)
     monkeypatch.setattr(NewtonManager, "_eval_fk", record_fk, raising=False)
     monkeypatch.setattr(NewtonManager, "_solver", _RecordingSolver(), raising=False)
 
@@ -503,8 +563,54 @@ def test_forward_consumes_existing_reset_masks(monkeypatch):
 
     assert observed == [([False, True], [True, False])]
     assert solver_resets == [[False, True]]
+    assert call_order == ["fk", "reset"]
     assert world_mask.numpy().tolist() == [False, False]
     assert fk_mask.numpy().tolist() == [False, False]
+
+
+def test_forward_preserves_solver_history_without_pending_teleport(monkeypatch):
+    """An ordinary derived-state refresh must not reset solver history."""
+    resets: list[object] = []
+    monkeypatch.setattr(NewtonManager, "_world_reset_mask", wp.zeros(1, dtype=wp.bool, device="cpu"), raising=False)
+    monkeypatch.setattr(NewtonManager, "_fk_reset_mask", wp.zeros(1, dtype=wp.bool, device="cpu"), raising=False)
+    monkeypatch.setattr(NewtonManager, "_state_teleport_pending", False, raising=False)
+    monkeypatch.setattr(NewtonManager, "_reset_solver", None, raising=False)
+    monkeypatch.setattr(NewtonManager, "_fk_articulation_filter", None, raising=False)
+    monkeypatch.setattr(NewtonManager, "_eval_fk", lambda worlds, articulations: None, raising=False)
+    monkeypatch.setattr(
+        NewtonManager,
+        "_solver",
+        SimpleNamespace(reset=lambda *args, **kwargs: resets.append(object())),
+        raising=False,
+    )
+
+    NewtonManager.forward()
+
+    assert resets == []
+
+
+def test_forward_excludes_solver_owned_articulations_from_generic_fk(monkeypatch):
+    """The persistent ownership filter clamps dirty articulations before generic FK."""
+    world_mask = wp.array([True], dtype=wp.bool, device="cpu")
+    fk_mask = wp.array([True, True], dtype=wp.bool, device="cpu")
+    observed: list[list[bool]] = []
+
+    monkeypatch.setattr(NewtonManager, "_world_reset_mask", world_mask, raising=False)
+    monkeypatch.setattr(NewtonManager, "_fk_reset_mask", fk_mask, raising=False)
+    monkeypatch.setattr(NewtonManager, "_fk_articulation_filter", None, raising=False)
+    monkeypatch.setattr(NewtonManager, "_model", SimpleNamespace(articulation_count=2), raising=False)
+    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace(reset=lambda *args, **kwargs: None), raising=False)
+    monkeypatch.setattr(
+        NewtonManager,
+        "_eval_fk",
+        lambda worlds, articulations: observed.append(articulations.numpy().tolist()),
+        raising=False,
+    )
+
+    NewtonManager._set_fk_articulation_filter([True, False])
+    NewtonManager.forward()
+
+    assert observed == [[True, False]]
 
 
 # ---------------------------------------------------------------------------

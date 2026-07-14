@@ -46,18 +46,19 @@ class reset_cable_to_default(ManagerTermBase):
         self._asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
         self._asset = env.scene[self._asset_cfg.name]
 
-        segment_body_indices = self._asset._registry_entry.segment_body_indices
-        if len(segment_body_indices) != env.num_envs:
+        registry_entry = self._asset._registry_entry
+        body_offsets = registry_entry.body_offsets
+        segment_count = len(registry_entry.edges)
+        if len(body_offsets) != env.num_envs:
             raise RuntimeError(
-                f"Cable registry for '{self._asset_cfg.name}' contains {len(segment_body_indices)} worlds; "
+                f"Cable registry for '{self._asset_cfg.name}' contains {len(body_offsets)} worlds; "
                 f"expected {env.num_envs}."
             )
-        segment_counts = {len(body_ids) for body_ids in segment_body_indices}
-        if not segment_counts or 0 in segment_counts or len(segment_counts) != 1:
-            raise RuntimeError(
-                f"Cable registry for '{self._asset_cfg.name}' must contain the same non-zero number of "
-                f"segments in every environment; got {sorted(segment_counts)}."
-            )
+        if segment_count == 0:
+            raise RuntimeError(f"Cable registry for '{self._asset_cfg.name}' contains no rod segments.")
+        segment_body_indices = [
+            list(range(int(body_offset), int(body_offset) + segment_count)) for body_offset in body_offsets
+        ]
         self._segment_body_ids = torch.tensor(segment_body_indices, dtype=torch.long, device=env.device)
         self._all_env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
 

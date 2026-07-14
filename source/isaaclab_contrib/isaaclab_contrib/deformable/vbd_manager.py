@@ -18,6 +18,8 @@ from newton.solvers import SolverVBD
 
 from isaaclab.sim.utils.stage import get_current_stage
 
+from isaaclab_contrib.cable.cable_object import install_cable_builder_hooks
+
 from .deformable_object import (
     add_deformable_entry_to_builder,
     clear_deformable_builder_hooks,
@@ -72,6 +74,7 @@ class NewtonVBDManager(NewtonManager):
         # Experimental deformable support registers callbacks here so the manager
         # and cloner can invoke them without hard-coding deformable logic.
         install_deformable_builder_hooks()
+        install_cable_builder_hooks()
 
         super().initialize(sim_context)
 
@@ -237,7 +240,11 @@ class NewtonVBDManager(NewtonManager):
     @classmethod
     def _create_solver(cls, model: Model, solver_cfg: VBDSolverCfg) -> SolverVBD:
         """Construct the configured VBD solver."""
-        return SolverVBD(model, **cls._filter_solver_kwargs(SolverVBD, solver_cfg))
+        solver = SolverVBD(model, **cls._filter_solver_kwargs(SolverVBD, solver_cfg))
+        if not solver_cfg.rigid_joint_hard:
+            for joint_index in range(int(model.joint_count)):
+                solver.set_joint_constraint_mode(joint_index, hard=False)
+        return solver
 
     @classmethod
     def _build_solver(cls, model: Model, solver_cfg: VBDSolverCfg) -> None:
@@ -249,6 +256,49 @@ class NewtonVBDManager(NewtonManager):
         NewtonManager._solver = cls._create_solver(model, solver_cfg)
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = True
+
+    @classmethod
+    def _configure_fk_articulation_filter(cls) -> None:
+        """Keep generic FK away from articulations owned by a coupled VBD entry.
+
+        A coupled solver advances VBD rod/body poses directly. Reconstructing those
+        bodies from joint coordinates at a later derived-state boundary overwrites
+        the VBD result. The coupled solver retains each entry's global joint ids, so
+        derive the articulation allow-mask here in the VBD manager rather than
+        teaching the generic coupler about solver-specific FK ownership.
+        """
+        solver = NewtonManager._solver
+        model = NewtonManager._model
+        # The Isaac Lab coupler resolves label selectors to global joint ids
+        # before constructing Newton's SolverCoupled. Keep that adapter-owned
+        # metadata on the concrete manager rather than injecting an undocumented
+        # attribute into the upstream solver instance.
+        entry_configs = getattr(cls, "_resolved_entries_by_name", None)
+        entry_names = getattr(solver, "entry_names", None)
+        entry_solver = getattr(solver, "solver", None)
+        if (
+            model is None
+            or not isinstance(entry_configs, dict)
+            or not callable(entry_names)
+            or not callable(entry_solver)
+        ):
+            super()._configure_fk_articulation_filter()
+            return
+
+        allow_fk = [True] * int(model.articulation_count)
+        joint_articulation = model.joint_articulation.numpy()
+        found_vbd_articulation = False
+        for name in entry_names():
+            if not isinstance(entry_solver(name), SolverVBD):
+                continue
+            entry_cfg = entry_configs.get(name)
+            for joint_raw in getattr(entry_cfg, "joints", ()):
+                articulation = int(joint_articulation[int(joint_raw)])
+                if articulation >= 0:
+                    allow_fk[articulation] = False
+                    found_vbd_articulation = True
+
+        NewtonManager._set_fk_articulation_filter(allow_fk if found_vbd_articulation else None)
 
     @classmethod
     def _simulate_physics_only(cls) -> None:

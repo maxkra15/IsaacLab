@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -35,6 +37,58 @@ def prefer_cuda_for_xr(args_cli: argparse.Namespace) -> bool:
         return False
     args_cli.device = "cuda:0"
     args_cli.device_explicit = True
+    return True
+
+
+def prefer_single_gpu_for_xr(args_cli: argparse.Namespace, *, allow_multi_gpu: bool = False) -> bool:
+    """Disable single-process multi-GPU rendering for XR unless opted in.
+
+    Multi-GPU Kit rendering can make XR shutdown wait on render semaphores when
+    simulation and display rendering use different GPUs. XR entry points can
+    call this helper before constructing :class:`~isaaclab.app.AppLauncher`.
+
+    Args:
+        args_cli: Parsed application launcher arguments.
+        allow_multi_gpu: Whether to preserve the launcher's multi-GPU setting.
+
+    Returns:
+        Whether the multi-GPU selection was changed.
+    """
+    if not bool(getattr(args_cli, "xr", False)) or allow_multi_gpu:
+        return False
+    if getattr(args_cli, "multi_gpu", None) is False:
+        return False
+    args_cli.multi_gpu = False
+    return True
+
+
+def align_cloudxr_gpu_for_xr(args_cli: argparse.Namespace) -> bool:
+    """Make CloudXR use the same GPU as an XR application's CUDA device.
+
+    CloudXR creates the OpenXR Vulkan compositor in a separate process. On a
+    multi-GPU host it otherwise defaults to physical GPU 0, even when Kit was
+    launched with ``--device cuda:N``. External-memory swapchain images cannot
+    be shared across those physical devices and Kit commonly reports the failed
+    allocation as ``VK_ERROR_OUT_OF_DEVICE_MEMORY``.
+
+    The CloudXR runtime documents ``NV_GPU_INDEX`` as its physical-device
+    selector. This helper derives it from ``args_cli.device`` for XR launches.
+
+    Returns:
+        Whether ``NV_GPU_INDEX`` changed.
+    """
+    if not bool(getattr(args_cli, "xr", False)):
+        return False
+
+    device = str(getattr(args_cli, "device", ""))
+    match = re.fullmatch(r"cuda(?::(\d+))?", device)
+    if match is None:
+        return False
+
+    gpu_index = match.group(1) or "0"
+    if os.environ.get("NV_GPU_INDEX") == gpu_index:
+        return False
+    os.environ["NV_GPU_INDEX"] = gpu_index
     return True
 
 

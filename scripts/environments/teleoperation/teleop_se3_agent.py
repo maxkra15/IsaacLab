@@ -19,6 +19,7 @@ The script automatically detects which stack to use based on the environment con
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
@@ -69,11 +70,14 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, remaining_args = parser.parse_known_args()
 
-# Newton waterhose XR is a GPU workload. Preserve explicit user device choices.
+# Newton waterhose XR is a GPU workload. Preserve explicit device and multi-GPU choices.
 if "Waterhose" in (args_cli.task or ""):
-    from isaaclab_teleop.cloudxr import prefer_cuda_for_xr
+    from isaaclab_teleop.cloudxr import align_cloudxr_gpu_for_xr, prefer_cuda_for_xr, prefer_single_gpu_for_xr
 
     prefer_cuda_for_xr(args_cli)
+    allow_multi_gpu = os.getenv("WATERHOSE_KIT_MULTI_GPU", "").strip().lower() in {"1", "true", "yes", "on"}
+    prefer_single_gpu_for_xr(args_cli, allow_multi_gpu=allow_multi_gpu)
+    align_cloudxr_gpu_for_xr(args_cli)
 
 app_launcher_args = vars(args_cli)
 
@@ -153,6 +157,34 @@ def _create_builtin_device(device_name: str, sensitivity: float) -> object | Non
     return None
 
 
+def _prepare_env_cfg() -> tuple[ManagerBasedRLEnvCfg, bool, bool]:
+    """Load the environment and resolve which teleoperation stack owns input."""
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    env_cfg.env_name = args_cli.task
+    if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
+        raise ValueError(
+            "Teleoperation is only supported for ManagerBasedRLEnv environments. "
+            f"Received environment config type: {type(env_cfg).__name__}"
+        )
+
+    env_cfg.terminations.time_out = None
+    if "Lift" in args_cli.task:
+        env_cfg.commands.object_pose.resampling_time_range = (1.0e9, 1.0e9)
+        env_cfg.terminations.object_reached_goal = DoneTerm(func=mdp.object_reached_goal)
+
+    teleop_device_explicitly_set = args_cli.teleop_device is not None
+    use_isaac_teleop = (
+        not teleop_device_explicitly_set and hasattr(env_cfg, "isaac_teleop") and env_cfg.isaac_teleop is not None
+    )
+    if use_isaac_teleop or args_cli.xr:
+        env_cfg = remove_camera_configs(env_cfg)
+        apply_isaac_rtx_global_settings(
+            IsaacRtxRendererGlobalSettingsCfg(antialiasing_mode="DLSS"),
+        )
+
+    return env_cfg, teleop_device_explicitly_set, use_isaac_teleop
+
+
 def main() -> None:
     """
     Run teleoperation with an Isaac Lab manipulation environment.
@@ -163,34 +195,7 @@ def main() -> None:
     Returns:
         None
     """
-    # parse configuration
-    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
-    env_cfg.env_name = args_cli.task
-    if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
-        raise ValueError(
-            "Teleoperation is only supported for ManagerBasedRLEnv environments. "
-            f"Received environment config type: {type(env_cfg).__name__}"
-        )
-    # modify configuration
-    env_cfg.terminations.time_out = None
-    if "Lift" in args_cli.task:
-        # set the resampling time range to large number to avoid resampling
-        env_cfg.commands.object_pose.resampling_time_range = (1.0e9, 1.0e9)
-        # add termination condition for reaching the goal otherwise the environment won't reset
-        env_cfg.terminations.object_reached_goal = DoneTerm(func=mdp.object_reached_goal)
-
-    # When --teleop_device is explicitly provided, use the legacy teleop_devices path
-    # even if isaac_teleop is configured. Otherwise prefer isaac_teleop when available.
-    teleop_device_explicitly_set = args_cli.teleop_device is not None
-    use_isaac_teleop = (
-        not teleop_device_explicitly_set and hasattr(env_cfg, "isaac_teleop") and env_cfg.isaac_teleop is not None
-    )
-
-    if use_isaac_teleop or args_cli.xr:
-        env_cfg = remove_camera_configs(env_cfg)
-        apply_isaac_rtx_global_settings(
-            IsaacRtxRendererGlobalSettingsCfg(antialiasing_mode="DLSS"),
-        )
+    env_cfg, teleop_device_explicitly_set, use_isaac_teleop = _prepare_env_cfg()
 
     try:
         # create environment

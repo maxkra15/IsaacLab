@@ -11,6 +11,26 @@ set -e
 # Get repo directory.
 export ISAACLAB_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
+# Worktrees commonly have incompatible editable installs and Newton builds. Prefer this checkout's
+# environment when it exists so an activated sibling-worktree venv cannot silently mix packages.
+# Set ISAACLAB_USE_ACTIVE_ENV=1 only when intentionally supplying a compatible external environment.
+repo_python_env=""
+if [ -x "$ISAACLAB_PATH/env_isaaclab/bin/python" ]; then
+    repo_python_env="$ISAACLAB_PATH/env_isaaclab"
+elif [ -x "$ISAACLAB_PATH/.venv/bin/python" ]; then
+    repo_python_env="$ISAACLAB_PATH/.venv"
+fi
+if [ -n "$repo_python_env" ] && [ "${ISAACLAB_USE_ACTIVE_ENV:-0}" != "1" ]; then
+    if [ -n "${VIRTUAL_ENV:-}" ] && [ "$(readlink -f "$VIRTUAL_ENV")" != "$(readlink -f "$repo_python_env")" ]; then
+        echo "[WARNING] Ignoring VIRTUAL_ENV=$VIRTUAL_ENV; using this checkout's $repo_python_env." >&2
+        unset VIRTUAL_ENV
+    fi
+    if [ -n "${CONDA_PREFIX:-}" ] && [ "$(readlink -f "$CONDA_PREFIX")" != "$(readlink -f "$repo_python_env")" ]; then
+        echo "[WARNING] Ignoring CONDA_PREFIX=$CONDA_PREFIX; using this checkout's $repo_python_env." >&2
+        unset CONDA_PREFIX
+    fi
+fi
+
 # Ignore stale environment variables instead of failing on a Python executable
 # that no longer exists.
 if [ -n "${VIRTUAL_ENV:-}" ] && [ ! -x "$VIRTUAL_ENV/bin/python" ]; then

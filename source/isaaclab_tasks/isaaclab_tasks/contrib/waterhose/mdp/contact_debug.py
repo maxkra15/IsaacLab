@@ -64,6 +64,7 @@ class _ContactLogger:
 
     def __init__(self) -> None:
         self._labels: list[str] | None = None
+        self._printed_shape_materials = False
         self._last_signature: frozenset | None = None
         self._step = 0
 
@@ -76,22 +77,44 @@ class _ContactLogger:
         labels = []
         for sid in range(len(shape_body)):
             bid = int(shape_body[sid])
-            if bid >= 0:
+            raw_shape_label = shape_label[sid] if shape_label is not None else ""
+            # The connector is a compound shape on the cable-head body. Prefer its
+            # shape label so contact logs do not misreport plug contacts as cable contacts.
+            if "waterhose_connector" in raw_shape_label.lower():
+                labels.append("plug")
+            elif bid >= 0:
                 labels.append(_category(body_label[bid]))
             elif shape_label is not None:
-                labels.append(_category(shape_label[sid]))
+                labels.append(_category(raw_shape_label))
             else:
                 labels.append(f"shape{sid}")
         self._labels = labels
         return labels
 
+    def _print_shape_materials(self, model, labels: list[str]) -> None:
+        """Print the effective grip-shape contact inputs once per debug run."""
+        if self._printed_shape_materials:
+            return
+        self._printed_shape_materials = True
+        mu = model.shape_material_mu.numpy()
+        margin = model.shape_margin.numpy()
+        gap = model.shape_gap.numpy()
+        rows = []
+        for shape_id, label in enumerate(labels):
+            if label in {"finger_L", "finger_R", "plug"}:
+                rows.append(
+                    f"{label}[{shape_id}]: mu={float(mu[shape_id]):.3g} "
+                    f"margin={1.0e3 * float(margin[shape_id]):.3g}mm "
+                    f"gap={1.0e3 * float(gap[shape_id]):.3g}mm"
+                )
+        print(f"[waterhose contacts] grip shapes: {', '.join(rows)}", flush=True)
+
     def _sources(self, solver):
         """Yield ``(name, Contacts)`` for every contact buffer the coupled solver exposes."""
         from isaaclab_newton.physics import NewtonManager
 
-        # Manager-level contacts (populated when the coupled solver runs a model-wide collision
-        # pipeline, i.e. ``CoupledSolverCfg(use_collision_pipeline=True)``). This is the buffer
-        # ``get_contacts()`` returns -- what the Newton viewer and contact sensors read.
+        # Manager-level contacts are populated when the current coupler needs the outer Newton
+        # collision pipeline. This is the public buffer ``get_contacts()`` returns.
         manager_contacts = NewtonManager.get_contacts()
         if manager_contacts is not None:
             yield "manager (get_contacts)", manager_contacts
@@ -124,6 +147,7 @@ class _ContactLogger:
             return
         self._step += 1
         labels = self._ensure_labels(model)
+        self._print_shape_materials(model, labels)
         n_shapes = len(labels)
 
         from collections import Counter

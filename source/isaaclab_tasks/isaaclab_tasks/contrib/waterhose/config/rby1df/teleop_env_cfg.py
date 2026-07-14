@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""RBY1DF waterhose task using Newton proxy coupling and native IsaacLab teleop devices."""
+"""RBY1DF waterhose task using Newton proxy coupling and bimanual XR teleoperation."""
 
 from isaaclab.utils.configclass import configclass
 
@@ -12,4 +12,4 @@ from ...waterhose_env_cfg import WaterhoseProxyTeleopEnvCfg
 
 @configclass
 class WaterhoseTeleopEnvCfg(WaterhoseProxyTeleopEnvCfg):
-    """RBY1DF waterhose task with relative differential IK for keyboard and SpaceMouse teleop."""
+    """RBY1DF waterhose task with absolute two-wrist Newton IK for Apple Vision Pro."""

@@ -46,6 +46,34 @@ def test_livestream_rejects_disabled_visualizers():
         _ensure_livestream_kit_visualizer(args)
 
 
+@pytest.mark.parametrize(
+    ("launcher_args", "expected"),
+    [
+        (argparse.Namespace(visualizer=None, visualizer_explicit=False), True),
+        (argparse.Namespace(visualizer=["kit"], visualizer_explicit=True), True),
+        (argparse.Namespace(visualizer=["newton"], visualizer_explicit=True), False),
+        (argparse.Namespace(visualizer=["none"], visualizer_explicit=True), False),
+        (argparse.Namespace(visualizer=None, visualizer_explicit=True), False),
+        (argparse.Namespace(headless=True, headless_explicit=True), False),
+    ],
+)
+def test_explicit_cli_selection_overrides_configured_kit_visualizer(launcher_args, expected):
+    scan = sim_launcher.Scan(
+        resolved_physics_cfg=None,
+        effective_cfg=object(),
+        visualizer_intent={"has_any_visualizers": True, "has_kit_visualizer": True},
+        has_ovrtx=False,
+        has_kit_camera=False,
+        has_kit_physics=False,
+        has_kitless_physics=True,
+        has_ovphysx_physics=False,
+        needs_kit=False,
+    )
+
+    assert sim_launcher._has_kit_visualizer(scan, launcher_args) is expected
+    assert sim_launcher._uses_isaac_sim_runtime(scan, launcher_args) is expected
+
+
 def test_launch_simulation_preserves_failure_exit_code(monkeypatch: pytest.MonkeyPatch):
     close_args = {}
 
