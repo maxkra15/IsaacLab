@@ -16,26 +16,22 @@ from collections.abc import Callable
 from dataclasses import MISSING, field
 from typing import TYPE_CHECKING, Literal
 
-from isaaclab_newton.physics import NewtonSolverCfg
-from newton import CollisionPipeline
+from isaaclab_newton.physics import NewtonCollisionPipelineCfg, NewtonSolverCfg
 
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
 
 from ..deformable.newton_manager_cfg import NewtonModelSolverCfg
 
 if TYPE_CHECKING:
     from isaaclab_newton.physics import NewtonManager
-    from newton import ModelView
-
-    from isaaclab.scene import InteractiveSceneCfg
+    from newton import CollisionPipeline, ModelView
 
 
 @configclass
 class CouplerEntryCfg:
     """Configuration for one named sub-solver and its model ownership.
 
-    Bodies are selected by scene entity or full Newton body-label regex.
+    Bodies are selected by full Newton body-label regex.
     Joints and shapes attached to selected bodies are included by default;
     additional shapes can be selected directly by their full labels.
     """
@@ -46,14 +42,11 @@ class CouplerEntryCfg:
     solver_cfg: NewtonSolverCfg = MISSING
     """Configuration used to construct this entry's Newton solver."""
 
-    bodies: list[SceneEntityCfg | str] = field(default_factory=list)
+    bodies: list[str] = field(default_factory=list)
     """Bodies owned by this entry.
 
-    A :class:`~isaaclab.managers.SceneEntityCfg` selects bodies below the
-    corresponding scene asset and may narrow them with ``body_names``; only
-    ``name``, ``body_names``, and ``preserve_order`` are supported. A string is
-    treated as a regex matched against full Newton body labels, and a match
-    also selects all descendant body labels below that path.
+    Each string is treated as a regex matched against full Newton body labels,
+    including all descendant body labels below the matched path.
     """
 
     particles: list[int] = field(default_factory=list)
@@ -100,13 +93,13 @@ class CouplerProxyMappingCfg:
     destination: str = MISSING
     """Name of the entry that receives the proxy bodies."""
 
-    bodies: list[SceneEntityCfg | str | int] = field(default_factory=list)
+    bodies: list[str | int] = field(default_factory=list)
     """Source bodies exposed as proxies in the destination entry.
 
-    Selectors use the same scene-entity and full-label-regex semantics as
-    :attr:`CouplerEntryCfg.bodies`, and raw Newton body ids may be given directly
-    as integers. The coupler resolves selectors to body ids in place, so after
-    build this list holds only integers.
+    String selectors use the full-label-regex semantics of
+    :attr:`CouplerEntryCfg.bodies`. Raw Newton body ids may be given directly as
+    integers. The coupler resolves selectors to body ids in place, so after build
+    this list holds only integers.
     """
 
     particles: list[int] = field(default_factory=list)
@@ -125,12 +118,11 @@ class CouplerProxyMappingCfg:
     positive integers and require :attr:`collision_pipeline` to be a factory.
     """
 
-    collision_pipeline: Callable[[ModelView], CollisionPipeline | None] | None = lambda model_view: CollisionPipeline(
-        model_view, broad_phase="explicit"
+    collision_pipeline: NewtonCollisionPipelineCfg | Callable[[ModelView], CollisionPipeline | None] | None = field(
+        default_factory=NewtonCollisionPipelineCfg
     )
-    """Factory for the proxy destination's collision pipeline, or ``None``.
+    """Configuration or factory for the proxy destination collision pipeline.
 
-    The default creates a proxy-local pipeline with ``broad_phase="explicit"``.
     Setting the field or returning ``None`` from the factory passes shared
     outer contacts to the destination.
     """
@@ -150,11 +142,6 @@ class CouplerCfg(NewtonModelSolverCfg):
 
     entries: list[CouplerEntryCfg] = field(default_factory=list)
     """Ordered named sub-solver entries and their ownership selectors."""
-
-    scene_cfg: InteractiveSceneCfg | None = None
-    """Scene cfg used to resolve :class:`~isaaclab.managers.SceneEntityCfg` selectors
-    to Newton bodies at solver-build time. This is unnecessary when all body
-    selectors are full Newton label regexes or integer ids."""
 
 
 @configclass
