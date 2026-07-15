@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 FRANKA_POUR_RESET_DATASET_FORMAT = "franka_pour_reset_dataset"
 FRANKA_POUR_RESET_DATASET_SCHEMA_VERSION = 6
+FRANKA_POUR_RESET_DATASET_TASK_ID = "Isaac-Pour-Franka-Reset-Dataset-v0"
 NON_GRASPING_CATEGORY = 0
 GRASPING_CATEGORY = 1
 RESET_DATASET_GRASPING_COUNT = 10_000
@@ -631,7 +632,8 @@ def validate_reset_dataset(
         if stored_contract_digest != expected_contract_digest:
             raise ValueError(
                 "Reset dataset task contract does not match the current environment: "
-                f"{stored_contract_digest} != {expected_contract_digest}."
+                f"{stored_contract_digest} != {expected_contract_digest}. Regenerate candidates "
+                "with the same task configuration used for validation and training."
             )
     expected_hash = payload.get("content_sha256")
     if not isinstance(expected_hash, str) or expected_hash != reset_dataset_content_sha256(payload):

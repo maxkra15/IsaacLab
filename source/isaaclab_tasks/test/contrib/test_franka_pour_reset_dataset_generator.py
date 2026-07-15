@@ -9,10 +9,12 @@ import math
 from copy import deepcopy
 from types import SimpleNamespace
 
+import gymnasium as gym
 import pytest
 import torch
 
 from isaaclab_tasks.contrib.franka_pour.reset_dataset_generator import (
+    FRANKA_POUR_RESET_DATASET_TASK_ID,
     FrankaPourResetDatasetGenerator,
     FrankaPourResetDatasetGeneratorCfg,
     above_target_tilted_mask,
@@ -524,3 +526,9 @@ def test_reset_dataset_cache_rejects_non_grasp_target_that_changes_sampled_openi
 
     with pytest.raises(ValueError, match="opening"):
         _tiny_payload(states=states)
+
+
+def test_reset_dataset_task_id_selects_the_production_registration():
+    spec = gym.spec(FRANKA_POUR_RESET_DATASET_TASK_ID)
+
+    assert spec.kwargs["env_cfg_entry_point"].endswith(":FrankaPourEnvCfg_RESET_DATASET")

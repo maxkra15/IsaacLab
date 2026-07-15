@@ -12,6 +12,8 @@ an oversampled pool of 14,000 grasping states (including 2,000 near-pour states)
 non-grasping states. Validation restores every candidate in the real task, simulates it, requires
 near-pour states to deliver at least 30% without excessive spill, and selects exactly 10,000 valid
 states from each category. The normal training environment rejects the intermediate candidate file.
+Generation and validation default to the same reset-dataset task configuration; custom ``--task``
+overrides must match in both commands because the cache records a strict physics contract.
 
 From the repository root, run:
 

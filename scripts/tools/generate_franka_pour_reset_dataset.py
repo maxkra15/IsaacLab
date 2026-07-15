@@ -15,6 +15,7 @@ from isaaclab.app import add_launcher_args, launch_simulation
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.contrib.franka_pour.pour_env import FrankaPourResetSamplerEnv
 from isaaclab_tasks.contrib.franka_pour.reset_dataset_generator import (
+    FRANKA_POUR_RESET_DATASET_TASK_ID,
     FrankaPourResetDatasetGenerator,
     FrankaPourResetDatasetGeneratorCfg,
     save_reset_dataset,
@@ -31,7 +32,7 @@ _CANDIDATE_NEAR_POUR_COUNT = 2_000
 def main() -> None:
     """Launch one task world, sample exact category quotas, and atomically save them."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", default="Isaac-Pour-Franka-v0")
+    parser.add_argument("--task", default=FRANKA_POUR_RESET_DATASET_TASK_ID)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--max_attempt_multiplier", type=int, default=100)

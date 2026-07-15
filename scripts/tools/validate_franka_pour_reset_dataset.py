@@ -26,6 +26,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.contrib.franka_pour.mdp.terminations import source_grasp_milestones
 from isaaclab_tasks.contrib.franka_pour.pour_env import FrankaPourResetDatasetValidationEnv
 from isaaclab_tasks.contrib.franka_pour.reset_dataset_generator import (
+    FRANKA_POUR_RESET_DATASET_TASK_ID,
     GRASPING_CATEGORY,
     NON_GRASPING_CATEGORY,
     RESET_DATASET_GRASPING_COUNT,
@@ -78,7 +79,7 @@ def _never_terminate(
 def _parse_args() -> argparse.Namespace:
     """Parse and validate command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", default="Isaac-Pour-Franka-Reset-Dataset-v0")
+    parser.add_argument("--task", default=FRANKA_POUR_RESET_DATASET_TASK_ID)
     parser.add_argument("--input", type=Path, default=_DEFAULT_INPUT, help="Candidate reset dataset.")
     parser.add_argument("--output", type=Path, default=_DEFAULT_OUTPUT, help="Validated production dataset.")
     parser.add_argument("--report", type=Path, default=_DEFAULT_REPORT, help="Compact JSON validation report.")
