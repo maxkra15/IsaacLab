@@ -86,13 +86,19 @@ from .rewards import (  # noqa: F401
     tilt_command_progress,
     tilt_over_target,
 )
+from .reset_dataset import (  # noqa: F401
+    PourResetDatasetCurriculum,
+    reset_dataset_difficulty,
+)
 from .reset_mixture import (  # noqa: F401
     RESET_MIXTURE_REGION_NAMES,
+    RESET_MIXTURE_STAGE_NAMES,
     PourResetMixture,
 )
 from .terminations import (  # noqa: F401
     excessive_spill,
     extreme_rigid_state,
+    immediate_pour_success,
     lost_lifted_grasp,
     nonterminating_stable_pour_success,
     nonfinite_failure,

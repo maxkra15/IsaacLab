@@ -162,7 +162,7 @@ def lost_lifted_grasp(
 
     A short dwell rejects isolated contact-deflection flicker from the coupled rigid solver while
     still allowing the reverse curriculum to terminate a genuinely dropped cup promptly. Static
-    reset-mixture training can disable termination while retaining the state monitor for metrics.
+    reset-dataset training can disable termination while retaining the state monitor for metrics.
     """
     if not math.isfinite(dwell_time_s) or dwell_time_s <= 0.0:
         raise ValueError(f"dwell_time_s must be finite and positive, got {dwell_time_s}.")
@@ -273,6 +273,21 @@ def stable_pour_success(
     return success
 
 
+def immediate_pour_success(env: FrankaPourEnv) -> torch.Tensor:
+    """Terminate immediately when the current target-bowl fraction reaches its threshold.
+
+    Reset-cache particles always start in the source cup, so current target occupancy directly
+    measures task progress without also requiring a retained grasp, lift milestone, delivery
+    history, or dwell interval. Failure terms run before success and therefore retain precedence.
+    """
+    target_fraction = env.count_in_target() / max(env.num_particles, 1)
+    env.ep_max_target_frac[:] = torch.maximum(env.ep_max_target_frac, target_fraction)
+    success = (target_fraction >= env.pour_target_frac) & ~env.termination_manager.terminated
+    env._success_dwell_count[:] = success.to(dtype=env._success_dwell_count.dtype)
+    env.episode_succeeded |= success
+    return success
+
+
 def nonterminating_stable_pour_success(
     env: FrankaPourEnv,
     dwell_time_s: float = 0.15,
@@ -292,7 +307,7 @@ def nonterminating_stable_pour_success(
     )
     # Standard record/replay tools temporarily remove the managed success term and invoke this
     # configured function directly. Return the real predicate in that context; suppress only the
-    # live TerminationManager's done signal used by fixed-horizon reset-mixture training.
+    # live TerminationManager's done signal used by fixed-horizon reset-dataset training.
     if "success" not in env.termination_manager.active_terms:
         return success
     return torch.zeros_like(success)

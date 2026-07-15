@@ -4,10 +4,18 @@ Added
 * Added the ``Isaac-Pour-Franka-v0`` contributed task, where a Franka pours
   granular MPM media between scene-owned cups using proxy-coupled MJWarp and
   implicit-MPM solvers.
-* Added backward-curriculum and OmniReset-style reset-mixture training presets
-  with collision-screened Newton IK resets, broad tabletop object and arm
-  randomization, asymmetric observations, general fixed-weight rewards, and
-  particle-based sustained success metrics.
+* Added both staged procedural resets and a reset-dataset training preset. The
+  latter uses offline rejection sampling, Newton IK and collision validation,
+  adaptive competence-weighted replay, general fixed-weight rewards, and
+  particle-based success.
 * Added CUDA-graph-captured sparse-grid training with isolated MPM worlds,
-  fixed-grid playback, visible MPM particles, video-friendly camera framing,
+  sparse-grid playback, visible MPM particles, video-friendly camera framing,
   and SpaceMouse teleoperation presets for Franka Pour.
+
+Deprecated
+^^^^^^^^^^
+
+* Deprecated the experimental ``Reset-Mixture`` task, configuration, runner,
+  and curriculum names in favor of their ``Reset-Dataset`` counterparts. The
+  compatibility names do not make older Cartesian-IK policy checkpoints
+  compatible with the new relative-joint policy.

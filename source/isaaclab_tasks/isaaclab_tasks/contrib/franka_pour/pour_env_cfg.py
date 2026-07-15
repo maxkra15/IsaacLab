@@ -18,8 +18,8 @@ This replaces the earlier welded-kinematic-cup design.
 
 The source cup carries two co-located shapes on the same body: a solid grasp box (``COLLIDE_SHAPES``,
 arm-entry-only) the fingers can actually grip, and a hollow cavity mesh (``COLLIDE_PARTICLES``) the
-proxy bridges to MPM. The reverse curriculum uses relative joint commands, while the reset-mixture
-variant uses relative Cartesian IK and a binary symmetric gripper.
+proxy bridges to MPM. Both learning variants use relative joint commands; the reset-dataset variant
+uses a binary symmetric gripper.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ from isaaclab_newton.sim.spawners.mpm import MPMParticleMaterialCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
-from isaaclab.controllers import DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -58,7 +57,9 @@ from isaaclab.visualizers import VisualizerCfg
 
 from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 
-from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
+from isaaclab_tasks.utils.adaptive_reset_sampler import AdaptiveResetSamplerCfg
+
+from isaaclab_assets.robots.franka import FRANKA_PANDA_CFG
 
 from . import mdp
 from .cube_bowl_mesh import cube_bowl_inner_bounds
@@ -67,6 +68,21 @@ from .cup_media import build_media_object_cfg, cup_cavity_lattice
 
 RIGID_ENTRY = "arm"
 MPM_ENTRY = "media"
+FRANKA_POUR_ROBOT_USD_PATH = "omniverse://isaac-dev.ov.nvidia.com/Isaac/IsaacLab/Robots/FrankaEmika/franka_panda.usda"
+FRANKA_POUR_ARM_COLLISION_PROXIES = frozenset(
+    {
+        "link0_c",
+        "link1_c",
+        "link2_c",
+        "link3_c",
+        "link4_c",
+        "link5_c0",
+        "link5_c1",
+        "link5_c2",
+        "link6_c",
+        "link7_c",
+    }
+)
 SPILL_FLOOR_LABEL_PATTERN = r".*/SpillFloor$"
 GRASP_APPROACH_STAGE_NAMES = (
     "approach_1",
@@ -89,6 +105,39 @@ CURRICULUM_STAGE_NAMES = (
     "full",
     "randomized",
 )
+
+
+def spawn_franka_with_arm_collisions(
+    prim_path: str,
+    cfg: UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+):
+    """Spawn the canonical Franka and activate only its dedicated arm collision proxies."""
+    from pxr import Usd, UsdPhysics  # noqa: PLC0415
+
+    robot_prim = sim_utils.spawn_from_usd(prim_path, cfg, translation, orientation, **kwargs)
+    for root_prim in sim_utils.find_matching_prims(prim_path, stage=robot_prim.GetStage()):
+        self_collision = root_prim.GetAttribute("newton:selfCollisionEnabled")
+        if not self_collision or not self_collision.Set(True):
+            raise RuntimeError(f"Franka asset at {root_prim.GetPath()} has no writable Newton self-collision flag.")
+        proxy_roots = {
+            prim.GetName(): prim.GetParent().GetPath()
+            for prim in Usd.PrimRange(root_prim, Usd.TraverseInstanceProxies())
+            if prim.GetName() in FRANKA_POUR_ARM_COLLISION_PROXIES and prim.GetParent().GetName() == prim.GetName()
+        }
+        if proxy_roots.keys() != FRANKA_POUR_ARM_COLLISION_PROXIES:
+            missing = sorted(FRANKA_POUR_ARM_COLLISION_PROXIES.difference(proxy_roots))
+            raise RuntimeError(f"Franka asset at {root_prim.GetPath()} is missing collision proxies: {missing}.")
+        for proxy_root in proxy_roots.values():
+            root_prim.GetStage().OverridePrim(proxy_root).SetInstanceable(False)
+        for proxy_root in proxy_roots.values():
+            collision_prim = root_prim.GetStage().GetPrimAtPath(proxy_root.AppendChild(proxy_root.name))
+            UsdPhysics.CollisionAPI(collision_prim).GetCollisionEnabledAttr().Set(True)
+    return robot_prim
+
+
 PANDA_ARM_JOINT_LIMITS = (
     (-2.8973, 2.8973),
     (-1.7628, 1.7628),
@@ -155,7 +204,24 @@ class PourSceneCfg(InteractiveSceneCfg):
     light = AssetBaseCfg(
         prim_path="/World/light", spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0)
     )
-    robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot = FRANKA_PANDA_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot.spawn.usd_path = FRANKA_POUR_ROBOT_USD_PATH
+    robot.spawn.func = spawn_franka_with_arm_collisions
+    # The task-specific spawner overrides the source USD's Newton-native value; retain the matching
+    # backend-independent intent in the articulation configuration as well.
+    robot.spawn.articulation_props.enabled_self_collisions = True
+    # Resolve the implicit-actuator parameters from the requested USD rather than overwriting them
+    # with Isaac Lab's generic Franka gains and limits.
+    robot.actuators = {
+        name: actuator_cfg.replace(
+            effort_limit_sim=None,
+            velocity_limit_sim=None,
+            stiffness=None,
+            damping=None,
+            armature=None,
+        )
+        for name, actuator_cfg in robot.actuators.items()
+    }
     robot.spawn.joint_drive_props = [MujocoJointCfg(actuatorgravcomp=True)]
     # Built by :meth:`FrankaPourEnvCfg.finalize` from the final override values.
     source_cup: RigidObjectCfg | None = None
@@ -333,17 +399,19 @@ class RewardsCfg:
 
 
 @configclass
-class ResetMixtureRewardsCfg:
-    """Stage-independent OmniReset-style reward groups for the reset-mixture ablation."""
+class ResetDatasetRewardsCfg:
+    """Stage-independent OmniReset-style rewards for reset-dataset training."""
 
     # Task rewards: generic reach and goal-set distance plus the strict particle success state.
-    # The broad kernel remains informative across full-workspace reaching while the reset mixture
+    # The broad kernel remains informative across full-workspace reaching while the reset dataset
     # supplies close-contact precision without adding a task-specific grasp trajectory.
     reach = RewTerm(func=mdp.tcp_cup_distance_tanh, weight=0.1, params={"std": 0.3})
     # Particle distances span only a few decimetres; this preserves useful transfer contrast
     # while retaining the same task-independent tanh form used by OmniReset.
     goal_distance = RewTerm(func=mdp.media_target_distance_tanh, weight=0.1, params={"std": 0.2})
-    success = RewTerm(func=mdp.sustained_pour_success, weight=1.0, params={"dwell_time_s": 0.15})
+    # A target occupancy of 30% is an immediate terminal success. Dividing the terminal pulse by
+    # the policy step keeps its integrated contribution equal to this unit weight.
+    success = RewTerm(func=mdp.pour_success_bonus, weight=1.0)
 
     # Smoothness is one semantic reward group, kept as separate standard terms for diagnostics.
     action_magnitude = RewTerm(func=mdp.action_l2, weight=-1.0e-4)
@@ -357,9 +425,9 @@ class ResetMixtureRewardsCfg:
         },
     )
 
-    # Ordinary fixed-horizon completion is neutral. Match OmniReset's effective one-time
-    # abnormal-state cost at 10 Hz without penalizing an ordinary timeout.
-    failure = RewTerm(func=mdp.terminal_failure, weight=-10.0, params={"include_time_out": False})
+    # Ordinary fixed-horizon completion is neutral. ``terminal_failure`` is already normalized by
+    # the policy step, so this weight produces one exact -1 abnormal-state pulse per episode.
+    failure = RewTerm(func=mdp.terminal_failure, weight=-1.0, params={"include_time_out": False})
 
 
 @configclass
@@ -402,8 +470,10 @@ class CurriculumCfg:
 
 
 @configclass
-class ResetMixtureCurriculumCfg:
-    reset_mixture = CurrTerm(func=mdp.PourResetMixture)
+class ResetDatasetCurriculumCfg:
+    """Adaptive curriculum over a validated reset-state dataset."""
+
+    reset_dataset = CurrTerm(func=mdp.PourResetDatasetCurriculum)
 
 
 @configclass
@@ -436,16 +506,6 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     tcp_body_name: str = "panda_hand"
     tcp_offset_pos: tuple[float, float, float] = (0.0, 0.0, 0.107)
     tcp_offset_rot: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
-    # Coupled-pipeline arm tuning: heavy PD damping + reflected rotor inertia keep the distal joints
-    # from limit-cycling under the coupled solver.
-    arm_stiffness: float = 800.0
-    arm_damping: float = 50.0
-    arm_armature: float = 0.5
-    # Slightly softer, proportionally damped finger gains close the 50 g source cup without the
-    # unilateral impulse produced by the stock drive, while still acquiring within the horizon.
-    finger_stiffness: float = 1500.0
-    finger_damping: float = 75.0
-    finger_armature: float = 0.0
     gripper_open_pos: float = 0.04  # finger position the cup is grasped from (fingers start open)
     # A target inside the 0.028 m geometric contact position proves active squeeze/preload instead
     # of open fingers passively compressed by cup contact.
@@ -556,7 +616,10 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     # Keep finite escaped particles from expanding the sparse NanoVDB hierarchy throughout
     # an episode. Bounds are in each environment's local frame and comfortably contain both cups,
     # every curriculum reset, and the robot workspace.
-    particle_workspace_lower_bound: tuple[float, float, float] = (-0.5, -1.0, -0.5)
+    # The reset-dataset generator covers the central 90% of the Franka's full 360-degree reachable
+    # workspace. Keep the sparse-grid safety envelope symmetric behind the base so valid rear
+    # grasps and their cup-contained media are not mistaken for numerical escapes.
+    particle_workspace_lower_bound: tuple[float, float, float] = (-1.0, -1.0, -0.5)
     particle_workspace_upper_bound: tuple[float, float, float] = (1.5, 1.0, 1.5)
 
     # ---- success-driven backward curriculum ----
@@ -823,11 +886,21 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
     voxel_size: float = 0.01
     particles_per_cell: float = 2.0
     mpm_iterations: int = 24
-    # The cup contains fewer than 256 particles, so one aligned sparse-cell block per world is a
-    # conservative graph-capture capacity without allocating a global fixed grid.
-    mpm_cell_capacity_alignment: int = 256
+    # A rebuildable multi-world grid stores guard/topology voxels in addition to each particle's
+    # occupied cell. Two aligned blocks per world prevent high world indices from exhausting the
+    # global captured reserve after tilted fills spread, while retaining a sparse local grid.
+    mpm_cell_capacity_alignment: int = 512
     mpm_cell_cap_override: int | None = None
-    num_substeps: int = 2
+    # Advance the complete coupled system once per 120 Hz simulation tick. Per-entry refinements
+    # below avoid repeating the outer collision and proxy-coupling pipeline.
+    physics_substeps: int = 1
+    # Four rigid refinements preserve the former number of arm solves per simulation tick without
+    # multiplying the coupled proxy exchange or MPM work.
+    rigid_entry_substeps: int = 4
+    # Refine only the implicit-MPM entry twice inside each coupled tick. This improves thin-wall
+    # collision stability without duplicating the outer collision/coupling pipeline; rigid and MPM
+    # accuracy remain independently configurable through their per-entry substeps.
+    mpm_entry_substeps: int = 2
     proxy_iterations: int = 1
     # This scales only the virtual cup inertia inside the destination MPM solve. The rigid solver
     # retains the authored cup mass and receives the harvested MPM reaction wrench. A stiff proxy
@@ -942,7 +1015,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                             SceneEntityCfg("target_cup"),
                         ],
                         include_static_shapes=True,
-                        substeps=self.num_substeps,
+                        substeps=self.rigid_entry_substeps,
                     ),
                     CouplerEntryCfg(
                         name=MPM_ENTRY,
@@ -969,6 +1042,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                         bodies=[SPILL_FLOOR_LABEL_PATTERN],
                         include_static_shapes=False,
                         include_child_joints=False,
+                        substeps=self.mpm_entry_substeps,
                         in_place=True,
                     ),
                 ],
@@ -989,7 +1063,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
             # Rigid contacts use Newton's outer pipeline. Implicit MPM handles particle/shape
             # collisions internally, so allocating outer soft contacts would waste O(P*S) work.
             collision_cfg=NewtonCollisionPipelineCfg(soft_contact_max=0),
-            num_substeps=self.num_substeps,
+            num_substeps=self.physics_substeps,
             use_cuda_graph=self.use_cuda_graph,
         )
 
@@ -1167,6 +1241,25 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
             raise ValueError("curriculum_randomization_start_level must index curriculum_randomization_extent_levels.")
         self._validate_reward_cfg(stage_count)
 
+    def _validate_solver_cfg(self) -> None:
+        """Validate the task-level controls copied into the coupled solver tree."""
+        for name in (
+            "physics_substeps",
+            "rigid_entry_substeps",
+            "mpm_entry_substeps",
+            "mpm_iterations",
+            "proxy_iterations",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
+        for name in ("voxel_size", "proxy_mass_scale"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        if not isinstance(self.use_cuda_graph, bool):
+            raise TypeError("use_cuda_graph must be a bool.")
+
     def _validate_reward_cfg(self, stage_count: int) -> None:
         """Validate the reverse-curriculum reward parameters."""
         tilt_params = self.rewards.task_progress.params
@@ -1247,6 +1340,7 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
 
     def _validate_curriculum_cfg(self) -> None:
         """Validate the aligned per-stage backward-curriculum settings."""
+        self._validate_solver_cfg()
         self._validate_source_cup_cfg()
         self._validate_gripper_action_cfg()
         self._validate_arm_action_cfg()
@@ -1719,19 +1813,11 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
                 raise ValueError(f"particle_workspace bounds do not contain the {region_name}.")
 
     def _apply_robot_cfg(self) -> None:
-        """Apply final task fields to the scene robot and its joint-position action offset."""
+        """Apply final task reset positions to the scene robot."""
         self.scene.robot.init_state.joint_pos.update(
             dict(zip([f"panda_joint{i}" for i in range(1, 8)], self.arm_home, strict=True))
         )
         self.scene.robot.init_state.joint_pos["panda_finger_joint.*"] = self.gripper_open_pos
-        for actuator_name in ("panda_shoulder", "panda_forearm"):
-            self.scene.robot.actuators[actuator_name].stiffness = self.arm_stiffness
-            self.scene.robot.actuators[actuator_name].damping = self.arm_damping
-            self.scene.robot.actuators[actuator_name].armature = self.arm_armature
-        hand = self.scene.robot.actuators["panda_hand"]
-        hand.stiffness = self.finger_stiffness
-        hand.damping = self.finger_damping
-        hand.armature = self.finger_armature
 
     def _apply_solver_cfg_overrides(self) -> None:
         """Propagate final top-level controls into the constructed coupled-solver config."""
@@ -1739,6 +1825,9 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         arm_entries = [entry for entry in coupled_cfg.entries if entry.name == RIGID_ENTRY]
         if len(arm_entries) != 1:
             raise ValueError(f"Expected exactly one {RIGID_ENTRY!r} solver entry, found {len(arm_entries)}.")
+        media_entries = [entry for entry in coupled_cfg.entries if entry.name == MPM_ENTRY]
+        if len(media_entries) != 1:
+            raise ValueError(f"Expected exactly one {MPM_ENTRY!r} solver entry, found {len(media_entries)}.")
         proxies = [
             proxy for proxy in coupled_cfg.proxies if proxy.source == RIGID_ENTRY and proxy.destination == MPM_ENTRY
         ]
@@ -1748,8 +1837,9 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         mpm_solver_cfg = _mpm_solver_cfg(self)
         mpm_solver_cfg.voxel_size = self.voxel_size
         mpm_solver_cfg.max_iterations = self.mpm_iterations
-        arm_entries[0].substeps = self.num_substeps
-        self.sim.physics.num_substeps = self.num_substeps
+        arm_entries[0].substeps = self.rigid_entry_substeps
+        media_entries[0].substeps = self.mpm_entry_substeps
+        self.sim.physics.num_substeps = self.physics_substeps
         self.sim.physics.use_cuda_graph = self.use_cuda_graph
         coupled_cfg.iterations = self.proxy_iterations
         proxies[0].mass_scale = self.proxy_mass_scale
@@ -1758,12 +1848,6 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         """Return an independent config with all derived scene assets resolved."""
         resolved = deepcopy(self)
         resolved.sim.render_interval = resolved.decimation
-        if isinstance(resolved.actions.arm_action, mdp.DifferentialInverseKinematicsActionCfg):
-            resolved.actions.arm_action.body_name = resolved.tcp_body_name
-            resolved.actions.arm_action.body_offset = mdp.DifferentialInverseKinematicsActionCfg.OffsetCfg(
-                pos=resolved.tcp_offset_pos,
-                rot=resolved.tcp_offset_rot,
-            )
         # Hydra and command-line overrides are applied after ``__post_init__`` constructs the
         # nested Newton solver tree. Reapply every public top-level solver control before resolving
         # derived configuration.
@@ -1790,11 +1874,14 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
         resolved._validate_curriculum_cfg()
         resolved._validate_particle_workspace_cfg()
         resolved._apply_robot_cfg()
-        resolved.terminations.success.params["dwell_time_s"] = resolved.success_dwell_time_s
-        resolved.terminations.success.params["min_lift_height"] = resolved.success_min_lift_height
-        resolved.terminations.success.params["max_tcp_distance"] = resolved.success_max_tcp_distance
-        resolved.terminations.success.params["max_gripper_width_error"] = resolved.success_max_gripper_width_error
-        resolved.terminations.success.params["max_gripper_command"] = max_gripper_command
+        if resolved.terminations.success.func is mdp.immediate_pour_success:
+            resolved.terminations.success.params = {}
+        else:
+            resolved.terminations.success.params["dwell_time_s"] = resolved.success_dwell_time_s
+            resolved.terminations.success.params["min_lift_height"] = resolved.success_min_lift_height
+            resolved.terminations.success.params["max_tcp_distance"] = resolved.success_max_tcp_distance
+            resolved.terminations.success.params["max_gripper_width_error"] = resolved.success_max_gripper_width_error
+            resolved.terminations.success.params["max_gripper_command"] = max_gripper_command
         resolved.scene.source_cup = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/SourceCup",
             init_state=RigidObjectCfg.InitialStateCfg(
@@ -1858,92 +1945,61 @@ class FrankaPourEnvCfg(ManagerBasedRLEnvCfg):
 
 
 @configclass
-class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
-    """Static four-region resets with one stage-independent OmniReset-style reward."""
+class FrankaPourEnvCfg_RESET_DATASET(FrankaPourEnvCfg):
+    """Validated reset-dataset curriculum with a stage-independent reward."""
 
-    curriculum: ResetMixtureCurriculumCfg = ResetMixtureCurriculumCfg()
-    rewards: ResetMixtureRewardsCfg = ResetMixtureRewardsCfg()
+    curriculum: ResetDatasetCurriculumCfg = ResetDatasetCurriculumCfg()
+    rewards: ResetDatasetRewardsCfg = ResetDatasetRewardsCfg()
     curriculum_early_target_frac: tuple[float, ...] = (0.30,) * 14
-    # Ordered as reaching, near-object, grasped, and near-goal. The final region is a fully
-    # refilled, pour-ready state rather than a partially transferred particle snapshot.
-    reset_mixture_probabilities: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
-    # Concentrate the open-hand portion of Near-Object on the final screened grasp neighborhood
-    # while retaining small early/bridge support and every source-row marginal.
-    reset_mixture_near_object_open_phase_probabilities: tuple[float, float, float] = (0.05, 0.05, 0.90)
-    # Split Near-Object between open-hand approach states and exact table grasps whose fingers
-    # start at contact with a preload drive target. This bridges fresh binary-gripper learning
-    # without changing the policy interface or moving the authored cup off the table.
-    reset_mixture_near_object_preloaded_probability: float = 0.5
-    reset_mixture_statistics_window_size: int = 4096
+    # The dataset is generated and collision-validated offline, then restored directly at reset.
+    # Training samples it through the adaptive curriculum below; frozen evaluation samples either
+    # every row or the requested highest-objective grasp subset.
+    reset_dataset_path: str = "datasets/franka_pour/reset_dataset.pt"
+    reset_dataset_content_sha256: str | None = None
+    reset_dataset_top_grasp_count: int | None = None
+    # Each process retains bounded online success evidence. Training begins on the easiest rows,
+    # calibrates a broad replay distribution near 50% success, and probes only the adjacent harder
+    # frontier. The state is intentionally rank-local and starts fresh on RSL-RL resume because
+    # environment state is not currently part of its checkpoints. The reusable sampler config
+    # remains directly overridable through Hydra.
+    reset_dataset_sampler: AdaptiveResetSamplerCfg = AdaptiveResetSamplerCfg()
+    # A spill is irreversible once more than 30% of the media rests on the table outside both
+    # vessels. At 245 particles the strict threshold terminates on particle 74.
+    max_spill_fraction: float = 0.30
 
     def __post_init__(self):
-        # Match OmniReset's task-space interface while retaining the existing high-PD position
-        # drives. DiffIK removes inverse kinematics from the policy without requiring OSC effort
-        # control or any Newton-side changes.
-        self.actions.arm_action = mdp.DifferentialInverseKinematicsActionCfg(
-            asset_name="robot",
-            joint_names=[f"panda_joint{i}" for i in range(1, 8)],
-            body_name=self.tcp_body_name,
-            body_offset=mdp.DifferentialInverseKinematicsActionCfg.OffsetCfg(
-                pos=self.tcp_offset_pos,
-                rot=self.tcp_offset_rot,
-            ),
-            controller=DifferentialIKControllerCfg(
-                command_type="pose",
-                use_relative_mode=True,
-                ik_method="adaptive_dls",
-                joint_limit_avoidance_gain=0.05,
-                joint_limit_avoidance_margin=0.25,
-            ),
-            # Two-centimetre translations follow OmniReset. Uniform 0.1 rad rotations retain
-            # enough authority for this task's large horizontal pouring tilt.
-            scale=(0.02, 0.02, 0.02, 0.10, 0.10, 0.10),
-        )
+        # Use the standard Isaac Lab relative joint-position action with the position drives
+        # authored by the selected Franka USD. A 0.015 rad tracking error keeps the stiff proximal
+        # USD drives within useful torque authority while improving contact-phase precision.
+        self.actions.arm_action.scale = 0.015
         # OmniReset uses one region-independent binary gripper action. Keep the existing moving-
-        # average filter to damp IID exploration chatter without accumulating stale open commands;
-        # at 10 Hz it reaches contact in roughly four close decisions (0.4 s).
+        # average filter to damp IID exploration chatter without accumulating stale open commands.
+        # Adjust its coefficient to retain the same physical-time response at three times the rate.
         self.actions.gripper_action.use_incremental_target = False
         self.actions.gripper_action.binary_threshold = 0.0
+        self.actions.gripper_action.alpha = 1.0 - (1.0 - self.actions.gripper_action.alpha) ** (1.0 / 3.0)
         super().__post_init__()
-        # Match OmniReset's 10 Hz, 16-second lifecycle. Five actor frames then represent 0.5 s of
-        # contact and slip history, while 32 PPO steps cover the same 3.2-second rollout window.
-        self.decimation = 12
+        # Run the policy at 30 Hz over the 120 Hz simulation. Thirteen frames span 0.4 seconds from
+        # oldest to newest, matching five frames at 10 Hz, while 32 PPO steps span 1.067 seconds.
+        self.decimation = 4
         self.sim.render_interval = self.decimation
-        self.episode_length_s = 16.0
-        self.observations.policy.history_length = 5
+        # Seven seconds gives broad reaching rows time to act while turning failed attempts over
+        # more quickly. At 30 Hz this is exactly 210 policy steps.
+        self.episode_length_s = 7.0
+        self.observations.policy.history_length = 13
         self.is_finite_horizon = False
-        # OmniReset treats success as a state reward and collects every reset region for the full
-        # horizon. Keep its managed predicate as a replay-discoverable, nonterminating context;
-        # the reward reads the current dwell-qualified state that context updates. Track dropped
-        # grasps without terminating so policies can retry, matching OmniReset's task lifecycle.
-        self.terminations.success.func = mdp.nonterminating_stable_pour_success
+        # The first step with at least ``pour_target_frac`` (30%) of the media in the receiver is
+        # terminal success. It deliberately has no dwell, retained-grasp, lift, or trajectory-history
+        # requirement. Failure predicates are evaluated first and retain same-step precedence.
+        self.terminations.success.func = mdp.immediate_pour_success
+        self.terminations.success.params = {}
         self.terminations.lost_grasp.params["terminate"] = False
-        self.terminations.spill.params["terminate"] = False
-        self.terminations.time_out.func = mdp.time_out
-
-    def _validate_arm_action_cfg(self) -> None:
-        """Validate the reset mixture's relative Cartesian IK contract."""
-        arm_action = self.actions.arm_action
-        if not isinstance(arm_action, mdp.DifferentialInverseKinematicsActionCfg):
-            raise ValueError("The reset mixture requires DifferentialInverseKinematicsActionCfg for the arm.")
-        if arm_action.joint_names != [f"panda_joint{i}" for i in range(1, 8)]:
-            raise ValueError("The reset-mixture DiffIK action requires all seven Panda arm joints in order.")
-        if arm_action.body_name != self.tcp_body_name or arm_action.body_offset is None:
-            raise ValueError("The reset-mixture DiffIK action must control the configured TCP frame.")
-        if tuple(arm_action.body_offset.pos) != tuple(self.tcp_offset_pos) or tuple(
-            arm_action.body_offset.rot
-        ) != tuple(self.tcp_offset_rot):
-            raise ValueError("The reset-mixture DiffIK action must use the configured TCP offset.")
-        scales = (float(arm_action.scale),) if isinstance(arm_action.scale, int | float) else tuple(arm_action.scale)
-        if len(scales) != 6 or any(not math.isfinite(value) or value <= 0.0 for value in scales):
-            raise ValueError("The reset-mixture DiffIK action scale must contain six finite positive values.")
-        controller = arm_action.controller
-        if controller.command_type != "pose" or not controller.use_relative_mode:
-            raise ValueError("The reset-mixture DiffIK controller must use relative pose commands.")
+        self.terminations.spill.params["terminate"] = True
+        self.terminations.time_out.func = mdp.unsuccessful_time_out
 
     def _configure_reward_cfg(self, max_gripper_command: float, *, initialize_stage_gates: bool) -> None:
         """Keep the general reward independent of curriculum and grasp thresholds."""
-        self.rewards.success.params["dwell_time_s"] = self.success_dwell_time_s
+        del max_gripper_command, initialize_stage_gates
 
     def _validate_reward_cfg(self, stage_count: int) -> None:
         """Validate the general reward without introducing reset-stage dependencies."""
@@ -1957,79 +2013,57 @@ class FrankaPourEnvCfg_RESET_MIXTURE(FrankaPourEnvCfg):
 
     def _validate_curriculum_cfg(self) -> None:
         super()._validate_curriculum_cfg()
-        probabilities = self.reset_mixture_probabilities
-        if len(probabilities) != len(mdp.RESET_MIXTURE_REGION_NAMES):
-            raise ValueError(f"reset_mixture_probabilities must contain {len(mdp.RESET_MIXTURE_REGION_NAMES)} values.")
-        if any(not math.isfinite(value) or value < 0.0 for value in probabilities) or not any(
-            value > 0.0 for value in probabilities
+        if not isinstance(self.reset_dataset_path, str):
+            raise TypeError("reset_dataset_path must be a string.")
+        if not self.reset_dataset_path:
+            raise ValueError("reset_dataset_path must be nonempty.")
+        top_grasp_count = self.reset_dataset_top_grasp_count
+        if top_grasp_count is not None:
+            if not isinstance(top_grasp_count, int) or isinstance(top_grasp_count, bool) or top_grasp_count <= 0:
+                raise ValueError("reset_dataset_top_grasp_count must be a positive integer or None.")
+            if not self.curriculum_freeze:
+                raise ValueError("reset_dataset_top_grasp_count requires curriculum_freeze=True.")
+        expected_hash = self.reset_dataset_content_sha256
+        if expected_hash is not None and (
+            not isinstance(expected_hash, str)
+            or len(expected_hash) != 64
+            or any(character not in "0123456789abcdef" for character in expected_hash)
         ):
-            raise ValueError("reset_mixture_probabilities must contain finite nonnegative values with a positive sum.")
-        phase_probabilities = self.reset_mixture_near_object_open_phase_probabilities
-        if len(phase_probabilities) != 3:
-            raise ValueError("reset_mixture_near_object_open_phase_probabilities must contain 3 values.")
-        if any(not math.isfinite(value) or value <= 0.0 for value in phase_probabilities) or not math.isfinite(
-            sum(phase_probabilities)
-        ):
-            raise ValueError("reset_mixture_near_object_open_phase_probabilities must contain finite positive values.")
-        preload_probability = self.reset_mixture_near_object_preloaded_probability
-        if (
-            isinstance(preload_probability, bool)
-            or not math.isfinite(preload_probability)
-            or not 0.0 <= preload_probability <= 1.0
-        ):
-            raise ValueError("reset_mixture_near_object_preloaded_probability must be finite and lie in [0, 1].")
-        if (
-            not isinstance(self.reset_mixture_statistics_window_size, int)
-            or isinstance(self.reset_mixture_statistics_window_size, bool)
-            or self.reset_mixture_statistics_window_size <= 0
-        ):
-            raise ValueError("reset_mixture_statistics_window_size must be positive.")
+            raise ValueError("reset_dataset_content_sha256 must be a lowercase SHA-256 or None.")
+        self.reset_dataset_sampler.validate_values()
 
 
 @configclass
-class FrankaPourEnvCfg_RESET_MIXTURE_EVAL(FrankaPourEnvCfg_RESET_MIXTURE):
-    """Full-amplitude reaching resets for unbiased reset-mixture evaluation."""
+class FrankaPourEnvCfg_RESET_DATASET_EVAL(FrankaPourEnvCfg_RESET_DATASET):
+    """Frozen full-distribution reset-dataset evaluation."""
 
-    reset_mixture_probabilities: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    curriculum_freeze: bool = True
 
 
 @configclass
-class FrankaPourEnvCfg_RESET_MIXTURE_PLAY(FrankaPourEnvCfg_RESET_MIXTURE_EVAL):
-    """Single-environment reset-mixture playback with a captured fixed MPM grid."""
-
-    success_dwell_time_s: float = 1.0
+class FrankaPourEnvCfg_RESET_DATASET_PLAY(FrankaPourEnvCfg_RESET_DATASET_EVAL):
+    """Reset-dataset playback using the captured sparse multi-world MPM configuration."""
 
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 1
         self.use_cuda_graph = True
         self.sim.physics.use_cuda_graph = True
-        mpm_solver_cfg = _mpm_solver_cfg(self)
-        mpm_solver_cfg.grid_type = "fixed"
-        # The retained Reaching bank spans 0.37--0.76 m in x and -0.39--0.31 m in y.
-        # Sixty-four 1 cm cells cover those resets, the receiver, and the normal lifted pour path
-        # without the cost of the base viewer's much larger emergency workspace.
-        mpm_solver_cfg.grid_padding = 64
-        mpm_solver_cfg.max_active_cell_count = 1024
-        self.terminations.success.func = mdp.stable_pour_success
         # Retain the base view direction while moving the camera about one metre closer.
         self.viewer.eye = (0.9, 0.65, 0.5)
         self.sim.default_visualizer_cfg = VisualizerCfg(eye=self.viewer.eye, lookat=self.viewer.lookat)
 
 
+# Compatibility aliases for checkpoints and commands produced while this task was experimental.
 @configclass
 class FrankaPourEnvCfg_PLAY(FrankaPourEnvCfg):
+    """Playback using the training task's captured sparse multi-world MPM configuration."""
+
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 1
         self.use_cuda_graph = True
         self.sim.physics.use_cuda_graph = True
-        mpm_solver_cfg = _mpm_solver_cfg(self)
-        mpm_solver_cfg.grid_type = "fixed"
-        # The fixed grid is frozen around the initial media. Padding covers the complete task
-        # workspace plus one velocity-clamped manager step before out-of-bounds termination.
-        mpm_solver_cfg.grid_padding = 192
-        mpm_solver_cfg.max_active_cell_count = 1024
         self.curriculum_start_stage = len(self.curriculum_stage_names) - 1
         self.curriculum_randomization_start_level = len(self.curriculum_randomization_extent_levels) - 1
         self.curriculum_freeze = True
@@ -2094,3 +2128,12 @@ class FrankaPourEnvCfg_TELEOP(FrankaPourEnvCfg_PLAY):
         if arm_action.clip != expected_clip:
             raise ValueError("Franka Pour teleoperation requires Panda joint-limit clipping.")
         return
+
+
+# Deprecated compatibility names; use the corresponding ``RESET_DATASET`` configurations. These
+# aliases preserve configuration and task lookup, not compatibility with older 7-action policies.
+ResetMixtureRewardsCfg = ResetDatasetRewardsCfg
+ResetMixtureCurriculumCfg = ResetDatasetCurriculumCfg
+FrankaPourEnvCfg_RESET_MIXTURE = FrankaPourEnvCfg_RESET_DATASET
+FrankaPourEnvCfg_RESET_MIXTURE_EVAL = FrankaPourEnvCfg_RESET_DATASET_EVAL
+FrankaPourEnvCfg_RESET_MIXTURE_PLAY = FrankaPourEnvCfg_RESET_DATASET_PLAY

@@ -109,23 +109,10 @@ class PourCurriculum(ManagerTermBase):
             and self.resets_in_stage >= minimum_completed_episodes
             and self.success_rate >= env.cfg.curriculum_success_threshold
         )
-        randomization_extent_fraction = float(env.cfg.curriculum_randomization_extent_levels[self.randomization_level])
         metrics = {
             "stage": float(self.stage),
             "randomization_level": float(self.randomization_level),
-            "randomization_extent_fraction": randomization_extent_fraction,
-            "independent_arm_fraction": env.curriculum_independent_arm_fraction(self.randomization_level),
-            "independent_target_fraction": env.curriculum_independent_target_fraction(self.randomization_level),
-            "eligible_bank_rows": float(env.curriculum_randomization_bank_size(self.randomization_level)),
-            "eligible_source_cells": float(env.curriculum_randomization_source_cell_count(self.randomization_level)),
-            "minimum_arm_variants_per_source": float(
-                env.curriculum_randomization_minimum_variant_count(self.randomization_level)
-            ),
-            "previous_frontier_replay_fraction": self._previous_frontier_replay_fraction(
-                env, minimum_completed_episodes
-            ),
             "success_rate": float(self.success_rate),
-            "target_frac": float(env.cfg.curriculum_target_frac[self.stage]),
             "completed_episodes": float(self.resets_in_stage),
             "required_completed_episodes": float(minimum_completed_episodes),
             "mastered": float(mastered),

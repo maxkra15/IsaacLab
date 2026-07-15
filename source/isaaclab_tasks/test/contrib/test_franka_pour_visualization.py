@@ -44,7 +44,7 @@ from isaaclab_tasks.contrib.franka_pour.pour_env_cfg import FrankaPourEnvCfg
 pytestmark = [pytest.mark.isaacsim_ci, pytest.mark.newton_ci]
 
 _TASK_ID = "Isaac-Pour-Franka-v0"
-_RESET_MIXTURE_PLAY_TASK_ID = "Isaac-Pour-Franka-Reset-Mixture-Play-v0"
+_RESET_DATASET_PLAY_TASK_ID = "Isaac-Pour-Franka-Reset-Dataset-Play-v0"
 _SCENE_PARTITION_ENV_VAR = "ISAAC_LAB_ENABLE_ISAAC_RTX_PER_ENV_SCENE_PARTITION"
 
 
@@ -63,7 +63,7 @@ def _make_visualization_cfg():
     cfg.curriculum_freeze = True
     cfg.scene.env_spacing = 2.5
     cfg.decimation = 1
-    cfg.num_substeps = 2
+    cfg.physics_substeps = 2
     cfg.mpm_iterations = 2
     cfg.use_cuda_graph = False
     cfg.sim.render_interval = 1
@@ -214,19 +214,19 @@ def _assert_visual_descendants_follow_fabric_bodies(task) -> None:
 
 
 @pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
-def test_franka_pour_fixed_grid_play_captures_outer_graph():
-    """Fixed-grid playback should capture and replay the complete coupled solve graph."""
+def test_franka_pour_reset_dataset_play_captures_sparse_outer_graph():
+    """Sparse reset-dataset playback should capture and replay the complete coupled solve graph."""
     sim_utils.create_new_stage()
     env = None
     try:
-        cfg = parse_env_cfg(_RESET_MIXTURE_PLAY_TASK_ID, device=_TEST_DEVICE, num_envs=1)
+        cfg = parse_env_cfg(_RESET_DATASET_PLAY_TASK_ID, device=_TEST_DEVICE, num_envs=1)
         cfg.seed = 37
         cfg.decimation = 1
-        cfg.num_substeps = 1
+        cfg.physics_substeps = 1
         cfg.mpm_iterations = 2
         cfg.sim.render_interval = 1
         cfg.sim.visualizer_cfgs = [KitVisualizerCfg(headless=True, randomly_sample_visible_envs=False)]
-        env = gym.make(_RESET_MIXTURE_PLAY_TASK_ID, cfg=cfg)
+        env = gym.make(_RESET_DATASET_PLAY_TASK_ID, cfg=cfg)
         task = env.unwrapped
         task.sim._app_control_on_stop_handle = None
         env.reset()

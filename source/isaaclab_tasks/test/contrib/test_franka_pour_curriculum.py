@@ -104,9 +104,6 @@ class FakeCurriculumEnv:
         self.episode_succeeded = torch.zeros(self.num_envs, dtype=torch.bool)
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
         self.ep_max_target_frac = torch.zeros(self.num_envs)
-        self.randomization_bank_sizes = tuple(11 * (level + 1) for level in range(len(extent_levels)))
-        self.randomization_source_cell_counts = tuple(5 + level for level in range(len(extent_levels)))
-        self.randomization_minimum_variant_counts = tuple(3 + level for level in range(len(extent_levels)))
 
     def set_curriculum_stage(self, env_ids, stage: int) -> None:
         self.curriculum_stage[env_ids] = stage
@@ -114,21 +111,6 @@ class FakeCurriculumEnv:
 
     def set_curriculum_randomization_level(self, env_ids, level: int) -> None:
         self.curriculum_randomization_level[env_ids] = level
-
-    def curriculum_randomization_bank_size(self, level: int) -> int:
-        return self.randomization_bank_sizes[level]
-
-    def curriculum_randomization_source_cell_count(self, level: int) -> int:
-        return self.randomization_source_cell_counts[level]
-
-    def curriculum_randomization_minimum_variant_count(self, level: int) -> int:
-        return self.randomization_minimum_variant_counts[level]
-
-    def curriculum_independent_arm_fraction(self, level: int) -> float:
-        return self.cfg.curriculum_independent_arm_fraction_levels[level]
-
-    def curriculum_independent_target_fraction(self, level: int) -> float:
-        return self.cfg.curriculum_independent_target_fraction_levels[level]
 
 
 def test_curriculum_ignores_initial_reset_and_advances_only_reset_worlds():
@@ -139,15 +121,7 @@ def test_curriculum_ignores_initial_reset_and_advances_only_reset_worlds():
     assert set(initial) == {
         "stage",
         "randomization_level",
-        "randomization_extent_fraction",
-        "independent_arm_fraction",
-        "independent_target_fraction",
-        "eligible_bank_rows",
-        "eligible_source_cells",
-        "minimum_arm_variants_per_source",
-        "previous_frontier_replay_fraction",
         "success_rate",
-        "target_frac",
         "completed_episodes",
         "required_completed_episodes",
         "mastered",
@@ -167,15 +141,7 @@ def test_curriculum_ignores_initial_reset_and_advances_only_reset_worlds():
         {
             "stage": 1.0,
             "randomization_level": 0.0,
-            "randomization_extent_fraction": _EXTENT_LEVELS[0],
-            "independent_arm_fraction": 0.0,
-            "independent_target_fraction": 0.0,
-            "eligible_bank_rows": 11.0,
-            "eligible_source_cells": 5.0,
-            "minimum_arm_variants_per_source": 3.0,
-            "previous_frontier_replay_fraction": 0.0,
             "success_rate": 0.0,
-            "target_frac": 0.08,
             "completed_episodes": 0.0,
             "required_completed_episodes": 2.0,
             "mastered": 0.0,
@@ -267,16 +233,16 @@ def test_curriculum_decays_entry_replay_toward_retention_floor(monkeypatch):
     draws = iter((torch.tensor([0.3, 0.45, 0.55, 0.8]), torch.tensor([0.2, 0.35])))
     monkeypatch.setattr(torch, "rand", lambda *args, **kwargs: next(draws))
 
-    metrics = term(env, torch.arange(env.num_envs))
-    assert metrics["previous_frontier_replay_fraction"] == pytest.approx(0.5)
+    term(env, torch.arange(env.num_envs))
+    assert term._previous_frontier_replay_fraction(env, 4) == pytest.approx(0.5)
     assert env.curriculum_stage.tolist() == [0, 0, 1, 1]
 
     env.episode_length_buf[2:] = 10
     env.episode_succeeded[2:] = False
-    metrics = term(env, torch.tensor([2, 3]))
+    term(env, torch.tensor([2, 3]))
 
     assert term.resets_in_stage == 2
-    assert metrics["previous_frontier_replay_fraction"] == pytest.approx(0.3)
+    assert term._previous_frontier_replay_fraction(env, 4) == pytest.approx(0.3)
     assert env.curriculum_stage[2:].tolist() == [0, 1]
 
 
@@ -441,12 +407,6 @@ def test_final_stage_advances_nested_randomization_frontiers_before_mastery(exte
         assert term.resets_in_stage == 0
         assert term.success_rate == 0.0
         assert metrics["mastered"] == 0.0
-        assert metrics["randomization_extent_fraction"] == pytest.approx(
-            env.cfg.curriculum_randomization_extent_levels[next_level]
-        )
-        assert metrics["eligible_bank_rows"] == env.randomization_bank_sizes[next_level]
-        assert metrics["eligible_source_cells"] == env.randomization_source_cell_counts[next_level]
-        assert metrics["minimum_arm_variants_per_source"] == env.randomization_minimum_variant_counts[next_level]
         assert env.curriculum_randomization_level[:2].tolist() == [next_level, next_level]
 
         assert env.curriculum_randomization_level[2].item() == next_level - 1
@@ -462,10 +422,6 @@ def test_final_stage_advances_nested_randomization_frontiers_before_mastery(exte
     assert term.resets_in_stage == 2
     assert term.success_rate == 1.0
     assert metrics["mastered"] == 1.0
-    assert metrics["randomization_extent_fraction"] == 1.0
-    assert metrics["eligible_bank_rows"] == env.randomization_bank_sizes[-1]
-    assert metrics["eligible_source_cells"] == env.randomization_source_cell_counts[-1]
-    assert metrics["minimum_arm_variants_per_source"] == env.randomization_minimum_variant_counts[-1]
 
 
 def test_curriculum_rejects_nonpositive_success_window():

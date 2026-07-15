@@ -62,41 +62,43 @@ class FrankaPourPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
-class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
-    """PPO runner calibrated for the stationary four-region reset mixture."""
+class FrankaPourResetDatasetPPORunnerCfg(FrankaPourPPORunnerCfg):
+    """PPO runner calibrated for adaptive reset-dataset training."""
 
     @configclass
     class ExplorationDistributionCfg(RslRlMLPModelCfg.HeteroscedasticGaussianDistributionCfg):
         """State-dependent exploration bounded for independently sampled action noise."""
 
-        std_range: tuple[float, float] = (0.05, 1.0)
+        std_range: tuple[float, float] = (0.05, 0.75)
 
-    # The environment runs at 10 Hz, so 32 transitions reproduce OmniReset's 3.2-second rollout.
+    # The environment runs at 30 Hz, so 32 transitions span a 1.067-second rollout.
     num_steps_per_env = 32
     save_interval = 25
-    # Keep incompatible 7-action, history-stacked checkpoints separate from the earlier direct-
-    # joint experiment so automatic checkpoint discovery cannot warm-start across semantics.
-    experiment_name = "franka_pour_reset_mixture_diffik"
-    run_name = "omnireset_diffik"
+    # Keep the 8-action relative-joint policy separate from incompatible Cartesian-IK checkpoints.
+    experiment_name = "franka_pour_reset_dataset_joint_rel"
+    run_name = "reset_dataset_joint_rel"
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128, 64],
         activation="elu",
-        # Every reset region is represented from the first rollout, so running statistics cannot
-        # acquire the sequential-stage zero-variance bias that motivated disabling normalization
-        # in the reverse curriculum.
-        obs_normalization=True,
+        # The adaptive cache deliberately changes its reset support as competence grows. Running
+        # statistics would therefore move the policy's coordinate system at every frontier
+        # expansion and can destroy behavior on previously mastered rows. The observations are
+        # physically scaled by the environment, so keep their representation stationary.
+        obs_normalization=False,
         # Mainline RSL-RL has no temporally correlated gSDE. Retain state-dependent exploration,
         # but use the standard Isaac Lab entropy scale below so independently sampled noise does
         # not grow merely because the environment clips actions.
         distribution_cfg=ExplorationDistributionCfg(
-            init_std=1.0,
+            # Start well inside the learned range. Initializing exactly at the former upper clamp
+            # pinned both standard deviation and entropy in the failed joint-relative runs.
+            init_std=0.25,
             std_type="log",
         ),
     )
     critic = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128, 64],
         activation="elu",
-        obs_normalization=True,
+        obs_normalization=False,
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
@@ -106,9 +108,18 @@ class FrankaPourResetMixturePPORunnerCfg(FrankaPourPPORunnerCfg):
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-4,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
+        # The stopped run's small early KL let the adaptive schedule raise this to 1.14e-3,
+        # coincident with the first curriculum expansion. Keep update size stationary while the
+        # reset distribution itself changes.
+        schedule="fixed",
+        # Preserve the 10 Hz configuration's physical discount and GAE time constants after
+        # increasing the policy rate by three.
+        gamma=0.99 ** (1.0 / 3.0),
+        lam=0.95 ** (1.0 / 3.0),
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+# Deprecated compatibility name; use ``FrankaPourResetDatasetPPORunnerCfg``.
+FrankaPourResetMixturePPORunnerCfg = FrankaPourResetDatasetPPORunnerCfg

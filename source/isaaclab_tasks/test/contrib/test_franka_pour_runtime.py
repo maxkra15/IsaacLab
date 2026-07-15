@@ -33,7 +33,6 @@ if _RUNTIME_AVAILABLE:
     import isaaclab.utils.math as math_utils
 
     import isaaclab_tasks  # noqa: F401
-    from isaaclab_tasks.contrib.franka_pour.mdp.terminations import source_grasp_milestones
     from isaaclab_tasks.contrib.franka_pour.pour_env_cfg import MPM_ENTRY, PANDA_ARM_JOINT_LIMITS
     from isaaclab_tasks.contrib.franka_pour.reset_utils import (
         asymmetric_reset_offset_samples,
@@ -44,7 +43,6 @@ if _RUNTIME_AVAILABLE:
 pytestmark = [pytest.mark.isaacsim_ci, pytest.mark.newton_ci]
 
 _TASK_ID = "Isaac-Pour-Franka-v0"
-_RESET_MIXTURE_TASK_ID = "Isaac-Pour-Franka-Reset-Mixture-v0"
 
 
 def _require_cuda() -> None:
@@ -113,7 +111,7 @@ def _make_runtime_cfg(
     cfg.curriculum_freeze = True
     cfg.scene.env_spacing = env_spacing
     cfg.decimation = 1
-    cfg.num_substeps = 1
+    cfg.physics_substeps = 1
     cfg.mpm_iterations = mpm_iterations
     cfg.use_cuda_graph = use_cuda_graph
     cfg.sim.render_interval = 1
@@ -192,145 +190,6 @@ def test_franka_pour_reset_uses_direct_actions_and_zero_arm_action_holds():
 
 
 @pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
-def test_franka_pour_reset_mixture_uses_filtered_binary_gripper_targets(monkeypatch):
-    """Cartesian IK holds safely while the binary gripper filters in every reset region."""
-    _require_cuda()
-    sim_utils.create_new_stage()
-    env = None
-    try:
-        cfg = parse_env_cfg(_RESET_MIXTURE_TASK_ID, device="cuda:0", num_envs=4)
-        cfg.seed = 37
-        cfg.decimation = 1
-        cfg.num_substeps = 1
-        cfg.mpm_iterations = 2
-        cfg.use_cuda_graph = False
-        cfg.sim.render_interval = 1
-        env = gym.make(_RESET_MIXTURE_TASK_ID, cfg=cfg)
-        task = env.unwrapped
-        task.sim._app_control_on_stop_handle = None
-        observations, _ = env.reset()
-
-        assert task.action_manager.action_term_dim == [6, 1]
-        assert task.action_manager.total_action_dim == 7
-        assert observations["policy"].shape == (4, 305)
-        assert observations["privileged"].shape == (4, 20)
-
-        env_ids = torch.arange(4, device=task.device)
-        task.reset_region_id.copy_(env_ids)
-        for env_id, stage_name in enumerate(("randomized", "grasp", "carry", "tilt")):
-            task.set_curriculum_stage(
-                torch.tensor([env_id], device=task.device),
-                task.cfg.curriculum_stage_names.index(stage_name),
-            )
-        original_multinomial = torch.multinomial
-        preloaded_slots = torch.nonzero(task._reset_mixture_near_object_preloaded_t, as_tuple=False).flatten()
-        assert preloaded_slots.numel() > 0
-
-        def select_preloaded_near_object(weights, num_samples, replacement=False, *, generator=None):
-            if weights.data_ptr() == task._reset_mixture_near_object_weights_t.data_ptr():
-                return preloaded_slots[0].expand(num_samples).clone()
-            return original_multinomial(
-                weights,
-                num_samples,
-                replacement=replacement,
-                generator=generator,
-            )
-
-        monkeypatch.setattr(torch, "multinomial", select_preloaded_near_object)
-        task.reset_pour_scene(env_ids)
-        task.action_manager.reset(env_ids)
-
-        arm_action = task.action_manager.get_term("arm_action")
-        gripper_action = task.action_manager.get_term("gripper_action")
-        assert arm_action.action_dim == 6
-        assert gripper_action.action_dim == 1
-        expected = torch.tensor(
-            [task.cfg.gripper_open_pos] + [task.cfg.gripper_preload_pos] * 3,
-            device=task.device,
-        )
-        torch.testing.assert_close(
-            task._robot.data.joint_pos.torch[1, task._finger_joint_ids],
-            torch.full((2,), task.cfg.cup_grasp_box_half[1], device=task.device),
-            rtol=0.0,
-            atol=1.0e-5,
-        )
-        torch.testing.assert_close(
-            gripper_action.action_offset[:, 0],
-            torch.full((4,), task.cfg.gripper_preload_pos, device=task.device),
-            rtol=0.0,
-            atol=0.0,
-        )
-        torch.testing.assert_close(
-            gripper_action.processed_actions,
-            expected.unsqueeze(-1).expand(-1, 2),
-            rtol=0.0,
-            atol=0.0,
-        )
-        actions = torch.zeros((task.num_envs, task.action_manager.total_action_dim), device=task.device)
-        actions[:, -1] = torch.tensor([-1.0, -1.0, -1.0, 0.0], device=task.device)
-        tcp_before = task.tcp_pose_e().clone()
-        before = gripper_action.processed_actions.clone()
-        env.step(actions)
-        torch.testing.assert_close(
-            arm_action.processed_actions,
-            torch.zeros_like(arm_action.processed_actions),
-            rtol=0.0,
-            atol=0.0,
-        )
-        tcp_after = task.tcp_pose_e()
-        assert bool(torch.all(torch.linalg.vector_norm(tcp_after[:, :3] - tcp_before[:, :3], dim=-1) < 5.0e-3))
-        assert bool(torch.all(math_utils.quat_error_magnitude(tcp_before[:, 3:7], tcp_after[:, 3:7]) < 0.05))
-        binary_target = torch.where(
-            actions[:, -1:] < task.cfg.actions.gripper_action.binary_threshold,
-            torch.full((4, 1), task.cfg.actions.gripper_action.close_position, device=task.device),
-            torch.full((4, 1), task.cfg.actions.gripper_action.neutral_position, device=task.device),
-        ).expand(-1, 2)
-        torch.testing.assert_close(
-            gripper_action.processed_actions,
-            torch.lerp(before, binary_target, task.cfg.actions.gripper_action.alpha),
-            rtol=0.0,
-            atol=0.0,
-        )
-
-        preloaded_cup_position = task.cup_pose_e()[1, :3].clone()
-        close_actions = torch.zeros_like(actions)
-        close_actions[1, -1] = -1.0
-        for _ in range(19):
-            env.step(close_actions)
-        assert bool(torch.all(task.state_finite() & task.rigid_state_in_bounds()))
-        assert float(torch.linalg.vector_norm(task.cup_pose_e()[1, :3] - preloaded_cup_position)) < 0.05
-        assert float(task.spilled_fraction()[1]) == 0.0
-        _, preloaded_grasp, _ = source_grasp_milestones(
-            task,
-            min_lift_height=task.cfg.success_min_lift_height,
-            max_tcp_distance=task.cfg.success_max_tcp_distance,
-            max_gripper_width_error=task.cfg.success_max_gripper_width_error,
-            max_gripper_command=task.cfg._resolved_success_max_gripper_command(),
-        )
-        assert bool(preloaded_grasp[1])
-
-        motion_actions = torch.zeros_like(actions)
-        motion_actions[:, 0] = 0.5
-        motion_actions[:, -1] = 1.0
-        tcp_before = task.tcp_pos_e().clone()
-        env.step(motion_actions)
-        torch.testing.assert_close(
-            arm_action.processed_actions[:, 0],
-            torch.full((4,), 0.01, device=task.device),
-            rtol=0.0,
-            atol=0.0,
-        )
-        tcp_delta = task.tcp_pos_e() - tcp_before
-        assert float(torch.linalg.vector_norm(tcp_delta, dim=-1).max()) > 1.0e-7
-        assert float(tcp_delta[:, 0].mean()) > 0.0
-        assert bool(torch.all(torch.linalg.vector_norm(tcp_delta, dim=-1) < 3.0e-2))
-        assert bool(torch.all(task.state_finite()))
-    finally:
-        if env is not None:
-            env.close()
-
-
-@pytest.mark.skipif(not _RUNTIME_AVAILABLE, reason=_RUNTIME_UNAVAILABLE_REASON)
 def test_franka_pour_direct_arm_action_moves_without_hidden_reference():
     """A bounded arm increment moves its joint while all other direct coordinates remain zero."""
     _require_cuda()
@@ -342,7 +201,7 @@ def test_franka_pour_direct_arm_action_moves_without_hidden_reference():
         cfg.curriculum_start_stage = full_stage
         cfg.curriculum_freeze = True
         cfg.decimation = 2
-        cfg.num_substeps = 2
+        cfg.physics_substeps = 2
         env = gym.make(_TASK_ID, cfg=cfg)
         task = env.unwrapped
         task.sim._app_control_on_stop_handle = None
@@ -1104,12 +963,9 @@ def test_franka_pour_curriculum_mixed_stage_reset_uses_direct_actions_and_stays_
         grasp_stage = task.cfg.curriculum_stage_names.index("grasp")
         assert info["log"]["Curriculum/stage/stage"] == float(full_stage)
         assert "Curriculum/stage/success_rate" in info["log"]
-        assert "Curriculum/stage/target_frac" in info["log"]
         assert "Curriculum/stage/completed_episodes" in info["log"]
-        assert "Curriculum/stage/previous_frontier_replay_fraction" in info["log"]
-        assert "Curriculum/stage/eligible_source_cells" in info["log"]
-        assert "Curriculum/stage/independent_arm_fraction" in info["log"]
-        assert "Curriculum/stage/independent_target_fraction" in info["log"]
+        assert "Curriculum/stage/required_completed_episodes" in info["log"]
+        assert "Curriculum/stage/mastered" in info["log"]
 
         selected = torch.tensor([0], device=task.device, dtype=torch.long)
         transport_distance = []
@@ -1327,7 +1183,7 @@ def test_franka_pour_scene_owned_cups_use_public_state_and_leave_caller_cfg_unmo
     env = None
     caller_cfg = _make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5)
     # Keep public views on the authoritative state after the eager step below.
-    caller_cfg.num_substeps = 2
+    caller_cfg.physics_substeps = 2
     assert caller_cfg.scene.source_cup is None
     assert caller_cfg.scene.target_cup is None
     assert caller_cfg.scene.media is None
@@ -1389,7 +1245,7 @@ def test_franka_pour_offset_world_tables_support_both_cups_without_reset():
     env = None
     try:
         runtime_cfg = _make_runtime_cfg(use_cuda_graph=False, env_spacing=2.5, mpm_iterations=24)
-        runtime_cfg.num_substeps = 2
+        runtime_cfg.physics_substeps = 2
         env = gym.make(_TASK_ID, cfg=runtime_cfg)
         task = env.unwrapped
         task.sim._app_control_on_stop_handle = None

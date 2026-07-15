@@ -301,62 +301,6 @@ def balanced_cyclic_permutations(values: torch.Tensor, group_count: int) -> torc
     return values[(group_ids + value_ids) % values.numel()]
 
 
-def balanced_reset_triples(pool: torch.Tensor, attempt_count: int) -> torch.Tensor:
-    """Return deterministic source/arm/target triples with balanced pool marginals."""
-    if pool.ndim != 1 or pool.numel() == 0 or pool.dtype == torch.bool or pool.is_floating_point():
-        raise ValueError("pool must be a nonempty one-dimensional integer tensor.")
-    if isinstance(attempt_count, bool) or not isinstance(attempt_count, int) or not 0 < attempt_count <= pool.numel():
-        raise ValueError("attempt_count must be a positive integer no greater than the pool size.")
-
-    pool_size = pool.numel()
-    source_slots = torch.arange(pool_size, device=pool.device).unsqueeze(1)
-    attempt_slots = torch.arange(attempt_count, device=pool.device).unsqueeze(0)
-    # Equal circular strides spread the attempts across the pool. Every attempt column remains a
-    # complete permutation; the zero stride retains one known correlated candidate per source.
-    offsets = torch.div(attempt_slots * pool_size, attempt_count, rounding_mode="floor")
-    arm_slots = (source_slots + offsets) % pool_size
-    target_slots = (source_slots - offsets) % pool_size
-    return torch.stack(
-        (
-            pool[source_slots.expand(-1, attempt_count)],
-            pool[arm_slots],
-            pool[target_slots],
-        ),
-        dim=-1,
-    ).reshape(-1, 3)
-
-
-def hierarchical_reset_sampling_weights(source_rows: torch.Tensor, source_cell_ids: torch.Tensor) -> torch.Tensor:
-    """Weight reset candidates uniformly by source cell, source row, then candidate."""
-    if source_rows.ndim != 1 or source_rows.numel() == 0:
-        raise ValueError("source_rows must be a nonempty one-dimensional tensor.")
-    if source_cell_ids.shape != source_rows.shape:
-        raise ValueError("source_cell_ids must contain one cell id per candidate.")
-    if source_rows.device != source_cell_ids.device:
-        raise ValueError("source_rows and source_cell_ids must use the same device.")
-
-    cells = torch.unique(source_cell_ids, sorted=True)
-    source_pairs = torch.stack((source_cell_ids, source_rows), dim=-1)
-    unique_sources, source_inverse, candidates_per_source = torch.unique(
-        source_pairs,
-        dim=0,
-        sorted=True,
-        return_inverse=True,
-        return_counts=True,
-    )
-    if unique_sources.shape[0] != torch.unique(source_rows).numel():
-        raise ValueError("Each source reset row must map to exactly one source cell.")
-    source_cell_slots = torch.searchsorted(cells, unique_sources[:, 0].contiguous())
-    sources_per_cell = torch.bincount(source_cell_slots, minlength=cells.numel())
-    weights = (
-        1.0
-        / cells.numel()
-        / sources_per_cell[source_cell_slots[source_inverse]]
-        / candidates_per_source[source_inverse]
-    )
-    return weights.to(dtype=torch.float32)
-
-
 def scale_randomization_rows_by_extent(
     rows: torch.Tensor,
     extent_levels: tuple[float, ...],

@@ -427,6 +427,20 @@ def test_stable_success_requires_consecutive_valid_steps_and_rejects_failures():
     torch.testing.assert_close(env.ep_max_target_frac, torch.tensor([0.95, 0.95, 0.95, 0.95]))
 
 
+def test_immediate_pour_success_uses_only_current_target_fraction_and_failure_precedence():
+    env = FakeEnv()
+    env.pour_target_frac[:] = 0.30
+    env._tgt[:] = torch.tensor([299.0, 300.0, 950.0, 950.0])
+    env.termination_manager.terminated[3] = True
+
+    success = terminations.immediate_pour_success(env)
+
+    assert success.tolist() == [False, True, True, False]
+    assert env.episode_succeeded.tolist() == [False, True, True, False]
+    assert env._success_dwell_count.tolist() == [0, 1, 1, 0]
+    torch.testing.assert_close(env.ep_max_target_frac, torch.tensor([0.299, 0.300, 0.950, 0.950]))
+
+
 def test_stable_success_counter_resets_selected_worlds_only():
     env = FakeEnv()
     env._cup[:, 2] = 0.06
@@ -899,6 +913,17 @@ def test_excessive_spill_is_strictly_greater_than_ten_percent():
     assert excessive.tolist() == [False, False, True, False]
 
 
+def test_reset_dataset_spill_threshold_triggers_on_particle_74_of_245():
+    env = FakeEnv()
+    env.num_particles = 245
+    env.cfg.max_spill_fraction = 0.30
+    env._spill = torch.tensor([0.0, 73.0, 74.0, 245.0])
+
+    excessive = terminations.excessive_spill(env)
+
+    assert excessive.tolist() == [False, False, True, True]
+
+
 def test_excessive_spill_can_monitor_without_terminating():
     env = FakeEnv()
     env._spill = torch.tensor([0.0, 100.0, 101.0, 1000.0])
@@ -963,6 +988,25 @@ def test_lost_grasp_can_monitor_without_terminating():
     assert not bool(torch.any(reported))
     assert env._lifted_grasp_seen.tolist() == [True, True, True, True]
     assert env._lost_grasp_dwell_count.tolist() == [1, 1, 1, 1]
+
+
+def test_cached_grasp_drop_terminates_and_produces_failure_pulse():
+    env = FakeEnv()
+    env.cfg.success_min_lift_height = 0.05
+    env._cup[:, 2] = 0.06
+    env._width[:] = env.gripper_grasp_width
+    env._gripper_command[:] = 0.0
+    # Model a grasping cache row followed by non-grasping rows. All cups are geometrically lost,
+    # but only the demonstrated grasp is eligible for dropped-cup termination.
+    env._lifted_grasp_seen[:] = torch.tensor([True, False, False, False])
+    env._tcp[:] = env._grasp + torch.tensor((0.1, 0.0, 0.0))
+
+    dropped = terminations.lost_lifted_grasp(env, dwell_time_s=env.step_dt)
+    env.termination_manager.terminated[:] = dropped
+    failure_pulse = rewards.terminal_failure(env, include_time_out=False) * env.step_dt
+
+    assert dropped.tolist() == [True, False, False, False]
+    torch.testing.assert_close(failure_pulse, torch.tensor([1.0, 0.0, 0.0, 0.0]))
 
 
 def test_trajectory_phase_and_applied_reference_error_are_observable():

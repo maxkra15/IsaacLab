@@ -23,6 +23,7 @@ _DISTAL_TABLE_BODIES = {
     "panda_leftfinger",
     "panda_rightfinger",
 }
+_COMPLETE_TABLE_BODIES = _DISTAL_TABLE_BODIES | {"panda_link1", "panda_link2"}
 
 
 @wp.kernel(enable_backward=False)
@@ -44,7 +45,12 @@ def _mark_colliding_reset_worlds(
     body_q: wp.array(dtype=wp.transform),
     body_robot: wp.array(dtype=wp.int32),
     body_tests_table: wp.array(dtype=wp.int32),
+    body_allows_source_contact: wp.array(dtype=wp.int32),
+    shape_source: wp.array(dtype=wp.int32),
+    shape_margin: wp.array(dtype=wp.float32),
+    check_self_collision: int,
     penetration_tolerance: float,
+    source_finger_penetration_tolerance: float,
     colliding_worlds: wp.array(dtype=wp.int32),
 ):
     contact_index = wp.tid()
@@ -55,11 +61,27 @@ def _mark_colliding_reset_worlds(
     shape1 = contact_shape1[contact_index]
     obstacle0 = shape_obstacle[shape0] != 0
     obstacle1 = shape_obstacle[shape1] != 0
-    if obstacle0 == obstacle1:
-        return
-
     body0 = shape_body[shape0]
     body1 = shape_body[shape1]
+    if not obstacle0 and not obstacle1:
+        if check_self_collision == 0 or body0 < 0 or body1 < 0 or body0 == body1:
+            return
+        if body_robot[body0] == 0 or body_robot[body1] == 0:
+            return
+        world0 = body_world[body0]
+        world1 = body_world[body1]
+        if world0 < 0 or world0 != world1:
+            return
+        point0_w = wp.transform_point(body_q[body0], contact_point0[contact_index])
+        point1_w = wp.transform_point(body_q[body1], contact_point1[contact_index])
+        separation = wp.dot(contact_normal[contact_index], point1_w - point0_w)
+        separation = separation - contact_margin0[contact_index] - contact_margin1[contact_index]
+        if separation < -penetration_tolerance:
+            wp.atomic_max(colliding_worlds, world0, 1)
+        return
+    if obstacle0 and obstacle1:
+        return
+
     obstacle_shape = shape0
     robot_body = body1
     if not obstacle0:
@@ -83,7 +105,14 @@ def _mark_colliding_reset_worlds(
     point1_w = wp.transform_point(transform1, contact_point1[contact_index])
     separation = wp.dot(contact_normal[contact_index], point1_w - point0_w)
     separation = separation - contact_margin0[contact_index] - contact_margin1[contact_index]
-    if separation < -penetration_tolerance:
+    allowed_penetration = penetration_tolerance
+    if shape_source[obstacle_shape] != 0 and body_allows_source_contact[robot_body] != 0:
+        # Newton's contact margins include both geometric effective radii and the shapes'
+        # speculative collision margins. Keep the effective radii in the distance, but do not
+        # treat an intentionally configured speculative margin as physical finger-cup overlap.
+        separation = separation + shape_margin[shape0] + shape_margin[shape1]
+        allowed_penetration = source_finger_penetration_tolerance
+    if separation < -allowed_penetration:
         wp.atomic_max(colliding_worlds, world, 1)
 
 
@@ -99,6 +128,11 @@ def collision_free_reset_candidates(
     target_indices,
     collider_margin: float,
     device: str,
+    penetration_tolerance: float = 1.0e-4,
+    allow_source_finger_contact: bool = False,
+    source_finger_penetration_tolerance: float = 0.0,
+    check_self_collision: bool = False,
+    check_complete_robot_table: bool = False,
 ) -> torch.Tensor:
     """Return exact collision validity for explicit ``(robot, source, target)`` reset triples."""
     candidate_count = robot_q.shape[0]
@@ -111,6 +145,10 @@ def collision_free_reset_candidates(
         raise ValueError("Target reset positions must have shape (N, 3).")
     if candidate_count == 0:
         return torch.empty(0, device=device, dtype=torch.bool)
+    if penetration_tolerance < 0.0:
+        raise ValueError("penetration_tolerance must be nonnegative.")
+    if source_finger_penetration_tolerance < 0.0:
+        raise ValueError("source_finger_penetration_tolerance must be nonnegative.")
 
     half_x, half_y, half_z = (float(value) for value in source_box_half)
     center_offset = torch.zeros_like(source_positions)
@@ -173,35 +211,67 @@ def collision_free_reset_candidates(
     body_robot = torch.as_tensor(
         ["/Robot/" in str(label) for label in model.body_label], device=device, dtype=torch.int32
     )
-    body_tests_table = torch.as_tensor(
-        [name in _DISTAL_TABLE_BODIES for name in body_names], device=device, dtype=torch.int32
+    table_body_names = _COMPLETE_TABLE_BODIES if check_complete_robot_table else _DISTAL_TABLE_BODIES
+    body_tests_table = torch.as_tensor([name in table_body_names for name in body_names], device=device, dtype=torch.int32)
+    body_allows_source_contact = torch.as_tensor(
+        [allow_source_finger_contact and name in {"panda_leftfinger", "panda_rightfinger"} for name in body_names],
+        device=device,
+        dtype=torch.int32,
     )
     prototype_robot_count = sum("/Robot/" in str(label) for label in prototype_builder.body_label)
     if prototype_robot_count <= 0 or int(body_robot.sum()) != candidate_count * prototype_robot_count:
         raise RuntimeError("Reset validation did not import the expected explicit /Robot/ bodies.")
-    prototype_distal_count = sum(
-        str(label).rsplit("/", 1)[-1] in _DISTAL_TABLE_BODIES for label in prototype_builder.body_label
+    prototype_table_body_count = sum(
+        str(label).rsplit("/", 1)[-1] in table_body_names for label in prototype_builder.body_label
     )
-    if prototype_distal_count != len(_DISTAL_TABLE_BODIES) or int(body_tests_table.sum()) != (
-        candidate_count * prototype_distal_count
+    if prototype_table_body_count != len(table_body_names) or int(body_tests_table.sum()) != (
+        candidate_count * prototype_table_body_count
     ):
-        raise RuntimeError("Reset validation did not import the expected distal table-tested bodies.")
+        raise RuntimeError("Reset validation did not import the expected table-tested robot bodies.")
+    if allow_source_finger_contact:
+        prototype_finger_count = sum(
+            str(label).rsplit("/", 1)[-1] in {"panda_leftfinger", "panda_rightfinger"}
+            for label in prototype_builder.body_label
+        )
+        if prototype_finger_count != 2 or int(body_allows_source_contact.sum()) != 2 * candidate_count:
+            raise RuntimeError("Reset validation did not import exactly two source-contact finger bodies per world.")
 
-    shape_obstacle = torch.as_tensor(
+    shape_labels = [str(label) for label in model.shape_label]
+    explicit_obstacle = torch.as_tensor(
         [
-            str(label).endswith(("ResetCandidate/Source", "ResetCandidate/Target", "ResetCandidate/Table"))
-            for label in model.shape_label
+            label.endswith(("ResetCandidate/Source", "ResetCandidate/Target", "ResetCandidate/Table"))
+            for label in shape_labels
         ],
         device=device,
         dtype=torch.int32,
     )
-    shape_table = torch.as_tensor(
-        [str(label).endswith("ResetCandidate/Table") for label in model.shape_label],
+    prototype_table = torch.as_tensor(
+        [
+            check_complete_robot_table and ("/Table/" in label or label.endswith("/Table"))
+            for label in shape_labels
+        ],
         device=device,
         dtype=torch.int32,
     )
-    if int(shape_obstacle.sum()) != 3 * candidate_count or int(shape_table.sum()) != candidate_count:
+    shape_obstacle = torch.maximum(explicit_obstacle, prototype_table)
+    shape_table = torch.as_tensor(
+        [label.endswith("ResetCandidate/Table") for label in shape_labels],
+        device=device,
+        dtype=torch.int32,
+    )
+    shape_table = torch.maximum(shape_table, prototype_table)
+    shape_source = torch.as_tensor(
+        [label.endswith("ResetCandidate/Source") for label in shape_labels],
+        device=device,
+        dtype=torch.int32,
+    )
+    if (
+        int(explicit_obstacle.sum()) != 3 * candidate_count
+        or int(shape_source.sum()) != candidate_count
+    ):
         raise RuntimeError("Reset validation did not build exactly one source, target, and table obstacle per world.")
+    if check_complete_robot_table and int(prototype_table.sum()) == 0:
+        raise RuntimeError("Complete reset validation requires the SeattleLab table collision shapes in the prototype.")
 
     pipeline = newton.CollisionPipeline(
         model,
@@ -248,7 +318,12 @@ def collision_free_reset_candidates(
             state.body_q,
             wp.from_torch(body_robot, dtype=wp.int32),
             wp.from_torch(body_tests_table, dtype=wp.int32),
-            1.0e-4,
+            wp.from_torch(body_allows_source_contact, dtype=wp.int32),
+            wp.from_torch(shape_source, dtype=wp.int32),
+            model.shape_margin,
+            int(check_self_collision),
+            float(penetration_tolerance),
+            float(source_finger_penetration_tolerance),
         ],
         outputs=[colliding_worlds],
         device=model.device,
