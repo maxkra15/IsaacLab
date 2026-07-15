@@ -19,12 +19,12 @@ from isaaclab_tasks.contrib.waterhose.teleop_pipelines import build_waterhose_bi
 from isaaclab_tasks.contrib.waterhose.waterhose_env_cfg import WaterhoseProxyTeleopEnvCfg
 
 
-def test_waterhose_bimanual_pipeline_matches_the_15d_environment_action():
-    """Two wrist poses and the right gripper must flatten to the environment's 15D action."""
+def test_waterhose_bimanual_pipeline_matches_the_16d_environment_action():
+    """Two wrist poses and two grippers must flatten to the environment's 16D action."""
 
     pipeline, retargeters = build_waterhose_bimanual_teleop_pipeline()
 
-    assert pipeline.output_types()["action"].types[0].shape == (15,)
+    assert pipeline.output_types()["action"].types[0].shape == (16,)
     reorderer = pipeline.output_mapping["action"].module._target_module
     assert reorderer._output_order == [
         "r_pos_x",
@@ -41,7 +41,8 @@ def test_waterhose_bimanual_pipeline_matches_the_15d_environment_action():
         "l_quat_y",
         "l_quat_z",
         "l_quat_w",
-        "gripper",
+        "right_gripper",
+        "left_gripper",
     ]
     assert [retargeter._config.input_device for retargeter in retargeters] == [HandsSource.RIGHT, HandsSource.LEFT]
 
@@ -51,7 +52,7 @@ def test_waterhose_teleop_config_exposes_the_pipeline_not_the_tuning_tuple():
 
     pipeline = WaterhoseProxyTeleopEnvCfg().isaac_teleop.pipeline_builder()
 
-    assert pipeline.output_types()["action"].types[0].shape == (15,)
+    assert pipeline.output_types()["action"].types[0].shape == (16,)
 
 
 def test_waterhose_bimanual_pipeline_tracks_both_wrist_orientations_without_axis_suppression():

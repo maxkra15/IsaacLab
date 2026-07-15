@@ -30,12 +30,12 @@ _EE_FRAME_TWIST_TOL = 1.0e-5
 
 @configclass
 class WaterhoseGripperPositionActionCfg(ActionTermCfg):
-    """One-dimensional continuous position command for the RBY1 right gripper."""
+    """One-dimensional continuous position command for one RBY1 gripper."""
 
     class_type: type[ActionTerm] | str = "{DIR}.actions:WaterhoseGripperPositionAction"
 
     joint_names: list[str] = MISSING
-    """Right gripper driver and finger joints to command explicitly."""
+    """Gripper driver and finger joints to command explicitly."""
 
     open_command_expr: dict[str, float] = MISSING
     """Joint position targets for a normalized action of ``+1``."""
@@ -156,7 +156,7 @@ def _remap_teleop_rotvec_to_local_ee_roll(rotvec: torch.Tensor) -> torch.Tensor:
 
 
 class WaterhoseGripperPositionAction(ActionTerm):
-    """Interpolates one scalar into explicit right-gripper joint position targets."""
+    """Interpolates one scalar into explicit gripper joint position targets."""
 
     cfg: WaterhoseGripperPositionActionCfg
 

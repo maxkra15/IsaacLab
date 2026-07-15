@@ -14,9 +14,9 @@
 **/*.usdc
 **/*.usdz
 
-# The self-contained waterhose task ships its USD assets through Git LFS.
-!source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/**/*.usda
-!source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/**/*.usd
+# The internal waterhose demo assets are distributed as a separate tarball.
+/source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/
+/waterhose_demo_assets.tar.gz
 
 # Python
 .DS_Store

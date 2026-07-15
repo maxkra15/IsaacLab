@@ -17,12 +17,12 @@ from __future__ import annotations
 
 
 def build_waterhose_bimanual_teleop_pipeline():
-    """Build the 15D Apple Vision Pro pipeline for both RBY1 wrists and the right gripper.
+    """Build the 16D Apple Vision Pro pipeline for both RBY1 wrists and grippers.
 
     Absolute wrist poses preserve the tracked orientation exactly, including all three rotation
     axes. ``IsaacTeleopCfg.target_frame_prim_path`` rebases these poses into the robot root frame
     before they reach the Newton IK action. The output order is right wrist, left wrist, then the
-    right-hand pinch command.
+    independent binary right- and left-hand pinch commands.
     """
 
     import numpy as np
@@ -80,32 +80,47 @@ def build_waterhose_bimanual_teleop_pipeline():
     left_se3 = WaterhoseSe3AbsRetargeter(left_cfg, name="left_ee_pose")
     left_output = left_se3.connect({HandsSource.LEFT: transformed_hands.output(HandsSource.LEFT)}).output("ee_pose")
 
-    gripper = GripperRetargeter(GripperRetargeterConfig(hand_side="right"), name="gripper")
-    gripper_output = gripper.connect(
+    right_gripper = GripperRetargeter(GripperRetargeterConfig(hand_side="right"), name="right_gripper")
+    right_gripper_output = right_gripper.connect(
         {
             HandsSource.RIGHT: hands.output(HandsSource.RIGHT),
             ControllersSource.RIGHT: controllers.output(ControllersSource.RIGHT),
         }
     ).output("gripper_command")
+    left_gripper = GripperRetargeter(GripperRetargeterConfig(hand_side="left"), name="left_gripper")
+    left_gripper_output = left_gripper.connect(
+        {
+            HandsSource.LEFT: hands.output(HandsSource.LEFT),
+            ControllersSource.LEFT: controllers.output(ControllersSource.LEFT),
+        }
+    ).output("gripper_command")
 
     right_elements = ["r_pos_x", "r_pos_y", "r_pos_z", "r_quat_x", "r_quat_y", "r_quat_z", "r_quat_w"]
     left_elements = ["l_pos_x", "l_pos_y", "l_pos_z", "l_quat_x", "l_quat_y", "l_quat_z", "l_quat_w"]
-    gripper_elements = ["gripper"]
+    right_gripper_elements = ["right_gripper"]
+    left_gripper_elements = ["left_gripper"]
     reorderer = TensorReorderer(
         input_config={
             "right_ee_pose": right_elements,
             "left_ee_pose": left_elements,
-            "gripper": gripper_elements,
+            "right_gripper": right_gripper_elements,
+            "left_gripper": left_gripper_elements,
         },
-        output_order=right_elements + left_elements + gripper_elements,
+        output_order=right_elements + left_elements + right_gripper_elements + left_gripper_elements,
         name="action_reorderer",
-        input_types={"right_ee_pose": "array", "left_ee_pose": "array", "gripper": "scalar"},
+        input_types={
+            "right_ee_pose": "array",
+            "left_ee_pose": "array",
+            "right_gripper": "scalar",
+            "left_gripper": "scalar",
+        },
     )
     output = reorderer.connect(
         {
             "right_ee_pose": right_output,
             "left_ee_pose": left_output,
-            "gripper": gripper_output,
+            "right_gripper": right_gripper_output,
+            "left_gripper": left_gripper_output,
         }
     )
 

@@ -202,6 +202,11 @@ _RIGHT_GRIPPER_JOINT_NAMES = [
     "right_gripper_left_finger_joint",
     "right_gripper_right_finger_joint",
 ]
+_LEFT_GRIPPER_JOINT_NAMES = [
+    "left_gripper_finger_joint_1",
+    "left_gripper_left_finger_joint",
+    "left_gripper_right_finger_joint",
+]
 # Teleop actions arrive as per-step relative commands. Bound them so high-gain IK targets stay finite
 # while still feeling responsive during free teleop.
 _TELEOP_MAX_EE_TRANSLATION_DELTA = 0.07
@@ -233,6 +238,17 @@ _RIGHT_GRIPPER_CLOSE_COMMAND = {
     "right_gripper_finger_joint_1": 0.014,
     "right_gripper_left_finger_joint": -0.007,
     "right_gripper_right_finger_joint": 0.007,
+}
+_LEFT_GRIPPER_OPEN_COMMAND = {
+    "left_gripper_finger_joint_1": 0.09,
+    "left_gripper_left_finger_joint": -0.045,
+    "left_gripper_right_finger_joint": 0.045,
+}
+_LEFT_GRIPPER_CLOSE_COMMAND = {
+    # Match the validated right-hand endpoint: this is a contact grip, not a command to zero gap.
+    "left_gripper_finger_joint_1": 0.014,
+    "left_gripper_left_finger_joint": -0.007,
+    "left_gripper_right_finger_joint": 0.007,
 }
 
 
@@ -991,7 +1007,7 @@ class WaterhoseNewtonBimanualIkActionsCfg(WaterhoseIkActionsCfg):
     gripper-base wrist frames using the torso and every joint in both arms, while an internal hold
     objective keeps the shared torso stable. The scripted insertion action keeps using its pad/contact
     offset; wrist teleoperation intentionally pivots at the physical robot wrist. External action
-    layout: ``[right pose(7), left pose(7)]`` followed by the right gripper scalar.
+    layout: ``[right pose(7), left pose(7), right gripper, left gripper]``.
     """
 
     arm_action = NewtonInverseKinematicsActionCfg(
@@ -1041,6 +1057,13 @@ class WaterhoseNewtonBimanualIkActionsCfg(WaterhoseIkActionsCfg):
         joint_names=_RIGHT_GRIPPER_JOINT_NAMES,
         open_command_expr=dict(_RIGHT_GRIPPER_OPEN_COMMAND),
         close_command_expr=dict(_RIGHT_GRIPPER_CLOSE_COMMAND),
+        max_joint_delta_per_step=_TELEOP_MAX_GRIPPER_JOINT_DELTA,
+    )
+    left_gripper_action = WaterhoseGripperPositionActionCfg(
+        asset_name="robot",
+        joint_names=_LEFT_GRIPPER_JOINT_NAMES,
+        open_command_expr=dict(_LEFT_GRIPPER_OPEN_COMMAND),
+        close_command_expr=dict(_LEFT_GRIPPER_CLOSE_COMMAND),
         max_joint_delta_per_step=_TELEOP_MAX_GRIPPER_JOINT_DELTA,
     )
 
@@ -1140,7 +1163,7 @@ class WaterhoseProxyTeleopEnvCfg(WaterhoseProxyIkEnvCfg):
             control_channel_uuid=None,
         )
         # Native single-arm devices emit seven actions and therefore do not match this bimanual
-        # 15D contract. Keep those devices on the legacy relative action configuration instead of
+        # 16D contract. Keep those devices on the legacy relative action configuration instead of
         # silently padding or freezing one arm here.
         self.teleop_devices = DevicesCfg(devices={})
 

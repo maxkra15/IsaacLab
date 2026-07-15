@@ -18,6 +18,15 @@ uv venv --python 3.12 .venv
 ./isaaclab.sh -i all
 ```
 
+The internal waterhose assets are distributed separately as ``waterhose_demo_assets.tar.gz`` and are
+not tracked by Git. Extract the archive from the Isaac Lab repository root; its paths are already rooted
+at the correct task directory:
+
+```bash
+tar -xzf /path/to/waterhose_demo_assets.tar.gz -C .
+test -f source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/rby1df/rby1df_waterhose.usda
+```
+
 Verify that the declared Newton build, Isaac Teleop, and WebSockets resolve from that environment:
 
 ```bash
@@ -109,27 +118,31 @@ pause for CloudXR EULA acceptance. Apply the visible-run environment above befor
   --num_envs 1 \
   --visualizer kit \
   --xr \
-  --device cuda:1 \
+  --device cuda:0 \
   --cloudxr_env avp \
   --debug_teleop
 ```
 
 CloudXR auto-launch is enabled by default. Add `--no-auto_launch_cloudxr` when managing the runtime
-separately. The explicit `--device cuda:1` above keeps this checkout's acceptance run on the requested
+separately. The explicit `--device cuda:0` above keeps this checkout's acceptance run on the requested
 GPU. Waterhose XR defaults Kit to one renderer GPU
 to avoid hybrid-GPU semaphore stalls during shutdown. Set `WATERHOSE_KIT_MULTI_GPU=1` only when multi-GPU
 rendering is intentional and validated on the host.
 
-The 15-D waterhose pipeline maps complete absolute poses from both tracked wrists to the complete right
-and left RBY1 arm chains, followed by the right-hand pinch command. Each first valid (or reacquired) hand
-pose is clutched to the robot's current gripper-base wrist pose, so neutral alignment does not depend on
-guessed tool-frame Euler offsets. Subsequent translation and spatial rotation deltas stay one-to-one on
-all three axes, and tracking loss holds the last target. The shared torso is held stable. The configured
-robot-base target frame keeps hand axes aligned with the task; if that prim cannot be read, the runtime
-logs a reason and emits no action until the frame resolves rather than sending world-frame poses to IK.
+The 16-D waterhose pipeline maps complete absolute poses from both tracked wrists to the complete right
+and left RBY1 arm chains, followed by independent right- and left-hand pinch commands. Each gripper uses
+the standard binary hysteresis: a thumb-index distance below 3 cm closes it, a distance above 5 cm opens
+it, and the state is retained between those thresholds. The closed target deliberately retains the
+existing nonzero finger gap instead of commanding the joints fully shut. Each first valid (or reacquired)
+hand pose is clutched to the robot's current gripper-base wrist pose, so neutral alignment does not depend
+on guessed tool-frame Euler offsets. Subsequent translation and spatial rotation deltas stay one-to-one
+on all three axes, and wrist tracking loss holds the last target. The shared torso is held stable. The
+configured robot-base target frame keeps hand axes aligned with the task; if that prim cannot be read, the
+runtime logs a reason and emits no action until the frame resolves rather than sending world-frame poses
+to IK.
 
 The bimanual task intentionally does not configure keyboard or SpaceMouse devices: those devices emit a
-single 7-D arm command and do not satisfy the two-wrist 15-D action contract.
+single 7-D arm command and do not satisfy the two-wrist 16-D action contract.
 
 Use `--max_steps 100 --cloudxr_env none` for a bounded XR startup smoke without launching CloudXR. A real
 AVP acceptance pass must still verify:
@@ -173,7 +186,7 @@ The coupled scene has an explicit ownership boundary:
   already owns robot-to-fridge contact; solving that pair in both entries pushes the grasp away from the
   bore.
 
-This branch pins Newton commit `c5e557529fac0c53dd2ff313977f8422747238b8`. It contains Newton PR
+This branch pins Newton commit `32b69be8726f89bdb1f9ddf31984d1609c73c1bc`. It contains Newton PR
 [#3262](https://github.com/newton-physics/newton/pull/3262), which adds water-tight full-surface
 rigid-soft SDF contacts.
 

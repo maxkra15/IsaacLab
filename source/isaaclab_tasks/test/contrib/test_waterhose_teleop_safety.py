@@ -37,6 +37,24 @@ def test_waterhose_bimanual_ik_drives_both_complete_arm_chains():
     assert arm_cfg.class_type.endswith(":WaterhoseBimanualTeleopNewtonIkAction")
 
 
+def test_waterhose_bimanual_teleop_commands_both_grippers_with_safe_close_endpoints():
+    """Each hand gets one scalar and neither side commands a zero-gap closure."""
+
+    actions_cfg = WaterhoseNewtonBimanualIkActionsCfg()
+    assert actions_cfg.gripper_action.joint_names == [
+        "right_gripper_finger_joint_1",
+        "right_gripper_left_finger_joint",
+        "right_gripper_right_finger_joint",
+    ]
+    assert actions_cfg.left_gripper_action.joint_names == [
+        "left_gripper_finger_joint_1",
+        "left_gripper_left_finger_joint",
+        "left_gripper_right_finger_joint",
+    ]
+    assert tuple(actions_cfg.gripper_action.close_command_expr.values()) == pytest.approx((0.014, -0.007, 0.007))
+    assert tuple(actions_cfg.left_gripper_action.close_command_expr.values()) == pytest.approx((0.014, -0.007, 0.007))
+
+
 def test_waterhose_bimanual_ik_regularizes_shoulders_and_elbows_to_start_posture():
     """Redundant arm IK should prefer the task's natural bent-arm posture."""
 
