@@ -145,6 +145,32 @@ def spawn_fridge_without_embedded_body_collision(
     return prim
 
 
+@clone
+def _spawn_rby1_with_fabric_compatible_geometry(
+    prim_path: str,
+    cfg: sim_utils.UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+):
+    """Spawn RBY1 with ordinary references so GPU body transforms reach its render meshes.
+
+    The imported RBY1 USD marks every visual and collision reference instanceable. Kit 110's
+    Fabric hierarchy does not propagate Newton-authored parent world matrices across those
+    instance-proxy boundaries. De-instancing once during stage authoring preserves the referenced
+    geometry and physics while allowing Cubric and RTX to keep the per-frame path entirely on GPU.
+    """
+    from pxr import Usd  # noqa: PLC0415
+
+    prim = spawn_from_usd.__wrapped__(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
+    # Collect before editing because de-instancing expands each referenced subtree
+    # and therefore invalidates an active PrimRange iterator.
+    instance_roots = [descendant for descendant in Usd.PrimRange(prim) if descendant.IsInstanceable()]
+    for instance_root in instance_roots:
+        instance_root.SetInstanceable(False)
+    return prim
+
+
 _GRIPPER_DRIVER_STIFFNESS = 1.0e4
 _GRIPPER_DRIVER_DAMPING = 1.0e3
 _GRIPPER_DRIVER_EFFORT_LIMIT = 150.0
@@ -462,7 +488,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     ### rby1df robot (28-DOF, fixed base). Gripper drives are force-limited so VBD contacts can stop the fingers.
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
-        spawn=sim_utils.UsdFileCfg(usd_path=_RBY1_USD),
+        spawn=sim_utils.UsdFileCfg(usd_path=_RBY1_USD, func=_spawn_rby1_with_fabric_compatible_geometry),
         articulation_root_prim_path="/Geometry/origin",
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 1.0, -1.0),
@@ -745,11 +771,9 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # against the gripper and socket, paired with a gentle penalty ramp (beta=1e2) and
                         # enough VBD iterations for the contact duals to converge. The cable-tail anchor
                         # stays a soft fixed joint; the connector itself is part of segment 0 and needs no weld.
-                        # iterations x num_substeps (below) is the throughput knob. The high-fidelity
-                        # default is 20 x 10; 16 x 8 is ~1.2x faster with a byte-identical scripted-demo
-                        # arc, while 12 x 6 is ~1.44x faster (good for training; the plug seats a little
-                        # slower in the demo). Select those lower-cost modes per run via
-                        # WATERHOSE_VBD_ITERS / WATERHOSE_SUBSTEPS.
+                        # iterations x num_substeps (below) is the primary performance/stability
+                        # trade-off. The validated high-fidelity default is 20 x 10; use
+                        # WATERHOSE_VBD_ITERS / WATERHOSE_SUBSTEPS only for explicit experiments.
                         solver_cfg=VBDSolverCfg(
                             iterations=vbd_iterations,
                             friction_epsilon=0.1,

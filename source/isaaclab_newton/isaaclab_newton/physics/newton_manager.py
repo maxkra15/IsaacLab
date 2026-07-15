@@ -17,7 +17,6 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 import warp as wp
 
@@ -318,11 +317,9 @@ class NewtonManager(PhysicsManager):
     _newton_particle_offset_attr = "newton:particleOffset"
     _newton_particle_count_attr = "newton:particleCount"
     _particle_visual_prims: dict[str, _ParticleVisualPrim] = {}
-    _usd_xform_ops: dict[str, object] = {}
 
-    # Cubric propagates body world matrices through instance proxies and notifies
-    # Kit's Fabric Scene Delegate. The public IFabricHierarchy update does not
-    # currently cross those instance boundaries.
+    # Cubric propagates body world matrices through the Fabric hierarchy and emits
+    # the scene-delegate invalidation needed after direct GPU matrix writes.
     _cubric = None
     _cubric_adapter: int | None = None
     _cubric_bound_fabric_id: int | None = None
@@ -488,7 +485,7 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def sync_transforms_to_usd(cls) -> None:
-        """Write Newton body poses to USD/Fabric for Kit viewport and RTX rendering.
+        """Write Newton body poses to Fabric for Kit viewport and RTX rendering.
 
         No-op when ``_usdrt_stage`` is None (i.e. Kit visualizer is not active)
         or when transforms have not changed since the last sync.
@@ -499,12 +496,12 @@ class NewtonManager(PhysicsManager):
         so that the expensive Fabric hierarchy update only runs once per render
         frame rather than after every physics step.
 
-        The authored USD xform mirror is intentional: RBY1's render geometry is
-        instanceable, and Kit's geometry-streaming path observes those USD xforms.
-        Fabric body world matrices are updated in parallel for RTX consumers.
-        Cubric then propagates them through instance-proxy descendants and notifies
-        the Fabric Scene Delegate. If Cubric is unavailable, the public CPU
-        hierarchy update remains a safe fallback.
+        Body matrices stay on the GPU: a Warp kernel writes Fabric world matrices
+        directly, then Cubric propagates them through ordinary descendants and notifies
+        the Fabric Scene Delegate. A narrow stream fence orders the Warp write
+        before Cubric because its adapter API does not accept a CUDA stream or event;
+        this fence performs no host data transfer. If Cubric is unavailable, the public
+        CPU hierarchy update remains a safe fallback.
         """
         if cls._usdrt_stage is None or cls._model is None or cls._state_0 is None:
             return
@@ -512,10 +509,6 @@ class NewtonManager(PhysicsManager):
             return
         try:
             import usdrt
-
-            body_paths = getattr(cls._model, "body_label", None) or getattr(cls._model, "body_key", None)
-            if body_paths is not None:
-                cls._sync_transforms_to_usd_xform_ops(body_paths)
 
             # Adapter creation is lazy because omni.cubric is not guaranteed to be
             # ready at solver initialization time.
@@ -562,7 +555,10 @@ class NewtonManager(PhysicsManager):
                     inputs=[fabric_transforms, newton_indices, cls._state_0.body_q],
                     device=PhysicsManager._device,
                 )
-                wp.synchronize_device(PhysicsManager._device)
+                # Cubric may dispatch hierarchy work on a different CUDA stream and
+                # does not expose stream/event interop. Wait only for the stream that
+                # produced the matrices, rather than synchronizing the whole device.
+                wp.synchronize_stream(wp.get_stream(PhysicsManager._device))
                 NewtonManager._transforms_dirty = False
 
                 if use_cubric and fabric_hierarchy is not None:
@@ -894,7 +890,6 @@ class NewtonManager(PhysicsManager):
         NewtonManager._transforms_may_change_on_graph_replay = False
         NewtonManager._particles_dirty = False
         NewtonManager._particle_visual_prims = {}
-        NewtonManager._usd_xform_ops = {}
         NewtonManager._mpm_object_registry = []
         NewtonManager._deformable_registry = []
         NewtonManager._per_world_builder_hooks = []
@@ -1209,91 +1204,6 @@ class NewtonManager(PhysicsManager):
             # Fallback: no topology info — mark everything dirty
             NewtonManager._world_reset_mask.fill_(True)
             NewtonManager._fk_reset_mask.fill_(True)
-
-    @classmethod
-    def _sync_transforms_to_usd_xform_ops(cls, body_paths: Sequence[str]) -> None:
-        """Author Newton world poses as local USD xform ops for Kit rendering.
-
-        Kit's geometry-streaming path does not reliably inherit Fabric-only body
-        updates across USD instance proxies. This authored mirror exposes the
-        transforms to Hydra while Cubric updates the Fabric hierarchy used by RTX.
-        """
-        try:
-            from pxr import Gf, Sdf, UsdGeom, Vt  # noqa: PLC0415
-        except Exception:
-            return
-
-        stage = get_current_stage()
-        if stage is None:
-            return
-
-        try:
-            body_q = cls._state_0.body_q.numpy()
-        except Exception:
-            return
-
-        world_mats: dict[str, object] = {}
-        for body_id, prim_path in enumerate(body_paths):
-            if not isinstance(prim_path, str) or not prim_path.startswith("/") or body_id >= body_q.shape[0]:
-                continue
-            pose = body_q[body_id]
-            quat = np.asarray(pose[3:7], dtype=np.float64)
-            norm = float(np.linalg.norm(quat))
-            if not np.isfinite(norm) or norm <= 1.0e-12:
-                continue
-            quat /= norm
-
-            world_mat = Gf.Matrix4d(1.0)
-            world_mat.SetRotateOnly(Gf.Quatd(float(quat[3]), Gf.Vec3d(float(quat[0]), float(quat[1]), float(quat[2]))))
-            world_mat.SetTranslateOnly(Gf.Vec3d(float(pose[0]), float(pose[1]), float(pose[2])))
-            world_mats[prim_path] = world_mat
-
-        if not world_mats:
-            return
-
-        xform_cache = UsdGeom.XformCache()
-        xform_attr_name = "xformOp:transform:newton"
-        for prim_path, world_mat in world_mats.items():
-            prim = stage.GetPrimAtPath(prim_path)
-            if not prim.IsValid() or prim.IsInstanceProxy():
-                continue
-
-            parent = prim.GetParent()
-            parent_path = str(parent.GetPath()) if parent and parent.IsValid() else ""
-            parent_world = world_mats.get(parent_path)
-            if parent_world is None:
-                parent_world = (
-                    xform_cache.GetLocalToWorldTransform(parent) if parent and parent.IsValid() else Gf.Matrix4d(1.0)
-                )
-            local_mat = world_mat * parent_world.GetInverse()
-
-            transform_attr = NewtonManager._usd_xform_ops.get(prim_path)
-            if transform_attr is not None:
-                try:
-                    if (
-                        not transform_attr.IsValid()
-                        or transform_attr.GetPrim() != prim
-                        or transform_attr.GetName() != xform_attr_name
-                        or transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d
-                    ):
-                        transform_attr = None
-                except Exception:
-                    transform_attr = None
-            if transform_attr is None:
-                transform_attr = prim.GetAttribute(xform_attr_name)
-                if transform_attr.IsValid() and transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d:
-                    transform_attr.SetTypeName(Sdf.ValueTypeNames.Matrix4d)
-                if not transform_attr.IsValid() or transform_attr.GetTypeName() != Sdf.ValueTypeNames.Matrix4d:
-                    transform_attr = prim.CreateAttribute(xform_attr_name, Sdf.ValueTypeNames.Matrix4d, False)
-
-                order_attr = prim.GetAttribute("xformOpOrder")
-                if order_attr.IsValid() and order_attr.GetTypeName() != Sdf.ValueTypeNames.TokenArray:
-                    order_attr.SetTypeName(Sdf.ValueTypeNames.TokenArray)
-                if not order_attr.IsValid():
-                    order_attr = prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray, False)
-                order_attr.Set(Vt.TokenArray([xform_attr_name]))
-                NewtonManager._usd_xform_ops[prim_path] = transform_attr
-            transform_attr.Set(local_mat)
 
     @classmethod
     def _set_fk_articulation_filter(cls, mask: Sequence[bool] | None) -> None:
@@ -1877,7 +1787,7 @@ class NewtonManager(PhysicsManager):
         - Call ``cudaStreamEndCapture`` to close the CUDA stream capture and get the graph.
 
         Warmup run pre-allocates all solver scratch buffers so no ``cudaMalloc`` occurs during
-        capture.  ``sync_transforms_to_usd`` (which calls ``wp.synchronize_device``) is
+        capture.  ``sync_transforms_to_usd`` (which fences its Warp producer stream) is
         excluded from the capture and runs eagerly in ``step()`` after ``wp.capture_launch``.
 
         Returns a ``wp.Graph`` on success, or ``None`` on failure.

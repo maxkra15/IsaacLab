@@ -39,8 +39,10 @@ app.version = "3.0.0"
 
 ### FSD
 app.useFabricSceneDelegate = true
-# Temporary, should be enabled by default in Kit soon
+# The first setting enables Fabric transform ingestion; the second keeps that
+# ingestion GPU-resident. The GPU path does not replace the first setting.
 rtx.hydra.readTransformsFromFabricInRenderDelegate = true
+rtx.hydra.readGPUTransformsFromFabricInRenderDelegate = true
 renderer.scenePartitioning.enabled = true # Enable before RTX initialization so env-root partitions are honored
 
 # Disable print outs on extension startup information

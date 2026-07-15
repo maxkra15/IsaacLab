@@ -168,7 +168,7 @@ def test_initialize_fabric_body_prims_skips_missing_synthetic_body():
 
 
 def test_sync_transforms_prepares_world_matrix_before_cubric_compute(monkeypatch: pytest.MonkeyPatch):
-    """Body world matrices notify Fabric before Cubric propagates instance proxies."""
+    """Body world matrices notify Fabric before Cubric propagates descendants."""
     events = []
 
     class _Selection:
@@ -238,8 +238,10 @@ def test_sync_transforms_prepares_world_matrix_before_cubric_compute(monkeypatch
     monkeypatch.setattr(
         "isaaclab_newton.physics.newton_manager.wp.launch", lambda *_args, **_kwargs: events.append("launch")
     )
+    monkeypatch.setattr("isaaclab_newton.physics.newton_manager.wp.get_stream", lambda *_args: "producer-stream")
     monkeypatch.setattr(
-        "isaaclab_newton.physics.newton_manager.wp.synchronize_device", lambda *_args: events.append("synchronize")
+        "isaaclab_newton.physics.newton_manager.wp.synchronize_stream",
+        lambda stream: events.append(f"synchronize:{stream}"),
     )
     monkeypatch.setattr(PhysicsManager, "_device", "cuda:1")
     monkeypatch.setattr(NewtonManager, "_usdrt_stage", _SyncStage())
@@ -260,7 +262,7 @@ def test_sync_transforms_prepares_world_matrix_before_cubric_compute(monkeypatch
         "fabricarray:omni:fabric:worldMatrix",
         "fabricarray:newton:index",
         "launch",
-        "synchronize",
+        "synchronize:producer-stream",
         "bind:7:1",
         "compute:7",
         "track_world:True",
@@ -275,9 +277,9 @@ def test_root_pose_write_is_visible_on_next_render_without_step():
 
     This reproduces the application sequence that used to render one-frame-old
     transforms: write asset state, then render without an intervening physics
-    step or asset-data read. The assertion reads Fabric's world matrix, which is
-    the transform consumed by Kit/RTX; instanced visuals also receive the authored
-    USD xform mirror used by geometry streaming.
+    step or asset-data read. The assertions verify Fabric's world matrix, which is
+    consumed by Kit/RTX, and guard against restoring the old per-frame CPU xform
+    mirror.
     """
     device = "cuda:1"
     sim_cfg = SimulationCfg(
@@ -316,6 +318,7 @@ def test_root_pose_write_is_visible_on_next_render_without_step():
                 rtol=0.0,
                 atol=1.0e-4,
             )
+            assert not sim_utils.get_current_stage().GetPrimAtPath(body_path).HasAttribute("xformOp:transform:newton")
 
             # Exercise the same application boundary with a production
             # graph-safe writer. Clearing the capture-time host flag before

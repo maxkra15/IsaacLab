@@ -257,7 +257,10 @@ renderer.multiGpu.maxGpuCount = 1
 
 ### FSD
 app.useFabricSceneDelegate = true
+# The first setting enables Fabric transform ingestion; the second keeps that
+# ingestion GPU-resident. The GPU path does not replace the first setting.
 rtx.hydra.readTransformsFromFabricInRenderDelegate = true
+rtx.hydra.readGPUTransformsFromFabricInRenderDelegate = true
 
 # disable replicator orchestrator for better runtime perf
 exts."omni.replicator.core".Orchestrator.enabled = false
