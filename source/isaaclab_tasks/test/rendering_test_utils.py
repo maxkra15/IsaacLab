@@ -1339,6 +1339,38 @@ def _make_franka_cloth_camera_env_cfg(data_type: str):
     return TestFrankaClothCameraEnvCfg()
 
 
+def _set_franka_cloth_render_pose(env) -> None:
+    """Put the cloth in a deterministic draped pose without advancing physics."""
+    deformable = env.scene["deformable"]
+    nodal_state = deformable.data.default_nodal_state_w.torch.clone()
+    local_pos = nodal_state[..., :3] - env.scene.env_origins.unsqueeze(1)
+
+    # Form a smooth ridge over the test cube with a small cross-cloth wrinkle. Rendering
+    # tests only need non-planar geometry; simulating the fall makes the image depend on
+    # GPU-parallel contact ordering and produces substantially different poses across runs.
+    x_from_cube = (local_pos[..., 0] - 0.45) / 0.035
+    y_from_cube = local_pos[..., 1] / 0.025
+    ridge = 0.075 * torch.exp(-(x_from_cube.square().square() + y_from_cube.square().square()))
+    wrinkle = 0.006 * torch.sin((local_pos[..., 0] - 0.3) * 20.0 * torch.pi)
+    nodal_state[..., 2] = env.scene.env_origins[:, 2].unsqueeze(1) + 0.008 + ridge + wrinkle
+    nodal_state[..., 3:] = 0.0
+
+    deformable.write_nodal_state_to_sim_index(nodal_state)
+
+    # Newton's direct particle writes need to invalidate the Fabric sync cache. PhysX
+    # updates its simulation view in write_nodal_state_to_sim_index and has no such hook.
+    mark_particles_dirty = getattr(env.sim.physics_manager, "_mark_particles_dirty", None)
+    if mark_particles_dirty is not None:
+        mark_particles_dirty()
+
+
+def _refresh_camera_sensor(env, sensor_name: str) -> None:
+    """Render and fetch a fresh camera frame after scene preparation."""
+    sensor = env.scene.sensors[sensor_name]
+    env.sim.render()
+    sensor.update(0.0, force_recompute=True)
+
+
 def rendering_test_franka_cloth(
     physics_backend: str,
     renderer: str,
@@ -1350,6 +1382,8 @@ def rendering_test_franka_cloth(
 
     if renderer == "ovrtx_renderer" and data_type == "instance_segmentation_fast":
         pytest.skip("instance_segmentation_fast crashes with the OVRTX renderer on franka_cloth (OMPE-101520).")
+
+    _skip_if_newton_motion_vectors(physics_backend, data_type)
 
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -1371,14 +1405,23 @@ def rendering_test_franka_cloth(
     try:
         env = ManagerBasedRLEnv(env_cfg)
 
-        _maybe_disable_instancing_for_current_stage(physics_backend, renderer, data_type)
-
-        maybe_save_stage(test_name, physics_backend, renderer, data_type)
-
-        # After 15 steps, the cloth should have fallen down on top of the cube and deformed.
-        zero_actions = torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=env.device)
-        for _ in range(15):
-            env.step(zero_actions)
+        requires_simulation = data_type == "motion_vectors" or (
+            renderer == "isaacsim_rtx_renderer"
+            and data_type in {"instance_segmentation_fast", "instance_id_segmentation_fast"}
+        )
+        if requires_simulation:
+            # Motion vectors require frame evolution, while the Isaac RTX instance-segmentation
+            # workaround invalidates physics views by making the stage uninstanceable.
+            _maybe_disable_instancing_for_current_stage(physics_backend, renderer, data_type)
+            maybe_save_stage(test_name, physics_backend, renderer, data_type)
+            zero_actions = torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=env.device)
+            for _ in range(15):
+                env.step(zero_actions)
+        else:
+            _set_franka_cloth_render_pose(env)
+            _maybe_disable_instancing_for_current_stage(physics_backend, renderer, data_type)
+            maybe_save_stage(test_name, physics_backend, renderer, data_type)
+            _refresh_camera_sensor(env, "tiled_camera")
 
         validate_camera_outputs(
             test_name,
