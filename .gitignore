@@ -14,6 +14,10 @@
 **/*.usdc
 **/*.usdz
 
+# The internal waterhose demo assets are distributed as a separate tarball.
+/source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets/
+/waterhose_demo_assets.tar.gz
+
 # Python
 .DS_Store
 **/*.egg-info/

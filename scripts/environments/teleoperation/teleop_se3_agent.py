@@ -71,6 +71,15 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, remaining_args = parser.parse_known_args()
 
+if args_cli.xr:
+    from isaaclab_teleop.cloudxr import align_cloudxr_gpu_for_xr
+
+    align_cloudxr_gpu_for_xr(args_cli)
+if args_cli.auto_launch_cloudxr and args_cli.cloudxr_env and args_cli.cloudxr_env.strip().lower() != "none":
+    from isaaclab_teleop.cloudxr import preload_cloudxr_websockets
+
+    preload_cloudxr_websockets()
+
 app_launcher_args = vars(args_cli)
 
 # launch omniverse app

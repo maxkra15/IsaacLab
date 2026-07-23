@@ -83,6 +83,7 @@ The following modules are available in the ``isaaclab_contrib`` extension:
 
    actuators
    assets
+   cable
    controllers
    coupling
    deformable
@@ -151,6 +152,7 @@ The following modules are available in the ``isaaclab_newton`` extension:
 
    assets
    cloner
+   ik
    physics
    renderers
    sensors

@@ -7,10 +7,13 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 from isaaclab.app import AppLauncher
 
 # Launch Isaac Sim before importing Newton modules so USD schema bindings are initialized.
-simulation_app = AppLauncher(headless=True, enable_cameras=True).app
+simulation_app = AppLauncher(headless=True, enable_cameras=True, device="cuda:0").app
 
 import pytest
 import torch
@@ -21,6 +24,7 @@ from usdrt import Rt
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
+from isaaclab.physics import PhysicsManager
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg, build_simulation_context
 from isaaclab.utils.configclass import configclass
@@ -68,7 +72,6 @@ class _FakePrim:
         self.valid = valid
         self.attributes = {}
         self.applied_schemas = []
-        self.created_world_matrix_attrs = 0
         self.set_world_xform_from_usd = 0
 
     def IsValid(self):
@@ -107,9 +110,6 @@ class _FakeXformable:
     def SetWorldXformFromUsd(self):
         self.prim.set_world_xform_from_usd += 1
 
-    def CreateFabricHierarchyWorldMatrixAttr(self):
-        self.prim.created_world_matrix_attrs += 1
-
 
 class _FakeFabricHierarchy:
     def __init__(self):
@@ -147,7 +147,6 @@ def test_initialize_fabric_body_prims_uses_existing_fabric_prim():
 
     assert stage.defined_prims == []
     assert prim.set_world_xform_from_usd == 1
-    assert prim.created_world_matrix_attrs == 0
     assert prim.GetAttribute("newton:index").value_type == "UInt"
     assert prim.GetAttribute("newton:index").custom is True
     assert prim.GetAttribute("newton:index").value == 3
@@ -155,23 +154,120 @@ def test_initialize_fabric_body_prims_uses_existing_fabric_prim():
     assert fabric_hierarchy.update_world_xforms_count == 1
 
 
-def test_initialize_fabric_body_prims_creates_missing_body_as_xform():
+def test_initialize_fabric_body_prims_skips_missing_synthetic_body():
     stage = _FakeStage()
     fabric_hierarchy = _FakeFabricHierarchy()
 
     NewtonManager._initialize_fabric_body_prims(
-        stage, fabric_hierarchy, _FakeUsdrt, [("/World/envs/env_1/Robot/joints/forearm", 7)]
+        stage, fabric_hierarchy, _FakeUsdrt, [("/World/envs/env_1/Cable1/cable_edge_body_7", 7)]
     )
 
-    prim = stage.prims["/World/envs/env_1/Robot/joints/forearm"]
-    assert stage.defined_prims == [("/World/envs/env_1/Robot/joints/forearm", "Xform")]
-    assert prim.set_world_xform_from_usd == 0
-    assert prim.created_world_matrix_attrs == 1
-    assert prim.GetAttribute("newton:index").value_type == "UInt"
-    assert prim.GetAttribute("newton:index").custom is True
-    assert prim.GetAttribute("newton:index").value == 7
-    assert prim.applied_schemas == ["PhysicsRigidBodyAPI"]
+    assert stage.defined_prims == []
+    assert stage.prims == {}
     assert fabric_hierarchy.update_world_xforms_count == 1
+
+
+def test_sync_transforms_prepares_world_matrix_before_cubric_compute(monkeypatch: pytest.MonkeyPatch):
+    """Body world matrices notify Fabric before Cubric propagates descendants."""
+    events = []
+
+    class _Selection:
+        prepared = False
+
+        def GetCount(self):
+            return 1
+
+        def PrepareForReuse(self):
+            events.append("prepare")
+            self.prepared = True
+            return False
+
+    selection = _Selection()
+
+    class _SyncStage:
+        def SelectPrims(self, **kwargs):
+            assert {entry[1] for entry in kwargs["require_attrs"]} == {
+                "omni:fabric:worldMatrix",
+                "newton:index",
+            }
+            events.append("select")
+            return selection
+
+        def GetFabricId(self):
+            return SimpleNamespace(id=1)
+
+        def GetStageIdAsStageId(self):
+            return 1
+
+    class _Hierarchy:
+        def update_world_xforms(self):
+            events.append("update_world_xforms")
+
+        def track_world_xform_changes(self, enabled):
+            events.append(f"track_world:{enabled}")
+
+        def track_local_xform_changes(self, enabled):
+            events.append(f"track_local:{enabled}")
+
+    class _HierarchyInterface:
+        def get_fabric_hierarchy(self, _fabric_id, _stage_id):
+            return _Hierarchy()
+
+    fake_usdrt = SimpleNamespace(
+        Sdf=SimpleNamespace(ValueTypeNames=SimpleNamespace(Matrix4d="Matrix4d", UInt="UInt")),
+        Usd=SimpleNamespace(Access=SimpleNamespace(ReadWrite="ReadWrite", Read="Read")),
+        hierarchy=SimpleNamespace(IFabricHierarchy=_HierarchyInterface),
+    )
+
+    def fake_fabricarray(selected, attribute):
+        assert selected.prepared, f"Fabric attribute {attribute} was accessed before PrepareForReuse()"
+        events.append(f"fabricarray:{attribute}")
+        return SimpleNamespace(shape=(1,))
+
+    class _Cubric:
+        available = True
+
+        def bind_to_stage(self, adapter, fabric_id):
+            events.append(f"bind:{adapter}:{fabric_id}")
+
+        def compute(self, adapter):
+            events.append(f"compute:{adapter}")
+
+    monkeypatch.setitem(sys.modules, "usdrt", fake_usdrt)
+    monkeypatch.setattr("isaaclab_newton.physics.newton_manager.wp.fabricarray", fake_fabricarray)
+    monkeypatch.setattr(
+        "isaaclab_newton.physics.newton_manager.wp.launch", lambda *_args, **_kwargs: events.append("launch")
+    )
+    monkeypatch.setattr("isaaclab_newton.physics.newton_manager.wp.get_stream", lambda *_args: "producer-stream")
+    monkeypatch.setattr(
+        "isaaclab_newton.physics.newton_manager.wp.synchronize_stream",
+        lambda stream: events.append(f"synchronize:{stream}"),
+    )
+    monkeypatch.setattr(PhysicsManager, "_device", "cuda:0")
+    monkeypatch.setattr(NewtonManager, "_usdrt_stage", _SyncStage())
+    monkeypatch.setattr(NewtonManager, "_model", SimpleNamespace(body_label=[]))
+    monkeypatch.setattr(NewtonManager, "_state_0", SimpleNamespace(body_q=object()))
+    monkeypatch.setattr(NewtonManager, "_transforms_dirty", True)
+    monkeypatch.setattr(NewtonManager, "_cubric", _Cubric())
+    monkeypatch.setattr(NewtonManager, "_cubric_adapter", 7)
+    monkeypatch.setattr(NewtonManager, "_cubric_bound_fabric_id", None)
+
+    NewtonManager.sync_transforms_to_usd()
+
+    assert events == [
+        "track_world:False",
+        "track_local:False",
+        "select",
+        "prepare",
+        "fabricarray:omni:fabric:worldMatrix",
+        "fabricarray:newton:index",
+        "launch",
+        "synchronize:producer-stream",
+        "bind:7:1",
+        "compute:7",
+        "track_world:True",
+        "track_local:True",
+    ]
 
 
 @pytest.mark.isaacsim_ci
@@ -181,8 +277,9 @@ def test_root_pose_write_is_visible_on_next_render_without_step():
 
     This reproduces the application sequence that used to render one-frame-old
     transforms: write asset state, then render without an intervening physics
-    step or asset-data read. The assertion reads Fabric's world matrix, which is
-    the transform consumed by Kit/RTX; USD is intentionally not written back.
+    step or asset-data read. The assertions verify Fabric's world matrix, which is
+    consumed by Kit/RTX, and guard against restoring the old per-frame CPU xform
+    mirror.
     """
     device = "cuda:0"
     sim_cfg = SimulationCfg(
@@ -221,6 +318,7 @@ def test_root_pose_write_is_visible_on_next_render_without_step():
                 rtol=0.0,
                 atol=1.0e-4,
             )
+            assert not sim_utils.get_current_stage().GetPrimAtPath(body_path).HasAttribute("xformOp:transform:newton")
 
             # Exercise the same application boundary with a production
             # graph-safe writer. Clearing the capture-time host flag before

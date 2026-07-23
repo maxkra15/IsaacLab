@@ -28,7 +28,8 @@ def _verify_version(major: int, minor: int) -> bool:
     return CubricBindings._verify_iadapter_version(ctypes.addressof(framework), 1)
 
 
-def test_cubric_adapter_rejects_unvalidated_minor_version():
-    """A newer minor ABI must use the safe CPU transform-hierarchy fallback."""
-    assert _verify_version(0, 1)
-    assert not _verify_version(0, 2)
+def test_cubric_adapter_accepts_only_validated_minor_version():
+    """Only the exact v0.2 ABI may use the GPU transform-hierarchy adapter."""
+    assert not _verify_version(0, 1)
+    assert _verify_version(0, 2)
+    assert not _verify_version(0, 3)

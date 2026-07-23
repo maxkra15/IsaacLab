@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 import warnings
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -12,8 +13,9 @@ from typing import Any
 import torch
 import warp as wp
 from newton import GeoType, ModelBuilder, ShapeFlags, solvers
+from newton._src.usd import utils as usd_utils
 
-from pxr import Usd, UsdPhysics
+from pxr import Usd, UsdGeom, UsdPhysics
 
 from isaaclab.cloner.cloner_utils import replace_path_prefix
 from isaaclab.sim.utils.newton_model_utils import replace_newton_builder_shape_colors
@@ -66,6 +68,100 @@ def _unauthored_collision_mesh_shapes(builder: ModelBuilder, authored_shape_indi
         and (builder.shape_flags[index] & ShapeFlags.COLLIDE_SHAPES)
         and index not in authored_shape_indices
     ]
+
+
+def _is_collision_mesh_prim(prim: Usd.Prim) -> bool:
+    """Return whether a mesh prim is authored as collision geometry."""
+    return bool(prim.HasAPI(UsdPhysics.CollisionAPI) or prim.HasAPI(UsdPhysics.MeshCollisionAPI))
+
+
+def _has_rigid_body_ancestor(prim: Usd.Prim) -> bool:
+    """Return whether *prim* belongs to a USD rigid body."""
+    current = prim
+    while current.IsValid() and not current.IsPseudoRoot():
+        if current.HasAPI(UsdPhysics.RigidBodyAPI):
+            return True
+        current = current.GetParent()
+    return False
+
+
+def add_static_visual_shapes_from_stage(
+    builder: ModelBuilder,
+    stage: Usd.Stage,
+    root_path: str,
+    ignore_paths: Sequence[str] | None = None,
+) -> int:
+    """Import render-only meshes that Newton's physical USD import did not add."""
+    root_prim = stage.GetPrimAtPath(root_path)
+    if not root_prim.IsValid():
+        return 0
+
+    existing_shape_labels = {str(label) for label in getattr(builder, "shape_label", [])}
+    ignore_patterns = tuple(re.compile(path) for path in (ignore_paths or ()))
+    visual_shape_cfg = None
+    xform_cache = UsdGeom.XformCache()
+    added_count = 0
+
+    for prim in Usd.PrimRange(root_prim):
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+
+        path_name = str(prim.GetPath())
+        if path_name in existing_shape_labels:
+            continue
+        if any(pattern.match(path_name) for pattern in ignore_patterns):
+            continue
+        if _is_collision_mesh_prim(prim):
+            continue
+        # Missing visuals beneath a rigid body must remain attached to that body.
+        # Importing them through this static fallback would freeze them in world space.
+        if _has_rigid_body_ancestor(prim):
+            continue
+
+        imageable = UsdGeom.Imageable(prim)
+        if not imageable or imageable.ComputeVisibility() == UsdGeom.Tokens.invisible:
+            continue
+        if imageable.ComputePurpose() in (UsdGeom.Tokens.guide, UsdGeom.Tokens.proxy):
+            continue
+
+        material_props = usd_utils.resolve_material_properties_for_prim(prim)
+        mesh = usd_utils.get_mesh(
+            prim,
+            load_uvs=material_props.get("texture") is not None,
+            load_normals=True,
+        ).copy(recompute_inertia=False)
+        if material_props.get("texture") is not None:
+            mesh.texture = material_props["texture"]
+        if material_props.get("color") is not None and mesh.texture is None:
+            mesh.color = material_props["color"]
+        if material_props.get("roughness") is not None:
+            mesh.roughness = material_props["roughness"]
+        if material_props.get("metallic") is not None:
+            mesh.metallic = material_props["metallic"]
+
+        world_mat = usd_utils.get_transform_matrix(prim, local=False, xform_cache=xform_cache)
+        xform_pos, xform_rot, scale = wp.transform_decompose(world_mat)
+        if visual_shape_cfg is None:
+            visual_shape_cfg = ModelBuilder.ShapeConfig(
+                density=0.0,
+                has_shape_collision=False,
+                has_particle_collision=False,
+                collision_group=0,
+            )
+        shape_id = builder.add_shape_mesh(
+            body=-1,
+            xform=wp.transform(xform_pos, xform_rot),
+            mesh=mesh,
+            scale=scale,
+            cfg=visual_shape_cfg.copy(),
+            color=material_props.get("color"),
+            label=path_name,
+        )
+        if shape_id >= 0:
+            existing_shape_labels.add(path_name)
+            added_count += 1
+
+    return added_count
 
 
 def build_source_builders(
@@ -133,6 +229,9 @@ def _build_source_builder(
         schema_resolvers=schema_resolvers,
         ignore_paths=ignore_paths,
     )
+    # Newton's physical USD import can omit render-only meshes under instanceable
+    # assemblies. Preserve them as non-colliding static shapes for the Newton viewer.
+    add_static_visual_shapes_from_stage(builder, stage, source, ignore_paths=ignore_paths)
     if authored:
         authored_shape_indices = _apply_authored_approximations(builder, import_result["path_shape_map"], authored)
         if simplify_meshes:

@@ -70,7 +70,15 @@ class VBDSolverCfg(NewtonModelSolverCfg):
     """Manager class for the VBD solver."""
 
     iterations: int = 10
-    """Number of VBD iterations per substep."""
+    """Number of particle-VBD and rigid-AVBD iterations per substep.
+
+    Newton does not expose separate rigid-joint iteration or convergence-
+    tolerance controls; tune this shared iteration count and the joint penalty
+    parameters below instead.
+    """
+
+    friction_epsilon: float = 1.0e-2
+    """Relative-velocity threshold used to smooth contact friction [m/s]."""
 
     integrate_with_external_rigid_solver: bool = False
     """Whether rigid bodies are integrated by an external solver (one-way coupling).
@@ -116,6 +124,61 @@ class VBDSolverCfg(NewtonModelSolverCfg):
 
     rigid_contact_k_start: float = 1.0e2
     """Initial stiffness seed for all rigid body contacts [N/m]."""
+
+    rigid_contact_hard: bool = True
+    """Whether body-body contacts use augmented-Lagrangian hard constraints."""
+
+    rigid_contact_history: bool = False
+    """Whether to warm-start body-body contacts from collision-pipeline matching.
+
+    The collision pipeline must populate contact-match indices, for example by
+    setting ``contact_matching="latest"``.
+    """
+
+    rigid_body_contact_buffer_size: int = 64
+    """Maximum number of body-body contacts tracked per rigid body."""
+
+    rigid_body_particle_contact_buffer_size: int = 256
+    """Maximum number of body-particle and full-surface contacts tracked per rigid body."""
+
+    rigid_avbd_beta: float = 0.0
+    """Per-iteration AVBD penalty-stiffness ramp rate.
+
+    The value has units of [N/m per iteration] for linear constraints and
+    [N*m/rad per iteration] for angular constraints. ``0.0`` uses fixed
+    stiffness.
+    """
+
+    rigid_avbd_gamma: float = 0.999
+    """Per-step decay for AVBD penalty stiffness and hard-mode multipliers."""
+
+    rigid_joint_linear_ke: float = 1.0e5
+    """Maximum linear penalty stiffness for VBD rigid joints [N/m]."""
+
+    rigid_joint_angular_ke: float = 1.0e5
+    """Maximum angular penalty stiffness for VBD rigid joints [N*m/rad]."""
+
+    rigid_joint_linear_k_start: float = 1.0e2
+    """Initial linear penalty seed for VBD rigid joints [N/m]."""
+
+    rigid_joint_angular_k_start: float = 1.0e1
+    """Initial angular penalty seed for VBD rigid joints [N*m/rad]."""
+
+    rigid_joint_linear_kd: float = 0.0
+    """Damping coefficient for non-cable linear joint constraints [N*s/m]."""
+
+    rigid_joint_angular_kd: float = 0.0
+    """Damping coefficient for non-cable angular joint constraints [N*m*s/rad]."""
+
+    rigid_joint_hard: bool = True
+    """Whether to preserve Newton's hard-mode defaults for structural rigid joints.
+
+    ``True`` preserves authored modes and Newton's defaults (hard for non-cable
+    structural slots and soft for cable slots). ``False`` switches every
+    structural slot to penalty-only mode after Newton constructs the solver.
+    Drive and limit slots remain soft as required by
+    :class:`newton.solvers.SolverVBD`.
+    """
 
 
 @configclass

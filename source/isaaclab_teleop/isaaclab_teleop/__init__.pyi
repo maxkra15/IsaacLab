@@ -22,9 +22,11 @@ __all__ = [
     "create_haptic_feedback_driver",
     "create_isaac_teleop_device",
     "poll_control_events",
+    "preload_cloudxr_websockets",
     "remove_camera_configs",
 ]
 
+from .cloudxr import preload_cloudxr_websockets
 from .control_events import TELEOP_CONTROL_CHANNEL_UUID, ControlEvents, SupportsControlEvents, poll_control_events
 from .haptic_feedback import (
     ControllerHapticFeedbackCfg,

@@ -8,6 +8,7 @@ isaaclab_newton.sim.spawners
   .. autosummary::
 
     NewtonMaterialCfg
+    NewtonCableMaterialCfg
     NewtonDeformableBodyMaterialCfg
     NewtonDeformableMaterialCfg
     NewtonSurfaceDeformableBodyMaterialCfg
@@ -16,6 +17,14 @@ Rigid Materials
 ---------------
 
 .. autoclass:: NewtonMaterialCfg
+    :members:
+    :show-inheritance:
+    :exclude-members: __init__, func
+
+Cable Materials
+---------------
+
+.. autoclass:: NewtonCableMaterialCfg
     :members:
     :show-inheritance:
     :exclude-members: __init__, func

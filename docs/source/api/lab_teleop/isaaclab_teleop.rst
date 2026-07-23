@@ -26,6 +26,7 @@ isaaclab_teleop
 
     create_isaac_teleop_device
     create_haptic_feedback_driver
+    preload_cloudxr_websockets
     remove_camera_configs
 
 Configuration
@@ -48,6 +49,11 @@ Device
     :show-inheritance:
 
 .. autofunction:: create_isaac_teleop_device
+
+CloudXR
+-------
+
+.. autofunction:: preload_cloudxr_websockets
 
 Haptic Feedback
 ---------------

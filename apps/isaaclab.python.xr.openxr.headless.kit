@@ -19,8 +19,10 @@ app.version = "3.0.0"
 
 ### FSD
 app.useFabricSceneDelegate = true
-# Temporary, should be enabled by default in Kit soon
+# The first setting enables Fabric transform ingestion; the second keeps that
+# ingestion GPU-resident. The GPU path does not replace the first setting.
 rtx.hydra.readTransformsFromFabricInRenderDelegate = true
+rtx.hydra.readGPUTransformsFromFabricInRenderDelegate = true
 renderer.scenePartitioning.enabled = true # Enable before RTX initialization so env-root partitions are honored
 
 # xr optimizations
@@ -57,6 +59,7 @@ folders = [
     "${exe-path}/extscore",  # kit core extensions
     "${exe-path}/../exts",  # isaac extensions
     "${exe-path}/../extsInternal",  # isaac internal extensions
+    "${exe-path}/../extsDeprecated",  # isaac deprecated extensions (e.g. isaacsim.sensors.rtx)
     "${exe-path}/../extscache",  # isaac cache extensions
     "${exe-path}/../extsPhysics",  # isaac physics extensions
     "${exe-path}/../isaacsim/exts",  # isaac extensions for pip

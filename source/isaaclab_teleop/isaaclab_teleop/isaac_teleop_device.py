@@ -160,6 +160,7 @@ class IsaacTeleopDevice:
 
         self._prev_right_a_pressed = False
         self._prev_control_is_active: bool | None = None
+        self._last_target_frame_warning_reason: str | None = None
 
         # Each visualizer is created lazily on the first frame with matching
         # data; the failure latches stop retry spam if creation fails (e.g.
@@ -281,12 +282,14 @@ class IsaacTeleopDevice:
                 When ``None`` and
                 :attr:`~IsaacTeleopCfg.target_frame_prim_path` is set, the
                 transform is computed automatically by reading the prim's
-                world matrix from Fabric and inverting it.
+                world matrix from Fabric and inverting it.  If that configured
+                frame cannot be read, no action is emitted until it resolves.
 
         Returns:
             A flattened action :class:`torch.Tensor` ready for the Isaac Lab
-            environment, or ``None`` if the session has not started yet
-            (e.g. still waiting for the user to start AR).
+            environment, or ``None`` if the session has not started yet (e.g.
+            still waiting for the user to start AR) or a configured target
+            frame is not currently readable.
 
         Raises:
             RuntimeError: If called outside of a context manager.
@@ -294,6 +297,10 @@ class IsaacTeleopDevice:
         # Auto-compute target_T_world from config if not explicitly provided
         if target_T_world is None and self._cfg.target_frame_prim_path is not None:
             target_T_world = self._get_target_frame_T_world()
+            if target_T_world is None:
+                # A configured frame is part of the action contract.  Falling
+                # back to no transform would silently emit world-frame poses.
+                return None
 
         # Step the session (handles lazy start and action extraction)
         action = self._session_lifecycle.step(
@@ -397,6 +404,28 @@ class IsaacTeleopDevice:
     # Target frame transform (config-driven rebase)
     # ------------------------------------------------------------------
 
+    def _warn_target_frame_unavailable(self, reason: str) -> None:
+        """Warn once per failure reason when target-frame rebasing is unavailable."""
+        if self._last_target_frame_warning_reason == reason:
+            return
+        self._last_target_frame_warning_reason = reason
+        logger.warning(
+            "Target frame prim '%s' is unavailable (%s); IsaacTeleop actions are suppressed until it resolves. "
+            "Check IsaacTeleopCfg.target_frame_prim_path if hand directions are rotated or inverted.",
+            self._cfg.target_frame_prim_path,
+            reason,
+        )
+
+    def _mark_target_frame_resolved(self) -> None:
+        """Clear target-frame warning state after the configured prim becomes readable."""
+        if self._last_target_frame_warning_reason is None:
+            return
+        logger.info(
+            "Target frame prim '%s' resolved; IsaacTeleop poses are now rebased into this frame.",
+            self._cfg.target_frame_prim_path,
+        )
+        self._last_target_frame_warning_reason = None
+
     def _get_target_frame_T_world(self) -> np.ndarray | None:
         """Read the target-frame prim's world matrix from Fabric and return its inverse.
 
@@ -421,22 +450,27 @@ class IsaacTeleopDevice:
                 stage_id = stage_cache.Insert(stage).ToLongInt()
             rt_stage = usdrt.Usd.Stage.Attach(stage_id)
             if rt_stage is None:
+                self._warn_target_frame_unavailable("USDRT stage attach returned None")
                 return None
 
             rt_prim = rt_stage.GetPrimAtPath(self._cfg.target_frame_prim_path)
             if not rt_prim.IsValid():
+                self._warn_target_frame_unavailable("prim path is invalid")
                 return None
 
             rt_xformable = Rt.Xformable(rt_prim)
             if not rt_xformable.GetPrim().IsValid():
+                self._warn_target_frame_unavailable("prim is not xformable")
                 return None
 
             world_matrix_attr = rt_xformable.GetFabricHierarchyWorldMatrixAttr()
             if world_matrix_attr is None:
+                self._warn_target_frame_unavailable("Fabric hierarchy world matrix attribute is missing")
                 return None
 
             rt_matrix = world_matrix_attr.Get()
             if rt_matrix is None:
+                self._warn_target_frame_unavailable("Fabric hierarchy world matrix is not available yet")
                 return None
 
             pos = rt_matrix.ExtractTranslation()
@@ -457,9 +491,10 @@ class IsaacTeleopDevice:
             inv_mat = np.eye(4, dtype=np.float32)
             inv_mat[:3, :3] = R.T
             inv_mat[:3, 3] = -(R.T @ t)
+            self._mark_target_frame_resolved()
             return inv_mat
         except Exception as e:
-            logger.warning(f"Failed to read target frame prim '{self._cfg.target_frame_prim_path}': {e}")
+            self._warn_target_frame_unavailable(f"read failed: {e}")
             return None
 
     # ------------------------------------------------------------------

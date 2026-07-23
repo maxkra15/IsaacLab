@@ -12,9 +12,14 @@ These tests exercise pure math (no Omniverse/Isaac Sim stack required).
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import numpy as np
 import pytest
 import torch
+from isaaclab_teleop.isaac_teleop_device import IsaacTeleopDevice
 from isaaclab_teleop.session_lifecycle import _to_numpy_4x4
 
 # ---------------------------------------------------------------------------
@@ -254,7 +259,7 @@ class TestConfigDrivenAutoSelection:
         np.testing.assert_array_equal(result, explicit)
 
     def test_config_prim_returns_none_passes_none(self):
-        """If the prim read fails (returns None), step() receives None."""
+        """If the prim read fails, target selection yields no usable transform."""
         result, called = _simulate_advance_selection(
             target_T_world=None,
             target_frame_prim_path="/World/Robot/base_link",
@@ -262,3 +267,78 @@ class TestConfigDrivenAutoSelection:
         )
         assert called
         assert result is None
+
+
+class TestAdvanceTargetFrameSafety:
+    """Device-level regressions for configured target-frame handling."""
+
+    @staticmethod
+    def _make_device_shell() -> IsaacTeleopDevice:
+        device = IsaacTeleopDevice.__new__(IsaacTeleopDevice)
+        device._cfg = SimpleNamespace(target_frame_prim_path="/World/Robot/base_link")
+        device._session_lifecycle = Mock()
+        device._anchor_manager = Mock()
+        device._anchor_manager.get_world_matrix.return_value = np.eye(4, dtype=np.float32)
+        device._poll_buttons = Mock()
+        device._dispatch_control_callbacks = Mock()
+        device._enable_debug_visualization = False
+        return device
+
+    def test_configured_target_frame_unavailable_suppresses_action(self):
+        """A missing configured frame must not silently produce a world-frame action."""
+        device = self._make_device_shell()
+        device._get_target_frame_T_world = Mock(return_value=None)
+        device._session_lifecycle.step.return_value = torch.ones(1)
+
+        action = device.advance()
+
+        assert action is None
+        device._session_lifecycle.step.assert_not_called()
+
+    def test_configured_target_frame_resolved_is_passed_to_session(self, translation_matrix: np.ndarray):
+        device = self._make_device_shell()
+        expected_action = torch.ones(1)
+        device._get_target_frame_T_world = Mock(return_value=translation_matrix)
+        device._session_lifecycle.step.return_value = expected_action
+
+        action = device.advance()
+
+        assert action is expected_action
+        device._session_lifecycle.step.assert_called_once()
+        np.testing.assert_array_equal(
+            device._session_lifecycle.step.call_args.kwargs["target_T_world"], translation_matrix
+        )
+
+
+class TestTargetFrameWarnings:
+    """Tests for target-frame unavailability warning state."""
+
+    @staticmethod
+    def _make_device_shell() -> IsaacTeleopDevice:
+        device = IsaacTeleopDevice.__new__(IsaacTeleopDevice)
+        device._cfg = SimpleNamespace(target_frame_prim_path="/World/Robot/base_link")
+        device._last_target_frame_warning_reason = None
+        return device
+
+    def test_warning_emits_once_per_reason(self, caplog: pytest.LogCaptureFixture):
+        device = self._make_device_shell()
+        caplog.set_level(logging.WARNING, logger="isaaclab_teleop.isaac_teleop_device")
+
+        device._warn_target_frame_unavailable("prim path is invalid")
+        device._warn_target_frame_unavailable("prim path is invalid")
+        device._warn_target_frame_unavailable("Fabric hierarchy world matrix is not available yet")
+
+        warning_records = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warning_records) == 2
+        assert "prim path is invalid" in warning_records[0].message
+        assert "Fabric hierarchy world matrix is not available yet" in warning_records[1].message
+
+    def test_resolved_clears_warning_state(self, caplog: pytest.LogCaptureFixture):
+        device = self._make_device_shell()
+        caplog.set_level(logging.INFO, logger="isaaclab_teleop.isaac_teleop_device")
+
+        device._warn_target_frame_unavailable("prim path is invalid")
+        device._mark_target_frame_resolved()
+
+        assert device._last_target_frame_warning_reason is None
+        assert "resolved" in caplog.text

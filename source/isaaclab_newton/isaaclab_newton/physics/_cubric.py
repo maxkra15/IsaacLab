@@ -50,7 +50,7 @@ _FW_OFF_GET_INTERFACE_PLUGIN_DESC = 96
 # ---------------------------------------------------------------------------
 #  IAdapter struct layout  (from omni/cubric/IAdapter.h)
 # ---------------------------------------------------------------------------
-# v0.1 layout:
+# v0.2 layout (v0.2 appends bindToStageWithListener after compute):
 #   0: getAttribute
 #   8: create(AdapterId*)
 #  16: refcount
@@ -66,7 +66,7 @@ _IA_OFF_COMPUTE = 56
 
 # Expected IAdapter version.
 _IA_EXPECTED_MAJOR = 0
-_IA_EXPECTED_MINOR = 1
+_IA_EXPECTED_MINOR = 2
 
 # AdapterId sentinel
 _INVALID_ADAPTER_ID = ctypes.c_uint64(~0).value

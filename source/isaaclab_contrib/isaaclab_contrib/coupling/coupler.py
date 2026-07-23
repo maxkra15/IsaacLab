@@ -20,7 +20,13 @@ from isaaclab_newton.physics import (
 from isaaclab_newton.physics.mpm_manager import NewtonMPMManager
 from isaaclab_newton.physics.newton_manager import NewtonManager
 from newton import CollisionPipeline, Model, ModelBuilder, ShapeFlags
-from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
+from newton.solvers import SolverBase
+from newton.solvers.experimental.coupled import (
+    CouplingInterface,
+    SolverCoupled,
+    SolverCoupledADMM,
+    SolverCoupledProxy,
+)
 
 from isaaclab.physics import PhysicsManager
 from isaaclab.utils.string import resolve_matching_names
@@ -33,6 +39,46 @@ from .coupler_cfg import (
     CouplerProxyCfg,
     CouplerProxyMappingCfg,
 )
+
+
+class _GenericEffectiveMassSolver(CouplingInterface):
+    """Use model-view inertia while delegating every other coupling operation."""
+
+    def __init__(self, solver: SolverBase):
+        self._solver = solver
+
+    def __getattr__(self, name):
+        return getattr(self._solver, name)
+
+    def coupling_eval_effective_mass(self, *args, **kwargs):
+        return CouplingInterface.coupling_eval_effective_mass(self, *args, **kwargs)
+
+    def coupling_eval_effective_mass_block(self, *args, **kwargs):
+        return CouplingInterface.coupling_eval_effective_mass_block(self, *args, **kwargs)
+
+    def coupling_notify_input_state_update(self, *args, **kwargs):
+        return self._solver.coupling_notify_input_state_update(*args, **kwargs)
+
+    def coupling_supports_inertial_property_refresh(self, *args, **kwargs):
+        return self._solver.coupling_supports_inertial_property_refresh(*args, **kwargs)
+
+    def coupling_eval_gravity_acceleration(self, *args, **kwargs):
+        return self._solver.coupling_eval_gravity_acceleration(*args, **kwargs)
+
+    def coupling_rewind_proxy_body(self, *args, **kwargs):
+        return self._solver.coupling_rewind_proxy_body(*args, **kwargs)
+
+    def coupling_rewind_proxy_particle(self, *args, **kwargs):
+        return self._solver.coupling_rewind_proxy_particle(*args, **kwargs)
+
+    def coupling_harvest_proxy_wrenches(self, *args, **kwargs):
+        return self._solver.coupling_harvest_proxy_wrenches(*args, **kwargs)
+
+    def coupling_harvest_proxy_particle_forces(self, *args, **kwargs):
+        return self._solver.coupling_harvest_proxy_particle_forces(*args, **kwargs)
+
+    def coupling_prepare_proxy_contacts(self, *args, **kwargs):
+        return self._solver.coupling_prepare_proxy_contacts(*args, **kwargs)
 
 
 class NewtonCouplerManager(NewtonVBDManager):
@@ -219,6 +265,11 @@ class NewtonCouplerManager(NewtonVBDManager):
         )
 
     @classmethod
+    def _should_defer_cuda_graph_capture(cls) -> bool:
+        """Wait until environment managers and controller prototypes are initialized."""
+        return True
+
+    @classmethod
     def _resolve_entry(
         cls,
         model: Model,
@@ -329,9 +380,13 @@ class NewtonCouplerManager(NewtonVBDManager):
     @classmethod
     def _build_entry(cls, entry: _ResolvedEntry) -> SolverCoupled.Entry:
         entry_cfg = entry.config
+        use_solver_effective_mass = entry_cfg.use_solver_effective_mass
 
         def solver_factory(model_view):
-            return entry_cfg.solver_cfg.class_type._create_solver(model_view, entry_cfg.solver_cfg)
+            solver = entry_cfg.solver_cfg.class_type._create_solver(model_view, entry_cfg.solver_cfg)
+            if not use_solver_effective_mass:
+                solver = _GenericEffectiveMassSolver(solver)
+            return solver
 
         return SolverCoupled.Entry(
             name=entry_cfg.name,

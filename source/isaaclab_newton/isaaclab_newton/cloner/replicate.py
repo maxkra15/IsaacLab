@@ -68,26 +68,25 @@ def _build_newton_builder_from_mapping(
     )
     replace_newton_builder_shape_colors(builder, stage)
 
-    # Deformable prim paths are handled by per_world_builder_hooks, not add_usd.
+    # Deformable and cable prim paths are handled by per_world_builder_hooks, not add_usd.
     # Resolve the regex prim_path patterns to concrete env_0 paths so add_usd
     # can skip them via ignore_paths.
-    deformable_patterns = tuple(
-        re.compile(entry.prim_path.replace(".*", "[^/]*")) for entry in NewtonManager._deformable_registry
-    )
-    deformable_ignore_paths = []
-    if deformable_patterns:
+    hook_entries = [*NewtonManager._deformable_registry, *getattr(NewtonManager, "_cable_registry", ())]
+    hook_patterns = tuple(re.compile(entry.prim_path.replace(".*", "[^/]*")) for entry in hook_entries)
+    hook_ignore_paths = []
+    if hook_patterns:
         for source in sources:
             for child in Usd.PrimRange(stage.GetPrimAtPath(source)):
                 child_path = str(child.GetPath())
-                if any(pattern.fullmatch(child_path) for pattern in deformable_patterns):
-                    deformable_ignore_paths.append(child_path)
+                if any(pattern.fullmatch(child_path) for pattern in hook_patterns):
+                    hook_ignore_paths.append(child_path)
 
     source_builders = build_source_builders(
         stage,
         sources,
         lambda: manager_cls.create_builder(up_axis=up_axis),
         schema_resolvers,
-        ignore_paths=deformable_ignore_paths or None,
+        ignore_paths=hook_ignore_paths or None,
         simplify_meshes=simplify_meshes,
     )
 

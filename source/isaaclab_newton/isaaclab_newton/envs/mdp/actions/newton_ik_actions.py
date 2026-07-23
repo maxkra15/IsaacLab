@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -180,9 +181,16 @@ class NewtonInverseKinematicsAction(ActionTerm):
         plan = sim_utils.SimulationContext.instance().get_clone_plan()
         source_path, _, asset_suffix = resolve_clone_plan_source(self._asset.cfg.prim_path, plan)
         # The proto builder is keyed by the bare clone source; the articulation
-        # lives at the asset suffix below it (e.g. ".../env_0" + "/Robot").
-        self._source_path = source_path + asset_suffix
-        prototype_model = NewtonManager._cl_protos[source_path].finalize(device=NewtonManager.get_model().device)
+        # lives at the asset suffix below it (e.g. ".../env_0" + "/Robot"), optionally
+        # deeper when the asset authors its articulation root on a child prim.
+        articulation_root = getattr(self._asset.cfg, "articulation_root_prim_path", None) or ""
+        self._source_path = source_path + asset_suffix + articulation_root
+        # Finalizing the shared prototype builder replaces its shape-source
+        # geometry in place, invalidating the already-finalized main model's
+        # shared mesh handles. Finalize a geometry-isolated shallow copy.
+        proto_builder = copy.copy(NewtonManager._cl_protos[source_path])
+        proto_builder.shape_source = [copy.copy(geo) if geo is not None else None for geo in proto_builder.shape_source]
+        prototype_model = proto_builder.finalize(device=NewtonManager.get_model().device)
         prototype_view = ArticulationView(
             prototype_model,
             self._source_path,
@@ -200,6 +208,7 @@ class NewtonInverseKinematicsAction(ActionTerm):
             device=self.device,
             objectives=self.cfg.objectives,
             link_resolver=lambda body_name: self._resolve_prototype_link_index(prototype_view, body_name),
+            joint_resolver=lambda joint_name: self._resolve_prototype_scalar_joint_indices(prototype_view, joint_name),
         )
 
         # Bind each pose objective to the live body it reads and its action slice.
@@ -366,6 +375,32 @@ class NewtonInverseKinematicsAction(ActionTerm):
         selected_indices = self._layout_indices(layout)
         local_link_index = prototype_view.link_names.index(body_name)
         return layout.offset + selected_indices[local_link_index]
+
+    def _resolve_prototype_scalar_joint_indices(
+        self, prototype_view: ArticulationView, joint_name: str
+    ) -> tuple[int, int]:
+        """Resolve one-coordinate/one-DoF joint indices in the prototype model."""
+        if joint_name not in prototype_view.joint_names:
+            raise ValueError(f"Newton IK joint-posture objective could not find joint '{joint_name}'.")
+        joint_index = prototype_view.joint_names.index(joint_name)
+        coord_count = prototype_view.joint_coord_counts[joint_index]
+        dof_count = prototype_view.joint_dof_counts[joint_index]
+        if coord_count != 1 or dof_count != 1:
+            raise ValueError(
+                "Newton IK joint-posture objectives currently support only scalar joints; "
+                f"'{joint_name}' has {coord_count} coordinates and {dof_count} DoFs."
+            )
+
+        coord_layout = prototype_view.frequency_layouts[NewtonModel.AttributeFrequency.JOINT_COORD]
+        dof_layout = prototype_view.frequency_layouts[NewtonModel.AttributeFrequency.JOINT_DOF]
+        coord_selected = self._layout_indices(coord_layout)
+        dof_selected = self._layout_indices(dof_layout)
+        coord_local = prototype_view.joint_coord_names.index(joint_name)
+        dof_local = prototype_view.joint_dof_names.index(joint_name)
+        return (
+            coord_layout.offset + coord_selected[coord_local],
+            dof_layout.offset + dof_selected[dof_local],
+        )
 
     @staticmethod
     def _layout_indices(layout) -> list[int]:

@@ -18,6 +18,8 @@ from newton.solvers import SolverVBD
 
 from isaaclab.sim.utils.stage import get_current_stage
 
+from isaaclab_contrib.cable.cable_object import install_cable_builder_hooks
+
 from .deformable_object import (
     add_deformable_entry_to_builder,
     clear_deformable_builder_hooks,
@@ -72,6 +74,7 @@ class NewtonVBDManager(NewtonManager):
         # Experimental deformable support registers callbacks here so the manager
         # and cloner can invoke them without hard-coding deformable logic.
         install_deformable_builder_hooks()
+        install_cable_builder_hooks()
 
         super().initialize(sim_context)
 
@@ -237,7 +240,11 @@ class NewtonVBDManager(NewtonManager):
     @classmethod
     def _create_solver(cls, model: Model, solver_cfg: VBDSolverCfg) -> SolverVBD:
         """Construct the configured VBD solver."""
-        return SolverVBD(model, **cls._filter_solver_kwargs(SolverVBD, solver_cfg))
+        solver = SolverVBD(model, **cls._filter_solver_kwargs(SolverVBD, solver_cfg))
+        if not solver_cfg.rigid_joint_hard:
+            for joint_index in range(int(model.joint_count)):
+                solver.set_joint_constraint_mode(joint_index, hard=False)
+        return solver
 
     @classmethod
     def _build_solver(cls, model: Model, solver_cfg: VBDSolverCfg) -> None:

@@ -302,8 +302,12 @@ class NewtonManager(PhysicsManager):
     # Per-world reset masks (allocated in start_simulation, consumed in step/forward).
     _world_reset_mask: wp.array | None = None  # (num_envs,) wp.bool — for SolverKamino.reset(world_mask=...)
     _fk_reset_mask: wp.array | None = None  # (articulation_count,) wp.bool — for eval_fk(mask=...)
+    _state_teleport_pending: bool = False
+    """Whether authored state needs one solver-history reset after FK materialization."""
     # Solver-specialized FK delegate. Bound in initialize_solver() to the active subclass's choice of FK implementation.
     _eval_fk: Callable[[wp.array | None, wp.array | None], None] = _eval_fk_unbound
+    _reset_solver: Callable[[wp.array | None], None] | None = None
+    """Bound solver-specialized reset hook, callable even through the base manager."""
 
     # Newton actuator adapter (owns actuators and double-buffered states)
     _adapter: NewtonActuatorAdapter | None = None
@@ -342,7 +346,8 @@ class NewtonManager(PhysicsManager):
     _newton_particle_count_attr = "newton:particleCount"
     _particle_visual_prims: dict[str, _ParticleVisualPrim] = {}
 
-    # cubric GPU transform hierarchy (replaces CPU update_world_xforms)
+    # Cubric propagates body world matrices through the Fabric hierarchy and emits
+    # the scene-delegate invalidation needed after direct GPU matrix writes.
     _cubric = None
     _cubric_adapter: int | None = None
     _cubric_bound_fabric_id: int | None = None
@@ -384,6 +389,7 @@ class NewtonManager(PhysicsManager):
     _deformable_registry: list = []
     _per_world_builder_hooks: list[Callable[[ModelBuilder, int, list[float], list[float]], None]] = []
     _post_replicate_hooks: list[Callable[[ModelBuilder], None]] = []
+    _pre_render_callbacks: dict[str, Callable[[], None]] = {}
 
     @classmethod
     def initialize(cls, sim_context: SimulationContext) -> None:
@@ -473,8 +479,11 @@ class NewtonManager(PhysicsManager):
         data layer invokes ``NewtonManager.forward()`` on the base class, where ``cls`` is the
         base ``NewtonManager``; the bound delegate dispatches to the concrete subclass override.
         """
-        cls._reset_solver_internals(cls._world_reset_mask)
         cls._eval_fk(cls._world_reset_mask, cls._fk_reset_mask)
+        if cls._state_teleport_pending:
+            reset_solver = cls._reset_solver or cls._reset_solver_internals
+            reset_solver(cls._world_reset_mask)
+            NewtonManager._state_teleport_pending = False
         if cls._fk_reset_mask is not None:
             cls._fk_reset_mask.zero_()
         if cls._world_reset_mask is not None:
@@ -488,12 +497,28 @@ class NewtonManager(PhysicsManager):
             cls.forward()
             if NewtonManager._transforms_may_change_on_graph_replay:
                 NewtonManager._transforms_dirty = True
+        for name, callback in list(cls._pre_render_callbacks.items()):
+            try:
+                callback()
+            except Exception:
+                logger.exception("[NewtonManager] pre-render callback %s failed; deregistering", name)
+                NewtonManager._pre_render_callbacks.pop(name, None)
         cls.sync_transforms_to_usd()
         cls.sync_particles_to_usd()
 
     @classmethod
+    def register_pre_render_callback(cls, name: str, callback: Callable[[], None]) -> None:
+        """Register a named callback that runs before Newton render-state synchronization."""
+        NewtonManager._pre_render_callbacks[name] = callback
+
+    @classmethod
+    def deregister_pre_render_callback(cls, name: str) -> None:
+        """Remove a named pre-render callback."""
+        NewtonManager._pre_render_callbacks.pop(name, None)
+
+    @classmethod
     def sync_transforms_to_usd(cls) -> None:
-        """Write Newton body_q to USD Fabric world matrices for Kit viewport / RTX rendering.
+        """Write Newton body poses to Fabric for Kit viewport and RTX rendering.
 
         No-op when ``_usdrt_stage`` is None (i.e. Kit visualizer is not active)
         or when transforms have not changed since the last sync.
@@ -504,15 +529,12 @@ class NewtonManager(PhysicsManager):
         so that the expensive Fabric hierarchy update only runs once per render
         frame rather than after every physics step.
 
-        Uses ``wp.fabricarray`` directly (no ``isaacsim.physics.newton`` extension needed).
-        The Warp kernel reads ``state_0.body_q[newton_index[i]]`` and writes the
-        corresponding ``mat44d`` to ``omni:fabric:worldMatrix`` for each prim.
-
-        When cubric is available the method mirrors PhysX's ``DirectGpuHelper``
-        pattern: pause Fabric change tracking, write transforms, resume tracking,
-        then call ``IAdapter::compute`` on the GPU to propagate the hierarchy and
-        notify the Fabric Scene Delegate.  Otherwise it falls back to the CPU
-        ``update_world_xforms()`` path.
+        Body matrices stay on the GPU: a Warp kernel writes Fabric world matrices
+        directly, then Cubric propagates them through ordinary descendants and notifies
+        the Fabric Scene Delegate. A narrow stream fence orders the Warp write
+        before Cubric because its adapter API does not accept a CUDA stream or event;
+        this fence performs no host data transfer. If Cubric is unavailable, the public
+        CPU hierarchy update remains a safe fallback.
         """
         if cls._usdrt_stage is None or cls._model is None or cls._state_0 is None:
             return
@@ -521,8 +543,8 @@ class NewtonManager(PhysicsManager):
         try:
             import usdrt
 
-            # Lazy adapter creation: deferred from initialize_solver() to avoid
-            # startup-ordering issues with the cubric plugin.
+            # Adapter creation is lazy because omni.cubric is not guaranteed to be
+            # ready at solver initialization time.
             if cls._cubric is not None and cls._cubric.available and cls._cubric_adapter is None:
                 NewtonManager._cubric_adapter = cls._cubric.create_adapter()
                 if cls._cubric_adapter is not None:
@@ -532,20 +554,14 @@ class NewtonManager(PhysicsManager):
                     NewtonManager._cubric = None
 
             use_cubric = cls._cubric is not None and cls._cubric_adapter is not None
-
             fabric_hierarchy = None
             if hasattr(usdrt, "hierarchy"):
                 fabric_hierarchy = usdrt.hierarchy.IFabricHierarchy().get_fabric_hierarchy(
                     cls._usdrt_stage.GetFabricId(), cls._usdrt_stage.GetStageIdAsStageId()
                 )
 
-            # Pause hierarchy change tracking BEFORE SelectPrims.
-            # SelectPrims with ReadWrite access calls getAttributeArrayGpu
-            # internally, which marks Fabric buffers dirty.  If tracking is
-            # still active at that point the hierarchy records the change and
-            # Kit's updateWorldXforms will do an expensive connectivity
-            # rebuild every frame.  PhysX avoids this via ScopedUSDRT which
-            # pauses tracking before any Fabric writes.
+            # Mirror PhysX's DirectGpuHelper ordering: pause change tracking before
+            # acquiring writable Fabric arrays, then let Cubric rebuild/propagate.
             if use_cubric and fabric_hierarchy is not None:
                 fabric_hierarchy.track_world_xform_changes(False)
                 fabric_hierarchy.track_local_xform_changes(False)
@@ -562,6 +578,8 @@ class NewtonManager(PhysicsManager):
                     NewtonManager._transforms_dirty = False
                     return
 
+                # Required to invalidate the render delegate's cached buffers.
+                selection.PrepareForReuse()
                 fabric_transforms = wp.fabricarray(selection, "omni:fabric:worldMatrix")
                 newton_indices = wp.fabricarray(selection, cls._newton_index_attr)
                 wp.launch(
@@ -570,8 +588,10 @@ class NewtonManager(PhysicsManager):
                     inputs=[fabric_transforms, newton_indices, cls._state_0.body_q],
                     device=PhysicsManager._device,
                 )
-                wp.synchronize_device(PhysicsManager._device)
-
+                # Cubric may dispatch hierarchy work on a different CUDA stream and
+                # does not expose stream/event interop. Wait only for the stream that
+                # produced the matrices, rather than synchronizing the whole device.
+                wp.synchronize_stream(wp.get_stream(PhysicsManager._device))
                 NewtonManager._transforms_dirty = False
 
                 if use_cubric and fabric_hierarchy is not None:
@@ -753,8 +773,6 @@ class NewtonManager(PhysicsManager):
         if sim is None or not sim.is_playing():
             return
 
-        cls._reset_solver_internals(cls._world_reset_mask)
-
         # Notify solver of model changes
         if cls._model_changes:
             with wp.ScopedDevice(PhysicsManager._device):
@@ -767,7 +785,13 @@ class NewtonManager(PhysicsManager):
         device = PhysicsManager._device
         if cls._graph_capture_pending and cfg is not None and cfg.use_cuda_graph and "cuda" in device:  # type: ignore[union-attr]
             NewtonManager._graph_capture_pending = False
-            NewtonManager._graph = cls._capture_relaxed_graph(device)
+            capture_mode = "standard Warp mode"
+            with Timer(name="newton_cuda_graph", msg="CUDA graph took:"):
+                if cls._usdrt_stage is None:
+                    NewtonManager._graph = cls._capture_standard_graph(device)
+                else:
+                    NewtonManager._graph = cls._capture_relaxed_graph(device)
+                    capture_mode = "relaxed mode, RTX-compatible"
             if cls._graph is not None:
                 # Kamino: StateKamino.from_newton() lazily allocates body_f_total,
                 # joint_q_prev, and joint_lambdas via wp.clone/wp.zeros during the
@@ -775,7 +799,7 @@ class NewtonManager(PhysicsManager):
                 # memory-pool addresses before any eager solver.reset() call.
                 if isinstance(cls._solver, SolverKamino):
                     wp.capture_launch(cls._graph)
-                logger.info("Newton CUDA graph captured (deferred relaxed mode, RTX-compatible)")
+                logger.info("Newton CUDA graph captured (deferred %s)", capture_mode)
             else:
                 logger.warning("Newton deferred CUDA graph capture failed; using eager execution")
 
@@ -873,7 +897,9 @@ class NewtonManager(PhysicsManager):
         NewtonManager._control = None
         NewtonManager._contacts = None
         NewtonManager._needs_collision_pipeline = False
+        NewtonManager._state_teleport_pending = False
         NewtonManager._eval_fk = _eval_fk_unbound
+        NewtonManager._reset_solver = None
         NewtonManager._collision_pipeline = None
         NewtonManager._collision_cfg = None
         NewtonManager._newton_contact_sensors = {}
@@ -883,6 +909,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._supports_contact_sensors = True
         NewtonManager._adapter = None
         NewtonManager._post_actuator_callbacks = []
+        NewtonManager._pre_render_callbacks = {}
         NewtonManager._post_step_callbacks = []
         # Set by an articulation that took the ``use_newton_actuators=True``
         # branch in ``_process_actuators_cfg``.  Together with the adapter
@@ -1193,6 +1220,8 @@ class NewtonManager(PhysicsManager):
         if cls._world_reset_mask is None or cls._fk_reset_mask is None:
             return
 
+        NewtonManager._state_teleport_pending = True
+
         if articulation_ids is not None and env_mask is not None:
             wp.launch(
                 _or_reset_masks_from_mask,
@@ -1360,20 +1389,22 @@ class NewtonManager(PhysicsManager):
     def _initialize_fabric_body_prims(stage, fabric_hierarchy, usdrt, body_bindings: Sequence[tuple[str, int]]) -> None:
         """Initialize Fabric body prims used by Newton transform sync."""
         for prim_path, body_index in body_bindings:
+            # Builder hooks can create simulation-only bodies with no authored
+            # USD prim (for example, waterhose cable segments). They have no
+            # renderable geometry and must not become synthetic Fabric Xforms:
+            # doing so pollutes the rendered Fabric hierarchy.
+            if not isinstance(prim_path, str) or not prim_path.startswith("/"):
+                continue
             prim = stage.GetPrimAtPath(prim_path)
-            if prim.IsValid():
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.SetWorldXformFromUsd()
-            else:
-                prim = stage.DefinePrim(prim_path, "Xform")
-                xformable_prim = usdrt.Rt.Xformable(prim)
-                xformable_prim.CreateFabricHierarchyWorldMatrixAttr()
+            if not prim.IsValid():
+                continue
+            xformable_prim = usdrt.Rt.Xformable(prim)
+            xformable_prim.SetWorldXformFromUsd()
 
             prim.CreateAttribute(NewtonManager._newton_index_attr, usdrt.Sdf.ValueTypeNames.UInt, custom=True)
             prim.GetAttribute(NewtonManager._newton_index_attr).Set(body_index)
-            # Tag with PhysicsRigidBodyAPI so cubric's eRigidBody mode applies
-            # Inverse propagation (preserves Newton's world transforms and derives
-            # local) instead of Forward.
+            # Cubric's rigid-body mode preserves the world transform written by
+            # Newton and derives local/descendant transforms from it.
             prim.AddAppliedSchema("PhysicsRigidBodyAPI")
 
         fabric_hierarchy.update_world_xforms()
@@ -1508,6 +1539,19 @@ class NewtonManager(PhysicsManager):
         if cls._contacts is None:
             NewtonManager._contacts = cls._collision_pipeline.contacts()
 
+    @staticmethod
+    def _seed_rigid_contact_capacity(model: Model, collision_cfg: NewtonCollisionPipelineCfg | None) -> None:
+        """Apply an explicit collision-pipeline capacity before solver construction.
+
+        Solvers such as VBD allocate contact-history storage in their constructors,
+        before :meth:`_initialize_contacts` creates the collision pipeline.  Seeding
+        the finalized model here keeps those allocations consistent with an explicit
+        ``rigid_contact_max`` configured for the pipeline.
+        """
+        if collision_cfg is None or collision_cfg.rigid_contact_max is None:
+            return
+        model.rigid_contact_max = max(int(model.rigid_contact_max), int(collision_cfg.rigid_contact_max))
+
     # ----- Solver construction (subclass contract) ------------------------
 
     @classmethod
@@ -1614,15 +1658,14 @@ class NewtonManager(PhysicsManager):
         Thin orchestrator: delegates solver construction to
         :meth:`_build_solver` (overridden by each solver subclass), allocates
         the collision pipeline (when applicable) via
-        :meth:`_initialize_contacts`, then sets up cubric bindings and either
-        captures the CUDA graph immediately or defers capture until the
-        first :meth:`step` call (RTX-active path).
+        :meth:`_initialize_contacts`, then sets up Cubric bindings and either
+        captures the CUDA graph immediately or defers it until the first
+        :meth:`step` call.
 
         .. warning::
-            When using a CUDA-enabled device, the simulation is graphed.
-            This means the function steps the simulation once to capture the
-            graph, so it should only be called after everything else in the
-            simulation is initialized.
+            An immediate CUDA graph capture executes one simulation warmup
+            inside this function. Managers that need the complete environment,
+            or that share CUDA with RTX, defer that warmup to their first step.
         """
         cfg = PhysicsManager._cfg
         if cfg is None:
@@ -1634,6 +1677,7 @@ class NewtonManager(PhysicsManager):
             NewtonManager._solver_dt = cls.get_physics_dt() / cls._num_substeps
             NewtonManager._collision_cfg = cfg.collision_cfg  # type: ignore[union-attr]
 
+            cls._seed_rigid_contact_capacity(cls._model, cls._collision_cfg)
             cls._build_solver(cls._model, cfg.solver_cfg)  # type: ignore[union-attr]
             if NewtonManager._solver is None:
                 raise RuntimeError(
@@ -1648,6 +1692,7 @@ class NewtonManager(PhysicsManager):
         # base class (the data layer imports NewtonManager directly). ``cls`` is the concrete
         # subclass here, since initialize_solver is reached via sim.physics_manager.reset().
         NewtonManager._eval_fk = cls._eval_fk_impl
+        NewtonManager._reset_solver = cls._reset_solver_internals
 
         # Establish the initial kinematically-consistent body state through the
         # solver-specialized FK delegate, now that the solver and the delegate both exist.
@@ -1656,6 +1701,7 @@ class NewtonManager(PhysicsManager):
 
         if cls._usdrt_stage is not None:
             cls._setup_cubric_bindings()
+            cls._mark_transforms_dirty()
 
         # Skip the initial graph capture when the Newton actuator fast path is
         # active. Capturing here would use ``cls._decimation`` (still its default
@@ -1672,11 +1718,10 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def _setup_cubric_bindings(cls) -> None:
-        """Initialize cubric ctypes bindings when the Kit viewport is active.
+        """Prepare Cubric's instance-aware Fabric hierarchy adapter.
 
-        Adapter creation itself is deferred to the first
-        :meth:`sync_transforms_to_usd` call to avoid startup-ordering issues
-        with the cubric plugin.
+        Adapter allocation remains lazy in :meth:`sync_transforms_to_usd` to
+        avoid Kit extension startup-order races.
         """
         from isaaclab_newton.physics._cubric import CubricBindings
 
@@ -1695,11 +1740,12 @@ class NewtonManager(PhysicsManager):
         Called by :meth:`start_simulation` and :meth:`set_decimation`
         whenever the graph needs to be (re-)captured.
 
-        * **No USDRT / headless**: captures immediately via
+        * **Ordinary headless managers**: capture immediately via
           ``wp.ScopedCapture``.
-        * **RTX active**: defers capture to the first :meth:`step` call
-          via :meth:`_capture_relaxed_graph`, because RTX background
-          streams are not yet idle during initialisation.
+        * **Managers requiring completed environment initialization**, or
+          **RTX-active managers**: defer capture to the first :meth:`step`
+          call. The first case uses standard Warp capture; the second uses
+          relaxed capture so RTX background streams remain active.
         * **CUDA graphs disabled**: clears the graph reference.
         """
         cfg = PhysicsManager._cfg
@@ -1717,36 +1763,42 @@ class NewtonManager(PhysicsManager):
             )
             return
 
-        if use_cuda_graph:
+        if use_cuda_graph and cls._should_defer_cuda_graph_capture():
+            NewtonManager._graph = None
+            NewtonManager._graph_capture_pending = True
+            logger.info("Newton CUDA graph capture deferred until first step()")
+        elif use_cuda_graph:
             with Timer(name="newton_cuda_graph", msg="CUDA graph took:"):
-                if cls._usdrt_stage is None:
-                    simulate = cls._simulate_full if cls._is_all_graphable() else cls._simulate_physics_only
-                    with _paused_gc(), wp.ScopedCapture(device=device) as capture:
-                        simulate()
-                    NewtonManager._graph = capture.graph
-                    logger.info("Newton CUDA graph captured (standard Warp mode)")
+                NewtonManager._graph = cls._capture_standard_graph(device)
+                logger.info("Newton CUDA graph captured (standard Warp mode)")
 
-                    # Kamino: StateKamino.from_newton() lazily allocates body_f_total,
-                    # joint_q_prev, and joint_lambdas via wp.clone/wp.zeros during the
-                    # first step() inside graph capture. Replay once to pin those
-                    # memory-pool addresses before any eager solver.reset() call.
-                    if isinstance(cls._solver, SolverKamino):
-                        wp.capture_launch(cls._graph)
-                else:
-                    # RTX is active during initialization — cudaImportExternalMemory and other
-                    # non-capturable RTX ops run on background CUDA streams right now.
-                    # Defer capture to the first step() call, after RTX is fully initialized
-                    # and idle between render frames (clean capture window).
-                    NewtonManager._graph = None
-                    NewtonManager._graph_capture_pending = True
-                    logger.info("Newton CUDA graph capture deferred until first step() (RTX active)")
+                # Kamino: StateKamino.from_newton() lazily allocates body_f_total,
+                # joint_q_prev, and joint_lambdas via wp.clone/wp.zeros during the
+                # first step() inside graph capture. Replay once to pin those
+                # memory-pool addresses before any eager solver.reset() call.
+                if isinstance(cls._solver, SolverKamino):
+                    wp.capture_launch(cls._graph)
         else:
             NewtonManager._graph = None
+            NewtonManager._graph_capture_pending = False
 
     @classmethod
     def _supports_cuda_graph_capture(cls) -> bool:
         """Return whether the active solver configuration supports CUDA graph capture."""
         return True
+
+    @classmethod
+    def _should_defer_cuda_graph_capture(cls) -> bool:
+        """Return whether capture must wait until environment initialization completes."""
+        return cls._usdrt_stage is not None
+
+    @classmethod
+    def _capture_standard_graph(cls, device: str):
+        """Capture Newton simulation on Warp's standard stream."""
+        simulate = cls._simulate_full if cls._is_all_graphable() else cls._simulate_physics_only
+        with _paused_gc(), wp.ScopedCapture(device=device) as capture:
+            simulate()
+        return capture.graph
 
     @classmethod
     def _capture_relaxed_graph(cls, device: str, capture_target: Callable[[], None] | None = None):
@@ -1784,7 +1836,7 @@ class NewtonManager(PhysicsManager):
         - Call ``cudaStreamEndCapture`` to close the CUDA stream capture and get the graph.
 
         Warmup run pre-allocates all solver scratch buffers so no ``cudaMalloc`` occurs during
-        capture.  ``sync_transforms_to_usd`` (which calls ``wp.synchronize_device``) is
+        capture.  ``sync_transforms_to_usd`` (which fences its Warp producer stream) is
         excluded from the capture and runs eagerly in ``step()`` after ``wp.capture_launch``.
 
         When ``capture_target`` is provided it is captured instead of the physics simulate
@@ -2416,10 +2468,9 @@ class NewtonManager(PhysicsManager):
         is captured as a single CUDA graph.
 
         If a CUDA graph was previously captured, it is automatically
-        re-captured with the new decimation count using the same
-        strategy as :meth:`start_simulation`: standard
-        ``wp.ScopedCapture`` when no USDRT stage is active, or
-        deferred relaxed capture when RTX is running.
+        re-captured with the new decimation count using the manager's normal
+        capture policy. Deferred headless managers use standard Warp capture
+        on their first step; RTX-active managers use relaxed capture.
         """
         cls._decimation = max(1, decimation)
         if cls._is_all_graphable():

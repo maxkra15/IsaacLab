@@ -1,0 +1,15 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""RBY1DF waterhose task using Newton proxy coupling."""
+
+from isaaclab.utils.configclass import configclass
+
+from ...waterhose_env_cfg import WaterhoseProxyIkEnvCfg
+
+
+@configclass
+class WaterhoseCoupledEnvCfg(WaterhoseProxyIkEnvCfg):
+    """Client-facing RBY1DF waterhose task using Newton proxy coupling."""

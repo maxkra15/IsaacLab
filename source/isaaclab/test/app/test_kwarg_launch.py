@@ -64,6 +64,65 @@ def test_explicit_experience_requires_isaac_sim_runtime():
     assert _uses_isaac_sim_runtime(scan, args)
 
 
+@pytest.mark.parametrize(
+    ("config_has_kit", "launcher_args", "expected"),
+    [
+        pytest.param(True, {}, True, id="config-kit-without-cli-override"),
+        pytest.param(False, {}, False, id="config-without-kit"),
+        pytest.param(
+            False,
+            {"visualizer": ["kit"], "visualizer_explicit": True},
+            True,
+            id="explicit-kit-enables-kit",
+        ),
+        pytest.param(
+            True,
+            {"visualizer": ["newton"], "visualizer_explicit": True},
+            False,
+            id="explicit-newton-disables-config-kit",
+        ),
+        pytest.param(
+            True,
+            {"visualizer": None, "visualizer_explicit": True, "visualizer_disable_all": True},
+            False,
+            id="explicit-disable-all-disables-config-kit",
+        ),
+        pytest.param(
+            True,
+            {
+                "headless": True,
+                "headless_explicit": True,
+                "visualizer": ["kit"],
+                "visualizer_explicit": True,
+            },
+            False,
+            id="explicit-headless-overrides-explicit-kit",
+        ),
+        pytest.param(
+            True,
+            {"headless": True, "headless_explicit": False},
+            True,
+            id="implicit-headless-defers-to-config-kit",
+        ),
+    ],
+)
+def test_kit_visualizer_launch_precedence(config_has_kit: bool, launcher_args: dict, expected: bool):
+    """Explicit CLI launch choices must override visualizers embedded in the config."""
+    scan = Scan(
+        resolved_physics_cfg=None,
+        effective_cfg=object(),
+        visualizer_intent={"has_any_visualizers": config_has_kit, "has_kit_visualizer": config_has_kit},
+        has_ovrtx=False,
+        has_kit_camera=False,
+        has_kit_physics=False,
+        has_kitless_physics=True,
+        has_ovphysx_physics=False,
+        needs_kit=False,
+    )
+
+    assert sim_launcher._has_kit_visualizer(scan, launcher_args) is expected
+
+
 def test_launch_simulation_preserves_failure_exit_code(monkeypatch: pytest.MonkeyPatch):
     close_args = {}
 
