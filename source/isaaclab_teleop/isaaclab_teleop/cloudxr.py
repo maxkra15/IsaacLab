@@ -7,10 +7,7 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
-import os
-import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -21,54 +18,6 @@ _WEBSOCKETS_MODULE_NAMES = (
     "websockets.client",
     "websockets.server",
 )
-
-
-def align_cloudxr_gpu_for_xr(args_cli: argparse.Namespace) -> bool:
-    """Select a Kit-compatible physical GPU for CloudXR.
-
-    CloudXR creates the OpenXR Vulkan compositor in a separate process. On a
-    multi-GPU host, Kit's renderer can remain on its primary Vulkan GPU while
-    Newton simulation runs on another CUDA device. Consequently, an unmasked
-    ``--device cuda:N`` is not sufficient evidence that CloudXR should use
-    physical GPU ``N``.
-
-    The CloudXR runtime documents ``NV_GPU_INDEX`` as its physical-device
-    selector. This helper selects physical GPU 0 for the default unmasked
-    ``cuda:0`` launch and resolves numeric ``CUDA_VISIBLE_DEVICES`` remapping.
-    It deliberately leaves unmasked nonzero CUDA devices alone so CloudXR
-    stays with Kit's primary Vulkan GPU. An existing ``NV_GPU_INDEX`` is
-    treated as an explicit user override.
-
-    Returns:
-        Whether ``NV_GPU_INDEX`` changed.
-    """
-    if not bool(getattr(args_cli, "xr", False)) or "NV_GPU_INDEX" in os.environ:
-        return False
-
-    device = str(getattr(args_cli, "device", ""))
-    match = re.fullmatch(r"cuda(?::(\d+))?", device)
-    if match is None:
-        return False
-
-    logical_index = int(match.group(1) or 0)
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible_devices is None:
-        if logical_index != 0:
-            return False
-        gpu_index = "0"
-    else:
-        device_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
-        if logical_index >= len(device_tokens):
-            return False
-        gpu_index = device_tokens[logical_index]
-        if not gpu_index.isdecimal():
-            # CloudXR expects a physical ordinal. UUID and MIG visibility tokens
-            # cannot be translated reliably without querying the driver.
-            return False
-    if int(gpu_index) < 0:
-        return False
-    os.environ["NV_GPU_INDEX"] = gpu_index
-    return True
 
 
 def _module_path(module: ModuleType) -> Path:

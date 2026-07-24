@@ -44,19 +44,21 @@ Verify that the tested Newton pin, Isaac Teleop, and WebSockets resolve from tha
 uv pip freeze --python .venv/bin/python | grep '^newton'
 ```
 
-## Visible runs on a hybrid-GPU Linux desktop
-
-Point visible runs at the active X server. If that display is driven through an integrated GPU, use
-PRIME render offload so both Kit's Vulkan renderer and the Newton OpenGL viewer select NVIDIA. Confirm
-the provider name with `xrandr --listproviders` and replace `NVIDIA-G0` below if needed.
+## Visible runs
 
 ```bash
 export DISPLAY=:1
-export __NV_PRIME_RENDER_OFFLOAD=1
-export __NV_PRIME_RENDER_OFFLOAD_PROVIDER=NVIDIA-G0
-export __GLX_VENDOR_LIBRARY_NAME=nvidia
-export __VK_LAYER_NV_optimus=NVIDIA_only
+unset CUDA_VISIBLE_DEVICES
+unset NV_GPU_INDEX NV_CXR_GPU_INDEX_VULKAN
+export NV_CXR_GPU_INDEX_CUDA=0
+unset __NV_PRIME_RENDER_OFFLOAD __NV_PRIME_RENDER_OFFLOAD_PROVIDER
+unset __GLX_VENDOR_LIBRARY_NAME __VK_LAYER_NV_optimus
 ```
+
+Do not derive a CloudXR Vulkan device index from the CUDA ordinal. On hybrid-GPU hosts the two APIs
+enumerate different physical devices. The supported ``NV_CXR_GPU_INDEX_CUDA=0`` selector and
+``--device cuda:0`` keep CloudXR, Kit, and simulation on the same NVIDIA GPU without changing Vulkan
+device ordering.
 
 The task uses one scene-fit camera pose for `ViewerCfg`, Kit, and the Newton viewer.
 
@@ -133,6 +135,18 @@ CloudXR auto-launch is enabled by default. Add `--no-auto_launch_cloudxr` when m
 separately. The explicit `--device cuda:0` above keeps this checkout's acceptance run on the requested
 GPU. Add `--enable_debug_visualization` only when hand-joint and controller-aim markers are useful.
 
+The session starts paused and uses Isaac Teleop's standard AVP controls:
+
+- **Play** starts applying wrist and gripper commands.
+- **Stop** pauses physics stepping while keeping the XR session connected.
+- **Reset** restores the robot and cable to their initial state and clears the relative wrist
+  calibration. The first valid pose from each hand after reset is clutched to the reset robot pose, so
+  the next episode does not inherit the previous episode's extended-arm offset.
+
+Reset preserves whether the session is playing or stopped. For deliberate episode boundaries, use
+**Stop**, **Reset**, align your hands comfortably, and then **Play**. The same controls can be activated
+with visionOS Voice Control.
+
 The 16-D waterhose pipeline maps complete absolute poses from both tracked wrists to the complete right
 and left RBY1 arm chains, followed by independent right- and left-hand pinch commands. Each gripper uses
 the standard binary hysteresis: a thumb-index distance below 3 cm closes it, a distance above 5 cm opens
@@ -155,7 +169,7 @@ acceptance pass must still verify:
 1. The headset connects and the scene anchor faces the fridge.
 2. Both wrists track XYZ and all three rotation axes one-to-one; each hand's pinch controls its gripper.
 3. Robot and hose visuals update in the headset while physics is stepping.
-4. Reset/reconnect works and stopping XR terminates the CloudXR process cleanly.
+4. Play and Stop gate motion, and Reset restores the scene and re-clutches both wrists.
 5. No mixed-WebSockets or target-frame warnings remain after startup.
 
 ## Newton contact scope
@@ -181,9 +195,9 @@ The coupled scene has an explicit ownership boundary:
   fixed-feedback coupling pass without Aitken relaxation. The task contact material uses
   `ke=1.0e4 N/m` and `kd=0.1 N s/m`; the finger proxies use friction `20.0`, a 1 mm physical margin,
   and a 10 mm broad-phase gap, while connector/socket/cable shapes retain the lower task friction.
-  AVP gripper commands use synchronized finger interpolation limited to 2 mm of joint travel per
-  simulation step. The scripted demo closes smoothly over its state-machine trajectory and keeps its
-  direct target path.
+  AVP gripper commands use synchronized finger interpolation limited to 5 mm of joint travel per
+  simulation step (about 0.16 s for the full driver stroke). The scripted demo closes smoothly over
+  its state-machine trajectory and keeps its direct target path.
 
 Insertion and retention are pure contact physics. There is no connector latch, snap constraint,
 adhesion, or post-insertion kinematic hold. The success check only observes connector alignment and

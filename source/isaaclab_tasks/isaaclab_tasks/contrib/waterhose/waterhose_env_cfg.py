@@ -280,10 +280,10 @@ _LEFT_GRIPPER_JOINT_NAMES = [
     "left_gripper_left_finger_joint",
     "left_gripper_right_finger_joint",
 ]
-# Open/close is binary at the input, but the 76 mm gripper-driver stroke is applied over 0.38 s
+# Open/close is binary at the input, but the 76 mm gripper-driver stroke is applied over 0.16 s
 # instead of teleporting its VBD proxy through the connector in one 10 ms step. The action term
 # interpolates every gripper joint with one shared alpha.
-_GRIPPER_MAX_JOINT_DELTA_PER_STEP = 0.002
+_GRIPPER_MAX_JOINT_DELTA_PER_STEP = 0.005
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -911,7 +911,14 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
 
 @configclass
 class WaterhoseRightGripperActionsCfg:
-    """Shared normalized right-gripper action."""
+    """Shared arm-first action layout followed by the normalized right gripper.
+
+    The action manager slices commands in configuration-field order.  Keep the arm placeholder in
+    this base so every derived action config preserves the external ``[arm, right gripper]`` layout
+    when it supplies its concrete IK action.
+    """
+
+    arm_action: NewtonInverseKinematicsActionCfg = MISSING
 
     gripper_action = WaterhoseGripperPositionActionCfg(
         asset_name="robot",
@@ -1080,8 +1087,6 @@ class WaterhoseProxyTeleopEnvCfg(WaterhoseProxyIkEnvCfg):
             xr_cfg=self.xr,
             app_name="WaterhoseTeleop",
             target_frame_prim_path=_ROBOT_BASE_PRIM_PATH_ENV0,
-            teleoperation_active_default=True,
-            control_channel_uuid=None,
         )
         # Native single-arm devices emit seven actions and therefore do not match this bimanual
         # 16D contract. Do not silently pad their output or freeze one arm.

@@ -50,8 +50,8 @@ def test_waterhose_bimanual_teleop_commands_both_grippers_with_safe_close_endpoi
     ]
     assert tuple(actions_cfg.gripper_action.close_command_expr.values()) == pytest.approx((0.014, -0.007, 0.007))
     assert tuple(actions_cfg.left_gripper_action.close_command_expr.values()) == pytest.approx((0.014, -0.007, 0.007))
-    assert actions_cfg.gripper_action.max_joint_delta_per_step == pytest.approx(0.002)
-    assert actions_cfg.left_gripper_action.max_joint_delta_per_step == pytest.approx(0.002)
+    assert actions_cfg.gripper_action.max_joint_delta_per_step == pytest.approx(0.005)
+    assert actions_cfg.left_gripper_action.max_joint_delta_per_step == pytest.approx(0.005)
 
 
 def test_waterhose_bimanual_ik_regularizes_shoulders_and_elbows_to_start_posture():

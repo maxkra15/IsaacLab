@@ -13,10 +13,11 @@ from scipy.spatial.transform import Rotation
 
 pytest.importorskip("isaacteleop")
 
+from isaaclab_teleop import TELEOP_CONTROL_CHANNEL_UUID
 from isaacteleop.retargeting_engine.deviceio_source_nodes import HandsSource
 
 from isaaclab_tasks.contrib.waterhose.teleop_pipelines import build_waterhose_bimanual_teleop_pipeline
-from isaaclab_tasks.contrib.waterhose.waterhose_env_cfg import WaterhoseProxyTeleopEnvCfg
+from isaaclab_tasks.contrib.waterhose.waterhose_env_cfg import WaterhoseProxyIkEnvCfg, WaterhoseProxyTeleopEnvCfg
 
 
 def test_waterhose_bimanual_pipeline_matches_the_16d_environment_action():
@@ -47,12 +48,32 @@ def test_waterhose_bimanual_pipeline_matches_the_16d_environment_action():
     assert [retargeter._config.input_device for retargeter in retargeters] == [HandsSource.RIGHT, HandsSource.LEFT]
 
 
+def test_waterhose_action_configs_pack_arm_before_grippers():
+    """Scripted and bimanual commands must reach the matching action terms."""
+
+    assert list(WaterhoseProxyIkEnvCfg().actions.__dict__) == ["arm_action", "gripper_action"]
+    assert list(WaterhoseProxyTeleopEnvCfg().actions.__dict__) == [
+        "arm_action",
+        "gripper_action",
+        "left_gripper_action",
+    ]
+
+
 def test_waterhose_teleop_config_exposes_the_pipeline_not_the_tuning_tuple():
     """The session lifecycle consumes an OutputCombiner directly from ``pipeline_builder``."""
 
     pipeline = WaterhoseProxyTeleopEnvCfg().isaac_teleop.pipeline_builder()
 
     assert pipeline.output_types()["action"].types[0].shape == (16,)
+
+
+def test_waterhose_teleop_uses_standard_episode_controls():
+    """AVP Play, Stop, and Reset must use IsaacTeleop's standard control channel."""
+
+    teleop_cfg = WaterhoseProxyTeleopEnvCfg().isaac_teleop
+
+    assert not teleop_cfg.teleoperation_active_default
+    assert teleop_cfg.control_channel_uuid == TELEOP_CONTROL_CHANNEL_UUID
 
 
 def test_waterhose_bimanual_pipeline_tracks_both_wrist_orientations_without_axis_suppression():
