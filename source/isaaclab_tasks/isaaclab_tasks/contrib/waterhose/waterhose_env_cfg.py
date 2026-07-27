@@ -556,8 +556,9 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
     )
 
     # Keep solver-specific watertight housing proxies around the canonical visual fridge. The cable
-    # proxy removes only the plug corridor; the robot proxy clears the full gripper approach sweep.
-    # Housing contact remains active everywhere else, while the dedicated socket SDF owns insertion.
+    # proxy removes only the plug corridor; the robot proxy clears the full gripper approach sweep,
+    # then restores the authored Prop001 and Prop002 obstacles for MJWarp contact only. Housing contact
+    # remains active everywhere else, while the dedicated socket SDF owns cable insertion in VBD.
     fridge_robot_collision = AssetBaseCfg(
         prim_path="/World/envs/env_.*/FridgeRobotCollision",
         spawn=sim_utils.UsdFileCfg(usd_path=_FRIDGE_ROBOT_COLLISION_PROXY_USD),

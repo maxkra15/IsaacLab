@@ -568,6 +568,32 @@ def test_cable_housing_proxy_has_no_mjwarp_contact_metadata():
     assert not housing.HasAttribute("mjc:solref")
 
 
+def test_fridge_props_are_part_of_only_the_robot_housing_proxy():
+    """The rigid robot sees both fridge props while the deformable cable does not."""
+    from pxr import Usd
+
+    expected_sources = [
+        "/root/Cable008_Prop001/Collisions/Cable008_Prop001_Collider1",
+        "/root/Cable008_Prop002/Collisions/Cable008_Prop002_Collider1",
+    ]
+    fridge_stage = Usd.Stage.Open(waterhose_env_cfg._FRIDGE_USD)
+    robot_stage = Usd.Stage.Open(waterhose_env_cfg._FRIDGE_ROBOT_COLLISION_PROXY_USD)
+    cable_stage = Usd.Stage.Open(waterhose_env_cfg._FRIDGE_CABLE_COLLISION_PROXY_USD)
+    robot_housing = robot_stage.GetPrimAtPath("/FridgeCollision/Housing")
+    cable_housing = cable_stage.GetPrimAtPath("/FridgeCollision/Housing")
+
+    for prop_name in ("Cable008_Prop001", "Cable008_Prop002"):
+        prop_collision_scope = fridge_stage.GetPrimAtPath(f"/root/{prop_name}/Collisions")
+        assert not prop_collision_scope.IsActive()
+        assert prop_collision_scope.GetAttribute("physics:collisionEnabled").Get() is False
+
+    robot_sources = robot_housing.GetAttribute("waterhose:postClearanceColliderSources").Get()
+    cable_sources = cable_housing.GetAttribute("waterhose:postClearanceColliderSources").Get()
+
+    assert list(robot_sources) == expected_sources
+    assert list(cable_sources) == []
+
+
 def test_connector_mesh_is_lumped_into_the_cable_head():
     builder = ModelBuilder()
     head_mass = 1.3585861e-4

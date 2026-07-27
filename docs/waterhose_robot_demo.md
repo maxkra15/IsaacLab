@@ -25,7 +25,7 @@ not tracked by Git. From the Isaac Lab repository root, verify the archive and u
 
 ```bash
 ASSET_TARBALL=/path/to/waterhose_demo_assets.tar.gz
-echo "28d66857c46737aca62e351011d1246bdca722a18d7167cd7e2397234fe7daab  $ASSET_TARBALL" \
+echo "4c40dca88b4f5db17ef8fabd073f13fde1031a159e2e1da1867ef57d22ea5248  $ASSET_TARBALL" \
   | sha256sum --check -
 tar -xzf "$ASSET_TARBALL" -C .
 ```

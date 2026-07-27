@@ -13,8 +13,9 @@ non-manifold mesh with undefined inside/outside queries. This tool instead:
 2. removes exact duplicate hulls;
 3. computes a topology-preserving solid union;
 4. subtracts solver-specific closed insertion clearances;
-5. simplifies the result without changing its topology; and
-6. validates both topological and Newton-quantized geometric manifoldness.
+5. restores explicitly robot-owned fridge props after the approach clearance;
+6. simplifies the result without changing its topology; and
+7. validates both topological and Newton-quantized geometric manifoldness.
 
 Run from the repository root with the Isaac Lab environment:
 
@@ -44,6 +45,10 @@ _DEFAULT_ROBOT_OUTPUT = _ASSETS_DIR / "fridge_robot_manifold_collision.usda"
 _DEFAULT_CABLE_OUTPUT = _ASSETS_DIR / "fridge_cable_manifold_collision.usda"
 
 _COLLISION_SCOPE = "/root/Cable008/Collisions/"
+_ROBOT_ONLY_COLLIDER_PATHS = (
+    "/root/Cable008_Prop001/Collisions/Cable008_Prop001_Collider1",
+    "/root/Cable008_Prop002/Collisions/Cable008_Prop002_Collider1",
+)
 _CORRIDOR_START = np.asarray((-0.259345, 0.36352012, -0.2647031), dtype=np.float64)
 _CORRIDOR_END = np.asarray((-0.259345, 0.33718455, -0.19234677), dtype=np.float64)
 _CABLE_CORRIDOR_RADIUS = 0.015
@@ -87,8 +92,32 @@ def _mesh_points_in_root_frame(
     return np.asarray(points, dtype=np.float64)
 
 
-def _load_unique_source_hulls(source_path: Path) -> tuple[list[trimesh.Trimesh], int]:
-    """Load and deduplicate the active authored fridge collision hulls."""
+def _convex_hull_from_prim(
+    prim: Usd.Prim,
+    xform_cache: UsdGeom.XformCache,
+    world_to_root: Gf.Matrix4d,
+) -> trimesh.Trimesh:
+    """Reconstruct one mesh prim using its authored convex-hull approximation."""
+
+    path = str(prim.GetPath())
+    if not prim.IsValid() or not prim.IsA(UsdGeom.Mesh):
+        raise RuntimeError(f"Required fridge collider is missing or is not a mesh: {path}")
+    points = _mesh_points_in_root_frame(UsdGeom.Mesh(prim), xform_cache, world_to_root)
+    if len(points) < 4:
+        raise RuntimeError(f"Collider {path} has fewer than four points.")
+
+    # These prims are authored with physics:approximation = "convexHull". Reconstructing that
+    # intended geometry also repairs the few source triangle soups that are themselves open.
+    hull = trimesh.convex.convex_hull(points)
+    if not hull.is_volume:
+        raise RuntimeError(f"Collider {path} did not produce a closed, outward convex hull.")
+    return hull
+
+
+def _load_source_hulls(
+    source_path: Path,
+) -> tuple[list[trimesh.Trimesh], int, list[trimesh.Trimesh]]:
+    """Load the shared housing hulls and the two robot-only fridge props."""
 
     stage = Usd.Stage.Open(str(source_path))
     if stage is None:
@@ -108,15 +137,7 @@ def _load_unique_source_hulls(source_path: Path) -> tuple[list[trimesh.Trimesh],
         if not prim.IsA(UsdGeom.Mesh) or not path.startswith(_COLLISION_SCOPE):
             continue
         source_count += 1
-        points = _mesh_points_in_root_frame(UsdGeom.Mesh(prim), xform_cache, world_to_root)
-        if len(points) < 4:
-            raise RuntimeError(f"Collider {path} has fewer than four points.")
-
-        # These prims are authored with physics:approximation = "convexHull". Reconstructing that
-        # intended geometry also repairs the few source triangle soups that are themselves open.
-        hull = trimesh.convex.convex_hull(points)
-        if not hull.is_volume:
-            raise RuntimeError(f"Collider {path} did not produce a closed, outward convex hull.")
+        hull = _convex_hull_from_prim(prim, xform_cache, world_to_root)
 
         # The source contains repeated fragment geometry at identical transforms. Remove it before
         # Boolean union so duplicates cannot create coincident surfaces.
@@ -128,7 +149,11 @@ def _load_unique_source_hulls(source_path: Path) -> tuple[list[trimesh.Trimesh],
 
     if not hulls:
         raise RuntimeError(f"No active collider meshes found under {_COLLISION_SCOPE!r}.")
-    return hulls, source_count
+    robot_only_hulls = [
+        _convex_hull_from_prim(stage.GetPrimAtPath(path), xform_cache, world_to_root)
+        for path in _ROBOT_ONLY_COLLIDER_PATHS
+    ]
+    return hulls, source_count, robot_only_hulls
 
 
 def _cylinder_between(start: np.ndarray, end: np.ndarray, radius: float) -> trimesh.Trimesh:
@@ -180,8 +205,9 @@ def _build_housing(
     hulls: list[trimesh.Trimesh],
     corridor_radius: float,
     simplify_tolerance: float,
+    post_clearance_hulls: list[trimesh.Trimesh] | tuple[trimesh.Trimesh, ...] = (),
 ) -> tuple[trimesh.Trimesh, int]:
-    """Union the source hulls and subtract one closed insertion clearance."""
+    """Build one housing and preserve any solver-specific hulls after clearance."""
 
     housing = reduce(operator.add, (_to_manifold(hull) for hull in hulls))
     corridor_axis = _CORRIDOR_END - _CORRIDOR_START
@@ -194,6 +220,11 @@ def _build_housing(
     )
 
     housing = housing - _to_manifold(corridor)
+    if post_clearance_hulls:
+        # Prop001 and Prop002 are physical obstacles for the articulated robot but intentionally do
+        # not participate in cable/VBD contact. Add their authored convex hulls after carving the
+        # robot approach corridor so that the generic clearance cannot erase Prop001 near the socket.
+        housing = housing + reduce(operator.add, (_to_manifold(hull) for hull in post_clearance_hulls))
     housing = housing.simplify(float(simplify_tolerance))
     if housing.status() != manifold3d.Error.NoError:
         raise RuntimeError(f"Housing Boolean failed: {housing.status()}.")
@@ -240,6 +271,7 @@ def _write_housing(
     simplify_tolerance: float,
     separated_vertex_groups: int,
     author_mjwarp_solref: bool,
+    post_clearance_sources: tuple[str, ...],
 ) -> None:
     """Write one solver-specific collision-only USD."""
 
@@ -300,6 +332,11 @@ def _write_housing(
     mesh.GetPrim().CreateAttribute("waterhose:uniqueColliderCount", Sdf.ValueTypeNames.Int, custom=True).Set(
         unique_count
     )
+    mesh.GetPrim().CreateAttribute(
+        "waterhose:postClearanceColliderSources",
+        Sdf.ValueTypeNames.StringArray,
+        custom=True,
+    ).Set(Vt.StringArray(post_clearance_sources))
     stage.GetRootLayer().Save()
 
 
@@ -331,16 +368,23 @@ def main() -> None:
     args = parser.parse_args()
 
     source_path = args.source.resolve()
-    hulls, source_count = _load_unique_source_hulls(source_path)
+    hulls, source_count, robot_only_hulls = _load_source_hulls(source_path)
     outputs = (
-        (args.robot_output.resolve(), args.robot_corridor_radius, True),
-        (args.cable_output.resolve(), args.cable_corridor_radius, False),
+        (
+            args.robot_output.resolve(),
+            args.robot_corridor_radius,
+            True,
+            robot_only_hulls,
+            _ROBOT_ONLY_COLLIDER_PATHS,
+        ),
+        (args.cable_output.resolve(), args.cable_corridor_radius, False, (), ()),
     )
-    for output_path, corridor_radius, author_mjwarp_solref in outputs:
+    for output_path, corridor_radius, author_mjwarp_solref, post_clearance_hulls, post_clearance_sources in outputs:
         housing, separated_vertex_groups = _build_housing(
             hulls,
             corridor_radius,
             args.simplify_tolerance,
+            post_clearance_hulls,
         )
         _write_housing(
             output_path,
@@ -352,10 +396,12 @@ def main() -> None:
             simplify_tolerance=args.simplify_tolerance,
             separated_vertex_groups=separated_vertex_groups,
             author_mjwarp_solref=author_mjwarp_solref,
+            post_clearance_sources=post_clearance_sources,
         )
         print(
             f"Wrote {output_path} from {source_count} active colliders "
-            f"({len(hulls)} unique): {len(housing.vertices)} vertices, {len(housing.faces)} triangles."
+            f"({len(hulls)} unique, {len(post_clearance_hulls)} post-clearance): "
+            f"{len(housing.vertices)} vertices, {len(housing.faces)} triangles."
         )
 
 

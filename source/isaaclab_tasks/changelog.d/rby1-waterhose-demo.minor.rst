@@ -13,6 +13,9 @@ Added
 Fixed
 ^^^^^
 
+* Included both authored fridge props in the robot-only MJWarp collision proxy
+  without adding them to the cable VBD contact space.
+
 * Restored the standard Apple Vision Pro Play, Stop, and Reset controls for the
   waterhose task. Resetting an episode also clears the relative wrist
   calibration so both arms re-clutch from the reset pose.
