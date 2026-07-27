@@ -17,6 +17,7 @@ from isaaclab_newton.ik.newton_ik_objectives_cfg import NewtonIKPoseObjectiveCfg
 
 import isaaclab.utils.math as math_utils
 import isaaclab.utils.string as string_utils
+from isaaclab.envs.utils.io_descriptors import GenericActionIODescriptor
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.managers.manager_term_cfg import ActionTermCfg
 from isaaclab.utils.configclass import configclass
@@ -202,6 +203,78 @@ class WaterhoseGripperPositionAction(ActionTerm):
         self._processed_actions[env_ids] = self._open_command
 
 
+@configclass
+class WaterhoseDirectGripperJointPositionActionCfg(ActionTermCfg):
+    """Direct joint-position targets for one RBY1 gripper."""
+
+    class_type: type[ActionTerm] | str = "{DIR}.actions:WaterhoseDirectGripperJointPositionAction"
+
+    joint_names: list[str] = MISSING
+    """Gripper driver and finger joints to command explicitly."""
+
+    open_command_expr: dict[str, float] = MISSING
+    """Open joint-position targets, also used as one endpoint of the valid command range."""
+
+    close_command_expr: dict[str, float] = MISSING
+    """Closed joint-position targets, also used as the other endpoint of the valid command range."""
+
+
+class WaterhoseDirectGripperJointPositionAction(ActionTerm):
+    """Apply one explicit position target per RBY1 gripper joint."""
+
+    cfg: WaterhoseDirectGripperJointPositionActionCfg
+
+    def __init__(self, cfg: WaterhoseDirectGripperJointPositionActionCfg, env):
+        super().__init__(cfg, env)
+
+        self._joint_ids, self._joint_names = self._asset.find_joints(self.cfg.joint_names)
+        self._joint_ids_warp = wp.array(self._joint_ids, dtype=wp.int32, device=self.device)
+        self._num_joints = len(self._joint_ids)
+
+        self._open_command = self._resolve_command(self.cfg.open_command_expr, "open")
+        self._close_command = self._resolve_command(self.cfg.close_command_expr, "close")
+        self._command_lower = torch.minimum(self._open_command, self._close_command)
+        self._command_upper = torch.maximum(self._open_command, self._close_command)
+
+        self._raw_actions = self._open_command.unsqueeze(0).repeat(self.num_envs, 1)
+        self._processed_actions = self._raw_actions.clone()
+
+    def _resolve_command(self, command_expr: dict[str, float], command_name: str) -> torch.Tensor:
+        """Resolve one named command against the configured joint ordering."""
+
+        command = torch.zeros(self._num_joints, device=self.device)
+        indices, names, values = string_utils.resolve_matching_names_values(command_expr, self._joint_names)
+        if len(indices) != self._num_joints:
+            raise ValueError(f"Missing {command_name} gripper targets for: {set(self._joint_names) - set(names)}")
+        command[indices] = torch.tensor(values, device=self.device)
+        return command
+
+    @property
+    def action_dim(self) -> int:
+        return self._num_joints
+
+    @property
+    def raw_actions(self) -> torch.Tensor:
+        return self._raw_actions
+
+    @property
+    def processed_actions(self) -> torch.Tensor:
+        return self._processed_actions
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        self._raw_actions[:] = actions
+        self._processed_actions[:] = torch.clamp(actions, min=self._command_lower, max=self._command_upper)
+
+    def apply_actions(self) -> None:
+        self._asset.set_joint_position_target_index(target=self._processed_actions, joint_ids=self._joint_ids_warp)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self._raw_actions[env_ids] = self._open_command
+        self._processed_actions[env_ids] = self._open_command
+
+
 class WaterhoseBimanualTeleopNewtonIkAction(NewtonInverseKinematicsAction):
     """Calibrate both absolute wrist targets while holding the RBY1 torso fixed.
 
@@ -328,3 +401,139 @@ class WaterhoseBimanualTeleopNewtonIkAction(NewtonInverseKinematicsAction):
         self._operator_target_references_b[env_ids] = 0.0
         self._operator_tracking_valid[env_ids] = False
         self._holds_captured = False
+
+
+def _write_direct_bimanual_ik_actions(
+    full_actions: torch.Tensor,
+    wrist_targets: torch.Tensor,
+    hold_targets: torch.Tensor,
+    hold_action_offsets: Sequence[int],
+) -> torch.Tensor:
+    """Pack direct wrist targets and fixed-body holds into the full Newton IK action."""
+
+    full_actions.zero_()
+    full_actions[:, : wrist_targets.shape[-1]] = wrist_targets
+    for index, action_offset in enumerate(hold_action_offsets):
+        full_actions[:, action_offset : action_offset + 7] = hold_targets[:, index]
+    return full_actions
+
+
+def _capture_pending_hold_targets_b(
+    hold_targets_b: torch.Tensor,
+    holds_captured: torch.Tensor,
+    root_pos_w: torch.Tensor,
+    root_quat_w: torch.Tensor,
+    body_pos_w: torch.Tensor,
+    body_quat_w: torch.Tensor,
+    hold_body_indices: Sequence[int],
+) -> None:
+    """Capture root-relative hold poses only for environments marked pending."""
+
+    pending = ~holds_captured
+    for hold_index, body_index in enumerate(hold_body_indices):
+        pos_b, quat_b = math_utils.subtract_frame_transforms(
+            root_pos_w,
+            root_quat_w,
+            body_pos_w[:, body_index],
+            body_quat_w[:, body_index],
+        )
+        captured_pose_b = torch.cat((pos_b, quat_b), dim=-1)
+        hold_targets_b[:, hold_index] = torch.where(
+            pending.unsqueeze(-1),
+            captured_pose_b,
+            hold_targets_b[:, hold_index],
+        )
+    holds_captured.fill_(True)
+
+
+class WaterhoseDirectBimanualNewtonIkAction(NewtonInverseKinematicsAction):
+    """Drive two robot-side wrist targets directly while holding the RBY1 torso fixed."""
+
+    _WRIST_OBJECTIVE_NAMES = ("right_ee", "left_ee")
+    _HOLD_OBJECTIVE_NAMES = ("torso_hold",)
+
+    def __init__(self, cfg, env) -> None:
+        super().__init__(cfg, env)
+        driver_names = tuple(driver.objective.name for driver in self._drivers)
+        expected_names = self._WRIST_OBJECTIVE_NAMES + self._HOLD_OBJECTIVE_NAMES
+        if driver_names != expected_names:
+            raise ValueError(
+                f"WaterhoseDirectBimanualNewtonIkAction expects pose objectives {expected_names}, got {driver_names}."
+            )
+
+        wrist_driver_count = len(self._WRIST_OBJECTIVE_NAMES)
+        self._wrist_drivers = self._drivers[:wrist_driver_count]
+        self._hold_drivers = self._drivers[wrist_driver_count:]
+        self._direct_action_dim = sum(driver.objective.action_dim for driver in self._wrist_drivers)
+        if self._direct_action_dim != 14:
+            raise ValueError(f"Expected two seven-dimensional wrist targets, got {self._direct_action_dim} values.")
+
+        self._direct_raw_actions = torch.zeros(self.num_envs, self._direct_action_dim, device=self.device)
+        self._direct_processed_actions = torch.zeros_like(self._direct_raw_actions)
+        self._full_actions = torch.zeros(self.num_envs, self._action_dim, device=self.device)
+        self._hold_targets_b = torch.zeros(self.num_envs, len(self._hold_drivers), 7, device=self.device)
+        self._hold_action_offsets = tuple(driver.action_offset for driver in self._hold_drivers)
+        self._hold_body_indices = tuple(driver.body_idx for driver in self._hold_drivers)
+        self._holds_captured = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._hold_capture_pending = True
+
+    @property
+    def action_dim(self) -> int:
+        return self._direct_action_dim
+
+    @property
+    def raw_actions(self) -> torch.Tensor:
+        return self._direct_raw_actions
+
+    @property
+    def processed_actions(self) -> torch.Tensor:
+        return self._direct_processed_actions
+
+    @property
+    def IO_descriptor(self) -> GenericActionIODescriptor:
+        """Describe the two external wrist targets without the internal torso hold."""
+
+        descriptor = super().IO_descriptor
+        descriptor.shape = (self._direct_action_dim,)
+        descriptor.action_type = "WaterhoseDirectBimanualNewtonIkAction"
+        descriptor.extras["objective_names"] = [driver.objective.name for driver in self._wrist_drivers]
+        descriptor.extras["coordinate_names"] = [
+            f"{driver.objective.name}/{coordinate}"
+            for driver in self._wrist_drivers
+            for coordinate in driver.objective.command_coordinate_names()
+        ]
+        return descriptor
+
+    def _capture_hold_targets(self) -> None:
+        _capture_pending_hold_targets_b(
+            self._hold_targets_b,
+            self._holds_captured,
+            self._asset.data.root_pos_w.torch,
+            self._asset.data.root_quat_w.torch,
+            self._asset.data.body_pos_w.torch,
+            self._asset.data.body_quat_w.torch,
+            self._hold_body_indices,
+        )
+        self._hold_capture_pending = False
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        if self._hold_capture_pending:
+            self._capture_hold_targets()
+
+        self._direct_raw_actions[:] = actions
+        self._direct_processed_actions[:] = self._direct_raw_actions
+        _write_direct_bimanual_ik_actions(
+            self._full_actions,
+            self._direct_processed_actions,
+            self._hold_targets_b,
+            self._hold_action_offsets,
+        )
+        NewtonInverseKinematicsAction.process_actions(self, self._full_actions)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        env_ids = slice(None) if env_ids is None else env_ids
+        NewtonInverseKinematicsAction.reset(self, env_ids)
+        self._direct_raw_actions[env_ids] = 0.0
+        self._direct_processed_actions[env_ids] = 0.0
+        self._holds_captured[env_ids] = False
+        self._hold_capture_pending = True

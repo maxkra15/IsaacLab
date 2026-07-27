@@ -172,6 +172,37 @@ acceptance pass must still verify:
 4. Play and Stop gate motion, and Reset restores the scene and re-clutches both wrists.
 5. No mixed-WebSockets or target-frame warnings remain after startup.
 
+## Mimic annotation and generation
+
+AVP collection remains a 16-D operator-input task. Its recorder also stores a 20-D
+`processed_actions` stream containing the robot-side targets actually sent downstream:
+
+```text
+right wrist pose (7), left wrist pose (7),
+right gripper joint targets (3), left gripper joint targets (3)
+```
+
+`Isaac-Waterhose-Coupled-Mimic-v0` consumes that 20-D stream directly. It does not run the AVP
+clutch again, and annotated output is written back under the standard `actions` key expected by
+Mimic generation. The initial configuration treats each arm's complete trajectory as one final
+subtask, so automatic annotation does not require intermediate subtask signals.
+
+```bash
+VIRTUAL_ENV="$PWD/.venv" ./isaaclab.sh -p \
+  scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
+  --task Isaac-Waterhose-Coupled-Mimic-v0 \
+  --input_file /path/to/waterhose_teleop.hdf5 \
+  --output_file /path/to/waterhose_annotated.hdf5 \
+  --auto --headless --visualizer none --device cuda:0
+
+VIRTUAL_ENV="$PWD/.venv" ./isaaclab.sh -p \
+  scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+  --task Isaac-Waterhose-Coupled-Mimic-v0 \
+  --input_file /path/to/waterhose_annotated.hdf5 \
+  --output_file /path/to/waterhose_generated.hdf5 \
+  --num_envs 1 --headless --visualizer none --device cuda:0
+```
+
 ## Newton contact scope
 
 The coupled scene has an explicit ownership boundary:

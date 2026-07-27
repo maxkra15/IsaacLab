@@ -6,6 +6,10 @@ Added
   required waterhose assets are distributed separately from the Git
   repository.
 
+* Added a dedicated Isaac Lab Mimic task that replays the recorded 20D
+  ``processed_actions`` as direct bimanual wrist poses and explicit hand-joint
+  targets, without applying the Apple Vision Pro clutch a second time.
+
 Fixed
 ^^^^^
 

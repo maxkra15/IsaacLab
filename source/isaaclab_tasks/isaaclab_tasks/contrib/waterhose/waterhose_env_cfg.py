@@ -77,7 +77,7 @@ from .geometry import (
     SOCKET_ROT_QUAT_XYZW,
     SOCKET_SEATED_TIP_DEPTH,
 )
-from .mdp.actions import WaterhoseGripperPositionActionCfg
+from .mdp.actions import WaterhoseDirectGripperJointPositionActionCfg, WaterhoseGripperPositionActionCfg
 from .mdp.events import reset_cable_to_default
 from .mdp.terminations import plug_inserted_in_socket
 
@@ -1041,6 +1041,34 @@ class WaterhoseNewtonBimanualIkActionsCfg(WaterhoseRightGripperActionsCfg):
         close_command_expr=dict(_LEFT_GRIPPER_CLOSE_COMMAND),
         max_joint_delta_per_step=_GRIPPER_MAX_JOINT_DELTA_PER_STEP,
     )
+
+
+@configclass
+class WaterhoseNewtonDirectBimanualActionsCfg(WaterhoseNewtonBimanualIkActionsCfg):
+    """Direct robot-side wrist and gripper targets for Isaac Lab Mimic.
+
+    The action layout is ``[right wrist pose(7), left wrist pose(7), right hand joints(3),
+    left hand joints(3)]``. Unlike :class:`WaterhoseNewtonBimanualIkActionsCfg`, the wrist
+    targets are already expressed in the robot-root frame and bypass AVP clutching.
+    """
+
+    gripper_action = WaterhoseDirectGripperJointPositionActionCfg(
+        asset_name="robot",
+        joint_names=_RIGHT_GRIPPER_JOINT_NAMES,
+        open_command_expr=dict(_RIGHT_GRIPPER_OPEN_COMMAND),
+        close_command_expr=dict(_RIGHT_GRIPPER_CLOSE_COMMAND),
+    )
+    left_gripper_action = WaterhoseDirectGripperJointPositionActionCfg(
+        asset_name="robot",
+        joint_names=_LEFT_GRIPPER_JOINT_NAMES,
+        open_command_expr=dict(_LEFT_GRIPPER_OPEN_COMMAND),
+        close_command_expr=dict(_LEFT_GRIPPER_CLOSE_COMMAND),
+    )
+
+    def __post_init__(self) -> None:
+        self.arm_action.class_type = (
+            "isaaclab_tasks.contrib.waterhose.mdp.actions:WaterhoseDirectBimanualNewtonIkAction"
+        )
 
 
 @configclass

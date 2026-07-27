@@ -30,3 +30,12 @@ gym.register(
         "env_cfg_entry_point": f"{__name__}.teleop_env_cfg:WaterhoseTeleopEnvCfg",
     },
 )
+
+gym.register(
+    id="Isaac-Waterhose-Coupled-Mimic-v0",
+    entry_point="isaaclab_tasks.contrib.waterhose.waterhose_mimic_env:WaterhoseMimicEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.mimic_env_cfg:WaterhoseMimicEnvCfg",
+    },
+)
