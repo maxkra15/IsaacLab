@@ -8,6 +8,10 @@ import asyncio
 from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
 
 from isaaclab_mimic.datagen.datagen_info import DatagenInfo
+from isaaclab_mimic.episode_replay import (
+    get_required_subtask_term_signal_names,
+    resolve_episode_subtask_term_signals,
+)
 
 
 class DataGenInfoPool:
@@ -52,6 +56,7 @@ class DataGenInfoPool:
             self.subtask_term_offset_ranges[eef_name] = [
                 subtask_config.subtask_term_offset_range for subtask_config in eef_subtask_configs
             ]
+        self._required_subtask_term_signal_names = get_required_subtask_term_signal_names(env_cfg.subtask_configs)
 
     @property
     def datagen_infos(self):
@@ -104,7 +109,10 @@ class DataGenInfoPool:
             eef_pose = ep_grp["obs"]["datagen_info"]["eef_pose"]
             object_poses_dict = ep_grp["obs"]["datagen_info"]["object_pose"]
             target_eef_pose = ep_grp["obs"]["datagen_info"]["target_eef_pose"]
-            subtask_term_signals_dict = ep_grp["obs"]["datagen_info"]["subtask_term_signals"]
+            subtask_term_signals_dict = resolve_episode_subtask_term_signals(
+                episode,
+                required_signal_names=self._required_subtask_term_signal_names,
+            )
             # subtask_start_signals is optional
             subtask_start_signals_dict = ep_grp["obs"]["datagen_info"].get("subtask_start_signals")
         else:

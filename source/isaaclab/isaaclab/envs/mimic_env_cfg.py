@@ -320,3 +320,13 @@ class MimicEnvCfg:
 
     # Optional recorder configuration
     mimic_recorder_config: RecorderManagerBaseCfg | None = None
+
+    annotation_replay_action_key: str = "actions"
+    """Top-level episode-data key replayed by the Mimic annotation script.
+
+    The selected sequence must contain actions compatible with the configured
+    environment action space. The annotation recorder writes the replayed
+    sequence to the canonical ``actions`` field in the output dataset, even
+    when this option selects an alternate input field such as
+    ``processed_actions``.
+    """

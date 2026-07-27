@@ -66,6 +66,12 @@ import gymnasium as gym
 import torch
 
 import isaaclab_mimic.envs  # noqa: F401
+from isaaclab_mimic.episode_replay import (
+    get_required_subtask_term_signal_names,
+    has_manual_subtask_annotations,
+    resolve_episode_replay_actions,
+    resolve_episode_subtask_term_signals,
+)
 
 # Only enables inputs if this script is NOT headless mode
 if not args_cli.headless and not os.environ.get("HEADLESS", 0):
@@ -167,6 +173,15 @@ class MimicRecorderManagerCfg(ActionStateRecorderManagerCfg):
     record_pre_step_subtask_term_signals = PreStepSubtaskTermsObservationsRecorderCfg()
 
 
+def _get_episode_replay_actions(env: ManagerBasedRLMimicEnv, episode: EpisodeData) -> torch.Tensor:
+    """Return the configured replay sequence after validating it against the environment."""
+    return resolve_episode_replay_actions(
+        episode,
+        action_key=getattr(env.cfg, "annotation_replay_action_key", "actions"),
+        expected_action_dim=env.action_manager.total_action_dim,
+    )
+
+
 def main():
     """Add Isaac Lab Mimic annotations to the given demo dataset file."""
     global is_paused, current_action_index, marked_subtask_action_indices
@@ -198,6 +213,7 @@ def main():
     env_cfg = parse_env_cfg(env_name, device=args_cli.device, num_envs=1)
 
     env_cfg.env_name = env_name
+    required_subtask_term_signal_names = get_required_subtask_term_signal_names(env_cfg.subtask_configs)
 
     # extract success checking function to invoke manually
     success_term = None
@@ -212,8 +228,9 @@ def main():
 
     # Set up recorder terms for mimic annotations
     env_cfg.recorders = MimicRecorderManagerCfg()
-    if not args_cli.auto:
-        # disable subtask term signals recorder term if in manual mode
+    if not args_cli.auto or not required_subtask_term_signal_names:
+        # Manual annotation supplies its own boundaries. Final-only automatic
+        # configurations have no intermediate boundaries to record.
         env_cfg.recorders.record_pre_step_subtask_term_signals = None
 
     if not args_cli.auto or (args_cli.auto and not args_cli.annotate_subtask_start_signals):
@@ -230,8 +247,13 @@ def main():
         raise ValueError("The environment should be derived from ManagerBasedRLMimicEnv")
 
     if args_cli.auto:
-        # check if the mimic API env.get_subtask_term_signals() is implemented
-        if env.get_subtask_term_signals.__func__ is ManagerBasedRLMimicEnv.get_subtask_term_signals:
+        # Only configurations with non-final boundaries need the corresponding
+        # Mimic API method. A final-only trajectory is already delimited by the
+        # episode itself.
+        if (
+            required_subtask_term_signal_names
+            and env.get_subtask_term_signals.__func__ is ManagerBasedRLMimicEnv.get_subtask_term_signals
+        ):
             raise NotImplementedError(
                 "The environment does not implement the get_subtask_term_signals method required "
                 "to run automatic annotations."
@@ -350,9 +372,12 @@ def replay_episode(
         False otherwise.
     """
     global current_action_index, skip_episode, is_paused
-    # read initial state and actions from the loaded episode
+    # Read the initial state and configured replay sequence from the loaded
+    # episode. The pre-step action recorder writes this env.step input back to
+    # the canonical ``actions`` field, keeping annotated datasets compatible
+    # with the downstream Mimic data pool.
     initial_state = episode.data["initial_state"]
-    actions = episode.data["actions"]
+    actions = _get_episode_replay_actions(env, episode)
     env.sim.reset()
     env.recorder_manager.reset()
     env.reset_to(initial_state, None, is_relative=True)
@@ -405,8 +430,13 @@ def annotate_episode_in_auto_mode(
     else:
         # check if all the subtask term signals are annotated
         annotated_episode = env.recorder_manager.get_episode(0)
-        subtask_term_signal_dict = annotated_episode.data["obs"]["datagen_info"]["subtask_term_signals"]
-        for signal_name, signal_flags in subtask_term_signal_dict.items():
+        required_signal_names = get_required_subtask_term_signal_names(env.cfg.subtask_configs)
+        subtask_term_signal_dict = resolve_episode_subtask_term_signals(
+            annotated_episode,
+            required_signal_names=required_signal_names,
+        )
+        for signal_name in sorted(required_signal_names):
+            signal_flags = subtask_term_signal_dict[signal_name]
             signal_flags = torch.tensor(signal_flags, device=env.device)
             if not torch.any(signal_flags):
                 is_episode_annotated_successfully = False
@@ -442,6 +472,16 @@ def annotate_episode_in_manual_mode(
         True if the episode was successfully annotated, False otherwise.
     """
     global is_paused, marked_subtask_action_indices, skip_episode
+    if not has_manual_subtask_annotations(subtask_term_signal_names, subtask_start_signal_names):
+        skip_episode = False
+        task_success_result = replay_episode(env, episode, success_term)
+        if skip_episode:
+            print("\tSkipping the episode.")
+            return False
+        if not task_success_result:
+            print("\tThe final task was not completed.")
+        return task_success_result
+
     # iterate over the eefs for marking subtask term signals
     subtask_term_signal_action_indices = {}
     subtask_start_signal_action_indices = {}
@@ -510,7 +550,7 @@ def annotate_episode_in_manual_mode(
         subtask_term_signal_action_index,
     ) in subtask_term_signal_action_indices.items():
         # subtask termination signal is false until subtask is complete, and true afterwards
-        subtask_signals = torch.ones(len(episode.data["actions"]), dtype=torch.bool)
+        subtask_signals = torch.ones(len(_get_episode_replay_actions(env, episode)), dtype=torch.bool)
         subtask_signals[:subtask_term_signal_action_index] = False
         annotated_episode.add(f"obs/datagen_info/subtask_term_signals/{subtask_term_signal_name}", subtask_signals)
 
@@ -519,7 +559,7 @@ def annotate_episode_in_manual_mode(
             subtask_start_signal_name,
             subtask_start_signal_action_index,
         ) in subtask_start_signal_action_indices.items():
-            subtask_signals = torch.ones(len(episode.data["actions"]), dtype=torch.bool)
+            subtask_signals = torch.ones(len(_get_episode_replay_actions(env, episode)), dtype=torch.bool)
             subtask_signals[:subtask_start_signal_action_index] = False
             annotated_episode.add(
                 f"obs/datagen_info/subtask_start_signals/{subtask_start_signal_name}", subtask_signals
