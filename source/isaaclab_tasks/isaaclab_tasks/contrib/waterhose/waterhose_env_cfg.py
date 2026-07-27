@@ -282,10 +282,10 @@ _LEFT_GRIPPER_JOINT_NAMES = [
     "left_gripper_left_finger_joint",
     "left_gripper_right_finger_joint",
 ]
-# Open/close is binary at the input, but the 76 mm gripper-driver stroke is applied over 0.16 s
-# instead of teleporting its VBD proxy through the connector in one 10 ms step. The action term
-# interpolates every gripper joint with one shared alpha.
-_GRIPPER_MAX_JOINT_DELTA_PER_STEP = 0.005
+# Preserve the published client task's gripper response. This 150 mm per-step limit exceeds the
+# complete 76 mm driver stroke, so an open/close transition completes in one 10 ms simulation step
+# while the shared-alpha action term keeps all three gripper joints synchronized.
+_GRIPPER_MAX_JOINT_DELTA_PER_STEP = 0.15
 
 
 def _env_positive_int(name: str, default: int) -> int:

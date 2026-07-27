@@ -13,6 +13,9 @@ Added
 Fixed
 ^^^^^
 
+* Restored the published one-step RBY1 gripper response for Apple Vision Pro
+  teleoperation and recording compatibility.
+
 * Included both authored fridge props in the robot-only MJWarp collision proxy
   without adding them to the cable VBD contact space.
 

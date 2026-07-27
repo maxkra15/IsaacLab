@@ -230,9 +230,9 @@ The coupled scene has an explicit ownership boundary:
   fixed-feedback coupling pass without Aitken relaxation. The task contact material uses
   `ke=1.0e4 N/m` and `kd=0.1 N s/m`; the finger proxies use friction `20.0`, a 1 mm physical margin,
   and a 10 mm broad-phase gap, while connector/socket/cable shapes retain the lower task friction.
-  AVP gripper commands use synchronized finger interpolation limited to 5 mm of joint travel per
-  simulation step (about 0.16 s for the full driver stroke). The scripted demo closes smoothly over
-  its state-machine trajectory and keeps its direct target path.
+  AVP gripper commands preserve the published client task's 150 mm per-step limit. That exceeds the
+  complete 76 mm driver stroke, so open/close transitions complete in one simulation step while all
+  three gripper joints remain synchronized. The scripted demo keeps its direct target path.
 
 Insertion and retention are pure contact physics. There is no connector latch, snap constraint,
 adhesion, or post-insertion kinematic hold. The success check only observes connector alignment and
