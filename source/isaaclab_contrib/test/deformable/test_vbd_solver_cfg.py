@@ -13,9 +13,21 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from newton import ModelBuilder
 
 from isaaclab_contrib.deformable import vbd_manager
 from isaaclab_contrib.deformable.newton_manager_cfg import VBDSolverCfg
+
+
+def test_vbd_manager_registers_per_joint_constraint_attributes():
+    builder = ModelBuilder()
+
+    vbd_manager.NewtonVBDManager._register_builder_attributes(builder)
+    vbd_manager.NewtonVBDManager._register_builder_attributes(builder)
+
+    assert builder.custom_attributes["vbd:joint_is_hard"].default == 1
+    assert builder.custom_attributes["vbd:dahl_eps_max"].default == pytest.approx(0.0)
+    assert builder.custom_attributes["vbd:dahl_tau"].default == pytest.approx(0.0)
 
 
 def test_vbd_configured_rigid_options_match_newton_constructor():

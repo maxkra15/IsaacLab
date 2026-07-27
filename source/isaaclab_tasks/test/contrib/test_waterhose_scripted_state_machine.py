@@ -30,6 +30,10 @@ class _FakeRobot:
         return [self._body_ids[name]], [name]
 
 
+class _FakeActionManager:
+    total_action_dim = 22
+
+
 class _FakeCable:
     def __init__(self):
         self.position = torch.tensor([[-0.25, 0.25, 0.25]])
@@ -86,7 +90,7 @@ def test_carry_target_recenters_connector_slip_within_phase():
     cable = _FakeCable()
     env = SimpleNamespace(
         scene=_FakeScene(_FakeRobot(), cable),
-        action_manager=SimpleNamespace(total_action_dim=22),
+        action_manager=_FakeActionManager(),
     )
     state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
     state.phase[:] = state.CARRY
@@ -112,7 +116,7 @@ def test_carry_does_not_advance_on_hard_timeout():
     cable = _FakeCable()
     env = SimpleNamespace(
         scene=_FakeScene(_FakeRobot(), cable),
-        action_manager=SimpleNamespace(total_action_dim=22),
+        action_manager=_FakeActionManager(),
     )
     state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
     state.phase[:] = state.CARRY
@@ -131,7 +135,7 @@ def test_lost_grasp_retries_approach_before_align():
     cable = _FakeCable()
     env = SimpleNamespace(
         scene=_FakeScene(_FakeRobot(), cable),
-        action_manager=SimpleNamespace(total_action_dim=22),
+        action_manager=_FakeActionManager(),
     )
     state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
 
@@ -215,13 +219,81 @@ def test_graph_state_machine_retries_a_lost_grasp_on_cpu():
     assert not grasp_reference_valid.numpy()[0]
 
 
+def test_graph_inserted_hold_finishes_with_closed_gripper():
+    """The captured controller must finish directly from the seated hold."""
+
+    device = "cpu"
+    identity = wp.transform()
+    robot_body_q = wp.array([[identity]], dtype=wp.transform, device=device)
+    robot_root_q = wp.array([identity], dtype=wp.transform, device=device)
+    cable_body_q = wp.array(
+        [wp.transform(wp.vec3(0.0, 0.0, scripted_state_machine.SOCKET_SEATED_TIP_DEPTH), wp.quat_identity())],
+        dtype=wp.transform,
+        device=device,
+    )
+    cable_head_bodies = wp.array([0], dtype=wp.int32, device=device)
+    env_origins = wp.zeros(1, dtype=wp.vec3, device=device)
+    phase = wp.array([WaterhoseDemoState.HOLD_INSERTED], dtype=wp.int32, device=device)
+    elapsed = wp.array(
+        [WaterhoseDemoState.DURATIONS[WaterhoseDemoState.HOLD_INSERTED]], dtype=wp.float32, device=device
+    )
+    durations = wp.array(WaterhoseDemoState.DURATIONS, dtype=wp.float32, device=device)
+    phase_ee = wp.array([identity], dtype=wp.transform, device=device)
+    phase_connector = wp.array([identity], dtype=wp.transform, device=device)
+    frozen_tip_offset = wp.zeros(1, dtype=wp.vec3, device=device)
+    frozen_insert_rotation = wp.array([wp.quat_identity()], dtype=wp.quat, device=device)
+    grasp_reference_valid = wp.array([False], dtype=wp.bool, device=device)
+    right_target_position = wp.zeros(1, dtype=wp.vec3, device=device)
+    right_target_rotation = wp.zeros(1, dtype=wp.vec4, device=device)
+    gripper_blend = wp.zeros(1, dtype=wp.float32, device=device)
+    diagnostics = wp.zeros((1, 6), dtype=wp.float32, device=device)
+
+    wp.launch(
+        scripted_state_machine._update_state_machine_wp,
+        dim=1,
+        inputs=[
+            robot_body_q,
+            robot_root_q,
+            cable_body_q,
+            cable_head_bodies,
+            env_origins,
+            phase,
+            elapsed,
+            durations,
+            phase_ee,
+            phase_connector,
+            frozen_tip_offset,
+            frozen_insert_rotation,
+            grasp_reference_valid,
+            0,
+            identity,
+            identity,
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.quat_identity(),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.quat_identity(),
+            wp.vec3(0.0, 0.0, 0.0),
+            0.01,
+            right_target_position,
+            right_target_rotation,
+            gripper_blend,
+            diagnostics,
+        ],
+        device=device,
+    )
+
+    assert phase.numpy()[0] == WaterhoseDemoState.DONE
+    assert gripper_blend.numpy()[0] == 1.0
+
+
 def test_approach_target_is_fixed_to_its_phase_entry_connector_pose():
     """APPROACH must not chase cable motion and shift the connector within the finger pads."""
 
     cable = _FakeCable()
     env = SimpleNamespace(
         scene=_FakeScene(_FakeRobot(), cable),
-        action_manager=SimpleNamespace(total_action_dim=22),
+        action_manager=_FakeActionManager(),
     )
     state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
     state.phase[:] = state.APPROACH
@@ -243,7 +315,7 @@ def test_insert_retries_alignment_on_hard_timeout_when_connector_is_not_retained
     cable = _FakeCable()
     env = SimpleNamespace(
         scene=_FakeScene(_FakeRobot(), cable),
-        action_manager=SimpleNamespace(total_action_dim=22),
+        action_manager=_FakeActionManager(),
     )
     state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
     cable.position[:] = state.socket_pos_w + 1.0
@@ -264,7 +336,7 @@ def test_align_replans_from_measured_pose_on_hard_timeout():
     cable = _FakeCable()
     env = SimpleNamespace(
         scene=_FakeScene(_FakeRobot(), cable),
-        action_manager=SimpleNamespace(total_action_dim=22),
+        action_manager=_FakeActionManager(),
     )
     state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
     cable.position[:] = state.socket_pos_w + 1.0
@@ -283,7 +355,7 @@ def test_insert_does_not_advance_on_ee_convergence_when_connector_is_not_retaine
     cable = _FakeCable()
     env = SimpleNamespace(
         scene=_FakeScene(_FakeRobot(), cable),
-        action_manager=SimpleNamespace(total_action_dim=22),
+        action_manager=_FakeActionManager(),
     )
     state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
     cable.position[:] = state.socket_pos_w + 1.0
@@ -299,13 +371,36 @@ def test_insert_does_not_advance_on_ee_convergence_when_connector_is_not_retaine
     assert state.phase.item() == state.INSERT
 
 
+def test_inserted_hold_finishes_without_releasing_or_retreating():
+    """A seated connector should finish directly with the grasp held closed."""
+
+    cable = _FakeCable()
+    env = SimpleNamespace(
+        scene=_FakeScene(_FakeRobot(), cable),
+        action_manager=_FakeActionManager(),
+    )
+    state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
+    cable.orientation[:] = state.socket_quat_w
+    insertion_axis = normalize(quat_apply(state.socket_quat_w, state.connector_axis_local))
+    tip_offset = quat_apply(cable.orientation, state.connector_tip_local_pos)
+    cable.position[:] = state.socket_pos_w + state.seated_tip_depth * insertion_axis - tip_offset
+    state.phase[:] = state.HOLD_INSERTED
+    state.elapsed[:] = state.durations[state.HOLD_INSERTED]
+
+    state.compute(env)
+    done_action = state.compute(env)
+
+    assert state.phase.item() == state.DONE
+    assert done_action[0, -1].item() == -1.0
+
+
 def test_connector_retention_uses_measured_seated_pose():
     """The terminal predicate accepts the validated seat and rejects lateral loss."""
 
     cable = _FakeCable()
     env = SimpleNamespace(
         scene=_FakeScene(_FakeRobot(), cable),
-        action_manager=SimpleNamespace(total_action_dim=22),
+        action_manager=_FakeActionManager(),
     )
     state = WaterhoseDemoState(num_envs=1, step_dt=0.01, device="cpu", settle_time=0.01, debug=False)
     cable.orientation[:] = state.socket_quat_w

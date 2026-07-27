@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import warp as wp
 from isaaclab_newton.physics.newton_manager import NewtonManager
-from newton import Model
+from newton import Model, ModelBuilder
 from newton._src.usd.schemas import SchemaResolverNewton, SchemaResolverPhysx
 from newton.solvers import SolverVBD
 
@@ -57,6 +57,12 @@ class NewtonVBDManager(NewtonManager):
 
     Always uses Newton's :class:`CollisionPipeline` for contact handling.
     """
+
+    @classmethod
+    def _register_builder_attributes(cls, builder: ModelBuilder) -> None:
+        """Register per-joint VBD constraint and friction attributes."""
+        super()._register_builder_attributes(builder)
+        SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
 
     @classmethod
     def initialize(cls, sim_context: SimulationContext) -> None:

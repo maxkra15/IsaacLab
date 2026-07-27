@@ -6,12 +6,13 @@
 """Scripted IK state machine for the RBY1 waterhose grasp-and-insert demo.
 
 Phases: ``REST -> APPROACH -> ENGAGE -> GRASP -> HOLD_GRASP -> RETRACT -> SETTLE ->
-LIFT -> CARRY -> ALIGN -> INSERT -> HOLD_INSERTED -> RELEASE -> BACKOFF -> DONE``.
+LIFT -> CARRY -> ALIGN -> INSERT -> HOLD_INSERTED -> DONE``.
 
 Each phase has a fixed minimum *duration* and an end-effector *target pose*. The commanded pose is a
-smoothstep blend from the entry pose to the target. A phase advances once its minimum duration has
-elapsed and the end effector has converged; safe free-space phases have a bounded timeout, while the
-near-socket phases wait for measured connector alignment.
+smoothstep blend from the entry pose to the target. Free-space phases advance after the end effector
+converges, while insertion phases advance from the measured connector geometry because contact
+compliance can keep the hand away from its unconstrained target. The terminal state holds the
+inserted pose and closed grasp; the scripted demo does not release or retreat.
 
 The output is the registered task's 22-D action vector:
 ``[right_ee pose(7), left_hold pose(7), torso_hold pose(7), gripper(1)]``. Positions are expressed in
@@ -70,9 +71,7 @@ _CARRY = 8
 _ALIGN = 9
 _INSERT = 10
 _HOLD_INSERTED = 11
-_RELEASE = 12
-_BACKOFF = 13
-_DONE = 14
+_DONE = 12
 
 
 def connector_retained_mask(env) -> torch.Tensor:
@@ -291,15 +290,10 @@ def _update_state_machine_wp(
         target_position = align_position
         target_rotation = align_rotation
         grip = 1.0
-    elif p == _INSERT or p == _HOLD_INSERTED:  # noqa: SIM109 - Warp kernels do not support membership.
+    elif p >= _INSERT:  # INSERT, HOLD_INSERTED, and terminal DONE.
         target_position = frozen_insert_position
         target_rotation = frozen_insert_rotation[env_id]
         grip = 1.0
-    elif p == _RELEASE:
-        grip = 1.0 - _smoothstep_wp(time / durations[_RELEASE])
-    elif p == _BACKOFF:
-        withdraw_axis = wp.quat_rotate(socket_rotation, wp.vec3(0.0, 1.0, 0.0))
-        target_position = frozen_insert_position + 0.10 * withdraw_axis
 
     blend = _smoothstep_wp(time / durations[p])
     command_position = (1.0 - blend) * start_position + blend * target_position
@@ -346,14 +340,14 @@ def _update_state_machine_wp(
         )
         if not align_ready:
             converged = False
-    elif p >= _INSERT and p < _DONE:
+    elif p >= _INSERT:
         retained = (
             axis_cos >= SOCKET_RETAINED_AXIS_COS
             and tip_radial_error <= SOCKET_RETAINED_RADIAL_TOLERANCE
             and wp.abs(tip_depth - SOCKET_SEATED_TIP_DEPTH) <= SOCKET_RETAINED_DEPTH_TOLERANCE
         )
-        if not retained:
-            converged = False
+        # Once contact has seated the connector, measured retention is the phase objective.
+        converged = retained
 
     next_time = time + frame_dt
     minimum_time_met = next_time >= durations[p]
@@ -384,7 +378,7 @@ def _update_state_machine_wp(
         elapsed[env_id] = 0.0
     elif hard_timeout and p == _INSERT:
         # A failed axial push should back out to the standoff and re-align. Never
-        # advance toward release unless the measured connector is retained.
+        # advance toward the terminal hold unless the measured connector is retained.
         phase[env_id] = _ALIGN
         elapsed[env_id] = 0.0
     else:
@@ -458,8 +452,6 @@ class WaterhoseDemoState:
     ALIGN = _ALIGN
     INSERT = _INSERT
     HOLD_INSERTED = _HOLD_INSERTED
-    RELEASE = _RELEASE
-    BACKOFF = _BACKOFF
     DONE = _DONE
 
     PHASE_NAMES = (
@@ -475,12 +467,10 @@ class WaterhoseDemoState:
         "ALIGN",
         "INSERT",
         "HOLD_INSERTED",
-        "RELEASE",
-        "BACKOFF",
         "DONE",
     )
-    # Minimum time spent in each phase [s]. A phase advances once this has elapsed AND the end
-    # effector has converged, or its 2x hard timeout fires. DONE is terminal.
+    # Minimum time spent in each phase [s]. Free-space phases also require end-effector convergence;
+    # insertion uses measured connector retention. DONE holds the seated grasp and is terminal.
     DURATIONS = (
         0.25,
         3.0,
@@ -494,8 +484,6 @@ class WaterhoseDemoState:
         2.0,
         4.0,
         1.0,
-        0.8,
-        1.5,
         1.0e6,
     )
 
@@ -549,7 +537,6 @@ class WaterhoseDemoState:
         self.align_tip_depth = SOCKET_ALIGN_TIP_DEPTH
         self.lift_vector = self._vec((0.0, 0.0, 0.16))
         self.seated_tip_depth = SOCKET_SEATED_TIP_DEPTH
-        self.gripper_backoff_distance = 0.10
         self.connector_tip_local_pos = self._vec(CONNECTOR_TIP_LOCAL_POS)
 
         # End-effector orientation that grasps the plug from the side: Rx(+90) * Rz(-90).
@@ -678,7 +665,7 @@ class WaterhoseDemoState:
         #   * CARRY/ALIGN: live offset, to centre the physical tip on the bore axis.
         #   * INSERT entry: freeze the centred offset and aligned quaternion through
         #     INSERT/HOLD_INSERTED so the push stays straight instead of chasing contact deflection.
-        #   * Otherwise (REST..SETTLE, RELEASE..DONE): the static estimate.
+        #   * Otherwise (REST..SETTLE): the static estimate.
         grasped_tip_offset_ee = quat_apply(quat_inv(ee_quat_w), cable_tip_pos_w - ee_pos_w)
         retract_entry = (phase == self.RETRACT) & first_step
         self._tip_offset_frozen[retract_entry] = grasped_tip_offset_ee[retract_entry]
@@ -718,26 +705,14 @@ class WaterhoseDemoState:
         insert = phase == self.INSERT
         set_target(insert, frozen_inserted_pos, self._insert_quat_frozen, 1.0)
 
-        # HOLD_INSERTED: dwell at the seated pose before releasing the grasp.
+        # HOLD_INSERTED: dwell at the seated pose before finishing the scripted motion.
         hold_ins = phase == self.HOLD_INSERTED
         set_target(hold_ins, frozen_inserted_pos, self._insert_quat_frozen, 1.0)
 
-        # RELEASE: open the fingers while holding the inserted pose; do not pull the cable.
-        release = phase == self.RELEASE
-        release_blend = _smoothstep(self.elapsed / torch.clamp(self.durations[self.RELEASE], min=1.0e-6))
-        target_pos_w[release] = start_pos_w[release]
-        target_quat_w[release] = start_quat_w[release]
-        t_grip[release] = 1.0 - release_blend[release]
-
-        # BACKOFF: with the gripper open, move sideways away from the socket and cable.
-        withdraw_dir_w = quat_apply(self.socket_quat_w, self._vec((0.0, 1.0, 0.0)))
-        backoff_pos = frozen_inserted_pos + self.gripper_backoff_distance * withdraw_dir_w
-        backoff = phase == self.BACKOFF
-        set_target(backoff, backoff_pos, start_quat_w, 0.0)
-
-        # DONE: the gripper has backed away with the plug left inserted; keep the fingers open.
+        # DONE: hold the inserted pose and keep the fingers closed. The demo intentionally does not
+        # release, so the complete robot/fridge collision shells can remain enabled.
         done = phase == self.DONE
-        t_grip[done] = 0.0
+        set_target(done, frozen_inserted_pos, self._insert_quat_frozen, 1.0)
 
         # Smoothstep blend from the entry pose to the target pose (world frame).
         blend = _smoothstep(self.elapsed / self.durations[self.phase]).unsqueeze(-1)
@@ -790,13 +765,13 @@ class WaterhoseDemoState:
             & (torch.abs(tip_depth[:, 0] - self.align_tip_depth) < 0.003)
         )
         converged = converged & (~align_phase | align_ready)
-        retained_phase = (self.phase >= self.INSERT) & (self.phase < self.DONE)
         retained_ready = (
             (coax_cos >= SOCKET_RETAINED_AXIS_COS)
             & (tip_radial_error <= SOCKET_RETAINED_RADIAL_TOLERANCE)
             & (torch.abs(tip_depth[:, 0] - self.seated_tip_depth) <= SOCKET_RETAINED_DEPTH_TOLERANCE)
         )
-        converged = converged & (~retained_phase | retained_ready)
+        retained_objective_phase = self.phase >= self.INSERT
+        converged = torch.where(retained_objective_phase, retained_ready, converged)
 
         if self.debug:
             target_tip_offset = torch.where(align_phase.unsqueeze(-1), grasped_tip_offset_ee, tip_offset)
@@ -870,8 +845,6 @@ class WaterhoseGraphDemoState:
     ALIGN = _ALIGN
     INSERT = _INSERT
     HOLD_INSERTED = _HOLD_INSERTED
-    RELEASE = _RELEASE
-    BACKOFF = _BACKOFF
     DONE = _DONE
     PHASE_NAMES = WaterhoseDemoState.PHASE_NAMES
     DURATIONS = WaterhoseDemoState.DURATIONS
@@ -1071,9 +1044,12 @@ class WaterhoseGraphDemoState:
         phases = self.read_phases()
         current_phase = phases[0]
         phase_changed = current_phase != self._last_reported_phase
-        periodic_guided_report = current_phase in (self.CARRY, self.ALIGN, self.INSERT, self.HOLD_INSERTED) and (
-            step % 300 == 0
-        )
+        periodic_guided_report = current_phase in (
+            self.CARRY,
+            self.ALIGN,
+            self.INSERT,
+            self.HOLD_INSERTED,
+        ) and (step % 300 == 0)
         if phase_changed:
             print(f"[waterhose SM] step {step}: phase = {self.PHASE_NAMES[current_phase]}", flush=True)
             self._last_reported_phase = current_phase

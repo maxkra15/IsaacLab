@@ -19,6 +19,14 @@ def test_waterhose_physics_assets_are_task_local():
     assert Path(waterhose_env_cfg._RBY1_USD) == expected_dir / "rby1df" / "rby1df_waterhose.usda"
     assert Path(waterhose_env_cfg._PLUG_USD) == expected_dir / "fridge" / "cable" / "plug.usda"
     assert Path(waterhose_env_cfg._CABLE1_USD) == expected_dir / "fridge" / "cable" / "cable001.usda"
+    assert (
+        Path(waterhose_env_cfg._FRIDGE_ROBOT_COLLISION_PROXY_USD)
+        == expected_dir / "fridge_robot_manifold_collision.usda"
+    )
+    assert (
+        Path(waterhose_env_cfg._FRIDGE_CABLE_COLLISION_PROXY_USD)
+        == expected_dir / "fridge_cable_manifold_collision.usda"
+    )
 
 
 def test_required_waterhose_assets_exist():
@@ -32,7 +40,8 @@ def test_required_waterhose_assets_exist():
         Path(waterhose_env_cfg._CABLE1_USD),
         Path(waterhose_env_cfg._SKY_HDR),
         Path(waterhose_env_cfg._GROUND_USD),
-        Path(waterhose_env_cfg._FRIDGE_COLLISION_PROXY_USD),
+        Path(waterhose_env_cfg._FRIDGE_ROBOT_COLLISION_PROXY_USD),
+        Path(waterhose_env_cfg._FRIDGE_CABLE_COLLISION_PROXY_USD),
         expected_dir / "fridge" / "cable" / "plug_visual.usda",
     )
     if not expected_dir.is_dir():

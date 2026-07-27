@@ -2,7 +2,7 @@
 
 The waterhose demo has two supported entry points:
 
-- `run_robot_demo.py` runs the scripted grasp, insertion, release, and retreat sequence.
+- `run_robot_demo.py` runs the scripted grasp-and-insert sequence and finishes in a seated hold.
 - `teleop_se3_agent.py` runs bimanual Apple Vision Pro control.
 
 Both use the same Newton proxy-coupled scene. The scripted runner intentionally does not launch the
@@ -25,7 +25,7 @@ not tracked by Git. From the Isaac Lab repository root, verify the archive and u
 
 ```bash
 ASSET_TARBALL=/path/to/waterhose_demo_assets.tar.gz
-echo "eb9dcd6f153240806d31f8db01ebf1ac826f63685e72d98f1d25df620e566176  $ASSET_TARBALL" \
+echo "28d66857c46737aca62e351011d1246bdca722a18d7167cd7e2397234fe7daab  $ASSET_TARBALL" \
   | sha256sum --check -
 tar -xzf "$ASSET_TARBALL" -C .
 ```
@@ -113,8 +113,8 @@ The validated high-fidelity defaults use 10 substeps, 20 VBD iterations, and one
 proxy-coupling pass. For controlled experiments, override them per run with `WATERHOSE_SUBSTEPS`,
 `WATERHOSE_VBD_ITERS`, and `WATERHOSE_COUPLING_ITERS`. More coupling passes are not a higher-fidelity
 drop-in setting for this nonlinear contact scene: they changed the retained connector behavior in
-testing. Re-run the full insertion, release, backoff, and linger acceptance sequence after changing any
-of these values.
+testing. Re-run the full insertion, seated-hold, and linger acceptance sequence after changing any of
+these values.
 
 ## Apple Vision Pro teleoperation
 
@@ -181,11 +181,15 @@ The coupled scene has an explicit ownership boundary:
   authoring enables the asset's dedicated gripper-base, camera-bracket, tool-flange, and wrist-pitch
   collision meshes on both arms. All twelve robot contact shapes use a raw, critically damped MuJoCo
   `solref=(0.005, 1.0)`, and the outer collision pipeline refreshes on every 1 ms solver substep.
-- VBD owns the articulated cable rods, the connector, the socket SDF, and the cable-clearanced housing.
+- VBD owns the articulated cable rods, the connector, the socket SDF, and the cable housing proxy.
+  Cable-to-fridge contact is therefore solved directly inside VBD and does not use proxy feedback.
+  The housing remains collidable everywhere except for a 15 mm local insertion corridor, where the
+  dedicated socket SDF supplies the physical insertion contact.
   The connector mesh and inertia are lumped into cable segment 0, so it is physically part of the
   cable rather than a detached visual or welded rigid body. VBD preserves authored joint modes: the
   rod's stretch/bend joints remain compliant, while the tail attachment uses a finite penalty
-  constraint (`rigid_joint_hard=False`) rather than a hard augmented-Lagrangian joint.
+  constraint by authoring `vbd:joint_is_hard=0` on that joint alone. Other non-cable structural
+  joints retain Newton's hard augmented-Lagrangian default.
 - Proxy coupling mirrors all four finger bodies into VBD. Those proxies collide with both the connector
   and the cable rods. Finger-to-fridge and finger-to-socket proxy pairs are filtered because MJWarp
   already owns robot-to-fridge contact; solving that pair in both entries pushes the grasp away from the

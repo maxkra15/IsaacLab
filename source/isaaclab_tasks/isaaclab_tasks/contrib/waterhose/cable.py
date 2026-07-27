@@ -213,6 +213,7 @@ class WaterhoseCableObject(CableObject):
             label=f"{expanded_path}/tail_attachment_w{world_idx}",
             collision_filter_parent=True,
             enabled=True,
+            custom_attributes={"vbd:joint_is_hard": 0},
         )
         # The fixed joint is a loop constraint on the existing rod articulation. Register it
         # separately so the VBD entry includes it without changing the rod's parent tree.

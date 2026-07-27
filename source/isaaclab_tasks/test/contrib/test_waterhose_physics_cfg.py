@@ -23,6 +23,7 @@ from isaaclab.managers import SceneEntityCfg
 
 from isaaclab_contrib.cable import cable_object as cable_object_module
 
+from isaaclab_tasks.contrib.waterhose import cable as waterhose_cable
 from isaaclab_tasks.contrib.waterhose import waterhose_env_cfg
 from isaaclab_tasks.contrib.waterhose.cable import WaterhoseCableObject, WaterhoseCableObjectCfg
 from isaaclab_tasks.contrib.waterhose.geometry import (
@@ -32,6 +33,7 @@ from isaaclab_tasks.contrib.waterhose.geometry import (
     CONNECTOR_TIP_LEN,
     CONNECTOR_TIP_LOCAL_POS,
     SOCKET_ALIGN_TIP_DEPTH,
+    SOCKET_COLLISION_MESH_PATTERN,
     SOCKET_SEATED_TIP_DEPTH,
 )
 
@@ -81,9 +83,9 @@ def test_waterhose_refreshes_outer_contacts_each_solver_substep():
     ("asset_path", "expected_shape_count"),
     [
         (waterhose_env_cfg._RBY1_USD, 4),
-        (waterhose_env_cfg._FRIDGE_COLLISION_PROXY_USD, 1),
+        (waterhose_env_cfg._FRIDGE_ROBOT_COLLISION_PROXY_USD, 1),
     ],
-    ids=["rby1-fingers", "fridge-housing"],
+    ids=["rby1-fingers", "fridge-robot-housing"],
 )
 def test_mjwarp_contact_shapes_author_raw_critically_damped_solref(asset_path, expected_shape_count):
     """MJWarp contact shapes use a direct response instead of the VBD ke/kd fallback."""
@@ -151,7 +153,7 @@ def test_waterhose_proxy_contacts_warm_start_the_grip():
     assert cfg.sim.physics.use_cuda_graph is True
     assert entries["vbd"].solver_cfg.rigid_contact_history is True
     assert entries["vbd"].solver_cfg.rigid_contact_hard is True
-    assert entries["vbd"].solver_cfg.rigid_joint_hard is False
+    assert entries["vbd"].solver_cfg.rigid_joint_hard is True
     assert entries["vbd"].solver_cfg.rigid_avbd_beta == pytest.approx(1.0e2)
     assert entries["vbd"].solver_cfg.rigid_contact_k_start == pytest.approx(1.0e3)
     assert entries["vbd"].solver_cfg.friction_epsilon == pytest.approx(0.1)
@@ -233,6 +235,7 @@ def test_waterhose_proxy_pipeline_restores_task_materials_on_imported_contact_sh
                 (4, 8),
                 (1, 2),
                 (3, 4),
+                (5, 7),
                 (6, 7),
                 (5, 8),
                 (6, 8),
@@ -269,6 +272,7 @@ def test_waterhose_proxy_pipeline_restores_task_materials_on_imported_contact_sh
                 (2, 6),
                 (3, 6),
                 (4, 6),
+                (5, 7),
                 (6, 7),
                 (5, 8),
                 (6, 8),
@@ -276,7 +280,7 @@ def test_waterhose_proxy_pipeline_restores_task_materials_on_imported_contact_sh
             dtype=np.int32,
         ),
     )
-    assert "kept 11 contact pair(s), dropped 10 finger-vs-unrelated pair(s)" in capsys.readouterr().out
+    assert "kept 12 contact pair(s), dropped 10 finger-vs-unrelated pair(s)" in capsys.readouterr().out
     assert pipeline.kwargs["contact_matching"] == "latest"
     assert pipeline.kwargs["contact_matching_pos_threshold"] == pytest.approx(0.005)
     assert pipeline.kwargs["contact_matching_normal_dot_threshold"] == pytest.approx(0.95)
@@ -295,6 +299,12 @@ def test_waterhose_vbd_owns_rod_bodies_not_particles():
     assert entries["vbd"].bodies == [waterhose_env_cfg._CABLE_BODY_PATTERN]
     assert entries["vbd"].particles == []
     assert entries["vbd"].all_particles is False
+    assert entries["vbd"].include_body_shapes is True
+    assert entries["vbd"].include_static_shapes is False
+    assert entries["vbd"].shape_label_patterns == [
+        SOCKET_COLLISION_MESH_PATTERN,
+        waterhose_env_cfg._FRIDGE_CABLE_COLLISION_PATTERN,
+    ]
 
     proxy = cfg.sim.physics.solver_cfg.proxies[0]
     assert proxy.bodies == [r"/World/envs/env_.*/Robot/.*/(left|right)_gripper_(left|right)finger"]
@@ -498,10 +508,64 @@ def test_canonical_assets_author_socket_sdf_and_render_only_connector():
 
     builder = ModelBuilder()
     result = builder.add_usd(waterhose_env_cfg._PLUG_USD, floating=False, load_visual_shapes=True)
+    assert builder.body_count == 1
+    assert len(result["path_shape_map"]) == 1
     connector_shape = next(iter(result["path_shape_map"].values()))
     vertices = np.asarray(builder.shape_source[connector_shape].vertices)
     assert pytest.approx(float(vertices[:, 2].max()), abs=1.0e-7) == CONNECTOR_TIP_LEN
     assert CONNECTOR_TIP_LOCAL_POS[2] == CONNECTOR_TIP_LEN
+
+
+@pytest.mark.parametrize(
+    ("proxy_path", "corridor_radius"),
+    [
+        (waterhose_env_cfg._FRIDGE_ROBOT_COLLISION_PROXY_USD, 0.065),
+        (waterhose_env_cfg._FRIDGE_CABLE_COLLISION_PROXY_USD, 0.015),
+    ],
+)
+def test_fridge_housing_proxy_is_a_watertight_manifold(proxy_path, corridor_radius):
+    from pxr import Usd, UsdGeom
+
+    stage = Usd.Stage.Open(proxy_path)
+    housing = UsdGeom.Mesh(stage.GetPrimAtPath("/FridgeCollision/Housing"))
+    points = np.asarray(housing.GetPointsAttr().Get(), dtype=np.float64)
+    faces = np.asarray(housing.GetFaceVertexIndicesAttr().Get(), dtype=np.int64).reshape(-1, 3)
+    assert housing.GetPrim().GetAttribute("waterhose:corridorRadius").Get() == pytest.approx(corridor_radius)
+
+    undirected_edges = np.sort(
+        np.concatenate((faces[:, (0, 1)], faces[:, (1, 2)], faces[:, (2, 0)]), axis=0),
+        axis=1,
+    )
+    _, edge_counts = np.unique(undirected_edges, axis=0, return_counts=True)
+    signed_volume = (
+        np.einsum(
+            "ij,ij->i",
+            points[faces[:, 0]],
+            np.cross(points[faces[:, 1]], points[faces[:, 2]]),
+        ).sum()
+        / 6.0
+    )
+
+    assert np.all(edge_counts == 2)
+    assert signed_volume > 0.0
+
+    builder = ModelBuilder()
+    result = builder.add_usd(
+        proxy_path,
+        floating=False,
+        load_visual_shapes=False,
+    )
+    housing_shape = next(iter(result["path_shape_map"].values()))
+    assert builder.shape_source[housing_shape].is_watertight
+
+
+def test_cable_housing_proxy_has_no_mjwarp_contact_metadata():
+    from pxr import Usd
+
+    stage = Usd.Stage.Open(waterhose_env_cfg._FRIDGE_CABLE_COLLISION_PROXY_USD)
+    housing = stage.GetPrimAtPath("/FridgeCollision/Housing")
+
+    assert not housing.HasAttribute("mjc:solref")
 
 
 def test_connector_mesh_is_lumped_into_the_cable_head():
@@ -576,6 +640,42 @@ def test_connector_mesh_is_lumped_into_the_cable_head():
     inertia = np.asarray(builder.body_inertia[head_body]).reshape(3, 3)
     np.testing.assert_allclose(inertia, np.asarray(expected_inertia).reshape(3, 3), rtol=1.0e-6, atol=1.0e-12)
     assert np.all(np.linalg.eigvalsh(inertia) > 0.0)
+
+
+def test_tail_attachment_alone_authors_a_soft_vbd_joint(monkeypatch):
+    builder = ModelBuilder()
+    solvers.SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
+    tail_body = builder.add_body(mass=1.0, label="/World/envs/env_0/Cable1/cable_edge_body_0")
+    cable = SimpleNamespace(
+        cfg=SimpleNamespace(tail_anchor_prim_path="/World/envs/env_.*/Anchor1"),
+        _registry_entry=SimpleNamespace(
+            prim_path="/World/envs/env_.*/Cable1",
+            body_offsets=[tail_body],
+            edges=[(0, 1)],
+        ),
+    )
+    invalid_env_prim = SimpleNamespace(IsValid=lambda: False)
+    anchor_prim = SimpleNamespace(
+        GetPath=lambda: SimpleNamespace(pathString="/World/envs/env_0/Anchor1"),
+        GetStage=lambda: SimpleNamespace(GetPrimAtPath=lambda _path: invalid_env_prim),
+    )
+    monkeypatch.setattr(waterhose_cable.sim_utils, "find_first_matching_prim", lambda _path: anchor_prim)
+    monkeypatch.setattr(
+        waterhose_cable.sim_utils,
+        "resolve_prim_pose",
+        lambda _prim, ref_prim=None: ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+    )
+
+    WaterhoseCableObject._add_tail_attachment_to_builder(
+        cable,
+        builder,
+        world_idx=0,
+        env_position=[0.0, 0.0, 0.0],
+        env_rotation=(0.0, 0.0, 0.0, 1.0),
+    )
+
+    tail_joint = builder.joint_label.index("/World/envs/env_0/Cable1/tail_attachment_w0")
+    assert builder.custom_attributes["vbd:joint_is_hard"].values == {tail_joint: 0}
 
 
 def test_waterhose_reset_restores_the_full_scene_and_joint_targets():

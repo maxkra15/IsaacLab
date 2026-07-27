@@ -58,12 +58,12 @@ def _paused_gc():
             gc.collect()
 
 
-from newton import Axis, CollisionPipeline, Contacts, Control, Model, ModelBuilder, State, eval_fk
+from newton import Axis, CollisionPipeline, Contacts, Control, Model, ModelBuilder, ModelFlags, State, eval_fk
 from newton._src.usd.schemas import SchemaResolverNewton, SchemaResolverPhysx
 from newton.sensors import SensorContact as NewtonContactSensor
 from newton.sensors import SensorFrameTransform
 from newton.sensors import SensorIMU as NewtonSensorIMU
-from newton.solvers import SolverBase, SolverKamino, SolverNotifyFlags
+from newton.solvers import SolverBase, SolverKamino
 
 from pxr import UsdGeom
 
@@ -1189,7 +1189,7 @@ class NewtonManager(PhysicsManager):
         cls._cl_pending_sites.clear()
 
     @classmethod
-    def add_model_change(cls, change: SolverNotifyFlags) -> None:
+    def add_model_change(cls, change: ModelFlags) -> None:
         """Register a model change to notify the solver."""
         cls._model_changes.add(change)
 

@@ -63,6 +63,7 @@ from isaaclab_contrib.deformable.newton_manager_cfg import (
 from .cable import WaterhoseCableObjectCfg
 from .geometry import (
     ANCHOR_POS,
+    CABLE_POS,
     CONNECTOR_LOCAL_POS,
     CONNECTOR_LOCAL_QUAT_XYZW,
     CONNECTOR_MASS,
@@ -89,7 +90,8 @@ _FRIDGE_USD = str(_LOCAL_ASSETS_DIR / "fridge" / "fridge_waterhose.usda")
 _RBY1_USD = str(_LOCAL_ASSETS_DIR / "rby1df" / "rby1df_waterhose.usda")
 _PLUG_USD = str(_LOCAL_ASSETS_DIR / "fridge" / "cable" / "plug.usda")
 _CABLE1_USD = str(_LOCAL_ASSETS_DIR / "fridge" / "cable" / "cable001.usda")
-_FRIDGE_COLLISION_PROXY_USD = str(_LOCAL_ASSETS_DIR / "fridge_clearanced_collision.usda")
+_FRIDGE_ROBOT_COLLISION_PROXY_USD = str(_LOCAL_ASSETS_DIR / "fridge_robot_manifold_collision.usda")
+_FRIDGE_CABLE_COLLISION_PROXY_USD = str(_LOCAL_ASSETS_DIR / "fridge_cable_manifold_collision.usda")
 # Keep the sky and ground local so the demo needs no S3 or Nucleus connection at runtime. The ground
 # USD uses relative texture paths and the locally resolved ``OmniPBR.mdl``.
 _SKY_HDR = str(_LOCAL_ASSETS_DIR / "skies" / "kloofendal_43d_clear_puresky_4k.hdr")
@@ -553,16 +555,17 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         init_state=AssetBaseCfg.InitialStateCfg(pos=FRIDGE_POS),
     )
 
-    # Keep solver-specific collision surfaces around the canonical visual fridge. Only a 1.5 cm-radius
-    # corridor at the socket is removed; robot and cable contact remain active everywhere else.
+    # Keep solver-specific watertight housing proxies around the canonical visual fridge. The cable
+    # proxy removes only the plug corridor; the robot proxy clears the full gripper approach sweep.
+    # Housing contact remains active everywhere else, while the dedicated socket SDF owns insertion.
     fridge_robot_collision = AssetBaseCfg(
         prim_path="/World/envs/env_.*/FridgeRobotCollision",
-        spawn=sim_utils.UsdFileCfg(usd_path=_FRIDGE_COLLISION_PROXY_USD),
+        spawn=sim_utils.UsdFileCfg(usd_path=_FRIDGE_ROBOT_COLLISION_PROXY_USD),
         init_state=AssetBaseCfg.InitialStateCfg(pos=FRIDGE_POS),
     )
     fridge_cable_collision = AssetBaseCfg(
         prim_path="/World/envs/env_.*/FridgeCableCollision",
-        spawn=sim_utils.UsdFileCfg(usd_path=_FRIDGE_COLLISION_PROXY_USD),
+        spawn=sim_utils.UsdFileCfg(usd_path=_FRIDGE_CABLE_COLLISION_PROXY_USD),
         init_state=AssetBaseCfg.InitialStateCfg(pos=FRIDGE_POS),
     )
 
@@ -630,7 +633,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             ),
         ),
         init_state=WaterhoseCableObjectCfg.InitialStateCfg(
-            pos=FRIDGE_POS,
+            pos=CABLE_POS,
         ),
         connector_usd_path=_PLUG_USD,
         connector_mass=CONNECTOR_MASS,
@@ -641,7 +644,7 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         connector_kd=_VBD_CONTACT_DAMPING,
         connector_mu=_VBD_DEFAULT_SHAPE_FRICTION,
         connector_margin=0.0,
-        # The socket clearance is only 15 mm in radius. A 10 mm broad contact gap would make the
+        # The cable housing clearance is only 15 mm in radius. A 10 mm broad contact gap would make the
         # 7.3 mm-radius connector contact that wall even while perfectly centred, so use a local
         # millimetre-scale gap for the connector mesh.
         connector_gap=0.001,
@@ -782,7 +785,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         # deformable cable, its compound connector head, and the welded tail anchor. The two are joined
         # by proxy coupling: the gripper bodies are mirrored as proxy bodies in the VBD solver so the
         # cable and connector collide against them. The solver entries route the canonical socket SDF
-        # and task-local clearanced housing explicitly rather than importing the whole static scene.
+        # and solver-specific manifold housing explicitly rather than importing the whole static scene.
         self.sim.physics = NewtonCfg(
             use_cuda_graph=True,
             # The plug must insert into the authored socket bore: convex-hull mesh
@@ -796,7 +799,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             cone="elliptic",
                             ls_iterations=20,
                             integrator="implicitfast",
-                            # Newton generates contacts against the explicit clearanced housing proxy;
+                            # Newton generates contacts against the explicit robot housing proxy;
                             # MuJoCo-Warp resolves those contacts without convexifying the mesh.
                             use_mujoco_contacts=False,
                             # Match the standalone demo's contact and constraint capacity.
@@ -809,7 +812,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # connector slip.
                         use_solver_effective_mass=False,
                         bodies=[_ROBOT_BODY_PATTERN],
-                        # Route only the robot's clearanced housing. Explicit selection excludes the
+                        # Route only the robot's manifold housing. Explicit selection excludes the
                         # canonical SDF socket from the robot view.
                         include_body_shapes=True,
                         shape_label_patterns=[_FRIDGE_ROBOT_COLLISION_PATTERN],
@@ -821,7 +824,7 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                         # augmented-Lagrangian contacts enforce non-penetration
                         # of the plug against the gripper and socket. Cable
                         # joints use their authored rod stiffness, while the
-                        # tail weld remains a finite penalty constraint.
+                        # tail weld explicitly authors a finite penalty constraint.
                         # iterations x num_substeps (below) is the primary performance/stability
                         # trade-off. The validated high-fidelity default is 20 x 10; use
                         # WATERHOSE_VBD_ITERS / WATERHOSE_SUBSTEPS only for explicit experiments.
@@ -829,10 +832,6 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             iterations=vbd_iterations,
                             friction_epsilon=0.1,
                             rigid_contact_hard=True,
-                            # Keep the tail attachment soft to avoid transmitting an
-                            # augmented-Lagrangian impulse through the full bent hose when the
-                            # connector reaches the socket.
-                            rigid_joint_hard=False,
                             # A gentle penalty ramp keeps the cable and its
                             # hard-contact duals stable without the jumpiness
                             # observed with a zero beta.
@@ -861,7 +860,8 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             rigid_joint_angular_kd=0.0,
                         ),
                         bodies=[_CABLE_BODY_PATTERN],
-                        # VBD owns the canonical socket SDF plus the locally clearanced housing copy.
+                        # VBD directly owns both cable bodies and this manifold housing, so cable-fridge
+                        # contact needs no proxy feedback. The local corridor is owned by the socket SDF.
                         include_body_shapes=True,
                         include_static_shapes=False,
                         shape_label_patterns=[SOCKET_COLLISION_MESH_PATTERN, _FRIDGE_CABLE_COLLISION_PATTERN],
@@ -1057,8 +1057,8 @@ class WaterhoseProxyIkEnvCfg(WaterhoseEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.scene.robot.init_state.joint_pos = _RBY1_IK_INITIAL_JOINT_POS
-        # This task is driven by the full scripted grasp-insert-release arc. Success and timeout
-        # resets would teleport the robot before the runner can verify post-release retention.
+        # This task is driven by the full scripted grasp-insert-seated-hold arc. Success and timeout
+        # resets would teleport the robot before the runner can verify terminal retention.
         self.terminations.success = None
         self.terminations.time_out = None
         # No teleop on this (scripted) env: it uses the multi-body IK action (right_ee + left/torso

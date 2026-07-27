@@ -28,9 +28,14 @@ LEFT_GRIPPER_EE_FRAME_QUAT_XYZW = (-0.70710677, 0.70710677, 0.0, 0.0)
 # add_rod_graph places each segment's body frame at the edge's start node u
 # (edge (u, v), +Z from u->v).
 FRIDGE_POS = (0.0, 0.0, 0.5)
+# The source cable pose puts the connector 4 mm through the closed housing front. The legacy open
+# proxy silently tolerated that overlap; move the complete cable-and-anchor assembly into clear space
+# so the watertight housing starts from a valid contact configuration without changing the cable shape.
+CABLE_SCENE_OFFSET = (0.0, 0.004, 0.0)
+CABLE_POS = tuple(p + offset for p, offset in zip(FRIDGE_POS, CABLE_SCENE_OFFSET))
 CABLE1_TAIL_NODE_42 = (-0.18810473382472992, 0.3453156650066376, -0.25986239314079285)
 CABLE1_ANCHOR_NODE = CABLE1_TAIL_NODE_42
-ANCHOR_POS = tuple(p + n for p, n in zip(FRIDGE_POS, CABLE1_ANCHOR_NODE))
+ANCHOR_POS = tuple(p + n for p, n in zip(CABLE_POS, CABLE1_ANCHOR_NODE))
 
 # Authored plug pose expressed in cable segment 0's start-node frame. The plug mesh is added directly
 # to this body, so Newton derives one compound mass, center of mass, and inertia tensor for both pieces.
@@ -52,12 +57,14 @@ SOCKET_ALIGN_TIP_DEPTH = -0.030
 # Keep roughly 1 mm of solver/contact clearance instead of driving the 7.2 mm flange into the washer.
 SOCKET_SEATED_TIP_DEPTH = -0.004
 # A physically seated connector settles slightly behind the commanded face-contact depth under
-# compliant VBD contact. The validated coupled trajectory remains around -7.5 mm through gripper
-# release and backoff, so accept that contact equilibrium while still rejecting an uninserted or
-# laterally displaced connector.
+# compliant VBD contact. The validated coupled trajectory remains around -7.5 mm during the final
+# seated hold, so accept that contact equilibrium while still rejecting an uninserted or laterally
+# displaced connector.
 SOCKET_RETAINED_DEPTH_TOLERANCE = 0.005
 SOCKET_RETAINED_RADIAL_TOLERANCE = 0.001
-SOCKET_RETAINED_AXIS_COS = 0.9995
+# About 2.6 degrees. The connector settles near 2 degrees under pure socket contact, so a tighter
+# threshold flickers even while depth and sub-millimetre radial alignment remain physically seated.
+SOCKET_RETAINED_AXIS_COS = 0.999
 SOCKET_COLLISION_XFORM_SUFFIX = "/Cable008/SocketCollision"
 SOCKET_COLLISION_MESH_SUFFIX = f"{SOCKET_COLLISION_XFORM_SUFFIX}/Cable008_SocketCollision"
 SOCKET_COLLISION_MESH_PATTERN = rf".*/Fridge{SOCKET_COLLISION_MESH_SUFFIX}.*"
