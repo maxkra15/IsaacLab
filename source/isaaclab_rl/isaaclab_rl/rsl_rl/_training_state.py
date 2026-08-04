@@ -50,22 +50,11 @@ class _TrainingStateSyncWrapper(gym.Wrapper):
             env: Gymnasium environment to wrap.
             step_interval: Number of environment steps in one RSL-RL rollout.
             synchronize_training_state: Callback that synchronizes queued environment training state.
-
-        Raises:
-            ValueError: If :paramref:`step_interval` is not a positive integer.
         """
-        if not isinstance(step_interval, int) or isinstance(step_interval, bool) or step_interval < 1:
-            raise ValueError("step_interval must be a positive integer.")
-
         super().__init__(env)
         self._step_interval = step_interval
         self._synchronize_training_state = synchronize_training_state
         self._step_count = 0
-
-    def reset(self, **kwargs: Any) -> Any:
-        """Reset the wrapped environment and restart the synchronization interval."""
-        self._step_count = 0
-        return self.env.reset(**kwargs)
 
     def step(self, action: Any) -> Any:
         """Step the environment and synchronize after each completed rollout interval."""
