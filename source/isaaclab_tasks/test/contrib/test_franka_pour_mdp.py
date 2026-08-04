@@ -476,16 +476,16 @@ def test_reset_learning_progress_latches_local_advancement_without_terminating()
 
     env.episode_length_buf[:] = params["minimum_episode_steps"]
     term(env, **params)
-    assert not bool(env.reset_dataset_learning_progress.any())
+    assert not bool(term.ever_success.any())
 
     env._tcp[:] = env._grasp
     no_termination = term(env, **params)
     assert not bool(torch.any(no_termination))
-    assert bool(env.reset_dataset_learning_progress.all())
+    assert bool(term.ever_success.all())
 
     env._tcp[:] = env._grasp + torch.tensor([0.20, 0.0, 0.0])
     term(env, **params)
-    assert bool(env.reset_dataset_learning_progress.all())
+    assert bool(term.ever_success.all())
 
 
 def test_reset_learning_progress_requires_terminal_transfer_and_rejects_unsafe_progress():
@@ -499,10 +499,10 @@ def test_reset_learning_progress_requires_terminal_transfer_and_rejects_unsafe_p
     )
     terminal_term.reset()
     terminal_term(terminal_env, **params)
-    assert not bool(terminal_env.reset_dataset_learning_progress.any())
+    assert not bool(terminal_term.ever_success.any())
     terminal_env.episode_succeeded[:] = True
     terminal_term(terminal_env, **params)
-    assert bool(terminal_env.reset_dataset_learning_progress.all())
+    assert bool(terminal_term.ever_success.all())
 
     unsafe_env = FakeEnv()
     unsafe_term = rewards.PourResetLearningProgress(
@@ -514,7 +514,7 @@ def test_reset_learning_progress_requires_terminal_transfer_and_rejects_unsafe_p
     unsafe_env._tcp[:] = unsafe_env._grasp
     unsafe_env.termination_manager.terminated[:] = True
     unsafe_term(unsafe_env, **params)
-    assert not bool(unsafe_env.reset_dataset_learning_progress.any())
+    assert not bool(unsafe_term.ever_success.any())
 
 
 def test_physical_potential_ignores_dataset_labels_and_requires_contact_for_downstream_progress():
@@ -550,11 +550,11 @@ def test_reset_learning_progress_requires_bilateral_contact_at_grasp_crossing():
     env._width[:] = env.gripper_grasp_width
     env.gripper.commanded_position[:] = 0.024
     term(env, **params)
-    assert not bool(env.reset_dataset_learning_progress.any())
+    assert not bool(term.ever_success.any())
 
     env.gripper.bilateral_contact[:] = True
     term(env, **params)
-    assert bool(env.reset_dataset_learning_progress.all())
+    assert bool(term.ever_success.all())
 
 
 def test_state_finite_and_termination_wrappers_reject_raw_nonfinite_values():

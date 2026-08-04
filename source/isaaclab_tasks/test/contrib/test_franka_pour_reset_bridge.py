@@ -141,3 +141,18 @@ def test_reset_dataset_restores_exact_state_and_clears_solver_history(monkeypatc
     assert env._particle_region_cache is None
     assert not bool(env.episode_succeeded.any())
     assert env._lifted_grasp_seen.tolist() == [True, False]
+
+
+def test_synchronize_training_state_delegates_to_reset_dataset_curriculum():
+    """The rollout hook delegates through the manager-owned curriculum term."""
+    sync_calls = []
+    curriculum_term = SimpleNamespace(synchronize_pending_outcomes=lambda: sync_calls.append(True))
+    env = SimpleNamespace(
+        curriculum_manager=SimpleNamespace(
+            cfg=SimpleNamespace(reset_dataset=SimpleNamespace(func=curriculum_term)),
+        )
+    )
+
+    FrankaPourEnv.synchronize_training_state(env)
+
+    assert sync_calls == [True]

@@ -838,7 +838,4 @@ class FrankaPourEnv(ManagerBasedRLEnv):
 
     def synchronize_training_state(self) -> None:
         """Synchronize queued reset-dataset outcomes at a lockstep training boundary."""
-        curriculum = getattr(self, "_reset_dataset_curriculum_term", None)
-        if curriculum is None:
-            raise RuntimeError("The reset-dataset curriculum term is unavailable for synchronization.")
-        curriculum.synchronize_pending_outcomes()
+        self.curriculum_manager.cfg.reset_dataset.func.synchronize_pending_outcomes()

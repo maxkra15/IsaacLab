@@ -90,7 +90,7 @@ def test_reset_dataset_sampler_focuses_half_solved_rows_without_starvation():
     assert torch.isclose(probabilities.sum(), torch.tensor(1.0))
 
 
-def test_reset_dataset_sampler_cyclic_replay_covers_rows():
+def test_reset_dataset_sampler_cyclic_replay_covers_rows(monkeypatch: pytest.MonkeyPatch):
     """Exact cyclic replay covers every row before switching to the steady fraction."""
     sampler = _ResetDatasetSampler(
         5,
@@ -100,20 +100,31 @@ def test_reset_dataset_sampler_cyclic_replay_covers_rows():
             uniform_fraction=0.25,
         ),
     )
-    rows, probes = sampler._sample_with_uniform_replay(
+    cyclic_rows = []
+    take_uniform_rows = sampler._take_uniform_rows
+
+    def record_uniform_rows(count: int, generator: torch.Generator | None) -> torch.Tensor:
+        rows = take_uniform_rows(count, generator)
+        cyclic_rows.extend(rows.tolist())
+        return rows
+
+    monkeypatch.setattr(sampler, "_take_uniform_rows", record_uniform_rows)
+    expected_uniform_rows = sampler._uniform_order[:4].clone()
+    expected_generator = torch.Generator().manual_seed(17)
+    uniform_positions = torch.randperm(8, generator=expected_generator)[:4]
+    sampled_rows = sampler._sample_with_uniform_replay(
         8,
         generator=torch.Generator().manual_seed(17),
     )
 
-    assert probes.sum().item() == 4
+    torch.testing.assert_close(sampled_rows[uniform_positions], expected_uniform_rows)
     assert sampler.metrics()["sampler/uniform_replay_fraction"] == pytest.approx(0.5)
+    assert sampler.metrics()["sampler/uniform_first_sweep_progress"] == pytest.approx(0.8)
 
-    replay_rows = rows[probes].tolist()
     while not sampler.metrics()["sampler/uniform_first_sweep_complete"]:
-        rows, probes = sampler._sample_with_uniform_replay(4, generator=torch.Generator().manual_seed(23))
-        replay_rows.extend(rows[probes].tolist())
+        sampler._sample_with_uniform_replay(4, generator=torch.Generator().manual_seed(23))
 
-    assert len(set(replay_rows[:5])) == 5
+    assert set(cyclic_rows[: sampler.row_count]) == set(range(sampler.row_count))
     assert sampler.metrics()["sampler/uniform_replay_fraction"] == pytest.approx(0.25)
     assert sampler.metrics()["sampler/uniform_first_sweep_progress"] == 1.0
 

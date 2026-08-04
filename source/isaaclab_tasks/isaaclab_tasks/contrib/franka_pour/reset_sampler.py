@@ -187,13 +187,6 @@ class _ResetDatasetSampler:
         weights.add_(self.cfg.epsilon)
         return weights / weights.sum()
 
-    def _sampling_probabilities(self) -> torch.Tensor:
-        """Expected marginal probabilities including the current cyclic-replay fraction."""
-        adaptive = self._probabilities()
-        uniform = torch.full_like(adaptive, 1.0 / self.row_count)
-        fraction = self._uniform_replay_fraction()
-        return (1.0 - fraction) * adaptive + fraction * uniform
-
     def _uniform_replay_fraction(self) -> float:
         """Current fraction reserved for exact cyclic replay."""
         if not self._uniform_first_sweep_complete and self.cfg.uniform_fraction_initial is not None:
@@ -205,13 +198,12 @@ class _ResetDatasetSampler:
         count: int,
         *,
         generator: torch.Generator | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Sample rows with a mixture of adaptive and exact cyclic replay."""
         device = self._success_rates.device
         rows = torch.empty(count, device=device, dtype=torch.long)
-        is_uniform = torch.zeros(count, device=device, dtype=torch.bool)
         if count == 0:
-            return rows, is_uniform
+            return rows
 
         uniform_count = self._uniform_assignment_count(count)
         assignment_order = torch.randperm(count, device=device, generator=generator)
@@ -219,7 +211,6 @@ class _ResetDatasetSampler:
         adaptive_positions = assignment_order[uniform_count:]
         if uniform_count > 0:
             rows[uniform_positions] = self._take_uniform_rows(uniform_count, generator)
-            is_uniform[uniform_positions] = True
         if adaptive_positions.numel() > 0:
             rows[adaptive_positions] = torch.multinomial(
                 self._probabilities(),
@@ -227,7 +218,7 @@ class _ResetDatasetSampler:
                 replacement=True,
                 generator=generator,
             )
-        return rows, is_uniform
+        return rows
 
     def _record_validated(self, rows: torch.Tensor, success: torch.Tensor) -> None:
         """Append outcomes whose shape, dtype, device, and row values are already trusted."""
@@ -243,13 +234,15 @@ class _ResetDatasetSampler:
 
     def metrics(self) -> dict[str, float]:
         """Return sampling-concentration and cyclic-replay metrics."""
-        probabilities = self._sampling_probabilities()
+        replay_fraction = self._uniform_replay_fraction()
+        probabilities = self._probabilities()
+        probabilities.mul_(1.0 - replay_fraction).add_(replay_fraction / self.row_count)
         top_count = max(1, math.ceil(0.01 * self.row_count))
         values = torch.stack(
             (
                 probabilities.square().sum().reciprocal() / self.row_count,
                 torch.topk(probabilities, top_count, sorted=False).values.sum(),
-                probabilities.new_tensor(self._uniform_replay_fraction()),
+                probabilities.new_tensor(replay_fraction),
                 probabilities.new_tensor(float(self._uniform_first_sweep_complete)),
                 probabilities.new_tensor(self._uniform_first_sweep_progress()),
             )

@@ -293,7 +293,6 @@ class PourResetLearningProgress(ManagerTermBase):
         self._no_termination = torch.zeros_like(self.is_success)
         # The curriculum runs before manager reset, so it observes the completed episode's sticky
         # value. Manager reset then clears this tensor after the next row has been restored.
-        env.reset_dataset_learning_progress = self.ever_success
 
     @staticmethod
     def _potential_params(params: Mapping[str, object]) -> dict[str, object]:

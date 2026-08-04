@@ -69,7 +69,6 @@ class PourResetDatasetCurriculum(ManagerTermBase):
         self._metrics_cache = self._sampler.metrics()
         self._local_reset_assignments_since_metrics = 0
         self._local_metrics_refresh_interval = max(1, env.num_envs)
-        env._reset_dataset_curriculum_term = self
 
     @staticmethod
     def _env_ids(
@@ -94,9 +93,10 @@ class PourResetDatasetCurriculum(ManagerTermBase):
         completed = (env.episode_length_buf[ids] > 0) & (env.reset_dataset_row_id[ids] >= 0)
         completed_ids = ids[completed]
         if completed_ids.numel() > 0 and not env.cfg.curriculum_freeze:
+            progress = env.termination_manager.get_term_cfg("learning_progress_context").func
             batch = (
                 env.reset_dataset_row_id[completed_ids],
-                env.reset_dataset_learning_progress[completed_ids],
+                progress.ever_success[completed_ids],
             )
             if self._distributed_world_size() > 1:
                 self._pending_outcome_batches.append(batch)
@@ -109,7 +109,7 @@ class PourResetDatasetCurriculum(ManagerTermBase):
         elif self._sampling_mode == "uniform":
             rows = torch.randint(self._row_count, (ids.numel(),), device=self._device)
         else:
-            rows, _ = self._sampler._sample_with_uniform_replay(ids.numel())
+            rows = self._sampler._sample_with_uniform_replay(ids.numel())
             if rows.shape != ids.shape or rows.dtype != torch.long:
                 raise RuntimeError("Adaptive sampler returned invalid reset-row IDs.")
 

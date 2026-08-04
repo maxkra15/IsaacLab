@@ -52,9 +52,12 @@ class _FakeResetDatasetEnv:
             reset_dataset_sampling_mode=sampling_mode,
             reset_dataset_top_grasp_count=top_grasp_count,
         )
+        self.learning_progress = SimpleNamespace(ever_success=torch.zeros(self.num_envs, dtype=torch.bool))
+        self.termination_manager = SimpleNamespace(
+            get_term_cfg=lambda _name: SimpleNamespace(func=self.learning_progress)
+        )
         self.reset_dataset_row_id = torch.full((self.num_envs,), -1, dtype=torch.long)
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
-        self.reset_dataset_learning_progress = torch.zeros(self.num_envs, dtype=torch.bool)
         self.pour_target_frac = torch.zeros(self.num_envs)
 
 
@@ -74,9 +77,9 @@ def _install_adaptive_draw(
 
     def sample_with_uniform_replay(
         count: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         assert count <= sampled_rows.numel()
-        return sampled_rows[:count].clone(), torch.zeros(count, dtype=torch.bool)
+        return sampled_rows[:count].clone()
 
     monkeypatch.setattr(term._sampler, "_sample_with_uniform_replay", sample_with_uniform_replay)
 
@@ -88,7 +91,7 @@ def test_adaptive_sampling_updates_rows_from_local_progress(monkeypatch: pytest.
 
     term(env, slice(None))
     env.episode_length_buf[:] = 1
-    env.reset_dataset_learning_progress[:] = torch.tensor((True, False, True, False))
+    env.learning_progress.ever_success[:] = torch.tensor((True, False, True, False))
     term(env, slice(None))
 
     assert term._sampler._history_sizes.tolist() == [1, 1, 1, 1, 0, 0]
@@ -118,7 +121,7 @@ def test_uniform_mode_samples_every_row_without_adaptive_draw(monkeypatch: pytes
     assert env.reset_dataset_row_id.tolist() == [4, 3, 2, 1]
 
     env.episode_length_buf[:] = 1
-    env.reset_dataset_learning_progress[:] = torch.tensor((False, True, False, True))
+    env.learning_progress.ever_success[:] = torch.tensor((False, True, False, True))
     term(env, slice(None))
 
     assert term._sampler._history_sizes.tolist() == [0, 1, 1, 1, 1, 0]
@@ -147,7 +150,7 @@ def test_frozen_playback_uses_top_grasp_rows(monkeypatch: pytest.MonkeyPatch):
     }
 
     env.episode_length_buf[:] = 1
-    env.reset_dataset_learning_progress[:] = True
+    env.learning_progress.ever_success[:] = True
     term(env, slice(None))
 
 
@@ -164,7 +167,7 @@ def test_distributed_async_resets_queue_outcomes_without_collectives(monkeypatch
 
     term(env, slice(None))
     env.episode_length_buf[[1, 3]] = 1
-    env.reset_dataset_learning_progress[[1, 3]] = torch.tensor((True, False))
+    env.learning_progress.ever_success[[1, 3]] = torch.tensor((True, False))
     term(env, torch.tensor((1, 3)))
 
     assert term._sampler._history_sizes.sum().item() == 0
