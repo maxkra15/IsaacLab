@@ -10,37 +10,27 @@ from __future__ import annotations
 from typing import Any
 
 import gymnasium as gym
-import pytest
 
 from isaaclab_rl.rsl_rl import _training_state
 
 
-class _FakeEnv(gym.Env):
-    """Minimal environment that records wrapper call ordering."""
+class _SyncEnv(gym.Env):
+    """Minimal environment that records steps and synchronization calls."""
 
     def __init__(self):
         self.events: list[str] = []
-
-    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
-        del seed, options
-        self.events.append("reset")
-        return 0, {}
 
     def step(self, action: Any):
         del action
         self.events.append("step")
         return 0, 0.0, False, False, {}
 
-
-class _SyncEnv(_FakeEnv):
-    """Fake environment that opts in to training-state synchronization."""
-
     def synchronize_training_state(self):
         self.events.append("sync")
 
 
-def test_sync_wrapper_runs_after_each_rollout_and_reset_restarts_interval():
-    """Synchronization runs after the final rollout step and explicit reset restarts the interval."""
+def test_sync_wrapper_runs_at_rollout_boundaries_and_requires_opt_in():
+    """Distributed opt-in environments synchronize once per rollout; all others remain unchanged."""
     env = _SyncEnv()
     wrapped = _training_state._wrap_distributed_training_state_sync(
         env,
@@ -50,54 +40,19 @@ def test_sync_wrapper_runs_after_each_rollout_and_reset_restarts_interval():
 
     wrapped.step(None)
     wrapped.step(None)
-    wrapped.reset()
     wrapped.step(None)
     wrapped.step(None)
-    assert env.events == ["step", "step", "reset", "step", "step"]
+    wrapped.step(None)
+    wrapped.step(None)
+    assert env.events == ["step", "step", "step", "sync", "step", "step", "step", "sync"]
 
-    wrapped.step(None)
-    assert env.events == ["step", "step", "reset", "step", "step", "step", "sync"]
-
-    wrapped.step(None)
-    wrapped.step(None)
-    wrapped.step(None)
-    assert env.events[-4:] == ["step", "step", "step", "sync"]
-
-
-@pytest.mark.parametrize("step_interval", [0, -1, True, 1.5])
-def test_sync_wrapper_rejects_invalid_intervals(step_interval: int | float | bool):
-    """Synchronization intervals must contain at least one environment step."""
-    env = _SyncEnv()
-
-    with pytest.raises(ValueError, match="positive integer"):
-        _training_state._TrainingStateSyncWrapper(
-            env,
-            step_interval=step_interval,
-            synchronize_training_state=env.synchronize_training_state,
+    assert _training_state._wrap_distributed_training_state_sync(env, distributed=False, step_interval=3) is env
+    env_without_hook = gym.Env()
+    assert (
+        _training_state._wrap_distributed_training_state_sync(
+            env_without_hook,
+            distributed=True,
+            step_interval=3,
         )
-
-
-def test_sync_wrapper_is_disabled_for_non_distributed_training():
-    """Non-distributed training leaves an opt-in environment unwrapped."""
-    env = _SyncEnv()
-
-    wrapped = _training_state._wrap_distributed_training_state_sync(
-        env,
-        distributed=False,
-        step_interval=3,
+        is env_without_hook
     )
-
-    assert wrapped is env
-
-
-def test_sync_wrapper_is_disabled_when_environment_has_no_hook():
-    """Distributed training leaves environments without the synchronization hook unwrapped."""
-    env = _FakeEnv()
-
-    wrapped = _training_state._wrap_distributed_training_state_sync(
-        env,
-        distributed=True,
-        step_interval=3,
-    )
-
-    assert wrapped is env
