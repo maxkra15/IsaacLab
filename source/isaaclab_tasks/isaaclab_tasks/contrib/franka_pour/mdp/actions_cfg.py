@@ -7,11 +7,10 @@
 
 from __future__ import annotations
 
-from dataclasses import MISSING
+from dataclasses import field
 from typing import TYPE_CHECKING
 
-from isaaclab.envs.mdp.actions.actions_cfg import RelativeJointPositionActionCfg
-from isaaclab.managers.manager_term_cfg import ActionTermCfg
+from isaaclab.envs.mdp.actions import BinaryJointPositionActionCfg, RelativeJointPositionActionCfg
 from isaaclab.utils.configclass import configclass
 
 if TYPE_CHECKING:
@@ -32,21 +31,25 @@ class EMARelativeJointPositionActionCfg(RelativeJointPositionActionCfg):
 
 
 @configclass
-class CurriculumGripperPositionActionCfg(ActionTermCfg):
+class CurriculumGripperPositionActionCfg(BinaryJointPositionActionCfg):
     """Configuration for :class:`CurriculumGripperPositionAction`."""
 
-    joint_names: list[str] = MISSING
+    open_command_expr: dict[str, float] = field(default_factory=dict)
+    """Populated from :attr:`neutral_position` when the action term is constructed."""
+    close_command_expr: dict[str, float] = field(default_factory=dict)
+    """Populated from :attr:`close_position` when the action term is constructed."""
     scale: float = 0.04
-    """Per-finger residual delta per policy-action unit [m]; unused in binary mode."""
+    """Checkpoint compatibility metadata exposed in the action descriptor [m]."""
     alpha: float = 0.2
     """Interpolation weight applied to the selected finger target."""
-    binary_threshold: float | None = None
-    """Optional threshold selecting filtered close/maximum targets; values below it close."""
+    binary_threshold: float = 0.0
+    """Compatibility metadata. The checkpoint-facing binary action uses a zero threshold."""
     close_position: float = 0.0
+    """Per-finger closed command [m]."""
     neutral_position: float = 0.025
     """Largest per-finger command accepted from the action [m]."""
     default_position: float | None = None
-    """Per-finger residual-mode zero command and initial target [m]. ``None`` uses ``close_position``."""
+    """Initial filtered target [m]. ``None`` uses :attr:`close_position`."""
     contact_min_deflection: float = 0.001
     """Minimum settled position-drive deflection required on each finger [m]."""
     class_type: type[CurriculumGripperPositionAction] | str = "{DIR}.actions:CurriculumGripperPositionAction"

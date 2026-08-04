@@ -145,11 +145,6 @@ def reset_dataset_validate_runtime(
     if expected_content_sha256 is not None and content_sha256 != expected_content_sha256:
         raise ValueError("Reset dataset content digest does not match the configured digest.")
 
-    contract_sha256 = payload.get("contract_sha256")
-    _validate_sha256(contract_sha256, "contract_sha256")
-    contract = {"sampler_cfg": sampler_cfg, "task_contract": task_contract}
-    if contract_sha256 != reset_dataset_digest(contract):
-        raise ValueError("Reset dataset contract digest does not match its metadata.")
     if expected_task_contract is not None:
         _validate_contract_subset(task_contract, expected_task_contract, path="metadata.task_contract")
 
@@ -322,10 +317,6 @@ def _validate_production_marker(metadata: Mapping[str, Any]):
     )
     if measured_result.get("passed") is not True:
         raise ValueError("Reset dataset terminal-pour calibration result has not passed.")
-    result_sha256 = calibration.get("result_sha256")
-    _validate_sha256(result_sha256, "terminal calibration result_sha256")
-    if result_sha256 != reset_dataset_digest(measured_result):
-        raise ValueError("Reset dataset terminal-pour calibration result digest is invalid.")
     source_sha256 = calibration.get("source_content_sha256")
     _validate_sha256(source_sha256, "terminal calibration source_content_sha256")
     physics_sha256 = manifold.get("physics_contract_sha256")

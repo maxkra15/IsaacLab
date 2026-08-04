@@ -509,7 +509,6 @@ class UR10ParticlePushEnv(DirectRLEnv):
             else None
         )
         self._reset_curriculum_cycle_cursor = 0
-        self._reset_pose_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._reset_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
     def _collision_free_reset_candidates(
@@ -1169,12 +1168,8 @@ class UR10ParticlePushEnv(DirectRLEnv):
 
         self._robot.write_root_pose_to_sim_index(root_pose=default_root_pose, env_ids=env_ids)
         self._robot.write_root_velocity_to_sim_index(root_velocity=default_root_velocity, env_ids=env_ids)
-        self._robot.write_joint_position_to_sim_index(
+        self._robot.write_joint_state_to_sim_index(
             position=joint_position,
-            joint_ids=self._joint_ids,
-            env_ids=env_ids,
-        )
-        self._robot.write_joint_velocity_to_sim_index(
             velocity=joint_velocity,
             joint_ids=self._joint_ids,
             env_ids=env_ids,
@@ -1350,7 +1345,6 @@ class UR10ParticlePushEnv(DirectRLEnv):
             self._heightmap_xy_offset[env_ids] = 0.0
         self._heightmap_history_reset[env_ids] = True
         self._heightmap_history_reset_pending = True
-        self._reset_pose_ids[env_ids] = pose_ids
         self._reset_initialized[env_ids] = True
 
     def _particle_position_e(self) -> torch.Tensor:

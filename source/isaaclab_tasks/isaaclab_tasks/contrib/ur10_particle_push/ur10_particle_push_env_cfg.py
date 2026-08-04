@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import math
-from itertools import pairwise
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -33,8 +32,6 @@ from isaaclab.utils.configclass import configclass
 from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 
 from isaaclab_assets.robots.universal_robots import UR10_CFG
-
-from .reset_randomization import validate_reset_randomization_ranges
 
 RIGID_ENTRY = "robot"
 MPM_ENTRY = "media"
@@ -668,8 +665,8 @@ class UR10ParticlePushEnvCfg(DirectRLEnvCfg):
     # sampled. Bin delivery is capped and normalized by the active curriculum target so every
     # level exposes the same bounded signal. Signed changes immediately credit delivery and
     # penalize knocking particles back out; unlike absolute state rewards, they cannot reward
-    # holding a partial solution indefinitely. The terminal bonus is validated below to exceed the
-    # largest possible positive shaping return.
+    # holding a partial solution indefinitely. The terminal bonus exceeds the configured shaping
+    # terms so that a successful transition remains dominant.
     reward_success: float = 2.0
     reward_bin_progress: float = 1.50
     reward_transport_progress: float = 0.15
@@ -703,30 +700,26 @@ class UR10ParticlePushEnvCfg(DirectRLEnvCfg):
 
     def _validate_source_shape_profiles(self) -> None:
         """Validate source-pile profiles before any derived bounds consume them."""
-        if not isinstance(self.reset_source_shape_profiles, tuple) or not self.reset_source_shape_profiles:
-            raise ValueError("reset_source_shape_profiles must be a non-empty tuple.")
-        for profile in self.reset_source_shape_profiles:
-            if not isinstance(profile, tuple) or len(profile) != 2:
-                raise ValueError("Every source shape profile must contain vertical cells and an aspect ratio.")
-            vertical_cells, aspect_ratio = profile
-            if isinstance(vertical_cells, bool) or not isinstance(vertical_cells, int) or vertical_cells < 1:
-                raise ValueError("Source shape vertical-cell counts must be positive integers.")
-            if not math.isfinite(aspect_ratio) or aspect_ratio <= 0.0:
-                raise ValueError("Source shape footprint aspect ratios must be finite and positive.")
+        if not self.reset_source_shape_profiles or any(
+            len(profile) != 2 for profile in self.reset_source_shape_profiles
+        ):
+            raise ValueError("Source shape profiles must contain vertical cells and an aspect ratio.")
+        if any(
+            vertical_cells < 1 or not math.isfinite(aspect_ratio) or aspect_ratio <= 0.0
+            for vertical_cells, aspect_ratio in self.reset_source_shape_profiles
+        ):
+            raise ValueError("Source shape profiles must contain positive finite values.")
 
     def _validate_reset_config(self) -> None:
         """Validate variable-payload and canonical pose-bank resets."""
-        if self.scene.media.spawn.radius is None or self.scene.media.spawn.radius <= 0.0:
+        particle_radius = self.scene.media.spawn.radius
+        if particle_radius is None or not math.isfinite(particle_radius) or particle_radius <= 0.0:
             raise ValueError("UR10 Push requires an explicit positive particle radius.")
-        validate_reset_randomization_ranges(self)
-        for name, resolution in (
-            ("reset_pile_lattice_min_resolution", self.reset_pile_lattice_min_resolution),
-            ("reset_pile_lattice_max_resolution", self.reset_pile_lattice_max_resolution),
-        ):
-            if len(resolution) != 3 or any(
-                isinstance(count, bool) or not isinstance(count, int) or count < 1 for count in resolution
-            ):
-                raise ValueError(f"{name} must contain three positive integers.")
+        if self.reset_pose_count < 1:
+            raise ValueError("reset_pose_count must be positive.")
+        resolutions = (self.reset_pile_lattice_min_resolution, self.reset_pile_lattice_max_resolution)
+        if any(len(resolution) != 3 or any(count < 1 for count in resolution) for resolution in resolutions):
+            raise ValueError("Particle lattice crop bounds must contain three positive integers.")
         if self.reset_pile_lattice_max_resolution != PILE_LATTICE_RESOLUTION:
             raise ValueError("The maximum reset crop must equal the complete emitted particle lattice.")
         if any(
@@ -738,6 +731,49 @@ class UR10ParticlePushEnvCfg(DirectRLEnvCfg):
             )
         ):
             raise ValueError("The minimum reset crop must fit inside the maximum particle lattice.")
+
+        centers = (*self.paddle_reset_center, *self.pile_nominal_center)
+        if (
+            len(self.paddle_reset_center) != 3
+            or len(self.pile_nominal_center) != 3
+            or not all(math.isfinite(value) for value in centers)
+        ):
+            raise ValueError("Paddle and pile reset centers must contain three finite coordinates.")
+        longitudinal_ranges = (
+            self.reset_particle_longitudinal_offset_range,
+            self.reset_paddle_longitudinal_offset_range,
+        )
+        if any(
+            len(bounds) != 2 or not all(math.isfinite(value) for value in bounds) or not bounds[0] <= 0.0 <= bounds[1]
+            for bounds in longitudinal_ranges
+        ):
+            raise ValueError("Reset longitudinal ranges must be finite ordered intervals containing zero.")
+        if len(self.reset_particle_paddle_residual_half_range) != 2:
+            raise ValueError("reset_particle_paddle_residual_half_range must contain two values.")
+        randomization_magnitudes = (
+            self.reset_particle_max_lateral_offset,
+            self.reset_particle_split_max_lateral_offset,
+            self.reset_particle_max_yaw,
+            self.reset_particle_jitter,
+            self.reset_paddle_max_lateral_offset,
+            self.reset_paddle_split_max_lateral_offset,
+            self.reset_paddle_max_yaw,
+            *self.reset_particle_paddle_residual_half_range,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in randomization_magnitudes):
+            raise ValueError("Reset randomization magnitudes must be finite and non-negative.")
+        if (
+            self.reset_particle_longitudinal_offset_range[0] > self.reset_paddle_longitudinal_offset_range[0]
+            or self.reset_particle_longitudinal_offset_range[1] < self.reset_paddle_longitudinal_offset_range[1]
+            or self.reset_particle_max_lateral_offset < self.reset_paddle_max_lateral_offset
+            or self.reset_particle_split_max_lateral_offset < self.reset_paddle_split_max_lateral_offset
+        ):
+            raise ValueError("Particle translation ranges must contain the paddle translation ranges.")
+        if max(self.reset_particle_max_yaw, self.reset_paddle_max_yaw) >= 0.5 * math.pi:
+            raise ValueError("Reset yaw magnitudes must be smaller than pi/2.")
+        if self.reset_particle_jitter >= 0.5 * min(PILE_LATTICE_CELL_SIZE):
+            raise ValueError("Particle reset jitter must be smaller than half the particle spacing.")
+
         self._validate_curriculum_config()
         paddle_size = tuple(self.paddle_size)
         if (
@@ -748,20 +784,10 @@ class UR10ParticlePushEnvCfg(DirectRLEnvCfg):
         maximum_lateral_width = self.reset_pile_lattice_max_resolution[1] * PILE_LATTICE_CELL_SIZE[1]
         if paddle_size[1] >= maximum_lateral_width:
             raise ValueError("The paddle must remain narrower than the maximum pile.")
-        if not isinstance(self.reset_cycle, bool):
-            raise ValueError("reset_cycle must be Boolean.")
-        for name, value in (
-            ("reset_ik_seeds", self.reset_ik_seeds),
-            ("reset_ik_iterations", self.reset_ik_iterations),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"{name} must be a positive integer.")
-        for name, value in (
-            ("reset_ik_max_cost", self.reset_ik_max_cost),
-            ("reset_ik_noise_std", self.reset_ik_noise_std),
-        ):
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{name} must be finite and positive.")
+        if min(self.reset_ik_seeds, self.reset_ik_iterations) < 1:
+            raise ValueError("Reset IK seed and iteration counts must be positive.")
+        if any(not math.isfinite(value) or value <= 0.0 for value in (self.reset_ik_max_cost, self.reset_ik_noise_std)):
+            raise ValueError("Reset IK cost and noise thresholds must be finite and positive.")
 
     def _validate_curriculum_config(self) -> None:
         """Validate the reverse curriculum and collision-safe reset envelope."""
@@ -778,20 +804,8 @@ class UR10ParticlePushEnvCfg(DirectRLEnvCfg):
             raise ValueError("Every curriculum sequence must contain one value per level.")
         if self.reset_pose_count % level_count != 0:
             raise ValueError("reset_pose_count must be divisible by the number of curriculum levels.")
-        values = (
-            *self.curriculum_pile_center_x,
-            *self.curriculum_initial_bin_fraction,
-            *self.curriculum_source_lateral_offset,
-            *self.curriculum_randomization_scale,
-        )
-        if not all(math.isfinite(value) for value in values):
-            raise ValueError("Every curriculum value must be finite.")
-        if not all(first >= second for first, second in pairwise(self.curriculum_pile_center_x)):
-            raise ValueError("Curriculum pile centers must move monotonically away from the bin.")
-        if not all(first >= second for first, second in pairwise(self.curriculum_initial_bin_fraction)):
-            raise ValueError("Curriculum initial bin fractions must decrease monotonically.")
-        if not all(first < second for first, second in pairwise(self.curriculum_randomization_scale)):
-            raise ValueError("Curriculum randomization scales must increase strictly.")
+        if not all(math.isfinite(center_x) for center_x in self.curriculum_pile_center_x):
+            raise ValueError("Curriculum pile centers must be finite.")
         if not all(0.0 <= value < self.success_fraction for value in self.curriculum_initial_bin_fraction):
             raise ValueError("Curriculum initial bin fractions must lie in [0, success_fraction).")
         if not all(0.0 < value <= 1.0 for value in self.curriculum_randomization_scale):
@@ -800,46 +814,27 @@ class UR10ParticlePushEnvCfg(DirectRLEnvCfg):
         for level, (pile_count, lateral_offset) in enumerate(
             zip(self.curriculum_source_pile_count, self.curriculum_source_lateral_offset, strict=True)
         ):
-            if isinstance(pile_count, bool) or pile_count not in (1, 2):
+            if pile_count not in (1, 2):
                 raise ValueError(f"Curriculum level {level} must contain one or two source piles.")
             if rows_per_level % pile_count != 0:
                 raise ValueError(f"Reset-pose rows at curriculum level {level} must divide across its source piles.")
-            if lateral_offset < 0.0 or (pile_count == 1) != math.isclose(lateral_offset, 0.0):
+            if not lateral_offset >= 0.0 or (pile_count == 1) != math.isclose(lateral_offset, 0.0):
                 raise ValueError(
                     "Single source piles require zero lateral offset; split piles require a positive offset."
                 )
-        if not math.isclose(self.curriculum_pile_center_x[-1], self.pile_nominal_center[0]):
-            raise ValueError("The final curriculum pile center must equal the nominal deployment center.")
-        if not math.isclose(self.curriculum_initial_bin_fraction[-1], 0.0):
-            raise ValueError("The final curriculum reset must start with an empty bin.")
-        if self.curriculum_source_pile_count[-1] != 1:
-            raise ValueError("The final curriculum reset must restore one broad deployment pile.")
-        if not math.isclose(self.curriculum_randomization_scale[-1], 1.0):
-            raise ValueError("The final curriculum randomization scale must equal one.")
-        for name, count in (
-            ("curriculum_successes_to_promote", self.curriculum_successes_to_promote),
-            ("curriculum_failures_to_demote", self.curriculum_failures_to_demote),
-        ):
-            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-                raise ValueError(f"{name} must be a positive integer.")
-        if self.curriculum_level_override is not None and (
-            isinstance(self.curriculum_level_override, bool)
-            or not isinstance(self.curriculum_level_override, int)
-            or not 0 <= self.curriculum_level_override < level_count
-        ):
+        if min(self.curriculum_successes_to_promote, self.curriculum_failures_to_demote) < 1:
+            raise ValueError("Curriculum promotion and demotion streaks must be positive.")
+        if self.curriculum_level_override is not None and not 0 <= self.curriculum_level_override < level_count:
             raise ValueError(f"curriculum_level_override must be None or lie in [0, {level_count - 1}].")
         if self.reset_curriculum_level_cycle is not None:
             if self.curriculum_level_override is not None:
                 raise ValueError("reset_curriculum_level_cycle and curriculum_level_override are mutually exclusive.")
-            if not isinstance(self.reset_curriculum_level_cycle, tuple) or not self.reset_curriculum_level_cycle:
-                raise ValueError("reset_curriculum_level_cycle must be None or a non-empty tuple.")
-            if any(
-                isinstance(level, bool) or not isinstance(level, int) or not 0 <= level < level_count
-                for level in self.reset_curriculum_level_cycle
+            if not self.reset_curriculum_level_cycle or any(
+                not 0 <= level < level_count for level in self.reset_curriculum_level_cycle
             ):
                 raise ValueError(f"reset_curriculum_level_cycle entries must lie in [0, {level_count - 1}].")
-        if not math.isfinite(self.reset_bin_clearance) or self.reset_bin_clearance < 0.0:
-            raise ValueError("reset_bin_clearance must be finite and non-negative.")
+        if not self.reset_bin_clearance >= 0.0:
+            raise ValueError("reset_bin_clearance must be non-negative.")
         self._validate_particle_reset_envelopes()
 
     def _validate_particle_reset_envelopes(self) -> None:
@@ -918,15 +913,9 @@ class UR10ParticlePushEnvCfg(DirectRLEnvCfg):
 
     def _validate_heightmap_config(self) -> None:
         """Validate the deployable image observation and calibrated goal mask."""
-        if len(self.heightmap_shape) != 2 or any(
-            isinstance(size, bool) or not isinstance(size, int) or size < 8 for size in self.heightmap_shape
-        ):
+        if len(self.heightmap_shape) != 2 or any(size < 8 for size in self.heightmap_shape):
             raise ValueError("heightmap_shape must contain two integer dimensions of at least eight cells.")
-        if (
-            isinstance(self.heightmap_history_steps, bool)
-            or not isinstance(self.heightmap_history_steps, int)
-            or self.heightmap_history_steps < 1
-        ):
+        if self.heightmap_history_steps < 1:
             raise ValueError("heightmap_history_steps must be a positive integer.")
         for name, bounds in (
             ("heightmap_x_bounds", self.heightmap_x_bounds),
@@ -956,114 +945,81 @@ class UR10ParticlePushEnvCfg(DirectRLEnvCfg):
             ("y", self.heightmap_y_bounds, self.bin_inner_y_bounds, height_cells),
         ):
             cell_size = (map_bounds[1] - map_bounds[0]) / cell_count
-            covers_cell_center = any(
+            if not any(
                 bin_bounds[0] <= map_bounds[0] + (index + 0.5) * cell_size <= bin_bounds[1]
                 for index in range(cell_count)
-            )
-            if not covers_cell_center:
+            ):
                 raise ValueError(f"The bin must cover at least one heightmap cell center along {axis_name}.")
-        if not math.isfinite(self.heightmap_z_min):
-            raise ValueError("heightmap_z_min must be finite.")
-        if self.heightmap_z_range <= 0.0 or not math.isfinite(self.heightmap_z_range):
-            raise ValueError("heightmap_z_range must be finite and positive.")
-        for name, value in (
-            ("heightmap_depth_noise_std", self.heightmap_depth_noise_std),
-            ("heightmap_xy_noise_std", self.heightmap_xy_noise_std),
+        if (
+            not math.isfinite(self.heightmap_z_min)
+            or not math.isfinite(self.heightmap_z_range)
+            or self.heightmap_z_range <= 0.0
         ):
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(f"{name} must be finite and non-negative.")
+            raise ValueError("The heightmap vertical range must be finite and positive.")
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for value in (self.heightmap_depth_noise_std, self.heightmap_xy_noise_std)
+        ):
+            raise ValueError("Heightmap noise magnitudes must be finite and non-negative.")
         if not math.isfinite(self.heightmap_dropout_probability) or not 0.0 <= self.heightmap_dropout_probability < 1.0:
             raise ValueError("heightmap_dropout_probability must lie in [0, 1).")
         work_surface_top = (
             self.scene.mpm_work_surface.init_state.pos[2] + 0.5 * self.scene.mpm_work_surface.spawn.size[2]
         )
         maximum_vertical_cells = max(profile[0] for profile in self.reset_source_shape_profiles)
-        maximum_source_center_z = (
+        required_heightmap_top = (
             work_surface_top
             + MPM_COLLIDER_MARGIN
             + (maximum_vertical_cells - 1) * PILE_LATTICE_CELL_SIZE[2]
             + 2.0 * self.reset_particle_jitter
+            + self.scene.media.spawn.radius
         )
-        required_heightmap_top = maximum_source_center_z + self.scene.media.spawn.radius
         if self.heightmap_z_min + self.heightmap_z_range <= required_heightmap_top:
             raise ValueError("The heightmap vertical range must include the complete deployment pile.")
 
     def _validate_objective_config(self) -> None:
-        """Validate numerical safeguards, shaping, and the terminal objective."""
-        if not math.isfinite(self.particle_max_velocity) or self.particle_max_velocity <= 0.0:
-            raise ValueError("particle_max_velocity must be finite and positive.")
+        """Validate cross-field objective ranges and observation divisors."""
         if not math.isfinite(self.state_bound_joint_position_margin) or self.state_bound_joint_position_margin < 0.0:
             raise ValueError("state_bound_joint_position_margin must be finite and non-negative.")
-        for name, value in (
-            ("state_bound_max_joint_velocity", self.state_bound_max_joint_velocity),
-            ("state_bound_max_ee_linear_velocity", self.state_bound_max_ee_linear_velocity),
-            ("state_bound_max_ee_angular_velocity", self.state_bound_max_ee_angular_velocity),
+        if not 0.0 < self.success_fraction <= 1.0 or not (
+            0.0 <= self.success_max_spill_fraction <= self.failure_max_spill_fraction < 1.0
         ):
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{name} must be finite and positive.")
-        if not math.isfinite(self.proxy_mass_scale) or self.proxy_mass_scale <= 0.0:
-            raise ValueError("proxy_mass_scale must be finite and positive.")
-        if not 0.0 < self.success_fraction <= 1.0:
-            raise ValueError("success_fraction must lie in (0, 1].")
-        if not 0.0 <= self.success_max_spill_fraction < 1.0:
-            raise ValueError("success_max_spill_fraction must lie in [0, 1).")
-        if not self.success_max_spill_fraction <= self.failure_max_spill_fraction < 1.0:
-            raise ValueError("failure_max_spill_fraction must lie in [success_max_spill_fraction, 1).")
+            raise ValueError("Success and failure fractions must be ordered within [0, 1].")
         if not 0.0 <= self.max_escaped_particle_fraction <= self.failure_max_spill_fraction:
             raise ValueError("The escaped-particle tolerance must lie within the irrecoverable-spill threshold.")
-        if self.success_max_rms_particle_speed <= 0.0 or self.success_dwell_time_s <= 0.0:
-            raise ValueError("Success motion and dwell thresholds must be positive.")
-        reward_values = {
-            "reward_success": self.reward_success,
-            "reward_bin_progress": self.reward_bin_progress,
-            "reward_transport_progress": self.reward_transport_progress,
-            "reward_paddle_reach_potential_per_second": self.reward_paddle_reach_potential_per_second,
-            "penalty_spill_fraction_per_second": self.penalty_spill_fraction_per_second,
-            "penalty_failure": self.penalty_failure,
-            "penalty_action_magnitude_per_second": self.penalty_action_magnitude_per_second,
-            "penalty_action_rate_per_second": self.penalty_action_rate_per_second,
-        }
-        if not all(math.isfinite(value) for value in reward_values.values()):
-            raise ValueError("Every reward and penalty coefficient must be finite.")
-        if self.reward_success <= 0.0:
-            raise ValueError("reward_success must be positive.")
-        if (
-            self.reward_bin_progress <= 0.0
-            or self.reward_transport_progress <= 0.0
-            or self.reward_paddle_reach_potential_per_second <= 0.0
-        ):
-            raise ValueError("Potential-shaping coefficients and the paddle-reach reward rate must be positive.")
-        maximum_shaping_return = (
-            self.reward_bin_progress
-            + self.reward_transport_progress
-            + self.episode_length_s * self.reward_paddle_reach_potential_per_second
+        runtime_bounds = (
+            self.state_bound_max_joint_velocity,
+            self.state_bound_max_ee_linear_velocity,
+            self.state_bound_max_ee_angular_velocity,
+            self.proxy_mass_scale,
+            self.success_dwell_time_s,
         )
-        if self.reward_success <= maximum_shaping_return:
-            raise ValueError(
-                "reward_success must exceed the maximum undiscounted shaping return "
-                f"({maximum_shaping_return:.6g}) over one episode."
-            )
-        if self.penalty_failure > -maximum_shaping_return:
-            raise ValueError(
-                "penalty_failure must cancel the maximum undiscounted shaping return "
-                f"({maximum_shaping_return:.6g}) over one episode."
-            )
-        if (
-            not math.isfinite(self.paddle_reach_distance)
-            or self.paddle_reach_distance <= 0.0
-            or not math.isfinite(self.paddle_reach_contact_depth)
-            or self.paddle_reach_contact_depth < 0.0
-            or not math.isfinite(self.paddle_lateral_alignment_distance)
-            or self.paddle_lateral_alignment_distance <= 0.0
-            or not math.isfinite(self.paddle_vertical_alignment_distance)
-            or self.paddle_vertical_alignment_distance <= 0.0
-        ):
-            raise ValueError("Paddle reach/contact and pose-alignment distances are invalid.")
+        if any(not math.isfinite(value) or value <= 0.0 for value in runtime_bounds):
+            raise ValueError("State bounds, proxy mass scale, and success dwell time must be finite and positive.")
+        observation_divisors = (
+            self.particle_max_velocity,
+            self.success_max_rms_particle_speed,
+            self.paddle_reach_distance,
+            self.paddle_lateral_alignment_distance,
+            self.paddle_vertical_alignment_distance,
+        )
+        if any(not math.isfinite(value) or value <= 0.0 for value in observation_divisors):
+            raise ValueError("Particle-speed and paddle-alignment scales must be finite and positive.")
         nominal_pile_length = self.scene.media.spawn.upper[0] - self.scene.media.spawn.lower[0]
-        if self.paddle_reach_contact_depth >= 0.5 * nominal_pile_length:
-            raise ValueError("Paddle reach contact depth must be smaller than half the nominal pile length.")
-        if any(value > 0.0 for name, value in reward_values.items() if name.startswith("penalty_")):
-            raise ValueError("Penalty coefficients must be non-positive.")
+        if not 0.0 <= self.paddle_reach_contact_depth < 0.5 * nominal_pile_length:
+            raise ValueError("Paddle reach contact depth must lie within the trailing half of the pile.")
+        reward_values = (
+            self.reward_success,
+            self.reward_bin_progress,
+            self.reward_transport_progress,
+            self.reward_paddle_reach_potential_per_second,
+            self.penalty_spill_fraction_per_second,
+            self.penalty_failure,
+            self.penalty_action_magnitude_per_second,
+            self.penalty_action_rate_per_second,
+        )
+        if not all(math.isfinite(value) for value in reward_values):
+            raise ValueError("Every reward and penalty coefficient must be finite.")
 
     def __post_init__(self) -> None:
         self._validate_source_shape_profiles()

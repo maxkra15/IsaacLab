@@ -122,7 +122,6 @@ def test_randomized_reset_preserves_variable_payload_and_unselected_world():
         protected_particle_position = task._media.data.particle_pos_w.torch[1].clone()
         protected_particle_velocity = task._media.data.particle_vel_w.torch[1].clone()
         protected_active_mask = task._particle_active_mask[1].clone()
-        protected_pose_id = task._reset_pose_ids[1].clone()
         protected_episode_length = task.episode_length_buf[1].clone()
 
         final_level = len(cfg.curriculum_pile_center_x) - 1
@@ -145,7 +144,6 @@ def test_randomized_reset_preserves_variable_payload_and_unselected_world():
         torch.testing.assert_close(
             task._media.data.particle_vel_w.torch[1], protected_particle_velocity, atol=0.0, rtol=0.0
         )
-        torch.testing.assert_close(task._reset_pose_ids[1], protected_pose_id)
         torch.testing.assert_close(task.episode_length_buf[1], protected_episode_length)
 
         observations, reward, terminated, truncated, _ = env.step(zero_action)

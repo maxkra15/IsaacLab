@@ -11,10 +11,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from isaaclab.envs.mdp.actions import BinaryJointPositionAction
 from isaaclab.managers import TerminationTermCfg
+from isaaclab.test.mock_interfaces.assets import MockArticulation
 
 from isaaclab_tasks.contrib.franka_pour import _state as state_utils
 from isaaclab_tasks.contrib.franka_pour.mdp import observations, rewards, terminations
+from isaaclab_tasks.contrib.franka_pour.mdp.actions import CurriculumGripperPositionAction
+from isaaclab_tasks.contrib.franka_pour.mdp.actions_cfg import CurriculumGripperPositionActionCfg
 
 
 class FakeTerminationManager:
@@ -80,7 +84,6 @@ class FakeEnv:
         self.action_manager = FakeActionManager(self.num_envs)
         self.episode_succeeded = torch.zeros(self.num_envs, dtype=torch.bool)
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
-        self.ep_max_target_frac = torch.zeros(self.num_envs)
         self._success_dwell_count = torch.zeros(self.num_envs, dtype=torch.long)
         self._lost_grasp_dwell_count = torch.zeros(self.num_envs, dtype=torch.long)
         self._lifted_grasp_seen = torch.zeros(self.num_envs, dtype=torch.bool)
@@ -100,7 +103,6 @@ class FakeEnv:
         self._source_count = torch.tensor([245.0, 183.0, 98.0, 0.0])
         self._target_count = torch.tensor([0.0, 61.0, 122.0, 233.0])
         self._spill_count = torch.tensor([0.0, 0.0, 24.0, 12.0])
-        self._held_delivered = torch.zeros((self.num_envs, self.num_particles), dtype=torch.bool)
 
     @property
     def gripper(self) -> FakeGripperAction:
@@ -138,9 +140,6 @@ class FakeEnv:
 
     def spilled_fraction(self) -> torch.Tensor:
         return self._spill_count / self.num_particles
-
-    def current_held_delivered_mask(self) -> torch.Tensor:
-        return self._held_delivered
 
 
 def _physical_progress_params() -> dict[str, float]:
@@ -218,10 +217,6 @@ def test_immediate_success_uses_current_fraction_with_failure_precedence_and_245
 
     assert success.tolist() == [False, True, True, False]
     assert env.episode_succeeded.tolist() == [False, True, True, False]
-    torch.testing.assert_close(
-        env.ep_max_target_frac,
-        torch.tensor([171.0 / 245.0, 172.0 / 245.0, 1.0, 1.0]),
-    )
     boundary = terminations.immediate_pour_success_mask(
         torch.tensor([171.0 / 245.0, 172.0 / 245.0]),
         0.70,
@@ -338,6 +333,45 @@ def test_actor_gripper_and_horizon_observations_preserve_current_state():
     torch.testing.assert_close(observations.gripper_contact_obs(env), env.gripper.contact_deflection)
 
 
+def test_gripper_action_reuses_binary_mapping_with_identical_filter_and_reset_state():
+    robot = MockArticulation(
+        num_instances=2,
+        num_joints=2,
+        num_bodies=1,
+        joint_names=["panda_finger_joint1", "panda_finger_joint2"],
+        device="cpu",
+    )
+    env = SimpleNamespace(scene={"robot": robot}, num_envs=2, device="cpu")
+    alpha = 1.0 - (1.0 - 0.2) ** (1.0 / 3.0)
+    cfg = CurriculumGripperPositionActionCfg(
+        asset_name="robot",
+        joint_names=["panda_finger.*"],
+        alpha=alpha,
+        close_position=0.021,
+        neutral_position=0.04,
+        default_position=0.024,
+    )
+
+    action = CurriculumGripperPositionAction(cfg, env)
+    assert isinstance(action, BinaryJointPositionAction)
+    raw = torch.tensor(((-1.0,), (1.0,)))
+    action.process_actions(raw)
+    initial = torch.full((2, 2), 0.024)
+    expected = initial.lerp(torch.tensor(((0.021, 0.021), (0.04, 0.04))), alpha)
+    torch.testing.assert_close(action.raw_actions, raw)
+    torch.testing.assert_close(action.processed_actions, expected)
+
+    action.set_reset_position(torch.tensor(((0.03,),)), env_ids=torch.tensor((1,)))
+    torch.testing.assert_close(action.processed_actions[1], torch.tensor((0.03, 0.03)))
+    action.reset(torch.tensor((1,)))
+    torch.testing.assert_close(action.raw_actions[1], torch.zeros(1))
+    torch.testing.assert_close(action.processed_actions[1], torch.tensor((0.03, 0.03)))
+
+    robot.data.joint_pos.torch[:] = action.processed_actions + torch.tensor(((0.002, 0.001), (0.002, 0.0005)))
+    assert action.bilateral_contact.tolist() == [True, False]
+    torch.testing.assert_close(action.contact_quality, torch.tensor((1.0, 0.5)))
+
+
 def test_media_velocity_and_fraction_observations_are_bounded_and_permutation_invariant():
     env = FakeEnv()
     velocity = torch.tensor(
@@ -349,7 +383,6 @@ def test_media_velocity_and_fraction_observations_are_bounded_and_permutation_in
         ]
     )
     env.cup_velocity_w = lambda: velocity
-    env._held_delivered[1, :10] = True
 
     normalized_velocity = observations.normalized_cup_velocity_obs(env, max_surface_speed=0.5, surface_radius=0.13)
     fractions = observations.particle_fractions_obs(env)
@@ -363,11 +396,12 @@ def test_media_velocity_and_fraction_observations_are_bounded_and_permutation_in
                 env._source_count / env.num_particles,
                 env._target_count / env.num_particles,
                 env._spill_count / env.num_particles,
-                env._held_delivered.sum(dim=1).float() / env.num_particles,
+                torch.zeros(env.num_envs),
             ),
             dim=-1,
         ),
     )
+    torch.testing.assert_close(observations.held_delivery_history_obs(env), torch.zeros((env.num_envs, 1)))
     with pytest.raises(ValueError, match="surface_radius"):
         observations.normalized_cup_velocity_obs(env, surface_radius=0.0)
 

@@ -15,16 +15,12 @@ from isaaclab_tasks.contrib.franka_pour.pour_env import FrankaPourEnv
 
 class _RobotRecorder:
     def __init__(self):
-        self.position_writes = []
-        self.velocity_writes = []
+        self.state_writes = []
         self.position_targets = []
         self.data = SimpleNamespace(body_link_pose_w=torch.empty(0))
 
-    def write_joint_position_to_sim_index(self, *, position, **_kwargs):
-        self.position_writes.append(position.clone())
-
-    def write_joint_velocity_to_sim_index(self, *, velocity, **_kwargs):
-        self.velocity_writes.append(velocity.clone())
+    def write_joint_state_to_sim_index(self, *, position, velocity, **_kwargs):
+        self.state_writes.append((position.clone(), velocity.clone()))
 
     def set_joint_position_target_index(self, *, target, **_kwargs):
         self.position_targets.append(target.clone())
@@ -109,16 +105,9 @@ def test_reset_dataset_restores_exact_state_and_clears_solver_history(monkeypatc
         _particle_region_cache=object(),
         _particle_region_cache_step=1,
         episode_succeeded=torch.ones(2, dtype=torch.bool),
-        ep_max_target_frac=torch.ones(2),
-        ep_reached_grasp=torch.ones(2, dtype=torch.bool),
-        ep_preloaded_grasp=torch.ones(2, dtype=torch.bool),
-        ep_lifted_grasp=torch.ones(2, dtype=torch.bool),
         _success_dwell_count=torch.ones(2, dtype=torch.long),
         _lost_grasp_dwell_count=torch.ones(2, dtype=torch.long),
         _lifted_grasp_seen=torch.ones(2, dtype=torch.bool),
-        _target_entry_seen=torch.ones((2, 2), dtype=torch.bool),
-        _held_delivered=torch.ones((2, 2), dtype=torch.bool),
-        _held_delivery_tracker_step=1,
     )
     monkeypatch.setattr(
         pour_env_module.NewtonMPMManager,
@@ -129,9 +118,10 @@ def test_reset_dataset_restores_exact_state_and_clears_solver_history(monkeypatc
     world_mask = torch.tensor((True, True, False))
     FrankaPourEnv._reset_from_dataset(env, torch.arange(2), world_mask)
 
-    torch.testing.assert_close(robot.position_writes[0], states["arm_joint_position"][rows])
-    torch.testing.assert_close(robot.velocity_writes[0], states["arm_joint_velocity"][rows])
-    torch.testing.assert_close(robot.position_writes[1], states["finger_joint_position"][rows])
+    torch.testing.assert_close(robot.state_writes[0][0], states["arm_joint_position"][rows])
+    torch.testing.assert_close(robot.state_writes[0][1], states["arm_joint_velocity"][rows])
+    torch.testing.assert_close(robot.state_writes[1][0], states["finger_joint_position"][rows])
+    torch.testing.assert_close(robot.state_writes[1][1], states["finger_joint_velocity"][rows])
     torch.testing.assert_close(robot.position_targets[1], states["finger_joint_target"][rows])
     torch.testing.assert_close(gripper_reset[0], states["finger_joint_target"][rows, :1])
     torch.testing.assert_close(
@@ -150,7 +140,4 @@ def test_reset_dataset_restores_exact_state_and_clears_solver_history(monkeypatc
     )
     assert env._particle_region_cache is None
     assert not bool(env.episode_succeeded.any())
-    assert not bool(env.ep_reached_grasp.any())
-    assert not bool(env.ep_preloaded_grasp.any())
-    assert not bool(env.ep_lifted_grasp.any())
     assert env._lifted_grasp_seen.tolist() == [True, False]

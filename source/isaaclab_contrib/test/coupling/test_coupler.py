@@ -556,22 +556,6 @@ def test_only_sparse_coupled_mpm_defers_standard_graph_capture(monkeypatch, grid
     assert NewtonCouplerManager._defer_standard_graph_capture() is expected
 
 
-def test_mpm_entry_defers_automatic_reset(monkeypatch):
-    events: list[object] = []
-    cfg = CouplerAdmmCfg(entries=[CouplerEntryCfg(name="media", solver_cfg=MPMSolverCfg(), in_place=True)])
-    world_mask = object()
-    monkeypatch.setattr(coupler.PhysicsManager, "_cfg", SimpleNamespace(solver_cfg=cfg))
-    monkeypatch.setattr(
-        coupler.NewtonVBDManager,
-        "_reset_solver_internals",
-        classmethod(lambda cls, value: events.append(value)),
-    )
-
-    NewtonCouplerManager._reset_solver_internals(world_mask)
-
-    assert events == []
-
-
 def test_mpm_entry_reuses_builder_lifecycle_hooks(monkeypatch):
     """Coupled MPM entries register attributes and normalize kinematic colliders."""
     events: list[tuple[str, object]] = []

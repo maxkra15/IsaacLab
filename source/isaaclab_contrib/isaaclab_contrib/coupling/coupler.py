@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 
-import warp as wp
 from isaaclab_newton.physics import (
     KaminoSolverCfg,
     MJWarpSolverCfg,
@@ -232,18 +231,6 @@ class NewtonCouplerManager(NewtonVBDManager):
             isinstance(entry.solver_cfg, MPMSolverCfg) and solver.solver(entry.name).grid_type == "sparse"
             for entry in getattr(solver_cfg, "entries", ())
         )
-
-    @classmethod
-    def _reset_solver_internals(cls, world_mask: wp.array | None) -> None:
-        """Defer coupled MPM history reset until the task finishes authoring state.
-
-        Args:
-            world_mask: Per-world automatic reset mask.
-        """
-        solver_cfg = getattr(PhysicsManager._cfg, "solver_cfg", None)
-        if any(isinstance(entry.solver_cfg, MPMSolverCfg) for entry in getattr(solver_cfg, "entries", ())):
-            return
-        super()._reset_solver_internals(world_mask)
 
     @classmethod
     def _resolve_entry(

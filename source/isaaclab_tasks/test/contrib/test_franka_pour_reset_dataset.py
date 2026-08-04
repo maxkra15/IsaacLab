@@ -39,7 +39,6 @@ class _FakeResetDatasetEnv:
     ):
         self.num_envs = 4
         self.device = "cpu"
-        self._uses_reset_dataset = True
         self._reset_dataset_states = _states()
         self.cfg = SimpleNamespace(
             curriculum_freeze=freeze,

@@ -483,7 +483,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         self._particle_workspace_upper_t = torch.as_tensor(
             self.cfg.particle_workspace_upper_bound, device=dev, dtype=torch.float32
         )
-        self._uses_reset_dataset = True
         if not self.cfg.reset_dataset_path:
             raise ValueError("The Pour task requires reset_dataset_path.")
         self._load_reset_dataset(self.cfg.reset_dataset_path)
@@ -491,20 +490,9 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         self.reset_dataset_row_id = torch.full((self.num_envs,), -1, device=dev, dtype=torch.long)
         self.pour_target_frac = torch.full((self.num_envs,), float(self.cfg.pour_target_frac), device=dev)
         self.episode_succeeded = torch.zeros(self.num_envs, device=dev, dtype=torch.bool)
-        self.ep_max_target_frac = torch.zeros(self.num_envs, device=dev)
-        self.ep_reached_grasp = torch.zeros(self.num_envs, device=dev, dtype=torch.bool)
-        self.ep_preloaded_grasp = torch.zeros_like(self.ep_reached_grasp)
-        self.ep_lifted_grasp = torch.zeros_like(self.ep_reached_grasp)
         self._success_dwell_count = torch.zeros(self.num_envs, device=dev, dtype=torch.long)
         self._lost_grasp_dwell_count = torch.zeros(self.num_envs, device=dev, dtype=torch.long)
         self._lifted_grasp_seen = torch.zeros(self.num_envs, device=dev, dtype=torch.bool)
-        self._target_entry_seen = torch.zeros(
-            (self.num_envs, self.num_particles),
-            device=dev,
-            dtype=torch.bool,
-        )
-        self._held_delivered = torch.zeros_like(self._target_entry_seen)
-        self._held_delivery_tracker_step = -1
         self._source_inner_lo_t = torch.as_tensor(self._source_inner_lo, device=dev)
         self._source_inner_hi_t = torch.as_tensor(self._source_inner_hi, device=dev)
         self._target_inner_lo_t = torch.as_tensor(self._target_inner_lo, device=dev)
@@ -685,35 +673,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         """Return cached source, source-exclusive target, and irreversible-spill masks."""
         return self._particle_region_masks()
 
-    def update_held_delivery_tracker(self, held_pour: torch.Tensor) -> None:
-        """Record particles whose target-entry edge occurs during a held pour.
-
-        The tracker is idempotent within one manager step because success termination and reward
-        evaluation consume the same state. An unheld entry does not permanently disqualify a
-        particle: after it leaves the target, a later valid held re-entry can still qualify.
-
-        Args:
-            held_pour: Per-environment mask for a preloaded, lifted source grasp.
-        """
-        if held_pour.shape != (self.num_envs,):
-            raise ValueError(f"held_pour must have shape ({self.num_envs},), got {tuple(held_pour.shape)}.")
-        step = int(self.common_step_counter)
-        if self._held_delivery_tracker_step == step:
-            return
-        in_target = self.particles_in_target_mask()
-        target_entry = in_target & ~self._target_entry_seen
-        self._held_delivered |= target_entry & held_pour.unsqueeze(-1)
-        self._target_entry_seen.copy_(in_target)
-        self._held_delivery_tracker_step = step
-
-    def held_delivered_mask(self) -> torch.Tensor:
-        """Particles with at least one target-entry edge during a held pour."""
-        return self._held_delivered
-
-    def current_held_delivered_mask(self) -> torch.Tensor:
-        """Validly delivered particles that remain inside the receiving cup."""
-        return self.particles_in_target_mask() & self._held_delivered
-
     def particles_spilled_mask(self) -> torch.Tensor:
         """Per-particle irreversible-spill membership used by one-time penalties."""
         return self._particle_region_masks()[2]
@@ -792,12 +751,8 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         finger_qd = states["finger_joint_velocity"][rows]
         finger_target = states["finger_joint_target"][rows]
 
-        self._robot.write_joint_position_to_sim_index(
+        self._robot.write_joint_state_to_sim_index(
             position=arm_q,
-            joint_ids=self._arm_joint_ids,
-            env_ids=env_ids,
-        )
-        self._robot.write_joint_velocity_to_sim_index(
             velocity=arm_qd,
             joint_ids=self._arm_joint_ids,
             env_ids=env_ids,
@@ -807,12 +762,8 @@ class FrankaPourEnv(ManagerBasedRLEnv):
             joint_ids=self._arm_joint_ids,
             env_ids=env_ids,
         )
-        self._robot.write_joint_position_to_sim_index(
+        self._robot.write_joint_state_to_sim_index(
             position=finger_q,
-            joint_ids=self._finger_joint_ids,
-            env_ids=env_ids,
-        )
-        self._robot.write_joint_velocity_to_sim_index(
             velocity=finger_qd,
             joint_ids=self._finger_joint_ids,
             env_ids=env_ids,
@@ -865,10 +816,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         self._particle_pos_e_cache = None
         self._particle_pos_e_cache_step = -1
         self.episode_succeeded[env_ids] = False
-        self.ep_max_target_frac[env_ids] = 0.0
-        self.ep_reached_grasp[env_ids] = False
-        self.ep_preloaded_grasp[env_ids] = False
-        self.ep_lifted_grasp[env_ids] = False
         self._success_dwell_count[env_ids] = 0
         self._lost_grasp_dwell_count[env_ids] = 0
         # A grasping cache row is an offline-validated demonstrated grasp. Seed the latch from the
@@ -876,9 +823,6 @@ class FrankaPourEnv(ManagerBasedRLEnv):
         # termination before the first runtime grasp observation. Non-grasping rows remain
         # unlatched and may freely approach the cup.
         self._lifted_grasp_seen[env_ids] = states["category"][rows] == GRASPING_CATEGORY
-        self._target_entry_seen[env_ids] = False
-        self._held_delivered[env_ids] = False
-        self._held_delivery_tracker_step = -1
 
     def reset_pour_scene(self, env_ids: torch.Tensor) -> None:
         """Restore selected environments from reset-dataset rows."""

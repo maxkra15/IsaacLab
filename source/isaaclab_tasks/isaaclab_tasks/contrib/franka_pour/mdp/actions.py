@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Filtered arm and continuous symmetric-gripper actions."""
+"""Filtered arm and binary symmetric-gripper actions."""
 
 from __future__ import annotations
 
@@ -13,10 +13,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.envs.mdp.actions.joint_actions import RelativeJointPositionAction
-from isaaclab.managers import ActionTerm
+from isaaclab.envs.mdp.actions import BinaryJointPositionAction, RelativeJointPositionAction
 
 if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedEnv
+    from isaaclab.envs.utils.io_descriptors import GenericActionIODescriptor
+
     from .actions_cfg import (
         CurriculumGripperPositionActionCfg,
         EMARelativeJointPositionActionCfg,
@@ -30,7 +32,7 @@ class EMARelativeJointPositionAction(RelativeJointPositionAction):
 
     cfg: EMARelativeJointPositionActionCfg
 
-    def __init__(self, cfg: EMARelativeJointPositionActionCfg, env) -> None:
+    def __init__(self, cfg: EMARelativeJointPositionActionCfg, env: ManagerBasedEnv) -> None:
         super().__init__(cfg, env)
         self._alpha = float(cfg.alpha)
         if not 0.0 < self._alpha <= 1.0:
@@ -51,72 +53,40 @@ class EMARelativeJointPositionAction(RelativeJointPositionAction):
         self._previous_delta[selected] = 0.0
 
 
-class CurriculumGripperPositionAction(ActionTerm):
-    """Filtered symmetric finger-position command with residual and binary modes."""
+class CurriculumGripperPositionAction(BinaryJointPositionAction):
+    """Filtered binary symmetric finger-position command with grasp-contact state."""
 
     cfg: CurriculumGripperPositionActionCfg
 
-    def __init__(self, cfg: CurriculumGripperPositionActionCfg, env) -> None:
-        super().__init__(cfg, env)
-        self._joint_ids, self._joint_names = self._asset.find_joints(cfg.joint_names, preserve_order=True)
-        self._num_joints = len(self._joint_ids)
-        if self._num_joints == 0:
-            raise ValueError("CurriculumGripperPositionAction resolved no joints.")
-
+    def __init__(self, cfg: CurriculumGripperPositionActionCfg, env: ManagerBasedEnv) -> None:
+        binary_cfg = cfg.copy()
+        binary_cfg.open_command_expr = {".*": float(cfg.neutral_position)}
+        binary_cfg.close_command_expr = {".*": float(cfg.close_position)}
+        super().__init__(binary_cfg, env)
+        self._joint_ids_torch, _ = self._asset.find_joints(cfg.joint_names, preserve_order=True)
         self._scale = float(cfg.scale)
         self._alpha = float(cfg.alpha)
-        self._binary_threshold = cfg.binary_threshold
-        self._close_position = float(cfg.close_position)
+        close_position = float(cfg.close_position)
         self._neutral_position = float(cfg.neutral_position)
-        self._default_position = self._close_position if cfg.default_position is None else float(cfg.default_position)
+        default_position = close_position if cfg.default_position is None else float(cfg.default_position)
         self._contact_min_deflection = float(cfg.contact_min_deflection)
         if not math.isfinite(self._scale) or self._scale <= 0.0:
             raise ValueError("Curriculum gripper action scale must be finite and positive.")
         if not 0.0 < self._alpha <= 1.0:
             raise ValueError(f"Moving-average weight must lie in (0, 1], got {self._alpha}.")
-        if self._binary_threshold is not None:
-            if (
-                isinstance(self._binary_threshold, bool)
-                or not math.isfinite(self._binary_threshold)
-                or not -1.0 < self._binary_threshold < 1.0
-            ):
-                raise ValueError("Binary gripper threshold must be finite and lie strictly between -1 and 1.")
+        if isinstance(cfg.binary_threshold, bool) or float(cfg.binary_threshold) != 0.0:
+            raise ValueError("The checkpoint-facing binary gripper threshold must be zero.")
         if (
-            not math.isfinite(self._close_position)
+            not math.isfinite(close_position)
             or not math.isfinite(self._neutral_position)
-            or not self._close_position <= self._neutral_position
+            or not close_position <= self._neutral_position
         ):
             raise ValueError("Curriculum gripper positions must be finite with close_position <= neutral_position.")
-        if not math.isfinite(self._default_position) or not (
-            self._close_position <= self._default_position <= self._neutral_position
-        ):
+        if not math.isfinite(default_position) or not close_position <= default_position <= self._neutral_position:
             raise ValueError("default_position must lie in [close_position, neutral_position].")
         if not math.isfinite(self._contact_min_deflection) or self._contact_min_deflection <= 0.0:
             raise ValueError("contact_min_deflection must be finite and positive.")
-        self._raw_actions = torch.zeros((self.num_envs, 1), device=self.device)
-        self._action_offset = torch.full(
-            (self.num_envs, 1),
-            self._default_position,
-            device=self.device,
-        )
-        self._processed_actions = self._action_offset.expand(-1, self._num_joints).clone()
-
-    @property
-    def action_dim(self) -> int:
-        return 1
-
-    @property
-    def raw_actions(self) -> torch.Tensor:
-        return self._raw_actions
-
-    @property
-    def processed_actions(self) -> torch.Tensor:
-        return self._processed_actions
-
-    @property
-    def action_offset(self) -> torch.Tensor:
-        """Per-environment residual-mode target and initialization position [m]."""
-        return self._action_offset
+        self._processed_actions.fill_(default_position)
 
     @property
     def commanded_position(self) -> torch.Tensor:
@@ -126,7 +96,7 @@ class CurriculumGripperPositionAction(ActionTerm):
     @property
     def contact_deflection(self) -> torch.Tensor:
         """Per-finger position-drive deflection caused by contact [m]."""
-        joint_position = self._asset.data.joint_pos.torch[:, self._joint_ids]
+        joint_position = self._asset.data.joint_pos.torch[:, self._joint_ids_torch]
         finite = torch.isfinite(joint_position) & torch.isfinite(self._processed_actions)
         return torch.where(
             finite,
@@ -137,7 +107,7 @@ class CurriculumGripperPositionAction(ActionTerm):
     @property
     def bilateral_contact(self) -> torch.Tensor:
         """Whether both fingers remain deflected against the commanded cup contact."""
-        joint_position = self._asset.data.joint_pos.torch[:, self._joint_ids]
+        joint_position = self._asset.data.joint_pos.torch[:, self._joint_ids_torch]
         deflection = self.contact_deflection
         finite = torch.isfinite(joint_position).all(dim=-1) & torch.isfinite(self._processed_actions).all(dim=-1)
         command_valid = self._processed_actions.amax(dim=-1) <= (self._neutral_position + _GRIPPER_POSITION_TOLERANCE)
@@ -158,28 +128,10 @@ class CurriculumGripperPositionAction(ActionTerm):
         return deflection_quality * command_valid.float()
 
     @property
-    def IO_descriptor(self):
+    def IO_descriptor(self) -> GenericActionIODescriptor:
         descriptor = super().IO_descriptor
-        descriptor.shape = (1,)
-        descriptor.dtype = str(self.raw_actions.dtype)
-        descriptor.action_type = "JointAction"
-        descriptor.joint_names = self._joint_names
         descriptor.scale = self._scale
         return descriptor
-
-    def set_action_offset(
-        self,
-        offset: torch.Tensor,
-        env_ids: Sequence[int] | torch.Tensor | slice | None = None,
-    ) -> None:
-        """Set selected environments' residual-mode target and initialization position [m]."""
-        selected = slice(None) if env_ids is None else env_ids
-        expected_shape = self._action_offset[selected].shape
-        if offset.shape != expected_shape:
-            raise ValueError(f"Action offset shape {tuple(offset.shape)} does not match {tuple(expected_shape)}.")
-        offset = offset.to(device=self._action_offset.device, dtype=self._action_offset.dtype)
-        self._action_offset[selected] = offset
-        self._processed_actions[selected] = offset.expand(-1, self._num_joints)
 
     def set_reset_position(
         self,
@@ -188,7 +140,7 @@ class CurriculumGripperPositionAction(ActionTerm):
     ) -> None:
         """Align the filtered target with selected physical reset positions [m]."""
         selected = slice(None) if env_ids is None else env_ids
-        expected_shape = self._action_offset[selected].shape
+        expected_shape = self._raw_actions[selected].shape
         if position.shape != expected_shape:
             raise ValueError(f"Reset-position shape {tuple(position.shape)} does not match {tuple(expected_shape)}.")
         position = position.to(device=self.device, dtype=self._processed_actions.dtype)
@@ -196,25 +148,7 @@ class CurriculumGripperPositionAction(ActionTerm):
         self._processed_actions[selected] = expanded
 
     def process_actions(self, actions: torch.Tensor) -> None:
-        self._raw_actions.copy_(actions)
-        bounded_actions = torch.clamp(actions, -1.0, 1.0)
-        if self._binary_threshold is None:
-            target = torch.clamp(
-                self._action_offset + self._scale * bounded_actions,
-                min=self._close_position,
-                max=self._neutral_position,
-            )
-        else:
-            target = torch.where(
-                bounded_actions < self._binary_threshold,
-                torch.full_like(bounded_actions, self._close_position),
-                torch.full_like(bounded_actions, self._neutral_position),
-            )
-        self._processed_actions.lerp_(target.expand(-1, self._num_joints), self._alpha)
-
-    def apply_actions(self) -> None:
-        self._asset.set_joint_position_target_index(target=self._processed_actions, joint_ids=self._joint_ids)
-
-    def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
-        selected = slice(None) if env_ids is None else env_ids
-        self._raw_actions[selected] = 0.0
+        previous_target = self._processed_actions
+        super().process_actions(actions)
+        previous_target.lerp_(self._processed_actions, self._alpha)
+        self._processed_actions = previous_target

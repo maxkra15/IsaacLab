@@ -32,9 +32,6 @@ class PourResetDatasetCurriculum(ManagerTermBase):
 
     def __init__(self, cfg: CurriculumTermCfg, env: FrankaPourEnv):
         super().__init__(cfg, env)
-        if not getattr(env, "_uses_reset_dataset", False):
-            raise RuntimeError("PourResetDatasetCurriculum requires a reset-dataset environment.")
-
         states = env._reset_dataset_states
         category = states["category"]
         objective = states["objective"]

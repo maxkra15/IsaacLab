@@ -197,20 +197,17 @@ def lost_lifted_grasp(
         raise ValueError(f"dwell_time_s must be finite and positive, got {dwell_time_s}.")
     if not isinstance(terminate, bool):
         raise TypeError("terminate must be a bool.")
-    reached_grasp, preloaded_grasp, lifted_grasp = source_grasp_milestones(
-        env,
-        min_lift_height=max(float(env.cfg.success_min_lift_height), 1.0e-6),
-        max_tcp_distance=max_tcp_distance,
-        max_gripper_width_error=max_gripper_width_error,
-        max_gripper_command=max_gripper_command,
+    cup_lift = env.cup_pose_e()[:, 2] - float(env.cup_reset_height)
+    tcp_distance = torch.linalg.vector_norm(env.tcp_pos_e() - env.cup_grasp_point_e(), dim=-1)
+    gripper_width_error = torch.abs(env.gripper_width() - float(env.gripper_grasp_width))
+    gripper = env.action_manager.get_term("gripper_action")
+    preloaded_grasp = (
+        (tcp_distance <= float(max_tcp_distance))
+        & (gripper_width_error <= float(max_gripper_width_error))
+        & (gripper.commanded_position[:, 0] <= float(max_gripper_command) + _GRIPPER_POSITION_TOLERANCE)
+        & gripper.bilateral_contact
     )
-    if getattr(env, "_uses_reset_dataset", False):
-        # These episode latches intentionally describe milestones attained after at least one
-        # policy action. A grasp authored into a reset row is not credited unless the policy
-        # retains or reacquires it through the first control transition.
-        env.ep_reached_grasp |= reached_grasp
-        env.ep_preloaded_grasp |= preloaded_grasp
-        env.ep_lifted_grasp |= lifted_grasp
+    lifted_grasp = preloaded_grasp & (cup_lift >= max(float(env.cfg.success_min_lift_height), 1.0e-6))
     env._lifted_grasp_seen |= lifted_grasp
     lost = env._lifted_grasp_seen & ~preloaded_grasp
     dwell_steps = max(1, math.ceil(float(dwell_time_s) / max(float(env.step_dt), 1.0e-6)))
@@ -221,31 +218,6 @@ def lost_lifted_grasp(
     )
     dwell_qualified_loss = lost & (env._lost_grasp_dwell_count >= dwell_steps)
     return dwell_qualified_loss if terminate else torch.zeros_like(dwell_qualified_loss)
-
-
-def source_grasp_milestones(
-    env: FrankaPourEnv,
-    min_lift_height: float,
-    max_tcp_distance: float,
-    max_gripper_width_error: float,
-    max_gripper_command: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return reached, actively preloaded, and lifted source-grasp masks."""
-    cup_lift = env.cup_pose_e()[:, 2] - float(env.cup_reset_height)
-    tcp_distance = torch.linalg.vector_norm(env.tcp_pos_e() - env.cup_grasp_point_e(), dim=-1)
-    gripper_width_error = torch.abs(env.gripper_width() - float(env.gripper_grasp_width))
-    gripper = env.action_manager.get_term("gripper_action")
-    gripper_command = gripper.commanded_position[:, 0]
-    bilateral_contact = gripper.bilateral_contact
-    reached_grasp = tcp_distance <= float(max_tcp_distance)
-    preloaded_grasp = (
-        reached_grasp
-        & (gripper_width_error <= float(max_gripper_width_error))
-        & (gripper_command <= float(max_gripper_command) + _GRIPPER_POSITION_TOLERANCE)
-        & bilateral_contact
-    )
-    lifted_grasp = preloaded_grasp & (cup_lift >= float(min_lift_height))
-    return reached_grasp, preloaded_grasp, lifted_grasp
 
 
 def immediate_pour_success_mask(
@@ -265,7 +237,6 @@ def immediate_pour_success(env: FrankaPourEnv) -> torch.Tensor:
     history, or dwell interval. Failure terms run before success and therefore retain precedence.
     """
     target_fraction = env.count_in_target() / max(env.num_particles, 1)
-    env.ep_max_target_frac[:] = torch.maximum(env.ep_max_target_frac, target_fraction)
     success = immediate_pour_success_mask(
         target_fraction,
         env.pour_target_frac,

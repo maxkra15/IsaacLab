@@ -100,13 +100,7 @@ def _payload() -> dict:
 
 
 def _seal(payload: dict):
-    """Recompute hashes after one intentional semantic mutation."""
-    payload["contract_sha256"] = reset_dataset_digest(
-        {
-            "sampler_cfg": payload["metadata"]["sampler_cfg"],
-            "task_contract": payload["metadata"]["task_contract"],
-        }
-    )
+    """Recompute the content hash after one intentional semantic mutation."""
     payload["content_sha256"] = reset_dataset_content_digest(payload)
 
 
@@ -199,13 +193,7 @@ def test_runtime_validator_rejects_bad_metadata_and_production_marker(mutation, 
         _validate(payload)
 
 
-def test_runtime_validator_rejects_contract_tampering_and_subset_mismatch():
-    payload = _payload()
-    payload["metadata"]["task_contract"]["simulation_dt"] = 1.0 / 60.0
-    payload["content_sha256"] = reset_dataset_content_digest(payload)
-    with pytest.raises(ValueError, match="contract digest"):
-        _validate(payload)
-
+def test_runtime_validator_rejects_task_contract_subset_mismatch():
     payload = _payload()
     with pytest.raises(ValueError, match="media_material.density"):
         _validate(payload, expected_task_contract={"media_material": {"density": 900.0}})
