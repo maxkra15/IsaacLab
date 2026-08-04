@@ -230,6 +230,76 @@ def test_failed_rsl_training_restores_torch_backend_state(monkeypatch) -> None:
     assert _torch_backend_state() == caller_state
 
 
+def test_rsl_run_wires_distributed_sync_and_episode_initialization(monkeypatch) -> None:
+    """RSL training installs rollout synchronization and honors episode initialization config."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock, sentinel
+
+    import rsl_rl.runners as runners
+
+    import isaaclab.app as isaaclab_app
+
+    import isaaclab_rl.rsl_rl as rsl_rl
+    from isaaclab_rl.entrypoints.backends import train_rsl_rl
+
+    import isaaclab_tasks.utils as task_utils
+
+    env_cfg = SimpleNamespace(sim=SimpleNamespace(device="cuda:0"), seed=0, log_dir=None)
+    agent_cfg = SimpleNamespace(
+        seed=7,
+        device="cuda:1",
+        num_steps_per_env=8,
+        max_iterations=5,
+        init_at_random_ep_len=False,
+        experiment_name="test",
+        run_name="",
+        resume=False,
+        algorithm=SimpleNamespace(class_name="PPO"),
+        class_name="OnPolicyRunner",
+        clip_actions=1.0,
+        to_dict=Mock(return_value={"test": True}),
+    )
+    args_cli = SimpleNamespace(
+        task="Isaac-Test",
+        agent="rsl_rl_cfg_entry_point",
+        max_iterations=None,
+        distributed=True,
+        deterministic=False,
+        checkpoint=None,
+    )
+    sync_wrapper = Mock(return_value=sentinel.synced_env)
+    vec_env = Mock()
+    vec_wrapper = Mock(return_value=vec_env)
+    runner = Mock()
+
+    monkeypatch.setattr(train_rsl_rl, "_check_rsl_rl_version", lambda: "5.0.1")
+    monkeypatch.setattr(train_rsl_rl.cli_args, "update_rsl_rl_cfg", lambda cfg, _args: cfg)
+    monkeypatch.setattr(task_utils, "resolve_task_config", Mock(return_value=(env_cfg, agent_cfg)))
+    monkeypatch.setattr(isaaclab_app, "launch_simulation", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(rsl_rl, "handle_deprecated_rsl_rl_cfg", lambda cfg, _version: cfg)
+    monkeypatch.setattr(rsl_rl, "RslRlVecEnvWrapper", vec_wrapper)
+    monkeypatch.setattr(runners, "OnPolicyRunner", Mock(return_value=runner))
+    for name in (
+        "apply_env_overrides",
+        "validate_distributed_device",
+        "write_run_manifest",
+        "configure_io_descriptors",
+        "dump_train_configs",
+    ):
+        monkeypatch.setattr(train_rsl_rl, name, Mock())
+    monkeypatch.setattr(train_rsl_rl, "create_isaaclab_env", Mock(return_value=sentinel.created_env))
+    monkeypatch.setattr(train_rsl_rl, "wrap_training_capture", Mock(return_value=sentinel.captured_env))
+    monkeypatch.setattr(train_rsl_rl, "_wrap_distributed_training_state_sync", sync_wrapper)
+
+    train_rsl_rl._run(args_cli)
+
+    sync_wrapper.assert_called_once_with(sentinel.captured_env, distributed=True, step_interval=8)
+    vec_wrapper.assert_called_once_with(sentinel.synced_env, clip_actions=1.0)
+    runner.learn.assert_called_once_with(num_learning_iterations=5, init_at_random_ep_len=False)
+    vec_env.close.assert_called_once_with()
+
+
 def test_skrl_training_restores_jax_backend(monkeypatch) -> None:
     """SKRL training removes the JAX backend setting it created after an exception."""
     skrl = pytest.importorskip("skrl")

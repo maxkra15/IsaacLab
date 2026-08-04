@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
@@ -32,6 +34,70 @@ if TYPE_CHECKING:
     ]
 else:
     _MappingBatch = tuple
+
+
+@contextlib.contextmanager
+def newton_builder_world_hook(
+    hook: Callable[[ModelBuilder, int, list[float], list[float]], None],
+) -> Iterator[None]:
+    """Temporarily extend every world built by Newton replication.
+
+    Registration is idempotent. On exit, the context removes only the
+    registration it installed and preserves hooks owned by other callers.
+
+    Args:
+        hook: Callback receiving the builder, world index, world position [m],
+            and world orientation quaternion in xyzw order during replication.
+
+    Yields:
+        Control while the callback is registered.
+    """
+    hooks = NewtonManager._per_world_builder_hooks
+    installed = hook not in hooks
+    if installed:
+        hooks.append(hook)
+    try:
+        yield
+    finally:
+        if installed and hook in hooks:
+            hooks.remove(hook)
+
+
+def newton_builder_clone_source(source_path: str) -> ModelBuilder:
+    """Clone a retained Newton replication source into a fresh builder.
+
+    The returned builder owns independent collection containers and geometry
+    sources, so callers may modify or finalize it without mutating the retained
+    source. :meth:`newton.ModelBuilder.add_builder` intentionally treats
+    geometry entries as shared templates; detach those entries here because
+    finalization materializes their device data in place.
+
+    Args:
+        source_path: Clone-source prim path retained by the active replication
+            plan.
+
+    Returns:
+        A fresh builder populated from the retained source.
+
+    Raises:
+        RuntimeError: If the source path is not part of the active clone plan.
+    """
+    prototype = NewtonManager._cl_protos.get(source_path)
+    if prototype is None:
+        available = ", ".join(sorted(NewtonManager._cl_protos))
+        if available:
+            detail = f" Available source paths: {available}."
+        else:
+            detail = " No clone sources are registered."
+        raise RuntimeError(f"No retained Newton clone source for {source_path!r}.{detail}")
+
+    builder = ModelBuilder(up_axis=prototype.up_axis)
+    builder.add_builder(prototype)
+    builder.shape_source = [
+        source.copy() if callable(getattr(source, "copy", None)) else copy.copy(source)
+        for source in builder.shape_source
+    ]
+    return builder
 
 
 def _build_newton_builder_from_mapping(
