@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 
+import warp as wp
 from isaaclab_newton.physics import (
     KaminoSolverCfg,
     MJWarpSolverCfg,
@@ -211,12 +212,38 @@ class NewtonCouplerManager(NewtonVBDManager):
 
     @classmethod
     def _supports_cuda_graph_capture(cls) -> bool:
-        """Reject graph capture when a nested MPM entry uses a dynamic grid."""
+        """Accept coupled MPM only when every nested grid has capture-stable storage."""
         solver_cfg = getattr(PhysicsManager._cfg, "solver_cfg", None)
-        return all(
-            not isinstance(entry.solver_cfg, MPMSolverCfg) or entry.solver_cfg.grid_type == "fixed"
+        solver = NewtonManager._solver
+        for entry in getattr(solver_cfg, "entries", ()):
+            if isinstance(entry.solver_cfg, MPMSolverCfg):
+                if solver is None or not NewtonMPMManager._solver_supports_cuda_graph_capture(
+                    solver.solver(entry.name)
+                ):
+                    return False
+        return super()._supports_cuda_graph_capture()
+
+    @classmethod
+    def _defer_standard_graph_capture(cls) -> bool:
+        """Defer capture when an MPM entry builds reset-dependent sparse topology."""
+        solver_cfg = getattr(PhysicsManager._cfg, "solver_cfg", None)
+        solver = NewtonManager._solver
+        return solver is not None and any(
+            isinstance(entry.solver_cfg, MPMSolverCfg) and solver.solver(entry.name).grid_type == "sparse"
             for entry in getattr(solver_cfg, "entries", ())
         )
+
+    @classmethod
+    def _reset_solver_internals(cls, world_mask: wp.array | None) -> None:
+        """Defer coupled MPM history reset until the task finishes authoring state.
+
+        Args:
+            world_mask: Per-world automatic reset mask.
+        """
+        solver_cfg = getattr(PhysicsManager._cfg, "solver_cfg", None)
+        if any(isinstance(entry.solver_cfg, MPMSolverCfg) for entry in getattr(solver_cfg, "entries", ())):
+            return
+        super()._reset_solver_internals(world_mask)
 
     @classmethod
     def _resolve_entry(

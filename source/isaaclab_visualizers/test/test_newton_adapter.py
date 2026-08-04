@@ -345,6 +345,34 @@ def test_newton_viewer_inactive_mpm_particles_use_newton_filter(monkeypatch):
     assert fallback_calls == [state]
 
 
+def test_newton_viewer_dynamic_mpm_flags_never_use_static_all_active_cache(monkeypatch):
+    import newton as nt
+    from newton.viewer import ViewerGL
+
+    viewer = NewtonViewerGL.__new__(NewtonViewerGL)
+    viewer.device = "cpu"
+    viewer.model_changed = False
+    viewer.particle_color = None
+    viewer.show_particles = True
+    viewer._mpm_particle_flags_cache_key = None
+    viewer._mpm_particles_all_active = True
+    viewer.model = SimpleNamespace(
+        mpm=object(),
+        particle_count=2,
+        particle_flags=wp.array([int(nt.ParticleFlags.ACTIVE)] * 2, dtype=wp.int32, device="cpu"),
+        particle_radius=wp.ones(2, dtype=wp.float32, device="cpu"),
+    )
+    state = object()
+    fallback_calls = []
+
+    monkeypatch.setattr(viewer.model, "_isaaclab_particle_flags_dynamic", True, raising=False)
+    monkeypatch.setattr(ViewerGL, "_log_particles", lambda self, state: fallback_calls.append(state))
+
+    viewer._log_particles(state)
+
+    assert fallback_calls == [state]
+
+
 class _BodyQ:
     shape = (1,)
 

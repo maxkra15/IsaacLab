@@ -19,7 +19,11 @@ from isaaclab.physics import PhysicsEvent
 from isaaclab.utils.warp import ProxyArray
 
 from isaaclab_newton.physics import NewtonManager as SimulationManager
-from isaaclab_newton.sim.spawners.mpm import create_mpm_particle_visualization, emit_mpm_particles
+from isaaclab_newton.physics import NewtonMPMManager
+from isaaclab_newton.sim.spawners.mpm import (
+    create_mpm_particle_visualization,
+    emit_mpm_particles,
+)
 
 from .kernels import (
     compute_particle_state_w,
@@ -96,7 +100,11 @@ class MPMObject(BaseDeformableObject):
     cfg: MPMObjectCfg
     __backend_name__: str = "newton"
 
-    _DTYPE_TO_TORCH_TRAILING_DIMS = {**BaseDeformableObject._DTYPE_TO_TORCH_TRAILING_DIMS, vec6f: (6,)}
+    _DTYPE_TO_TORCH_TRAILING_DIMS = {
+        **BaseDeformableObject._DTYPE_TO_TORCH_TRAILING_DIMS,
+        wp.bool: (),
+        vec6f: (6,),
+    }
 
     def __init__(self, cfg: MPMObjectCfg):
         super().__init__(cfg)
@@ -105,6 +113,7 @@ class MPMObject(BaseDeformableObject):
         if add_registered_mpm_objects_to_builder not in SimulationManager._per_world_builder_hooks:
             SimulationManager._per_world_builder_hooks.append(add_registered_mpm_objects_to_builder)
         self._physics_ready_handle = None
+        self._particle_activation_target = None
 
     @property
     def data(self) -> MPMObjectData:
@@ -236,6 +245,44 @@ class MPMObject(BaseDeformableObject):
     write_particle_pos_to_sim_mask = write_nodal_pos_to_sim_mask
     write_particle_velocity_to_sim_mask = write_nodal_velocity_to_sim_mask
 
+    def write_particle_active_mask_to_sim_index(
+        self,
+        active: torch.Tensor | wp.array(dtype=wp.bool) | ProxyArray,
+        env_ids: Sequence[int] | torch.Tensor | wp.array(dtype=wp.int32) | None = None,
+        full_data: bool = False,
+    ) -> None:
+        """Activate a fixed-capacity subset of material particles for selected instances.
+
+        Particle count, mass, radius, and storage remain fixed. The Newton adapter updates the
+        public model particle flags and asks the implicit-MPM solver to refresh its derived
+        material data. Because that refresh reallocates solver-owned arrays, this operation
+        requires :attr:`NewtonCfg.use_cuda_graph` to be disabled.
+
+        Args:
+            active: Boolean activity mask with one row per selected instance and one column per
+                particle slot. When :paramref:`full_data` is true, provide all instance rows.
+            env_ids: Instance indices whose activity masks are written. Defaults to every instance.
+            full_data: Whether rows in :paramref:`active` are indexed by global instance ID.
+        """
+        env_ids = self._resolve_env_ids(env_ids)
+        if env_ids.shape[0] == 0:
+            return
+        num_rows = self.num_instances if full_data else env_ids.shape[0]
+        active = self._as_warp(active, wp.bool, (num_rows, self._particles_per_object), "particle_active_mask")
+        if self._particle_activation_target is None:
+            self._particle_activation_target = NewtonMPMManager._resolve_particle_activation_target(
+                tuple(self._recorded_particle_offsets),
+                self._particles_per_object,
+            )
+        NewtonMPMManager._write_particle_active_mask(
+            self._particle_activation_target,
+            active,
+            env_ids,
+            self._particle_offsets,
+            full_data=full_data,
+            particles_per_instance=self._particles_per_object,
+        )
+
     def _scatter_to_sim_index(self, data, env_ids, full_data: bool, dtype, kernel, targets, name: str) -> None:
         """Scatter per-environment particle data into the Newton state arrays in ``targets``."""
         env_ids = self._resolve_env_ids(env_ids)
@@ -273,6 +320,7 @@ class MPMObject(BaseDeformableObject):
         return data
 
     def _initialize_impl(self):
+        self._particle_activation_target = None
         entry = self._registry_entry
         self._num_instances = len(entry.particle_offsets)
         self._particles_per_object = entry.particles_per_object
@@ -344,7 +392,7 @@ class MPMObject(BaseDeformableObject):
         self._create_kit_points()
 
     def _create_kit_points(self) -> None:
-        """Create Kit-visible ``UsdGeom.Points`` prims for the particles when the Kit visualizer is active."""
+        """Create Kit-visible ``UsdGeom.Points`` prims when the Kit visualizer is active."""
         from isaaclab.sim import SimulationContext  # noqa: PLC0415
 
         sim = SimulationContext.instance()
@@ -363,6 +411,7 @@ class MPMObject(BaseDeformableObject):
             positions=self.data.particle_pos_w.warp.numpy(),
             widths=2.0 * radii,
             color=self.cfg.spawn.visual_color,
+            visual_material=self.cfg.spawn.visual_material,
         )
         for env_idx, prim_path in enumerate(prim_paths):
             SimulationManager.register_particle_visual_prim(

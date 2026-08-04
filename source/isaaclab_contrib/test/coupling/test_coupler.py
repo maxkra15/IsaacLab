@@ -506,19 +506,70 @@ def test_mpm_entry_does_not_request_external_contacts():
     assert NewtonCouplerManager._requires_external_contacts(MPMSolverCfg()) is False
 
 
-@pytest.mark.parametrize(("grid_type", "expected"), [("fixed", True), ("sparse", False), ("dense", False)])
-def test_mpm_grid_controls_cuda_graph_support(monkeypatch, grid_type, expected):
+@pytest.mark.parametrize(
+    ("solver_attributes", "expected"),
+    [
+        pytest.param({"grid_type": "fixed"}, True, id="fixed"),
+        pytest.param({}, True, id="bounded_sparse"),
+        pytest.param({"max_active_cell_count": -1}, False, id="unbounded_sparse"),
+        pytest.param({"grid_type": "dense"}, False, id="dense"),
+    ],
+)
+def test_mpm_grid_controls_cuda_graph_support(monkeypatch, solver_attributes, expected):
+    attributes = {
+        "grid_type": "sparse",
+        "max_active_cell_count": 128,
+        "grid_padding": 0,
+        "velocity_basis": "Q1",
+        "strain_basis": "P0",
+        "collider_basis": "S2",
+    }
+    attributes.update(solver_attributes)
     cfg = CouplerAdmmCfg(
         entries=[
             CouplerEntryCfg(
                 name="media",
-                solver_cfg=MPMSolverCfg(grid_type=grid_type),
+                solver_cfg=MPMSolverCfg(grid_type=attributes["grid_type"]),
                 in_place=True,
             )
         ]
     )
     monkeypatch.setattr(coupler.PhysicsManager, "_cfg", SimpleNamespace(solver_cfg=cfg))
+    nested_solver = SimpleNamespace(**attributes)
+    monkeypatch.setattr(
+        coupler.NewtonManager,
+        "_solver",
+        SimpleNamespace(solver=lambda name: nested_solver),
+    )
     assert NewtonCouplerManager._supports_cuda_graph_capture() is expected
+
+
+@pytest.mark.parametrize(("grid_type", "expected"), [("fixed", False), ("sparse", True)])
+def test_only_sparse_coupled_mpm_defers_standard_graph_capture(monkeypatch, grid_type, expected):
+    cfg = CouplerAdmmCfg(
+        entries=[CouplerEntryCfg(name="media", solver_cfg=MPMSolverCfg(grid_type=grid_type), in_place=True)]
+    )
+    nested_solver = SimpleNamespace(grid_type=grid_type)
+    monkeypatch.setattr(coupler.PhysicsManager, "_cfg", SimpleNamespace(solver_cfg=cfg))
+    monkeypatch.setattr(coupler.NewtonManager, "_solver", SimpleNamespace(solver=lambda name: nested_solver))
+
+    assert NewtonCouplerManager._defer_standard_graph_capture() is expected
+
+
+def test_mpm_entry_defers_automatic_reset(monkeypatch):
+    events: list[object] = []
+    cfg = CouplerAdmmCfg(entries=[CouplerEntryCfg(name="media", solver_cfg=MPMSolverCfg(), in_place=True)])
+    world_mask = object()
+    monkeypatch.setattr(coupler.PhysicsManager, "_cfg", SimpleNamespace(solver_cfg=cfg))
+    monkeypatch.setattr(
+        coupler.NewtonVBDManager,
+        "_reset_solver_internals",
+        classmethod(lambda cls, value: events.append(value)),
+    )
+
+    NewtonCouplerManager._reset_solver_internals(world_mask)
+
+    assert events == []
 
 
 def test_mpm_entry_reuses_builder_lifecycle_hooks(monkeypatch):

@@ -108,8 +108,12 @@ solver actually needs it:
   inertia on kinematic bodies so implicit MPM treats them as massless colliders.
 * ``_supports_cuda_graph_capture()``: return ``False`` to opt the solver out of
   CUDA graph capture and fall back to eager execution. Defaults to ``True``;
-  :class:`~isaaclab_newton.physics.NewtonMPMManager` returns ``True`` only for a
-  fixed grid, since sparse/dense MPM grids reallocate as particles move.
+  :class:`~isaaclab_newton.physics.NewtonMPMManager` returns ``True`` for fixed
+  grids and capacity-bounded rebuildable sparse grids. Configure a sparse grid
+  with a positive ``max_active_cell_count``, zero ``grid_padding``, the ``Q1``
+  velocity basis, and rebuild-safe strain and collider bases to reserve
+  capture-stable storage. Other sparse configurations and dense grids use eager
+  execution.
 * ``_solver_specific_clear()``: release any class-level state owned by the
   solver manager.
 

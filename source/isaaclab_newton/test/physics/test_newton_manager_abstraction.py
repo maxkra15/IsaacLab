@@ -50,6 +50,7 @@ from isaaclab_newton.physics import (
 from isaaclab_newton.physics.mpm_manager import _make_solver_config
 from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, SolverMuJoCo, SolverXPBD
 
+from isaaclab.physics import PhysicsManager
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
 # ---------------------------------------------------------------------------
@@ -274,6 +275,22 @@ def test_mpm_solver_cfg_maps_only_newton_solver_fields():
     assert not hasattr(newton_cfg, "project_outside_colliders")
 
 
+@pytest.mark.parametrize(
+    "deprecated_value, replacement",
+    [
+        ("instantaneous", "forward"),
+        ("finite_difference", "backward"),
+    ],
+)
+def test_mpm_solver_cfg_translates_deprecated_collider_velocity_modes(deprecated_value, replacement):
+    """Deprecated collider velocity modes warn and map to Newton's current values."""
+
+    with pytest.warns(DeprecationWarning, match=f"use {replacement!r}"):
+        newton_cfg = _make_solver_config(MPMSolverCfg(collider_velocity_mode=deprecated_value))
+
+    assert newton_cfg.collider_velocity_mode == replacement
+
+
 # Tuples of ``(field_name, non_default_value)`` covering every solver-tunable
 # field on :class:`MPMSolverCfg`. Each entry exercises the implementation-side
 # SolverImplicitMPM.Config construction so a Newton field rename or accidental
@@ -288,6 +305,10 @@ _MPM_FIELD_VALUES = [
     ("grid_type", "dense"),
     ("grid_padding", 4),
     ("max_active_cell_count", 1024),
+    ("max_leaf_node_count", 512),
+    ("max_lower_node_count", 128),
+    ("max_upper_node_count", 32),
+    ("separate_worlds", True),
     ("transfer_scheme", "pic"),
     ("integration_scheme", "gimp"),
     ("critical_fraction", 0.25),
@@ -511,25 +532,39 @@ def test_mpm_project_outside_colliders_gates_projection(project_outside):
 
 
 @pytest.mark.parametrize(
-    "grid_type, expected",
+    ("solver_attributes", "expected"),
     [
-        ("fixed", True),
-        ("sparse", False),
-        ("dense", False),
+        pytest.param({"grid_type": "fixed"}, True, id="fixed"),
+        pytest.param({}, True, id="bounded_sparse"),
+        pytest.param({"max_active_cell_count": -1}, False, id="unbounded_sparse"),
+        pytest.param({"velocity_basis": "B2"}, False, id="unsupported_sparse_basis"),
+        pytest.param({"grid_type": "dense"}, False, id="dense"),
     ],
 )
-def test_mpm_cuda_graph_capture_supports_only_fixed_grid(monkeypatch, grid_type, expected):
-    """Newton implicit MPM is CUDA-graph capturable only with a fixed grid."""
+def test_mpm_cuda_graph_capture_supports_bounded_sparse_grid(monkeypatch, solver_attributes, expected):
+    """Fixed and capacity-bounded rebuildable sparse grids support capture."""
+    attributes = {
+        "grid_type": "sparse",
+        "max_active_cell_count": 128,
+        "grid_padding": 0,
+        "velocity_basis": "Q1",
+        "strain_basis": "P0",
+        "collider_basis": "S2",
+    }
+    attributes.update(solver_attributes)
 
-    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace(grid_type=grid_type), raising=False)
+    monkeypatch.setattr(
+        NewtonManager,
+        "_solver",
+        SimpleNamespace(**attributes),
+        raising=False,
+    )
 
     assert NewtonMPMManager._supports_cuda_graph_capture() is expected
 
 
 def test_mpm_unsupported_cuda_graph_capture_uses_eager_execution(monkeypatch):
-    """Sparse/dense MPM should not enter a CUDA graph capture window."""
-    from isaaclab.physics import PhysicsManager
-
+    """A dynamic sparse grid should not enter a CUDA graph capture window."""
     monkeypatch.setattr(
         PhysicsManager,
         "_cfg",
@@ -537,7 +572,19 @@ def test_mpm_unsupported_cuda_graph_capture_uses_eager_execution(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(PhysicsManager, "_device", "cuda:0", raising=False)
-    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace(grid_type="sparse"), raising=False)
+    monkeypatch.setattr(
+        NewtonManager,
+        "_solver",
+        SimpleNamespace(
+            grid_type="sparse",
+            max_active_cell_count=-1,
+            grid_padding=0,
+            velocity_basis="Q1",
+            strain_basis="P0",
+            collider_basis="S2",
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(NewtonManager, "_graph", object(), raising=False)
     monkeypatch.setattr(NewtonManager, "_graph_capture_pending", True, raising=False)
 
@@ -577,6 +624,22 @@ def test_cuda_graph_capture_uses_simulation_device(monkeypatch):
 
     assert captured_devices == ["cuda:1"]
     assert NewtonManager._graph is captured_graph
+
+
+@pytest.mark.parametrize(("grid_type", "expected"), [("fixed", False), ("sparse", True)])
+def test_only_sparse_mpm_defers_standard_graph_capture(monkeypatch, grid_type, expected):
+    """Fixed MPM storage can capture immediately; sparse topology needs the initial reset."""
+    monkeypatch.setattr(NewtonManager, "_solver", SimpleNamespace(grid_type=grid_type), raising=False)
+
+    assert NewtonMPMManager._defer_standard_graph_capture() is expected
+
+
+def test_mpm_particle_activation_rejects_cuda_graphs(monkeypatch):
+    """Runtime activation must reject graphs before resolving solver-owned arrays."""
+    monkeypatch.setattr(PhysicsManager, "_cfg", SimpleNamespace(use_cuda_graph=True), raising=False)
+
+    with pytest.raises(RuntimeError, match="NewtonCfg.use_cuda_graph=False"):
+        NewtonMPMManager._resolve_particle_activation_target((0,), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +682,7 @@ def test_forward_consumes_existing_reset_masks(monkeypatch):
 
 def test_forward_dispatches_active_mpm_reset_hook_through_base_manager(monkeypatch):
     """Base-class state reads must use the active MPM manager's reset behavior."""
-    world_mask = wp.array([True], dtype=wp.bool, device="cpu")
+    world_mask = wp.array([True, False], dtype=wp.bool, device="cpu")
     fk_mask = wp.array([], dtype=wp.bool, device="cpu")
 
     class _RejectingSolver:
@@ -639,7 +702,7 @@ def test_forward_dispatches_active_mpm_reset_hook_through_base_manager(monkeypat
 
     NewtonManager.forward()
 
-    assert world_mask.numpy().tolist() == [False]
+    assert world_mask.numpy().tolist() == [False, False]
 
 
 # ---------------------------------------------------------------------------

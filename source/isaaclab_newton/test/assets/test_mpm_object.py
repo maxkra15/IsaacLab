@@ -10,6 +10,7 @@ import math
 import numpy as np
 import pytest
 import torch
+import warp as wp
 
 newton = pytest.importorskip("newton")
 
@@ -44,6 +45,34 @@ def test_mpm_object_cfg_resolves_asset_class():
     assert cfg.class_type.__name__ == MPMObject.__name__
 
 
+def test_mpm_object_empty_active_mask_write_is_noop():
+    """An empty instance selection must not resolve or rebuild Newton material arrays."""
+    empty_ids = wp.empty(0, dtype=wp.int32, device="cpu")
+
+    class _FakeMedia:
+        _particles_per_object = 4
+        _particle_activation_target = None
+
+        @staticmethod
+        def _resolve_env_ids(env_ids):
+            del env_ids
+            return empty_ids
+
+        @staticmethod
+        def _as_warp(*args, **kwargs):
+            del args, kwargs
+            pytest.fail("empty activity writes must return before data conversion")
+
+    media = _FakeMedia()
+    MPMObject.write_particle_active_mask_to_sim_index(
+        media,
+        torch.empty((0, 4), dtype=torch.bool),
+        env_ids=[],
+    )
+
+    assert media._particle_activation_target is None
+
+
 def test_mpm_grid_emission_records_constant_offsets_per_env():
     builder = newton.ModelBuilder()
     NewtonMPMManager._register_builder_attributes(builder)
@@ -56,6 +85,7 @@ def test_mpm_grid_emission_records_constant_offsets_per_env():
             voxel_size=0.1,
             particles_per_cell=1.0,
             jitter=0.0,
+            particle_placement="cell_center",
         ),
     )
     entry = MPMObjectRegistryEntry(cfg)
@@ -63,9 +93,9 @@ def test_mpm_grid_emission_records_constant_offsets_per_env():
     add_mpm_entry_to_builder(builder, entry, 0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
     add_mpm_entry_to_builder(builder, entry, 1, [1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
 
-    assert entry.particles_per_object == 8
-    assert entry.particle_offsets == [0, 8]
-    assert builder.particle_count == 16
+    assert entry.particles_per_object == 1
+    assert entry.particle_offsets == [0, 1]
+    assert builder.particle_count == 2
 
 
 def test_mpm_points_emission_records_constant_offsets_per_env():
@@ -97,7 +127,12 @@ def test_mpm_object_initializes_from_interactive_scene():
     class MPMSceneCfg(InteractiveSceneCfg):
         media = MPMObjectCfg(
             prim_path="{ENV_REGEX_NS}/Sand",
-            spawn=MPMGridCfg(lower=(0.0, 0.0, 0.0), upper=(0.1, 0.1, 0.1), voxel_size=0.1),
+            spawn=MPMGridCfg(
+                lower=(0.0, 0.0, 0.0),
+                upper=(0.1, 0.1, 0.1),
+                voxel_size=0.1,
+                particle_placement="cell_center",
+            ),
         )
 
     sim_cfg = SimulationCfg(
@@ -113,8 +148,9 @@ def test_mpm_object_initializes_from_interactive_scene():
 
         media = scene["media"]
         assert media.num_instances == 2
-        assert media.particles_per_object == 8
-        assert media.data.particle_pos_w.torch.shape == (2, 8, 3)
+        assert media.particles_per_object == 1
+        assert media.data.particle_pos_w.torch.shape == (2, 1, 3)
+        assert not NewtonMPMManager._particle_visual_prims
 
         default_state = media.data.default_particle_state_w.torch.clone()
         shifted_state = default_state[0:1].clone()
@@ -128,6 +164,84 @@ def test_mpm_object_initializes_from_interactive_scene():
 
         media.reset(env_ids=[0])
         torch.testing.assert_close(media.data.particle_state_w.torch[0], default_state[0])
+
+
+def test_mpm_object_runtime_active_mask_refreshes_eager_sparse_solver():
+    """Deactivate and reactivate fixed particle slots through Newton's public eager refresh."""
+
+    @configclass
+    class MPMSceneCfg(InteractiveSceneCfg):
+        media = MPMObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Sand",
+            spawn=MPMGridCfg(
+                lower=(0.0, 0.0, 0.2),
+                upper=(0.2, 0.1, 0.3),
+                voxel_size=0.1,
+                particles_per_cell=1.0,
+                particle_placement="cell_center",
+            ),
+        )
+
+    sim_cfg = SimulationCfg(
+        dt=1.0 / 120.0,
+        device="cuda:0",
+        gravity=(0.0, 0.0, -9.81),
+        physics=NewtonCfg(
+            solver_cfg=MPMSolverCfg(
+                max_iterations=2,
+                voxel_size=0.1,
+                grid_type="sparse",
+                separate_worlds=True,
+                max_active_cell_count=128,
+                max_leaf_node_count=128,
+                max_lower_node_count=64,
+                max_upper_node_count=32,
+            ),
+            use_cuda_graph=False,
+        ),
+    )
+
+    with build_simulation_context(sim_cfg=sim_cfg) as sim:
+        scene = InteractiveScene(MPMSceneCfg(num_envs=2, env_spacing=1.0))
+        sim.reset()
+        media = scene["media"]
+        assert media.particles_per_object == 4
+
+        first_mask = torch.tensor(
+            [[True, False, True, False], [False, True, False, True]],
+            dtype=torch.bool,
+            device=sim.device,
+        )
+        media.write_particle_active_mask_to_sim_index(first_mask)
+        sim.step(render=False)
+
+        model = NewtonMPMManager.get_model()
+        target = media._particle_activation_target
+        assert target is not None
+        public_flag_pointers = tuple(array.ptr for array in target.model_particle_flags)
+        assert any(target.solver.model.particle_flags is array for array in target.model_particle_flags)
+        active_flag = int(newton.ParticleFlags.ACTIVE)
+        model_active = (wp.to_torch(model.particle_flags).reshape(2, 4) & active_flag) != 0
+        torch.testing.assert_close(model_active, first_mask)
+        velocity = media.data.particle_vel_w.torch.clone()
+        assert torch.all(velocity[first_mask][:, 2].abs() > 0.0)
+        torch.testing.assert_close(velocity[~first_mask], torch.zeros_like(velocity[~first_mask]))
+
+        media.reset()
+        second_mask = ~first_mask
+        media.write_particle_active_mask_to_sim_index(second_mask)
+        world_mask = wp.array([True, True, False], dtype=wp.bool, device=sim.device)
+        NewtonMPMManager.reset_solver_state(world_mask=world_mask, flags=newton.StateFlags.PARTICLE)
+        sim.step(render=False)
+
+        assert tuple(array.ptr for array in target.model_particle_flags) == public_flag_pointers
+        assert target.solver.model.particle_flags.ptr in public_flag_pointers
+        model_active = (wp.to_torch(model.particle_flags).reshape(2, 4) & active_flag) != 0
+        torch.testing.assert_close(model_active, second_mask)
+        velocity = media.data.particle_vel_w.torch
+        assert torch.all(velocity[second_mask][:, 2].abs() > 0.0)
+        torch.testing.assert_close(velocity[~second_mask], torch.zeros_like(velocity[~second_mask]))
+        assert model._isaaclab_particle_flags_dynamic is True
 
 
 def test_mpm_solver_refreshes_kinematic_rigid_body_transforms():
@@ -181,7 +295,7 @@ def test_mpm_solver_refreshes_kinematic_rigid_body_transforms():
         np.testing.assert_allclose(body_q, root_pose.detach().cpu().numpy()[0], rtol=1.0e-5, atol=1.0e-6)
 
 
-def test_mpm_object_creates_kit_points_when_kit_visualizer_requested(monkeypatch):
+def test_mpm_object_creates_usd_points_for_kit_visualizer(monkeypatch):
     @configclass
     class MPMSceneCfg(InteractiveSceneCfg):
         media = MPMObjectCfg(
@@ -204,9 +318,10 @@ def test_mpm_object_creates_kit_points_when_kit_visualizer_requested(monkeypatch
     with build_simulation_context(sim_cfg=sim_cfg) as sim:
         monkeypatch.setattr(sim, "resolve_visualizer_types", lambda: ["kit"])
         scene = InteractiveScene(MPMSceneCfg(num_envs=2, env_spacing=1.0))
-        sim.reset()
 
         from pxr import UsdGeom  # noqa: PLC0415
+
+        sim.reset()
 
         media = scene["media"]
         records = NewtonMPMManager._particle_visual_prims

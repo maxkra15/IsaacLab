@@ -443,7 +443,11 @@ class NewtonViewerGL(ViewerGL):
             return False
         if model.particle_flags is None:
             return False
-
+        # Runtime emitters and fixed-capacity MPM assets mutate the existing flag buffer. They
+        # must stay on Newton's device-side compaction path even if the first rendered frame
+        # happens to contain an all-active mask.
+        if bool(getattr(model, "_isaaclab_particle_flags_dynamic", False)):
+            return False
         cache_key = (id(model), id(model.particle_flags), int(model.particle_count))
         if self._mpm_particle_flags_cache_key != cache_key:
             import newton as nt
