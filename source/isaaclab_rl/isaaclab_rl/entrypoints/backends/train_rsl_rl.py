@@ -36,6 +36,7 @@ from isaaclab_rl.entrypoints.common import (
     wrap_training_capture,
     write_run_manifest,
 )
+from isaaclab_rl.rsl_rl._training_state import _wrap_distributed_training_state_sync
 
 import isaaclab_tasks  # noqa: F401
 
@@ -181,6 +182,11 @@ def _run(args_cli: argparse.Namespace) -> None:
                 resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
         env = wrap_training_capture(env, log_dir, args_cli)
+        env = _wrap_distributed_training_state_sync(
+            env,
+            distributed=args_cli.distributed,
+            step_interval=agent_cfg.num_steps_per_env,
+        )
 
         start_time = time.time()
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -204,7 +210,10 @@ def _run(args_cli: argparse.Namespace) -> None:
         dump_train_configs(log_dir, env_cfg, agent_cfg)
 
         try:
-            runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+            runner.learn(
+                num_learning_iterations=agent_cfg.max_iterations,
+                init_at_random_ep_len=agent_cfg.init_at_random_ep_len,
+            )
             print(f"Training time: {round(time.time() - start_time, 2)} seconds")
             env.close()
         except KeyboardInterrupt:
