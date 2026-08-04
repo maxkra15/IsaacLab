@@ -210,27 +210,9 @@ class NewtonCouplerManager(NewtonVBDManager):
             NewtonManager._solver.prepare_contacts(cls._contacts)
 
     @classmethod
-    def _supports_cuda_graph_capture(cls) -> bool:
-        """Accept coupled MPM only when every nested grid has capture-stable storage."""
-        solver_cfg = getattr(PhysicsManager._cfg, "solver_cfg", None)
-        solver = NewtonManager._solver
-        for entry in getattr(solver_cfg, "entries", ()):
-            if isinstance(entry.solver_cfg, MPMSolverCfg):
-                if solver is None or not NewtonMPMManager._solver_supports_cuda_graph_capture(
-                    solver.solver(entry.name)
-                ):
-                    return False
-        return super()._supports_cuda_graph_capture()
-
-    @classmethod
     def _defer_standard_graph_capture(cls) -> bool:
-        """Defer capture when an MPM entry builds reset-dependent sparse topology."""
-        solver_cfg = getattr(PhysicsManager._cfg, "solver_cfg", None)
-        solver = NewtonManager._solver
-        return solver is not None and any(
-            isinstance(entry.solver_cfg, MPMSolverCfg) and solver.solver(entry.name).grid_type == "sparse"
-            for entry in getattr(solver_cfg, "entries", ())
-        )
+        """Defer capture when the coupled solver contains sparse implicit MPM."""
+        return any(solver.grid_type == "sparse" for solver in NewtonMPMManager._implicit_mpm_solvers())
 
     @classmethod
     def _resolve_entry(
