@@ -51,13 +51,10 @@ def test_vbd_configured_rigid_options_match_newton_constructor():
     }
 
     assert configured_options <= constructor_options
-    assert "rigid_joint_hard" not in constructor_options
-    assert callable(vbd_manager.SolverVBD.set_joint_constraint_mode)
 
 
-@pytest.mark.parametrize("rigid_joint_hard", [True, False])
-def test_vbd_factory_forwards_rigid_options_and_applies_joint_mode(monkeypatch, rigid_joint_hard):
-    """VBD construction forwards Newton options and applies the Isaac Lab all-joints mode."""
+def test_vbd_factory_forwards_rigid_options(monkeypatch):
+    """VBD construction forwards Newton options without task-specific joint-mode overrides."""
 
     class _FakeSolverVBD:
         def __init__(
@@ -98,10 +95,6 @@ def test_vbd_factory_forwards_rigid_options_and_applies_joint_mode(monkeypatch, 
                 "rigid_joint_linear_kd": rigid_joint_linear_kd,
                 "rigid_joint_angular_kd": rigid_joint_angular_kd,
             }
-            self.joint_mode_calls = []
-
-        def set_joint_constraint_mode(self, joint_index: int, *, hard: bool) -> None:
-            self.joint_mode_calls.append((joint_index, hard))
 
     monkeypatch.setattr(vbd_manager, "SolverVBD", _FakeSolverVBD)
     model = SimpleNamespace(joint_count=3)
@@ -121,7 +114,6 @@ def test_vbd_factory_forwards_rigid_options_and_applies_joint_mode(monkeypatch, 
         rigid_joint_angular_k_start=40.0,
         rigid_joint_linear_kd=5.0,
         rigid_joint_angular_kd=6.0,
-        rigid_joint_hard=rigid_joint_hard,
     )
 
     solver = vbd_manager.NewtonVBDManager._create_solver(model, cfg)
@@ -143,5 +135,3 @@ def test_vbd_factory_forwards_rigid_options_and_applies_joint_mode(monkeypatch, 
         "rigid_joint_linear_kd": 5.0,
         "rigid_joint_angular_kd": 6.0,
     }
-    expected_calls = [] if rigid_joint_hard else [(0, False), (1, False), (2, False)]
-    assert solver.joint_mode_calls == expected_calls

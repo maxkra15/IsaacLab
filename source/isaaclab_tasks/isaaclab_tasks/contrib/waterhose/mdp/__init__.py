@@ -22,5 +22,4 @@ from .actions import (  # noqa: F401
     WaterhoseDirectGripperJointPositionActionCfg,
     WaterhoseGripperPositionActionCfg,
 )
-from .events import reset_cable_to_default  # noqa: F401
 from .terminations import plug_inserted_in_socket  # noqa: F401

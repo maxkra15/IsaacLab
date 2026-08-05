@@ -330,3 +330,11 @@ class MimicEnvCfg:
     when this option selects an alternate input field such as
     ``processed_actions``.
     """
+
+    annotation_reset_sim_buffer_each_episode: bool = True
+    """Whether annotation replay hard-resets simulation buffers before each episode.
+
+    Disable this for task backends whose hard reset rebuilds or invalidates
+    solver state. The environment is still reset to the recorded episode's
+    initial state before replay.
+    """

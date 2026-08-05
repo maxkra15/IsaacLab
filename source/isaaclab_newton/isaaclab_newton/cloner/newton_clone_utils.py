@@ -5,19 +5,17 @@
 
 from __future__ import annotations
 
-import re
 import warnings
 from collections.abc import Callable, Sequence
 from typing import Any
 
+import numpy as np
 import torch
 import warp as wp
 from newton import GeoType, ModelBuilder, ShapeFlags, solvers
-from newton._src.usd import utils as usd_utils
 
 from pxr import Usd, UsdGeom, UsdPhysics
 
-from isaaclab.cloner.cloner_utils import replace_path_prefix
 from isaaclab.sim.utils.newton_model_utils import replace_newton_builder_shape_colors
 
 # USD ``physics:approximation`` token (lower case) -> Newton remeshing method.
@@ -70,98 +68,74 @@ def _unauthored_collision_mesh_shapes(builder: ModelBuilder, authored_shape_indi
     ]
 
 
-def _is_collision_mesh_prim(prim: Usd.Prim) -> bool:
-    """Return whether a mesh prim is authored as collision geometry."""
-    return bool(prim.HasAPI(UsdPhysics.CollisionAPI) or prim.HasAPI(UsdPhysics.MeshCollisionAPI))
-
-
-def _has_rigid_body_ancestor(prim: Usd.Prim) -> bool:
-    """Return whether *prim* belongs to a USD rigid body."""
-    current = prim
-    while current.IsValid() and not current.IsPseudoRoot():
-        if current.HasAPI(UsdPhysics.RigidBodyAPI):
+def _has_visible_non_collision_geometry(stage: Usd.Stage, prim_path: str) -> bool:
+    """Return whether a prim hierarchy contains visible geometry without collision."""
+    root_prim = stage.GetPrimAtPath(prim_path)
+    if not root_prim:
+        return False
+    for prim in Usd.PrimRange(root_prim):
+        if not prim.IsA(UsdGeom.Gprim) or prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        imageable = UsdGeom.Imageable(prim)
+        if imageable.ComputeVisibility() != UsdGeom.Tokens.invisible and imageable.ComputePurpose() in (
+            UsdGeom.Tokens.default_,
+            UsdGeom.Tokens.proxy,
+        ):
             return True
-        current = current.GetParent()
     return False
 
 
-def add_static_visual_shapes_from_stage(
+def _restore_visible_colliders_without_visual_shapes(
     builder: ModelBuilder,
     stage: Usd.Stage,
-    root_path: str,
-    ignore_paths: Sequence[str] | None = None,
-) -> int:
-    """Import render-only meshes that Newton's physical USD import did not add."""
-    root_prim = stage.GetPrimAtPath(root_path)
-    if not root_prim.IsValid():
-        return 0
+    path_shape_map: dict[str, int] | None,
+    load_visual_shapes: bool = True,
+) -> None:
+    """Show viewport-visible colliders on bodies without separate visual shapes.
 
-    existing_shape_labels = {str(label) for label in getattr(builder, "shape_label", [])}
-    ignore_patterns = tuple(re.compile(path) for path in (ignore_paths or ()))
-    visual_shape_cfg = None
-    xform_cache = UsdGeom.XformCache()
-    added_count = 0
+    Newton normally hides every collider when any visual-only shape exists in the
+    imported model. Isaac Lab procedural shapes use one default-purpose USD geometry
+    for both collision and visualization, so an unrelated visual asset must not hide
+    them. Imported collision meshes, guide-purpose collision geometry, and
+    colliders on bodies with separate visual shapes remain hidden.
 
-    for prim in Usd.PrimRange(root_prim):
-        if not prim.IsA(UsdGeom.Mesh):
+    With ``load_visual_shapes=False`` the pass is skipped: Newton never hides a collider
+    when the model holds no visual-only shapes, so every flag it would set is already set,
+    and nothing draws them in a run that opted out of visual geometry. The skipped USD
+    visibility/purpose resolution is per collider shape, so it is worth avoiding.
+    """
+    if not path_shape_map or not load_visual_shapes:
+        return
+    bodies_with_visual_shapes = {
+        builder.shape_body[index]
+        for index, flags in enumerate(builder.shape_flags)
+        if builder.shape_body[index] >= 0 and flags & ShapeFlags.VISIBLE and not flags & ShapeFlags.COLLIDE_SHAPES
+    }
+    # Resolved on first use: a static parent whose colliders are all filtered out below is
+    # never traversed at all.
+    static_parents_with_visual_shapes: dict[str, bool] = {}
+    for path, index in path_shape_map.items():
+        flags = builder.shape_flags[index]
+        body_index = builder.shape_body[index]
+        if (
+            not flags & ShapeFlags.COLLIDE_SHAPES
+            or builder.shape_type[index] == GeoType.MESH
+            or body_index in bodies_with_visual_shapes
+        ):
             continue
-
-        path_name = str(prim.GetPath())
-        if path_name in existing_shape_labels:
-            continue
-        if any(pattern.match(path_name) for pattern in ignore_patterns):
-            continue
-        if _is_collision_mesh_prim(prim):
-            continue
-        # Missing visuals beneath a rigid body must remain attached to that body.
-        # Importing them through this static fallback would freeze them in world space.
-        if _has_rigid_body_ancestor(prim):
-            continue
-
-        imageable = UsdGeom.Imageable(prim)
-        if not imageable or imageable.ComputeVisibility() == UsdGeom.Tokens.invisible:
-            continue
-        if imageable.ComputePurpose() in (UsdGeom.Tokens.guide, UsdGeom.Tokens.proxy):
-            continue
-
-        material_props = usd_utils.resolve_material_properties_for_prim(prim)
-        mesh = usd_utils.get_mesh(
-            prim,
-            load_uvs=material_props.get("texture") is not None,
-            load_normals=True,
-        ).copy(recompute_inertia=False)
-        if material_props.get("texture") is not None:
-            mesh.texture = material_props["texture"]
-        if material_props.get("color") is not None and mesh.texture is None:
-            mesh.color = material_props["color"]
-        if material_props.get("roughness") is not None:
-            mesh.roughness = material_props["roughness"]
-        if material_props.get("metallic") is not None:
-            mesh.metallic = material_props["metallic"]
-
-        world_mat = usd_utils.get_transform_matrix(prim, local=False, xform_cache=xform_cache)
-        xform_pos, xform_rot, scale = wp.transform_decompose(world_mat)
-        if visual_shape_cfg is None:
-            visual_shape_cfg = ModelBuilder.ShapeConfig(
-                density=0.0,
-                has_shape_collision=False,
-                has_particle_collision=False,
-                collision_group=0,
-            )
-        shape_id = builder.add_shape_mesh(
-            body=-1,
-            xform=wp.transform(xform_pos, xform_rot),
-            mesh=mesh,
-            scale=scale,
-            cfg=visual_shape_cfg.copy(),
-            color=material_props.get("color"),
-            label=path_name,
-        )
-        if shape_id >= 0:
-            existing_shape_labels.add(path_name)
-            added_count += 1
-
-    return added_count
+        if body_index < 0:
+            parent_path = path.rpartition("/")[0]
+            if parent_path not in static_parents_with_visual_shapes:
+                static_parents_with_visual_shapes[parent_path] = _has_visible_non_collision_geometry(stage, parent_path)
+            if static_parents_with_visual_shapes[parent_path]:
+                continue
+        imageable = UsdGeom.Imageable(stage.GetPrimAtPath(path))
+        if (
+            imageable
+            and imageable.ComputeVisibility() != UsdGeom.Tokens.invisible
+            and imageable.ComputePurpose() in (UsdGeom.Tokens.default_, UsdGeom.Tokens.proxy)
+        ):
+            builder.shape_flags[index] = flags | ShapeFlags.VISIBLE
 
 
 def build_source_builders(
@@ -172,6 +146,7 @@ def build_source_builders(
     *,
     ignore_paths: Sequence[str] | None = None,
     simplify_meshes: bool = True,
+    load_visual_shapes: bool = True,
 ) -> dict[str, ModelBuilder]:
     """Build one Newton builder for each clone source prim path.
 
@@ -180,11 +155,22 @@ def build_source_builders(
     honored modes leave multiple sources with differing shape-type sequences (e.g.
     heterogeneous asset variants), every mesh falls back to the uniform convex-hull
     treatment, because :class:`SolverMuJoCo` requires homogeneous worlds.
+
+    Args:
+        stage: USD stage containing the source prims.
+        sources: Source prim paths to build a builder for.
+        create_builder: Factory returning a fresh :class:`ModelBuilder`.
+        schema_resolvers: Schema resolvers forwarded to Newton's USD importer.
+        ignore_paths: Prim paths skipped during import.
+        simplify_meshes: Whether to run convex-hull mesh approximation.
+        load_visual_shapes: Whether to import visual-only geometry. Importing it costs
+            USD parse time and memory that only pays off when the shapes are rendered
+            or ray cast.
     """
     authored = _authored_collision_approximations(stage)
     builders = {
         source: _build_source_builder(
-            stage, source, create_builder, schema_resolvers, ignore_paths, simplify_meshes, authored
+            stage, source, create_builder, schema_resolvers, ignore_paths, simplify_meshes, authored, load_visual_shapes
         )
         for source in sources
     }
@@ -201,7 +187,14 @@ def build_source_builders(
             )
             builders = {
                 source: _build_source_builder(
-                    stage, source, create_builder, schema_resolvers, ignore_paths, simplify_meshes, {}
+                    stage,
+                    source,
+                    create_builder,
+                    schema_resolvers,
+                    ignore_paths,
+                    simplify_meshes,
+                    {},
+                    load_visual_shapes,
                 )
                 for source in sources
             }
@@ -216,6 +209,7 @@ def _build_source_builder(
     ignore_paths: Sequence[str] | None,
     simplify_meshes: bool,
     authored: dict[str, str],
+    load_visual_shapes: bool = True,
 ) -> ModelBuilder:
     """Build one source builder; an empty ``authored`` map restores hull-everything."""
     builder = create_builder()
@@ -224,14 +218,15 @@ def _build_source_builder(
     import_result = builder.add_usd(
         stage,
         root_path=source,
-        load_visual_shapes=True,
+        load_visual_shapes=load_visual_shapes,
+        hide_collision_shapes=True,
         skip_mesh_approximation=True,
         schema_resolvers=schema_resolvers,
         ignore_paths=ignore_paths,
     )
-    # Newton's physical USD import can omit render-only meshes under instanceable
-    # assemblies. Preserve them as non-colliding static shapes for the Newton viewer.
-    add_static_visual_shapes_from_stage(builder, stage, source, ignore_paths=ignore_paths)
+    _restore_visible_colliders_without_visual_shapes(
+        builder, stage, import_result["path_shape_map"], load_visual_shapes
+    )
     if authored:
         authored_shape_indices = _apply_authored_approximations(builder, import_result["path_shape_map"], authored)
         if simplify_meshes:
@@ -246,6 +241,41 @@ def _build_source_builder(
     return builder
 
 
+def _quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product of xyzw quaternion arrays, broadcast over the leading axes."""
+    ax, ay, az, aw = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bx, by, bz, bw = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    out = np.empty(np.broadcast_shapes(a.shape, b.shape), dtype=np.float32)
+    out[..., 0] = aw * bx + ax * bw + ay * bz - az * by
+    out[..., 1] = aw * by - ax * bz + ay * bw + az * bx
+    out[..., 2] = aw * bz + ax * by - ay * bx + az * bw
+    out[..., 3] = aw * bw - ax * bx - ay * by - az * bz
+    return out
+
+
+def _quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vectors ``v`` by xyzw quaternions ``q``, broadcast over the leading axes."""
+    axis, angle_w = q[..., :3], q[..., 3:4]
+    t = 2.0 * np.cross(axis, v)
+    return (v + angle_w * t + np.cross(axis, t)).astype(np.float32)
+
+
+def _compose_world_xforms(world_p: np.ndarray, world_q: np.ndarray, local: Sequence[float]) -> np.ndarray:
+    """``world_xform_w * local`` for every world, as one ``[num_worlds, 7]`` xyzw array."""
+    local = np.asarray(local, dtype=np.float32)
+    out = np.empty((world_p.shape[0], 7), dtype=np.float32)
+    out[:, :3] = world_p + _quat_rotate(world_q, np.broadcast_to(local[:3], world_p.shape))
+    out[:, 3:] = _quat_multiply(world_q, local[3:])
+    return out
+
+
+def _invert_xform(xform: Sequence[float] | np.ndarray) -> np.ndarray:
+    """Inverse of a single xyzw transform, assuming a unit quaternion."""
+    xform = np.asarray(xform, dtype=np.float32)
+    quat_inv = np.array([-xform[0 + 3], -xform[1 + 3], -xform[2 + 3], xform[6]], dtype=np.float32)
+    return np.concatenate([-_quat_rotate(quat_inv, xform[:3]), quat_inv])
+
+
 def replicate_builder_mapping(
     builder: ModelBuilder,
     sources: Sequence[str],
@@ -257,44 +287,100 @@ def replicate_builder_mapping(
     source_site_indices: dict[int, dict[str, list[int]]] | None = None,
     env_root_sites: dict[str, wp.transform] | None = None,
     per_world_builder_hooks: Sequence[Callable[[ModelBuilder, int, list[float], list[float]], None]] = (),
-    post_replicate_hooks: Sequence[Callable[[ModelBuilder], None]] = (),
 ) -> tuple[dict[str, list[list[int]]], list[wp.transform]]:
     """Replicate source builders into per-env Newton worlds."""
     source_site_indices = source_site_indices or {}
     env_root_sites = env_root_sites or {}
     num_worlds = mapping.size(1)
     local_site_map: dict[str, list[list[int]]] = {}
-    world_xforms: list[wp.transform] = []
-    source_world_indices = mapping.to(dtype=torch.int64).argmax(dim=1)
+    positions_np = positions.detach().cpu().numpy().astype(np.float32, copy=False)
+    quaternions_np = quaternions.detach().cpu().numpy().astype(np.float32, copy=False)
+    xforms_np = np.concatenate((positions_np, quaternions_np), axis=1)
+    xform_rows = xforms_np.tolist()
+    world_xforms = [wp.transform(*row) for row in xform_rows]
+
+    can_batch = (
+        len(sources) == 1
+        and mapping.size(0) == 1
+        and num_worlds > 0
+        and bool(mapping.all().item())
+        and not per_world_builder_hooks
+    )
+    if can_batch:
+        source_builder = source_builders[sources[0]]
+
+        # Inject env-root sites into the source so replicate() copies them. Prefixed
+        # by world_xforms[0] so R_w = world_xform_w * inv(world_xform_0) lands each
+        # copy at world_xform_w * xform.
+        site_local_indices: dict[str, list[int]] = {}
+        for label, xform in env_root_sites.items():
+            idx = source_builder.add_site(body=-1, xform=wp.transform_multiply(world_xforms[0], xform), label=label)
+            site_local_indices.setdefault(label, []).append(idx)
+        for label, indices in source_site_indices.get(id(source_builder), {}).items():
+            site_local_indices.setdefault(label, []).extend(indices)
+
+        # Site index after replicate: base_shape + world * stride + source_local_index.
+        base_shape = builder.shape_count
+        stride = source_builder.shape_count
+        source_xform_inv = _invert_xform(xforms_np[0])
+        xforms = _compose_world_xforms(positions_np, quaternions_np, source_xform_inv)
+        builder.replicate(source_builder, num_worlds, xforms=xforms)
+
+        for label, local_indices in site_local_indices.items():
+            local_site_map[label] = [
+                [base_shape + world * stride + local for local in local_indices] for world in range(num_worlds)
+            ]
+
+        return local_site_map, world_xforms
+
+    source_world_indices = mapping.to(dtype=torch.int64).argmax(dim=1).tolist()
+
+    # Per-world placements for every env-root site, composed up front so the per-world loop
+    # below only indexes rows.
+    root_site_xforms = {
+        label: _compose_world_xforms(positions_np, quaternions_np, xform) for label, xform in env_root_sites.items()
+    }
+    # Same for the source placements, but only for the occupied ``(row, col)`` pairs of the
+    # mapping: composing a dense ``num_rows x num_worlds`` table would blow up on heterogeneous
+    # plans where each row is present in a handful of worlds.
+    # One scan of the transposed mapping yields the occupied pairs in world-major order, which
+    # is the order both indices want; scanning per world instead costs a torch call and a
+    # device sync per world.
+    rows_per_world: list[list[int]] = [[] for _ in range(num_worlds)]
+    worlds_per_row: dict[int, list[int]] = {}
+    for col, row in mapping.t().nonzero(as_tuple=False).tolist():
+        rows_per_world[col].append(row)
+        worlds_per_row.setdefault(row, []).append(col)
+    source_xforms: dict[tuple[int, int], np.ndarray] = {}
+    for row, cols in worlds_per_row.items():
+        source_col = source_world_indices[row]
+        row_xforms = _compose_world_xforms(
+            positions_np[cols],
+            quaternions_np[cols],
+            _invert_xform(xforms_np[source_col]),
+        )
+        source_xforms.update(((row, col), row_xforms[index]) for index, col in enumerate(cols))
 
     for col in range(num_worlds):
         builder.begin_world()
-        world_xform = wp.transform(positions[col], quaternions[col])
-        world_xforms.append(world_xform)
 
-        for label, xform in env_root_sites.items():
-            site_idx = builder.add_site(body=-1, xform=wp.transform_multiply(world_xform, xform), label=label)
+        for label, world_site_xforms in root_site_xforms.items():
+            site_idx = builder.add_site(body=-1, xform=world_site_xforms[col], label=label)
             local_site_map.setdefault(label, [[] for _ in range(num_worlds)])[col].append(site_idx)
 
-        for row in torch.nonzero(mapping[:, col], as_tuple=True)[0].tolist():
-            source_builder = source_builders[sources[int(row)]]
+        for row in rows_per_world[col]:
+            source_builder = source_builders[sources[row]]
             offset = builder.shape_count
-            source_col = int(source_world_indices[int(row)])
-            source_xform = wp.transform(positions[source_col], quaternions[source_col])
-            builder.add_builder(
-                source_builder, xform=wp.transform_multiply(world_xform, wp.transform_inverse(source_xform))
-            )
+            builder.add_builder(source_builder, xform=source_xforms[row, col])
 
             for label, source_shape_indices in source_site_indices.get(id(source_builder), {}).items():
                 local_indices = local_site_map.setdefault(label, [[] for _ in range(num_worlds)])[col]
                 local_indices.extend(offset + shape_idx for shape_idx in source_shape_indices)
 
         for hook in per_world_builder_hooks:
-            hook(builder, col, positions[col].tolist(), quaternions[col].tolist())
+            hook(builder, col, xform_rows[col][:3], xform_rows[col][3:])
         builder.end_world()
 
-    for hook in post_replicate_hooks:
-        hook(builder)
     return local_site_map, world_xforms
 
 
@@ -318,24 +404,35 @@ def rename_builder_labels(
     """Rewrite source-root labels to per-env destination roots and return Fabric body bindings."""
     fabric_body_bindings: list[tuple[str, int]] = []
     bound_body_indices: set[int] = set()
+    env_ids_list = env_ids.tolist()
 
     for source_index, source in enumerate(sources):
-        source_root = source.rstrip("/")
+        source_root = source.rstrip("/") or "/"
+        source_root_len = len(source_root)
         world_cols = torch.nonzero(mapping[source_index], as_tuple=True)[0].tolist()
-        world_roots = {int(env_ids[col]): destinations[source_index].format(int(env_ids[col])) for col in world_cols}
+        # Pre-normalize the destination roots
+        destination = destinations[source_index]
+        world_roots = {
+            env_id: (destination.format(env_id).rstrip("/") or "/")
+            for env_id in (env_ids_list[col] for col in world_cols)
+        }
 
         def _rename_pair(values, worlds, *, collect_body_bindings: bool = False):
             for index, (value, world) in enumerate(zip(values, worlds, strict=True)):
-                if world is None:
+                if world is None or not isinstance(value, str) or not value.startswith(source_root):
+                    continue
+                suffix = value[source_root_len:]
+                if suffix and not suffix.startswith("/"):
                     continue
                 world_root = world_roots.get(int(world))
-                if isinstance(value, str) and world_root is not None:
-                    renamed_value = replace_path_prefix(value, source_root, world_root)
-                    if renamed_value != value:
-                        values[index] = renamed_value
-                        if collect_body_bindings:
-                            fabric_body_bindings.append((renamed_value, index))
-                            bound_body_indices.add(index)
+                if world_root is None:
+                    continue
+                renamed_value = world_root + suffix
+                if renamed_value != value:
+                    values[index] = renamed_value
+                    if collect_body_bindings:
+                        fabric_body_bindings.append((renamed_value, index))
+                        bound_body_indices.add(index)
 
         for labels, worlds, collect_body_bindings in (
             (builder.body_label, builder.body_world, True),

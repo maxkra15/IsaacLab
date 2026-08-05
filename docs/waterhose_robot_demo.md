@@ -5,8 +5,9 @@ The waterhose demo has two supported entry points:
 - `run_robot_demo.py` runs the scripted grasp-and-insert sequence and finishes in a seated hold.
 - `teleop_se3_agent.py` runs bimanual Apple Vision Pro control.
 
-Both use the same Newton proxy-coupled scene. The scripted runner intentionally does not launch the
-human-driven teleop task.
+Both use the same Newton proxy-coupled scene and Isaac Lab's native `CableObject` runtime. The task
+adds only the waterhose-specific connector, damping, and tail attachment while each Newton world is
+built. The scripted runner intentionally does not launch the human-driven teleop task.
 
 ## Install
 
@@ -34,13 +35,13 @@ The archive already contains the repository-relative
 ``source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/assets`` path. Keep both the extracted assets
 and the archive local; the repository ignores them.
 
-Verify that the tested Newton pin, Isaac Teleop, and WebSockets resolve from that environment:
+Verify that the tested Newton pin and Isaac Teleop resolve from that environment:
 
 ```bash
 .venv/bin/python -c \
-  'import importlib.metadata as m, newton, websockets; \
+  'import importlib.metadata as m, newton; \
    print(newton.__file__); print(m.version("newton")); \
-   print(m.version("isaacteleop")); print(websockets.__version__)'
+   print(m.version("isaacteleop"))'
 uv pip freeze --python .venv/bin/python | grep '^newton'
 ```
 
@@ -157,10 +158,21 @@ on guessed tool-frame Euler offsets. Subsequent translation and spatial rotation
 on all three axes, and wrist tracking loss holds the last target. The shared torso is held stable. The
 configured robot-base target frame keeps hand axes aligned with the task; if that prim cannot be read, the
 runtime logs a reason and emits no action until the frame resolves rather than sending world-frame poses
-to IK.
+to IK. Play, Stop, and Reset messages continue to be processed while actions are suppressed.
 
 The bimanual task intentionally does not configure keyboard or SpaceMouse devices: those devices emit a
 single 7-D arm command and do not satisfy the two-wrist 16-D action contract.
+
+Record HDF5 demonstrations with the same task and explicitly preserve the already-built coupled solver
+between episodes:
+
+```bash
+VIRTUAL_ENV="$PWD/.venv" ./isaaclab.sh -p scripts/tools/record_demos.py \
+  --task Isaac-Waterhose-Coupled-Teleop-v0 \
+  --dataset_file datasets/waterhose_teleop.hdf5 \
+  --num_envs 1 --visualizer kit --xr --device cuda:0 \
+  --cloudxr_env avp --no-reset_sim_buffer_each_episode
+```
 
 For a local XR startup check without launching CloudXR, replace `--cloudxr_env avp` with
 `--cloudxr_env none` and close the application after the scene and teleop session initialize. A real AVP
@@ -170,7 +182,7 @@ acceptance pass must still verify:
 2. Both wrists track XYZ and all three rotation axes one-to-one; each hand's pinch controls its gripper.
 3. Robot and hose visuals update in the headset while physics is stepping.
 4. Play and Stop gate motion, and Reset restores the scene and re-clutches both wrists.
-5. No mixed-WebSockets or target-frame warnings remain after startup.
+5. No persistent CloudXR startup or target-frame warnings remain after startup.
 
 ## Mimic annotation and generation
 
@@ -186,6 +198,23 @@ right gripper joint targets (3), left gripper joint targets (3)
 clutch again, and annotated output is written back under the standard `actions` key expected by
 Mimic generation. The initial configuration treats each arm's complete trajectory as one final
 subtask, so automatic annotation does not require intermediate subtask signals.
+
+The Waterhose annotation configuration deliberately skips the per-episode `env.sim.reset()` hard
+reset. It still resets the task and restores the recorded initial state through `env.reset_to()`, but
+preserves the already-built coupled solver and its CUDA resources. This task-level opt-out avoids the
+abnormal robot behavior reported when the complete Newton simulation buffer was rebuilt between
+episodes. It is independent of the similarly named record/replay CLI option; leave
+`--reset_sim_buffer_each_episode` disabled for Waterhose recordings by passing
+`--no-reset_sim_buffer_each_episode`, unless explicitly diagnosing a hard-reset issue.
+
+Current recordings store cable initial state under
+`initial_state/cable_object/cable1/{segment_pose,segment_velocity}`. The tensors contain one pose and
+velocity for every cable segment in every recorded environment. Older recordings that instead contain
+`initial_state/articulation/cable1` remain accepted by the Mimic task: the robot state and selected
+`processed_actions` are preserved, the obsolete cable articulation entry is ignored, and the native
+cable starts from its configured default. This fallback cannot reproduce a non-default legacy cable
+shape because the old generalized coordinates are not the per-segment state required by the native
+API. Re-annotating an old file exports a dataset using the current state layout.
 
 ```bash
 VIRTUAL_ENV="$PWD/.venv" ./isaaclab.sh -p \
@@ -203,6 +232,28 @@ VIRTUAL_ENV="$PWD/.venv" ./isaaclab.sh -p \
   --num_envs 1 --headless --visualizer none --device cuda:0
 ```
 
+Use standard MimicGen for this task. `--use_skillgen` is explicitly unsupported and fails before the
+environment or cuRobo planner is created: Waterhose has bimanual Newton IK targets and deformable cable
+contact, but no task-specific cuRobo planner or SkillGen start-signal annotations. The generic
+`--deterministic` launcher option makes rendering reproducible; it is not a bitwise-deterministic VBD
+or proxy-contact mode and should not be expected to change generation success rates.
+
+## Native cable state and rendering
+
+The hose is registered with `InteractiveScene` as `cable_object["cable1"]`, not as an articulation.
+Isaac Lab exposes the batched state as per-environment segment poses and velocities and uses indexed
+or masked state writes for partial resets. Consequently, resetting one MimicGen environment does not
+teleport another environment's cable, and each cloned cable, connector, and tail attachment is built
+in its matching Newton world.
+
+Cable physics and state remain on the simulation device. The Newton viewer reads the Newton model
+directly. Kit/RTX instead renders the authored `BasisCurves`, so at render cadence Newton's native
+Fabric bridge maps every cloned curve to its ordered segment bodies and publishes updated curve
+points. The current RTX Hydra path requires a CPU mirror for those curve points because it ignores GPU
+Fabric `BasisCurves` updates. This synchronization is visualization-only, runs when rendering, and is
+not part of the headless physics/CUDA graph. Waterhose no longer installs a task-global cable registry
+or a task-specific curve-sync callback.
+
 ## Newton contact scope
 
 The coupled scene has an explicit ownership boundary:
@@ -212,22 +263,24 @@ The coupled scene has an explicit ownership boundary:
   authoring enables the asset's dedicated gripper-base, camera-bracket, tool-flange, and wrist-pitch
   collision meshes on both arms. All twelve robot contact shapes use a raw, critically damped MuJoCo
   `solref=(0.005, 1.0)`, and the outer collision pipeline refreshes on every 1 ms solver substep.
-- VBD owns the articulated cable rods, the connector, the socket SDF, and the cable housing proxy.
+- VBD owns the native cable segment bodies, their compound connector head, the socket SDF, and the
+  cable housing proxy.
   Cable-to-fridge contact is therefore solved directly inside VBD and does not use proxy feedback.
   The housing remains collidable everywhere except for a 15 mm local insertion corridor, where the
   dedicated socket SDF supplies the physical insertion contact.
-  The connector mesh and inertia are lumped into cable segment 0, so it is physically part of the
-  cable rather than a detached visual or welded rigid body. VBD preserves authored joint modes: the
-  rod's stretch/bend joints remain compliant, while the tail attachment uses a finite penalty
-  constraint by authoring `vbd:joint_is_hard=0` on that joint alone. Other non-cable structural
-  joints retain Newton's hard augmented-Lagrangian default.
+  The standard deformable-curve importer creates one native segment chain per world. A scoped
+  Waterhose builder extension then adds the connector mesh and mass to segment 0, applies the task's
+  validated joint damping, and creates that world's tail constraint. The connector is therefore part
+  of the cable's compound head rather than a detached visual or welded rigid body. The native cable's
+  stretch/bend joints remain compliant, while the tail attachment uses a finite penalty constraint by
+  authoring `vbd:joint_is_hard=0` on that joint alone. Other non-cable structural joints retain
+  Newton's hard augmented-Lagrangian default.
 - Proxy coupling mirrors all four finger bodies into VBD. Those proxies collide with both the connector
   and the cable rods. Finger-to-fridge and finger-to-socket proxy pairs are filtered because MJWarp
   already owns robot-to-fridge contact; solving that pair in both entries pushes the grasp away from the
   bore. The shared outer pipeline is likewise reduced to pairs consumed by MJWarp; cable/socket/gripper
-  pairs are detected only by the proxy-local pipeline. The proxies retain the imported model-view
-  finger inertia (`use_solver_effective_mass=False`), use `mass_scale=1.0`, and run one staggered,
-  fixed-feedback coupling pass without Aitken relaxation. The task contact material uses
+  pairs are detected only by the proxy-local pipeline. The task uses one staggered, fixed-feedback
+  coupling pass without Aitken relaxation. The task contact material uses
   `ke=1.0e4 N/m` and `kd=0.1 N s/m`; the finger proxies use friction `20.0`, a 1 mm physical margin,
   and a 10 mm broad-phase gap, while connector/socket/cable shapes retain the lower task friction.
   AVP gripper commands preserve the published client task's 150 mm per-step limit. That exceeds the
@@ -239,17 +292,16 @@ adhesion, or post-insertion kinematic hold. The success check only observes conn
 depth; it does not apply forces. The plug remains seated through its mesh contact with the socket,
 contact friction, and the cable's elastic response.
 
-This branch pins the tested Newton commit `81cdcfc2dd89f8b7285e32b5e3853092a97fa6f9`. Isaac Lab seeds the
+This branch uses the project Newton pin `10402ecbaf2d8afda00507123155042cbcb5c3fb`. Isaac Lab seeds the
 configured rigid-contact capacity before solver construction so VBD contact history exists before CUDA
 graph capture. The default model-wide history capacity is 131,072. The default proxy-local capacity
-scales as 256 contacts per environment with a 30,000-contact floor. If a larger batch exceeds that envelope, increase
-`WATERHOSE_RIGID_CONTACT_MAX` and `WATERHOSE_PROXY_RIGID_CONTACT_MAX` together; the former must be at least
-the latter. These allocation limits do not change stiffness, friction, margins, substeps, or iterations.
+scales as 256 contacts per environment with a 30,000-contact floor. If a larger batch exceeds that
+envelope, increase `WATERHOSE_RIGID_CONTACT_MAX` and `WATERHOSE_PROXY_RIGID_CONTACT_MAX` together; the
+former must be at least the latter. These allocation limits do not change stiffness, friction, margins,
+substeps, or iterations.
 
 ## Troubleshooting
 
-- `CloudXR requires websockets >= 14`: reinstall this worktree and verify that WebSockets resolves from its
-  virtual environment. The launcher preloads one consistent WebSockets package before Kit starts.
 - A traceback that names another worktree's ``.venv`` indicates a mixed environment. Run the command with
   `VIRTUAL_ENV="$PWD/.venv"` and this checkout's ``./isaaclab.sh -p`` wrapper; do not invoke a sibling
   checkout's Python directly.

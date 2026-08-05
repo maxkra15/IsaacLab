@@ -24,6 +24,7 @@ from isaaclab_rl.entrypoints.common import (
     CHECKPOINT_SELECTORS,
     add_common_train_args,
     apply_env_overrides,
+    apply_video_recording,
     configure_io_descriptors,
     create_isaaclab_env,
     dump_train_configs,
@@ -68,7 +69,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="if toggled, this experiment will be tracked with Weights and Biases",
     )
     add_launcher_args(parser)
-    args_cli, hydra_args = setup_preset_cli(parser, argv)
+    args_cli, hydra_args = setup_preset_cli(parser, argv, agent_library="rl_games")
     enable_cameras_for_video(args_cli)
     set_hydra_args(hydra_args)
     return args_cli
@@ -168,6 +169,7 @@ def run(argv: list[str]) -> None:
 
         configure_io_descriptors(env_cfg, args_cli, logger)
         env_cfg.log_dir = run_log_dir
+        apply_video_recording(env_cfg, run_log_dir, args_cli)
 
         env = create_isaaclab_env(
             args_cli.task,

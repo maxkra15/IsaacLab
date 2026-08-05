@@ -16,6 +16,7 @@ The following modules are available in the ``isaaclab`` extension:
    app
    actuators
    assets
+   benchmark
    cloner
    controllers
    devices
@@ -83,9 +84,9 @@ The following modules are available in the ``isaaclab_contrib`` extension:
 
    actuators
    assets
-   cable
    controllers
    coupling
+   custom_coupling
    deformable
    mdp
    rl

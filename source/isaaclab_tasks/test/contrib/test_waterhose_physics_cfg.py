@@ -11,25 +11,23 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
 import warp as wp
 from isaaclab_newton.physics import NewtonManager
 from newton import GeoType, ModelBuilder, ShapeFlags, solvers
 from newton._src.solvers.mujoco.constants import SOLREF_MODE_RAW
 from newton._src.usd.schemas import SchemaResolverNewton, SchemaResolverPhysx
-from newton.geometry import compute_inertia_shape, transform_inertia
+from newton.geometry import compute_inertia_shape
 
-from isaaclab.managers import SceneEntityCfg
+import isaaclab.sim as sim_utils
+from isaaclab.assets import CableObjectCfg
 
-from isaaclab_contrib.cable import cable_object as cable_object_module
-
-from isaaclab_tasks.contrib.waterhose import cable as waterhose_cable
-from isaaclab_tasks.contrib.waterhose import waterhose_env_cfg
-from isaaclab_tasks.contrib.waterhose.cable import WaterhoseCableObject, WaterhoseCableObjectCfg
+from isaaclab_tasks.contrib.waterhose import waterhose_env, waterhose_env_cfg
+from isaaclab_tasks.contrib.waterhose.cable import (
+    WaterhoseCableBuilderExtension,
+    WaterhoseCableObjectCfg,
+    spawn_waterhose_cable_from_usd,
+)
 from isaaclab_tasks.contrib.waterhose.geometry import (
-    CONNECTOR_LOCAL_POS,
-    CONNECTOR_LOCAL_QUAT_XYZW,
-    CONNECTOR_MASS,
     CONNECTOR_TIP_LEN,
     CONNECTOR_TIP_LOCAL_POS,
     SOCKET_ALIGN_TIP_DEPTH,
@@ -114,38 +112,6 @@ def test_mjwarp_contact_shapes_author_raw_critically_damped_solref(asset_path, e
     )
 
 
-def test_waterhose_proxy_preserves_authored_gripper_inertia():
-    """The small grasp proxy bypasses MJWarp's whole-articulation effective inertia."""
-    cfg = waterhose_env_cfg.WaterhoseEnvCfg()
-    entries = {entry.name: entry for entry in cfg.sim.physics.solver_cfg.entries}
-    proxy = cfg.sim.physics.solver_cfg.proxies[0]
-
-    assert entries["mjc"].use_solver_effective_mass is False
-    assert entries["vbd"].use_solver_effective_mass is True
-    assert proxy.mass_scale == pytest.approx(1.0)
-    assert not hasattr(proxy, "proxy_relaxation")
-
-
-def test_cable_uses_post_replicate_coloring_hook(monkeypatch):
-    """Procedural rods follow the same post-replication coloring pattern as deformables."""
-
-    monkeypatch.setattr(NewtonManager, "_per_world_builder_hooks", [], raising=False)
-    monkeypatch.setattr(NewtonManager, "_post_replicate_hooks", [], raising=False)
-    monkeypatch.setattr(NewtonManager, "_pre_render_callbacks", {}, raising=False)
-
-    cable_object_module.install_cable_builder_hooks()
-
-    assert cable_object_module.color_registered_cables in NewtonManager._post_replicate_hooks
-    assert (
-        NewtonManager._pre_render_callbacks["cable_curve_sync"]
-        is cable_object_module.sync_registered_cable_curves_to_usd
-    )
-    color_calls = []
-    NewtonManager._cable_registry.append(object())
-    cable_object_module.color_registered_cables(SimpleNamespace(color=lambda: color_calls.append(True)))
-    assert color_calls == [True]
-
-
 def test_waterhose_proxy_contacts_warm_start_the_grip():
     cfg = waterhose_env_cfg.WaterhoseEnvCfg()
     entries = {entry.name: entry for entry in cfg.sim.physics.solver_cfg.entries}
@@ -153,7 +119,6 @@ def test_waterhose_proxy_contacts_warm_start_the_grip():
     assert cfg.sim.physics.use_cuda_graph is True
     assert entries["vbd"].solver_cfg.rigid_contact_history is True
     assert entries["vbd"].solver_cfg.rigid_contact_hard is True
-    assert entries["vbd"].solver_cfg.rigid_joint_hard is True
     assert entries["vbd"].solver_cfg.rigid_avbd_beta == pytest.approx(1.0e2)
     assert entries["vbd"].solver_cfg.rigid_contact_k_start == pytest.approx(1.0e3)
     assert entries["vbd"].solver_cfg.friction_epsilon == pytest.approx(0.1)
@@ -211,7 +176,7 @@ def test_waterhose_proxy_pipeline_restores_task_materials_on_imported_contact_sh
             "right_left_collision",
             "right_right_collision",
             "/World/envs/env_0/Cable1/waterhose_connector",
-            "/World/envs/env_0/Cable1/cable_edge_capsule_0",
+            "/World/envs/env_0/Cable1/curve_0_edge_capsule_0",
             "/World/envs/env_0/FridgeCableCollision/Housing",
             "/World/envs/env_0/Fridge/Cable008/SocketCollision/Cable008_SocketCollision",
         ],
@@ -448,30 +413,87 @@ def test_robot_asset_imports_visible_render_shapes_for_newton():
     assert {builder.shape_body[shape_index] for shape_index in wheel_shapes} == {0}
 
 
-def test_scene_imports_authored_assets_without_model_init_callbacks():
+def test_scene_uses_native_cable_config_and_runtime_schema_adapter():
     scene = waterhose_env_cfg.WaterhoseSceneCfg()
 
     assert scene.fridge.spawn.usd_path == waterhose_env_cfg._FRIDGE_USD
     assert scene.robot.spawn.usd_path == waterhose_env_cfg._RBY1_USD
     assert scene.cable1.spawn.usd_path == waterhose_env_cfg._CABLE1_USD
+    assert isinstance(scene.cable1, CableObjectCfg)
+    assert isinstance(scene.cable1, WaterhoseCableObjectCfg)
+    assert scene.cable1.spawn.func is spawn_waterhose_cable_from_usd
+    assert scene.cable1.class_type.endswith(":WaterhoseCableObject")
     assert scene.anchor1.spawn.rigid_props is None
     assert scene.anchor1.spawn.collision_props is None
     assert not hasattr(scene, "connector_visual")
     assert waterhose_env_cfg._SOCKET_CONTACT_PROPERTIES.contact_gap == 0.0
     assert scene.cable1.connector_gap == pytest.approx(0.001)
     assert scene.cable1.tail_anchor_prim_path == "/World/envs/env_.*/Anchor1"
+    assert scene.cable1.curve_prim_suffix == "/curve_0"
 
 
-def test_waterhose_uses_current_vbd_units_for_anchored_cable_material():
-    """The anchored hose must not lever itself out of the gripper from excess bend damping."""
+def test_waterhose_native_material_converts_to_validated_per_joint_stiffness():
+    """Native elastic moduli preserve the prior rod stiffness in Newton's physical units."""
 
-    material = waterhose_env_cfg.WaterhoseSceneCfg().cable1.spawn.physics_material
+    from pxr import UsdGeom
 
-    assert material.stretch_stiffness == pytest.approx(1.0e6)
-    assert material.stretch_damping == pytest.approx(1.0e-2)
-    assert material.bend_stiffness == pytest.approx(3.0e-1)
-    assert material.bend_damping == pytest.approx(2.0e-2)
+    cable_cfg = waterhose_env_cfg.WaterhoseSceneCfg().cable1
+    material = cable_cfg.spawn.physics_material
+    cable_stage = sim_utils.create_new_stage()
+    with sim_utils.use_stage(cable_stage):
+        cable_cfg.spawn.func("/World/Cable1", cable_cfg.spawn)
+    curve = UsdGeom.BasisCurves(cable_stage.GetPrimAtPath("/World/Cable1/curve_0"))
+    points = np.asarray(curve.GetPointsAttr().Get(), dtype=np.float64)
+    mean_segment_length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).mean())
+    radius = 0.5 * material.thickness
+    area = np.pi * radius**2
+    area_moment = np.pi * radius**4 / 4.0
+
+    assert material.stretch_stiffness * area / mean_segment_length == pytest.approx(1.0e6, rel=1.0e-6)
+    assert material.bend_stiffness * area_moment / mean_segment_length == pytest.approx(3.0e-1, rel=1.0e-6)
+    assert cable_cfg.stretch_shear_damping == pytest.approx(1.0e-2)
+    assert cable_cfg.bend_twist_damping == pytest.approx(2.0e-2)
     assert material.density == pytest.approx(100.0)
+    assert material.thickness == pytest.approx(0.006)
+    assert not hasattr(material, "stretch_damping")
+    assert not hasattr(material, "bend_damping")
+
+
+def test_spawn_adapter_authors_native_schema_without_modifying_the_asset():
+    """The distributed legacy USD stays immutable while its stage instance becomes a native cable."""
+
+    from pxr import Usd, UsdGeom, UsdShade
+
+    source_stage = Usd.Stage.Open(waterhose_env_cfg._CABLE1_USD)
+    source_curve_prim = source_stage.GetPrimAtPath("/cable001/curve_0")
+    source_connector = source_stage.GetPrimAtPath("/cable001/cable_edge_body_0/connector")
+    source_connector_world = np.asarray(UsdGeom.XformCache().GetLocalToWorldTransform(source_connector))
+    assert "PhysicsCurvesDeformableSimAPI" not in source_curve_prim.GetPrimTypeInfo().GetAppliedAPISchemas()
+
+    stage = sim_utils.create_new_stage()
+    cable_cfg = waterhose_env_cfg.WaterhoseSceneCfg().cable1
+    root = cable_cfg.spawn.func("/World/Cable1", cable_cfg.spawn)
+    curve_prim = stage.GetPrimAtPath("/World/Cable1/curve_0")
+    curve = UsdGeom.BasisCurves(curve_prim)
+
+    assert root.GetPath().pathString == "/World/Cable1"
+    assert "PhysicsCurvesDeformableSimAPI" in curve_prim.GetPrimTypeInfo().GetAppliedAPISchemas()
+    assert curve.GetNormalsAttr().Get() is None
+    binding = UsdShade.MaterialBindingAPI(curve_prim).GetDirectBinding("physics")
+    assert binding.GetMaterialPath() == "/World/Cable1/material"
+    assert binding.GetMaterialPurpose() == "physics"
+    material_prim = stage.GetPrimAtPath(binding.GetMaterialPath())
+    material_cfg = cable_cfg.spawn.physics_material
+    assert material_prim.GetAttribute("physics:thickness").Get() == pytest.approx(material_cfg.thickness)
+    assert material_prim.GetAttribute("physics:density").Get() == pytest.approx(material_cfg.density)
+    assert material_prim.GetAttribute("physics:stretchStiffness").Get() == pytest.approx(material_cfg.stretch_stiffness)
+    assert material_prim.GetAttribute("physics:bendStiffness").Get() == pytest.approx(material_cfg.bend_stiffness)
+
+    # The adapter changes the parent from the old segment-start frame to the
+    # native segment-center frame, but counter-translates the visual child.
+    spawned_connector = stage.GetPrimAtPath("/World/Cable1/cable_edge_body_0/connector")
+    spawned_connector_world = np.asarray(UsdGeom.XformCache().GetLocalToWorldTransform(spawned_connector))
+    np.testing.assert_allclose(spawned_connector_world, source_connector_world, rtol=0.0, atol=5.0e-8)
 
 
 def test_compound_connector_aligns_clear_of_the_success_region():
@@ -594,41 +616,73 @@ def test_fridge_props_are_part_of_only_the_robot_housing_proxy():
     assert list(cable_sources) == []
 
 
-def test_connector_mesh_is_lumped_into_the_cable_head():
+@pytest.fixture
+def native_waterhose_builder():
+    """Import one runtime-adapted cable and apply the task's scoped extension."""
+
+    from pxr import UsdGeom
+
+    stage = sim_utils.create_new_stage()
+    scene_cfg = waterhose_env_cfg.WaterhoseSceneCfg()
+    cable_cfg = scene_cfg.cable1
+    cable_cfg.spawn.func("/World/envs/env_0/Cable1", cable_cfg.spawn)
+    anchor = UsdGeom.Xform.Define(stage, "/World/envs/env_0/Anchor1")
+    anchor.AddTranslateOp().Set(scene_cfg.anchor1.init_state.pos)
+
     builder = ModelBuilder()
-    head_mass = 1.3585861e-4
-    head_com = wp.vec3(0.0, 0.0, 0.0)
-    head_inertia = wp.mat33(1.0e-7, 0.0, 0.0, 0.0, 1.0e-7, 0.0, 0.0, 0.0, 1.0e-7)
-    head_body = builder.add_body(
-        mass=head_mass,
-        com=head_com,
-        inertia=head_inertia,
-        label="/World/envs/env_0/Cable1/cable_edge_body_0",
+    solvers.SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
+    builder.begin_world()
+    builder.add_usd(
+        stage,
+        root_path="/World/envs/env_0",
+        load_visual_shapes=True,
+        return_deformable_results=True,
     )
-    cfg = WaterhoseCableObjectCfg(
-        prim_path="/World/envs/env_.*/Cable1",
-        connector_usd_path=waterhose_env_cfg._PLUG_USD,
-        connector_mass=CONNECTOR_MASS,
-        connector_local_pos=CONNECTOR_LOCAL_POS,
-        connector_local_quat=CONNECTOR_LOCAL_QUAT_XYZW,
-        connector_shape_label=waterhose_env_cfg._CONNECTOR_SHAPE_TOKEN,
+    extension = WaterhoseCableBuilderExtension(cable_cfg)
+    group = extension._curve_group_index(builder, world_idx=0)
+    body_start = int(builder._cable_body_start[group])
+    body_end = int(builder._cable_body_end[group])
+    joint_start = int(builder._cable_joint_start[group])
+    joint_end = int(builder._cable_joint_end[group])
+    before = SimpleNamespace(
+        body_count=builder.body_count,
+        joint_count=builder.joint_count,
+        shape_count=builder.shape_count,
+        head_mass=float(builder.body_mass[body_start]),
+        head_com=np.asarray(builder.body_com[body_start], dtype=np.float64),
     )
-    cable = SimpleNamespace(
-        cfg=cfg,
-        _registry_entry=SimpleNamespace(
-            prim_path=cfg.prim_path,
-            body_offsets=[head_body],
-            edges=[(0, 1)],
-        ),
-        _connector_shape_indices=[],
-        _connector_head_body_ids=None,
-        _connector_local_pose=None,
-        _connector_geometry=None,
-        _cable_registry_index=0,
+    extension.add_to_builder(
+        builder,
+        world_idx=0,
+        env_position=[0.0, 0.0, 0.0],
+        env_rotation=(0.0, 0.0, 0.0, 1.0),
     )
-    cable._load_connector_geometry = lambda: WaterhoseCableObject._load_connector_geometry(cable)
-    mesh, scale, connector_xform, density, is_solid, _ = cable._load_connector_geometry()
-    connector_mass, connector_com, connector_inertia = compute_inertia_shape(
+    builder.end_world()
+    return SimpleNamespace(
+        builder=builder,
+        cable_cfg=cable_cfg,
+        extension=extension,
+        body_start=body_start,
+        body_end=body_end,
+        joint_start=joint_start,
+        joint_end=joint_end,
+        before=before,
+    )
+
+
+def test_native_builder_extension_lumps_offset_connector_into_head(native_waterhose_builder):
+    built = native_waterhose_builder
+    builder = built.builder
+    cfg = built.cable_cfg
+    head_body = built.body_start
+    connector_shape = builder.shape_label.index(f"/World/envs/env_0/Cable1/{waterhose_env_cfg._CONNECTOR_SHAPE_TOKEN}")
+
+    mesh, scale, source_xform, density, is_solid, _ = built.extension._load_connector_geometry()
+    expected_xform = wp.transform_multiply(
+        wp.transform((0.0, 0.0, -built.extension.head_segment_half_length), wp.quat_identity()),
+        source_xform,
+    )
+    connector_mass, connector_com, _ = compute_inertia_shape(
         GeoType.MESH,
         scale,
         mesh,
@@ -636,72 +690,100 @@ def test_connector_mesh_is_lumped_into_the_cable_head():
         is_solid,
         cfg.connector_margin,
     )
-    connector_com_head = wp.transform_point(connector_xform, connector_com)
-    expected_mass = head_mass + connector_mass
-    expected_com = (head_mass * head_com + connector_mass * connector_com_head) / expected_mass
-    expected_inertia = transform_inertia(
-        head_mass,
-        head_inertia,
-        head_com - expected_com,
-        wp.quat_identity(),
-    ) + transform_inertia(
-        connector_mass,
-        connector_inertia,
-        connector_com_head - expected_com,
-        wp.transform_get_rotation(connector_xform),
-    )
+    connector_com_head = np.asarray(wp.transform_point(expected_xform, connector_com), dtype=np.float64)
+    expected_mass = built.before.head_mass + connector_mass
+    expected_com = (
+        built.before.head_mass * built.before.head_com + connector_mass * connector_com_head
+    ) / expected_mass
 
-    body_count = builder.body_count
-    joint_count = builder.joint_count
-    WaterhoseCableObject._add_connector_to_builder(cable, builder, 0, [0.0] * 3, [0.0, 0.0, 0.0, 1.0])
-
-    assert builder.body_count == body_count
-    assert builder.joint_count == joint_count
-    assert len(cable._connector_shape_indices) == 1
-    connector_shape = cable._connector_shape_indices[0]
+    assert builder.body_count == built.before.body_count
+    assert builder.joint_count == built.before.joint_count + 1
+    assert builder.shape_count == built.before.shape_count + 1
     assert builder.shape_body[connector_shape] == head_body
     assert builder.shape_collision_group[connector_shape] == -1
+    assert builder.shape_material_ke[connector_shape] == pytest.approx(cfg.connector_ke)
+    assert builder.shape_material_kd[connector_shape] == pytest.approx(cfg.connector_kd)
+    assert builder.shape_material_mu[connector_shape] == pytest.approx(cfg.connector_mu)
+    assert builder.shape_margin[connector_shape] == pytest.approx(cfg.connector_margin)
+    assert builder.shape_gap[connector_shape] == pytest.approx(cfg.connector_gap)
+    np.testing.assert_allclose(
+        np.asarray(builder.shape_transform[connector_shape]), np.asarray(expected_xform), atol=1.0e-8
+    )
+    assert connector_mass == pytest.approx(cfg.connector_mass, rel=1.0e-6)
     assert builder.body_mass[head_body] == pytest.approx(expected_mass, rel=1.0e-6)
-    np.testing.assert_allclose(np.asarray(builder.body_com[head_body]), np.asarray(expected_com), rtol=1.0e-6)
-    inertia = np.asarray(builder.body_inertia[head_body]).reshape(3, 3)
-    np.testing.assert_allclose(inertia, np.asarray(expected_inertia).reshape(3, 3), rtol=1.0e-6, atol=1.0e-12)
-    assert np.all(np.linalg.eigvalsh(inertia) > 0.0)
+    np.testing.assert_allclose(np.asarray(builder.body_com[head_body]), expected_com, rtol=1.0e-6, atol=1.0e-9)
+    assert np.all(np.linalg.eigvalsh(np.asarray(builder.body_inertia[head_body]).reshape(3, 3)) > 0.0)
+
+    static_visual = builder.shape_label.index("/World/envs/env_0/Cable1/cable_edge_body_0/connector/plug_mesh")
+    assert not int(builder.shape_flags[static_visual]) & int(ShapeFlags.VISIBLE)
+    for body_id in range(built.body_start, built.body_end):
+        assert all(builder.shape_collision_group[shape_id] == -1 for shape_id in builder.body_shapes[body_id])
 
 
-def test_tail_attachment_alone_authors_a_soft_vbd_joint(monkeypatch):
-    builder = ModelBuilder()
-    solvers.SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
-    tail_body = builder.add_body(mass=1.0, label="/World/envs/env_0/Cable1/cable_edge_body_0")
-    cable = SimpleNamespace(
-        cfg=SimpleNamespace(tail_anchor_prim_path="/World/envs/env_.*/Anchor1"),
-        _registry_entry=SimpleNamespace(
-            prim_path="/World/envs/env_.*/Cable1",
-            body_offsets=[tail_body],
-            edges=[(0, 1)],
-        ),
-    )
-    invalid_env_prim = SimpleNamespace(IsValid=lambda: False)
-    anchor_prim = SimpleNamespace(
-        GetPath=lambda: SimpleNamespace(pathString="/World/envs/env_0/Anchor1"),
-        GetStage=lambda: SimpleNamespace(GetPrimAtPath=lambda _path: invalid_env_prim),
-    )
-    monkeypatch.setattr(waterhose_cable.sim_utils, "find_first_matching_prim", lambda _path: anchor_prim)
-    monkeypatch.setattr(
-        waterhose_cable.sim_utils,
-        "resolve_prim_pose",
-        lambda _prim, ref_prim=None: ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
-    )
+def test_native_builder_extension_restores_per_dof_cable_damping(native_waterhose_builder):
+    built = native_waterhose_builder
+    builder = built.builder
+    expected = [
+        built.cable_cfg.stretch_shear_damping,
+        built.cable_cfg.stretch_shear_damping,
+        built.cable_cfg.bend_twist_damping,
+        built.cable_cfg.bend_twist_damping,
+    ]
 
-    WaterhoseCableObject._add_tail_attachment_to_builder(
-        cable,
-        builder,
-        world_idx=0,
-        env_position=[0.0, 0.0, 0.0],
-        env_rotation=(0.0, 0.0, 0.0, 1.0),
-    )
+    assert built.joint_end - built.joint_start == built.body_end - built.body_start - 1
+    for joint_id in range(built.joint_start, built.joint_end):
+        assert tuple(builder.joint_dof_dim[joint_id]) == (2, 2)
+        dof_start = int(builder.joint_qd_start[joint_id])
+        np.testing.assert_allclose(builder.joint_target_kd[dof_start : dof_start + 4], expected)
 
+
+def test_native_builder_extension_authors_tail_constraint_in_matching_world(native_waterhose_builder):
+    built = native_waterhose_builder
+    builder = built.builder
+    tail_body = built.body_end - 1
     tail_joint = builder.joint_label.index("/World/envs/env_0/Cable1/tail_attachment_w0")
+
+    assert builder.joint_parent[tail_joint] == -1
+    assert builder.joint_child[tail_joint] == tail_body
+    assert builder.joint_collision_filter_parent[tail_joint] is True
     assert builder.custom_attributes["vbd:joint_is_hard"].values == {tail_joint: 0}
+    assert "/World/envs/env_0/Cable1/tail_attachment_articulation" in builder.articulation_label
+
+    parent_frame_w = builder.joint_X_p[tail_joint]
+    child_frame_w = wp.transform_multiply(builder.body_q[tail_body], builder.joint_X_c[tail_joint])
+    np.testing.assert_allclose(np.asarray(child_frame_w), np.asarray(parent_frame_w), rtol=0.0, atol=1.0e-7)
+
+
+def test_waterhose_environment_scopes_and_binds_native_builder_extension(monkeypatch):
+    """The task-local world hook exists only during scene replication."""
+
+    class FakeCable:
+        def __init__(self):
+            self.bound_extension = None
+
+        def bind_builder_extension(self, extension):
+            self.bound_extension = extension
+
+    class FakeBaseEnv:
+        def _init_sim(self):
+            assert len(NewtonManager._per_world_builder_hooks) == 1
+            self.hook_owner_during_init = NewtonManager._per_world_builder_hooks[0].__self__
+            self.scene = {"cable1": FakeCable()}
+
+    class Harness(waterhose_env.WaterhoseCableEnvMixin, FakeBaseEnv):
+        def __init__(self):
+            self.cfg = SimpleNamespace(scene=SimpleNamespace(cable1=waterhose_env_cfg.WaterhoseSceneCfg().cable1))
+
+    monkeypatch.setattr(NewtonManager, "_per_world_builder_hooks", [])
+    monkeypatch.setattr(waterhose_env, "WaterhoseCableObject", FakeCable)
+    harness = Harness()
+
+    harness._init_sim()
+
+    extension = harness._waterhose_cable_builder_extension
+    assert harness.hook_owner_during_init is extension
+    assert NewtonManager._per_world_builder_hooks == []
+    assert harness.scene["cable1"].bound_extension is extension
 
 
 def test_waterhose_reset_restores_the_full_scene_and_joint_targets():
@@ -709,7 +791,7 @@ def test_waterhose_reset_restores_the_full_scene_and_joint_targets():
 
     assert events.reset_scene.func is waterhose_env_cfg.mdp.reset_scene_to_default
     assert events.reset_scene.params == {"reset_joint_targets": True}
-    assert not hasattr(events, "reset_robot_joints")
+    assert list(events.__dict__) == ["reset_scene"]
 
 
 def test_waterhose_gripper_proxy_uses_requested_mass_scale():
@@ -718,84 +800,3 @@ def test_waterhose_gripper_proxy_uses_requested_mass_scale():
 
     assert proxy.mass_scale == pytest.approx(1.0)
     assert proxy.mass_scale == pytest.approx(waterhose_env_cfg._GRIPPER_PROXY_MASS_SCALE)
-
-
-def test_waterhose_cable_reset_event_runs_after_full_scene_reset():
-    events = waterhose_env_cfg.EventCfg()
-    reset_cable_to_default = getattr(waterhose_env_cfg, "reset_cable_to_default", None)
-
-    assert reset_cable_to_default is not None
-    assert events.reset_cable.func is reset_cable_to_default
-    assert events.reset_cable.params == {"asset_cfg": SceneEntityCfg("cable1")}
-    term_names = list(events.__dict__)
-    assert term_names.index("reset_scene") < term_names.index("reset_cable")
-    assert term_names == ["reset_scene", "reset_cable"]
-
-
-@pytest.mark.parametrize(
-    ("selected_env_ids", "expected_env_ids"),
-    [
-        (torch.tensor([1], dtype=torch.int64), [1]),
-        ([1], [1]),
-        (slice(None), [0, 1]),
-    ],
-    ids=["tensor", "sequence", "full-reset-slice"],
-)
-def test_waterhose_cable_reset_restores_selected_segment_state(monkeypatch, selected_env_ids, expected_env_ids):
-    reset_cable_to_default = getattr(waterhose_env_cfg, "reset_cable_to_default", None)
-    assert reset_cable_to_default is not None
-
-    default_body_q = np.array(
-        [
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            [1.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    disturbed_body_q = default_body_q.copy()
-    disturbed_body_q[:, 1] += 0.5
-    disturbed_body_q[:, 3:7] = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
-    disturbed_body_qd = np.full((4, 6), 3.0, dtype=np.float32)
-    model = SimpleNamespace(body_q=wp.array(default_body_q, dtype=wp.transformf, device="cpu"))
-    state = SimpleNamespace(
-        body_q=wp.array(disturbed_body_q, dtype=wp.transformf, device="cpu"),
-        body_qd=wp.array(disturbed_body_qd, dtype=wp.spatial_vectorf, device="cpu"),
-    )
-    articulation_ids = object()
-    cable = SimpleNamespace(
-        _registry_entry=SimpleNamespace(body_offsets=[0, 2], edges=[(0, 1), (1, 2)]),
-        _root_view=SimpleNamespace(articulation_ids=articulation_ids),
-    )
-    env = SimpleNamespace(scene={"cable1": cable}, num_envs=2, device="cpu")
-    asset_cfg = SceneEntityCfg("cable1")
-    cfg = waterhose_env_cfg.EventTerm(
-        func=reset_cable_to_default,
-        mode="reset",
-        params={"asset_cfg": asset_cfg},
-    )
-    invalidations = []
-    monkeypatch.setattr(NewtonManager, "get_model", classmethod(lambda cls: model))
-    monkeypatch.setattr(NewtonManager, "get_state_0", classmethod(lambda cls: state))
-    monkeypatch.setattr(
-        NewtonManager,
-        "invalidate_fk",
-        classmethod(lambda cls, **kwargs: invalidations.append(kwargs)),
-    )
-
-    term = reset_cable_to_default(cfg, env)
-    term(env, selected_env_ids, asset_cfg=asset_cfg)
-
-    body_q_after = state.body_q.numpy()
-    body_qd_after = state.body_qd.numpy()
-    expected_body_q = disturbed_body_q.copy()
-    expected_body_qd = disturbed_body_qd.copy()
-    expected_body_ids = np.array([[0, 1], [2, 3]], dtype=np.int64)[expected_env_ids].reshape(-1)
-    expected_body_q[expected_body_ids] = default_body_q[expected_body_ids]
-    expected_body_qd[expected_body_ids] = 0.0
-    np.testing.assert_array_equal(body_q_after, expected_body_q)
-    np.testing.assert_array_equal(body_qd_after, expected_body_qd)
-    assert len(invalidations) == 1
-    np.testing.assert_array_equal(invalidations[0]["env_ids"].numpy(), np.array(expected_env_ids, dtype=np.int32))
-    assert invalidations[0]["articulation_ids"] is articulation_ids

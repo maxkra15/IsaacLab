@@ -871,12 +871,12 @@ class WaterhoseGraphDemoState:
         self._robot_body_q = robot.data.body_link_pose_w.warp
         self._robot_root_q = robot.data.root_link_pose_w.warp
         self._cable_body_q = NewtonManager.get_state_0().body_q
-        head_bodies = cable.connector_head_body_indices
-        if len(head_bodies) != self.num_envs:
+        self._cable_head_bodies = cable.connector_head_body_ids_warp
+        if self._cable_head_bodies.shape[0] != self.num_envs:
             raise RuntimeError(
-                f"Expected one cable head body per environment, got {len(head_bodies)} for {self.num_envs} envs."
+                "Expected one cable head body per environment, got "
+                f"{self._cable_head_bodies.shape[0]} for {self.num_envs} envs."
             )
-        self._cable_head_bodies = wp.array(head_bodies, dtype=wp.int32, device=self.device)
 
         # Keep Torch owners alive for every zero-copy Warp view stored in the graph.
         self._env_origins_owner = env.scene.env_origins.to(device=str(env.device), dtype=torch.float32).contiguous()
@@ -886,7 +886,9 @@ class WaterhoseGraphDemoState:
         left_hold_body = robot.find_bodies("left_gripper_base")[0][0]
         torso_hold_body = robot.find_bodies("torso_hip_yaw")[0][0]
         self._ee_local_xform = wp.transform(RIGHT_GRIPPER_EE_FRAME_POS, RIGHT_GRIPPER_EE_FRAME_QUAT_XYZW)
-        self._connector_local_xform = wp.transform(cable.cfg.connector_local_pos, cable.cfg.connector_local_quat)
+        self._connector_local_xform = wp.transform(
+            cable.connector_local_pos_from_head_com, cable.cfg.connector_local_quat
+        )
 
         q_rz = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -0.5 * wp.pi)
         q_rx = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * wp.pi)

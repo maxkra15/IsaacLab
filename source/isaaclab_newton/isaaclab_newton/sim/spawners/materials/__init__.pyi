@@ -5,7 +5,6 @@
 
 __all__ = [
     "spawn_deformable_body_material",
-    "NewtonCableMaterialCfg",
     "NewtonDeformableBodyMaterialCfg",
     "NewtonDeformableMaterialCfg",
     "NewtonMaterialCfg",
@@ -14,7 +13,6 @@ __all__ = [
 
 from .physics_materials import spawn_deformable_body_material
 from .physics_materials_cfg import (
-    NewtonCableMaterialCfg,
     NewtonDeformableBodyMaterialCfg,
     NewtonDeformableMaterialCfg,
     NewtonMaterialCfg,

@@ -108,6 +108,7 @@ class IsaacTeleopDevice:
         cfg: IsaacTeleopCfg,
         cloudxr_env_file: str | None = None,
         auto_launch_cloudxr: bool = True,
+        use_kit_xr_bridge: bool = True,
         mcap_record_path: str | None = None,
         mcap_replay_path: str | None = None,
         enable_debug_visualization: bool = False,
@@ -124,6 +125,11 @@ class IsaacTeleopDevice:
             auto_launch_cloudxr: Whether to auto-launch the CloudXR runtime
                 when *cloudxr_env_file* is set.  Ignored when
                 *cloudxr_env_file* is ``None``.
+            use_kit_xr_bridge: Whether to source live OpenXR handles from Kit's
+                XR bridge (``True``, the full XR rendering / anchor path) or run
+                standalone (``False``) with ``isaacteleop`` owning its own OpenXR
+                session through the CloudXR runtime -- teleop I/O with no Kit XR
+                rendering.  Typically wired to the ``--xr`` CLI flag.
             mcap_record_path: Optional MCAP file path to record the live
                 teleop session into.  Mutually exclusive with
                 *mcap_replay_path*.  Debug-grade only -- the produced file
@@ -152,6 +158,7 @@ class IsaacTeleopDevice:
             cfg,
             cloudxr_env_file=cloudxr_env_file,
             auto_launch_cloudxr=auto_launch_cloudxr,
+            use_kit_xr_bridge=use_kit_xr_bridge,
             mcap_record_path=mcap_record_path,
             mcap_replay_path=mcap_replay_path,
             enable_debug_visualization=enable_debug_visualization,
@@ -223,7 +230,7 @@ class IsaacTeleopDevice:
         self._session_lifecycle.stop(exc_type, exc_val, exc_tb)
         return False
 
-    def reset(self) -> None:
+    def reset(self, pause: bool = False) -> None:
         """Reset the device state.
 
         Resets the XR anchor synchronizer and schedules a
@@ -231,10 +238,36 @@ class IsaacTeleopDevice:
         for the next pipeline step so that all retargeters reinitialize
         their cross-step state.  Also clears any pending haptic force so a
         pulse in progress at reset time does not persist into the next episode.
+
+        Args:
+            pause: When ``True``, also pause a running session so teleop resumes
+                from a paused state -- the behavior for an *operator* reset
+                (e.g. keyboard ``R``). Defaults to ``False`` for a *host* reset
+                (e.g. environment auto-reset after task success), which keeps the
+                session running into the next episode.
         """
         self._anchor_manager.reset()
-        self._session_lifecycle.request_reset()
+        self._session_lifecycle.request_reset(pause=pause)
         self._session_lifecycle.reset_haptics()
+
+    def request_start(self) -> None:
+        """Start teleoperation without an XR client.
+
+        Drives the internal teleop state machine toward RUNNING (see
+        :meth:`TeleopSessionLifecycle.request_start`). Useful for headless or
+        keyboard-driven control when no headset UI is available to send START.
+        No-op when no control channel is configured.
+        """
+        self._session_lifecycle.request_start()
+
+    def request_stop(self) -> None:
+        """Stop (pause) teleoperation without an XR client.
+
+        Drives the internal teleop state machine to PAUSED (see
+        :meth:`TeleopSessionLifecycle.request_stop`). No-op when no control
+        channel is configured.
+        """
+        self._session_lifecycle.request_stop()
 
     @property
     def last_control_events(self) -> ControlEvents:
@@ -294,19 +327,26 @@ class IsaacTeleopDevice:
         Raises:
             RuntimeError: If called outside of a context manager.
         """
-        # Auto-compute target_T_world from config if not explicitly provided
+        suppress_action = False
+        # Auto-compute target_T_world from config if not explicitly provided.
+        # Keep stepping the session when the frame is unavailable so Play,
+        # Stop, and Reset messages continue to reach the host; only the unsafe
+        # world-frame action is discarded.
         if target_T_world is None and self._cfg.target_frame_prim_path is not None:
             target_T_world = self._get_target_frame_T_world()
             if target_T_world is None:
-                # A configured frame is part of the action contract.  Falling
-                # back to no transform would silently emit world-frame poses.
-                return None
+                suppress_action = True
 
         # Step the session (handles lazy start and action extraction)
         action = self._session_lifecycle.step(
             anchor_world_matrix_fn=self._anchor_manager.get_world_matrix,
             target_T_world=target_T_world,
         )
+        if suppress_action:
+            # A configured frame is part of the action contract. Falling back
+            # to no transform would emit world-frame poses, so consume the
+            # session/control frame without forwarding its action.
+            action = None
 
         if action is not None:
             # Poll controller buttons (e.g. toggle anchor rotation on right 'A' press)
@@ -333,6 +373,20 @@ class IsaacTeleopDevice:
                 value per finger for a glove); an all-zero vector stops feedback.
         """
         self._session_lifecycle.push_haptic(endpoint, values)
+
+    def send_client_message(self, message: dict) -> None:
+        """Queue a JSON message for delivery to the connected XR client.
+
+        Delivery is deferred until the control channel is connected, so a
+        message queued before the headset connects still reaches the client.
+        This is a no-op unless a control channel is configured.
+
+        Args:
+            message: A JSON-serializable dict carrying a ``"type"``
+                discriminator the client recognizes, e.g.
+                ``{"type": "system_notice", "message": {...}}``.
+        """
+        self._session_lifecycle.send_client_message(message)
 
     # ------------------------------------------------------------------
     # Debug visualization
@@ -542,6 +596,7 @@ def create_isaac_teleop_device(
     callbacks: dict[str, Callable] | None = None,
     cloudxr_env_file: str | None = None,
     auto_launch_cloudxr: bool = True,
+    use_kit_xr_bridge: bool = True,
     mcap_record_path: str | None = None,
     mcap_replay_path: str | None = None,
     enable_debug_visualization: bool = False,
@@ -577,6 +632,14 @@ def create_isaac_teleop_device(
             when *cloudxr_env_file* is set.  Set to ``False`` to skip the
             launch (e.g. when running the runtime externally).  Ignored
             when *cloudxr_env_file* is ``None``.
+        use_kit_xr_bridge: Whether to drive the session from Kit's XR bridge
+            (the full XR rendering / anchor path).  When ``True`` (default) the
+            ``isaacsim.kit.xr.teleop.bridge`` extension is enabled and the
+            session sources its OpenXR handles from Kit.  When ``False`` the
+            session runs standalone -- the bridge is left untouched and
+            ``isaacteleop`` creates its own OpenXR session through the CloudXR
+            runtime, so teleop I/O works headless without Kit XR rendering.
+            Typically wired to the ``--xr`` CLI flag.
         mcap_record_path: Optional MCAP file path to record the live teleop
             session into.  Debug-grade only.  Mutually exclusive with
             *mcap_replay_path*.
@@ -602,9 +665,11 @@ def create_isaac_teleop_device(
             "set at most one to switch between LIVE recording and REPLAY playback."
         )
 
-    # Replay sessions never talk to Kit's XR bridge, so loading/enabling the
-    # bridge extension would only add startup latency and noisy log lines.
-    if mcap_replay_path is None:
+    # Replay sessions never talk to Kit's XR bridge, and standalone sessions
+    # (use_kit_xr_bridge=False) deliberately bypass it, so loading/enabling the
+    # bridge extension would only add startup latency, noisy log lines, and --
+    # for standalone -- pull in the Kit XR rendering stack we want to avoid.
+    if mcap_replay_path is None and use_kit_xr_bridge:
         _enable_teleop_bridge()
 
     if sim_device is not None:
@@ -618,6 +683,7 @@ def create_isaac_teleop_device(
         cfg,
         cloudxr_env_file=cloudxr_env_file,
         auto_launch_cloudxr=auto_launch_cloudxr,
+        use_kit_xr_bridge=use_kit_xr_bridge,
         mcap_record_path=mcap_record_path,
         mcap_replay_path=mcap_replay_path,
         enable_debug_visualization=enable_debug_visualization,

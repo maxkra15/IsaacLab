@@ -18,8 +18,6 @@ from newton.solvers import SolverVBD
 
 from isaaclab.sim.utils.stage import get_current_stage
 
-from isaaclab_contrib.cable.cable_object import install_cable_builder_hooks
-
 from .deformable_object import (
     add_deformable_entry_to_builder,
     clear_deformable_builder_hooks,
@@ -80,7 +78,6 @@ class NewtonVBDManager(NewtonManager):
         # Experimental deformable support registers callbacks here so the manager
         # and cloner can invoke them without hard-coding deformable logic.
         install_deformable_builder_hooks()
-        install_cable_builder_hooks()
 
         super().initialize(sim_context)
 
@@ -121,6 +118,9 @@ class NewtonVBDManager(NewtonManager):
         having Newton bind a surface mesh to volume deformable tetrahedral mesh
         in addition to removing the deformable_registry data structure.
         """
+        # Color the replicated builder before finalization.
+        if cls._builder is not None:
+            cls._builder.color()
         super().start_simulation()
 
         if cls._model is not None:
@@ -237,20 +237,13 @@ class NewtonVBDManager(NewtonManager):
             }
             NewtonManager._num_envs = len(env_paths)
 
-        # Coloring is required by the VBD solver for particles and VBD-integrated bodies.
-        # Safe without particles: color() skips particle coloring when particle_count == 0.
         builder.color()
-
         cls.set_builder(builder)
 
     @classmethod
     def _create_solver(cls, model: Model, solver_cfg: VBDSolverCfg) -> SolverVBD:
         """Construct the configured VBD solver."""
-        solver = SolverVBD(model, **cls._filter_solver_kwargs(SolverVBD, solver_cfg))
-        if not solver_cfg.rigid_joint_hard:
-            for joint_index in range(int(model.joint_count)):
-                solver.set_joint_constraint_mode(joint_index, hard=False)
-        return solver
+        return SolverVBD(model, **cls._filter_solver_kwargs(SolverVBD, solver_cfg))
 
     @classmethod
     def _build_solver(cls, model: Model, solver_cfg: VBDSolverCfg) -> None:
@@ -266,6 +259,6 @@ class NewtonVBDManager(NewtonManager):
     @classmethod
     def _simulate_physics_only(cls) -> None:
         # Rebuild BVH once per step for solvers that require it (e.g. VBD cloth).
-        if hasattr(cls._solver, "rebuild_bvh"):
+        if cls._model.particle_count > 0 and hasattr(cls._solver, "rebuild_bvh"):
             cls._solver.rebuild_bvh(cls._state_0)
         super()._simulate_physics_only()

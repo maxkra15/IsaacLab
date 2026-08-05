@@ -21,6 +21,11 @@ class WaterhoseMimicEnvCfg(WaterhoseProxyIkEnvCfg, MimicEnvCfg):
 
     actions: WaterhoseNewtonDirectBimanualActionsCfg = WaterhoseNewtonDirectBimanualActionsCfg()
     annotation_replay_action_key: str = "processed_actions"
+    annotation_reset_sim_buffer_each_episode: bool = False
+    skillgen_unsupported_reason: str = (
+        "the task uses bimanual Newton IK targets and deformable cable contact, but has no task-specific "
+        "cuRobo planner or SkillGen start-signal annotations. Run standard MimicGen without --use_skillgen."
+    )
 
     def __post_init__(self) -> None:
         super().__post_init__()

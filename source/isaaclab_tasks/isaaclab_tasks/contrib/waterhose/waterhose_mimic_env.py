@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 
 import torch
@@ -16,6 +17,7 @@ from isaaclab.envs import ManagerBasedRLMimicEnv
 from isaaclab.utils.math import subtract_frame_transforms
 
 from .geometry import SOCKET_MOUTH_POS, SOCKET_ROT_QUAT_XYZW
+from .waterhose_env import WaterhoseCableEnvMixin
 
 WATERHOSE_MIMIC_EEF_NAMES = ("right", "left")
 """End-effector keys used by the bimanual Waterhose Mimic task."""
@@ -28,6 +30,80 @@ _GRIPPER_ACTION_SLICES = {"right": slice(14, 17), "left": slice(17, 20)}
 _EEF_BODY_NAMES = {"right": "right_gripper_base", "left": "left_gripper_base"}
 _CABLE_HEAD_OBJECT_NAME = "plug"
 _SOCKET_OBJECT_NAME = "socket"
+_CABLE_ASSET_NAME = "cable1"
+
+logger = logging.getLogger(__name__)
+
+
+def _selected_env_indices(
+    env_ids: Sequence[int] | torch.Tensor | slice | None,
+    *,
+    device: torch.device,
+) -> torch.Tensor | slice:
+    """Return an index suitable for selecting native cable default tensors."""
+    if env_ids is None:
+        return slice(None)
+    if isinstance(env_ids, slice):
+        return env_ids
+    if isinstance(env_ids, torch.Tensor):
+        return env_ids.to(device=device, dtype=torch.long)
+    return torch.as_tensor(list(env_ids), device=device, dtype=torch.long)
+
+
+def normalize_waterhose_mimic_initial_state(
+    state: dict[str, dict[str, dict[str, torch.Tensor]]],
+    *,
+    default_segment_pose_w: torch.Tensor,
+    default_segment_velocity_w: torch.Tensor,
+    env_origins: torch.Tensor,
+    env_ids: Sequence[int] | torch.Tensor | slice | None = None,
+    is_relative: bool = False,
+) -> tuple[dict[str, dict[str, dict[str, torch.Tensor]]], bool]:
+    """Normalize a pre-native-cable Waterhose snapshot for current replay.
+
+    Older Waterhose datasets recorded ``cable1`` as an articulation. Those
+    generalized coordinates cannot be translated losslessly into the native
+    cable object's required per-segment poses without reconstructing the old
+    articulation topology and forward kinematics. For such snapshots, this
+    function removes only the obsolete articulation entry and supplies the
+    native cable's configured default segment pose and velocity. Robot and
+    other scene state, including the episode's action streams, are unchanged.
+
+    A transitional snapshot containing both representations keeps its native
+    cable state and only drops the obsolete articulation entry. The input
+    dictionary and its tensors are never mutated.
+
+    Returns:
+        The normalized state and whether a configured-default cable state was
+        synthesized.
+    """
+    articulation_state = state.get("articulation", {})
+    if _CABLE_ASSET_NAME not in articulation_state:
+        return state, False
+
+    normalized_state = dict(state)
+    normalized_articulations = dict(articulation_state)
+    normalized_articulations.pop(_CABLE_ASSET_NAME)
+    normalized_state["articulation"] = normalized_articulations
+
+    cable_object_state = state.get("cable_object", {})
+    if _CABLE_ASSET_NAME in cable_object_state:
+        return normalized_state, False
+
+    env_index = _selected_env_indices(env_ids, device=default_segment_pose_w.device)
+    segment_pose = default_segment_pose_w[env_index].clone()
+    segment_velocity = default_segment_velocity_w[env_index].clone()
+    if is_relative:
+        selected_origins = env_origins.to(device=segment_pose.device, dtype=segment_pose.dtype)[env_index]
+        segment_pose[..., :3] -= selected_origins[:, None, :]
+
+    normalized_cable_objects = dict(cable_object_state)
+    normalized_cable_objects[_CABLE_ASSET_NAME] = {
+        "segment_pose": segment_pose,
+        "segment_velocity": segment_velocity,
+    }
+    normalized_state["cable_object"] = normalized_cable_objects
+    return normalized_state, True
 
 
 def waterhose_mimic_action_to_target_eef_poses(action: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -90,8 +166,34 @@ def target_eef_poses_and_grippers_to_waterhose_mimic_action(
     return action
 
 
-class WaterhoseMimicEnv(ManagerBasedRLMimicEnv):
+class WaterhoseMimicEnv(WaterhoseCableEnvMixin, ManagerBasedRLMimicEnv):
     """Mimic-compatible environment using direct robot-side bimanual targets."""
+
+    def reset_to(
+        self,
+        state: dict[str, dict[str, dict[str, torch.Tensor]]],
+        env_ids: Sequence[int] | None,
+        seed: int | None = None,
+        is_relative: bool = False,
+    ):
+        """Reset while accepting legacy articulation-backed cable snapshots."""
+        cable = self.scene[_CABLE_ASSET_NAME]
+        normalized_state, used_configured_cable_default = normalize_waterhose_mimic_initial_state(
+            state,
+            default_segment_pose_w=cable.data.default_segment_pose_w.torch,
+            default_segment_velocity_w=cable.data.default_segment_velocity_w.torch,
+            env_origins=self.scene.env_origins,
+            env_ids=env_ids,
+            is_relative=is_relative,
+        )
+        if used_configured_cable_default and not getattr(self, "_legacy_cable_state_warning_emitted", False):
+            logger.warning(
+                "This Waterhose episode contains legacy initial_state['articulation']['cable1'] data. "
+                "The robot and recorded actions will be replayed unchanged, but the native cable starts from its "
+                "configured default because the old generalized coordinates do not contain native per-segment state."
+            )
+            self._legacy_cable_state_warning_emitted = True
+        return super().reset_to(normalized_state, env_ids, seed=seed, is_relative=is_relative)
 
     def _robot_root_pose(self, env_ids: Sequence[int] | slice) -> tuple[torch.Tensor, torch.Tensor]:
         robot = self.scene["robot"]

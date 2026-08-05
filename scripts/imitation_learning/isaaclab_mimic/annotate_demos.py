@@ -71,6 +71,7 @@ from isaaclab_mimic.episode_replay import (
     has_manual_subtask_annotations,
     resolve_episode_replay_actions,
     resolve_episode_subtask_term_signals,
+    should_reset_sim_buffer_for_annotation,
 )
 
 # Only enables inputs if this script is NOT headless mode
@@ -378,7 +379,8 @@ def replay_episode(
     # with the downstream Mimic data pool.
     initial_state = episode.data["initial_state"]
     actions = _get_episode_replay_actions(env, episode)
-    env.sim.reset()
+    if should_reset_sim_buffer_for_annotation(env.cfg):
+        env.sim.reset()
     env.recorder_manager.reset()
     env.reset_to(initial_state, None, is_relative=True)
     first_action = True

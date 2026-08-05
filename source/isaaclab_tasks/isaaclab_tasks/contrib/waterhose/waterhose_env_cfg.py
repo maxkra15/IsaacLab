@@ -31,7 +31,6 @@ from isaaclab_newton.physics import (
     NewtonShapeCfg,
 )
 from isaaclab_newton.sim.schemas.schemas_cfg import NewtonSDFCollisionPropertiesCfg
-from isaaclab_newton.sim.spawners.materials.physics_materials_cfg import NewtonCableMaterialCfg
 from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 from isaaclab_visualizers.kit.kit_visualizer_cfg import KitVisualizerCfg
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
@@ -60,7 +59,7 @@ from isaaclab_contrib.deformable.newton_manager_cfg import (
     VBDSolverCfg,
 )
 
-from .cable import WaterhoseCableObjectCfg
+from .cable import WaterhoseCableObjectCfg, spawn_waterhose_cable_from_usd
 from .geometry import (
     ANCHOR_POS,
     CABLE_POS,
@@ -78,7 +77,6 @@ from .geometry import (
     SOCKET_SEATED_TIP_DEPTH,
 )
 from .mdp.actions import WaterhoseDirectGripperJointPositionActionCfg, WaterhoseGripperPositionActionCfg
-from .mdp.events import reset_cable_to_default
 from .mdp.terminations import plug_inserted_in_socket
 
 # The bimanual pipeline exposes complete absolute poses for both AVP wrists.
@@ -334,7 +332,7 @@ _GRIPPER_FINGER_BODY_TOKENS = (
 )
 # Shape-label suffix for the connector mesh lumped directly into the cable head.
 _CONNECTOR_SHAPE_TOKEN = "waterhose_connector"
-_CABLE_ROD_SHAPE_TOKEN = "/Cable1/cable_edge_capsule_"
+_CABLE_ROD_SHAPE_TOKEN = "/Cable1/curve_0_edge_capsule_"
 _CABLE_HOUSING_SHAPE_TOKEN = "/FridgeCableCollision/Housing"
 _VBD_TIGHT_GEOMETRY_GAP = 0.001
 
@@ -606,7 +604,8 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
 
     ### Cable 1 (connector lumped into the head; tail welded to a kinematic anchor sphere)
 
-    # Static target for the cable-tail weld. This demo intentionally runs one environment.
+    # Static target for the cable-tail weld. The scoped native cable hook creates one constraint
+    # per Newton world, so the same configuration is safe for batched replay and MimicGen.
     anchor1 = AssetBaseCfg(
         prim_path="/World/envs/env_.*/Anchor1",
         spawn=sim_utils.SphereCfg(
@@ -622,14 +621,15 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
         prim_path="/World/envs/env_.*/Cable1",
         spawn=sim_utils.UsdFileCfg(
             usd_path=_CABLE1_USD,
-            physics_material=NewtonCableMaterialCfg(
-                # Current VBD uses absolute physical damping units. Keep the stretch stiffness and low
-                # density of Newton's proxy-coupled pick/place cable, while retaining enough bending
-                # resistance for this long, tail-anchored hose to move as a hose instead of a loose chain.
-                stretch_stiffness=1.0e6,
-                stretch_damping=1.0e-2,
-                bend_stiffness=3.0e-1,
-                bend_damping=2.0e-2,
+            func=spawn_waterhose_cable_from_usd,
+            physics_material=sim_utils.CableMaterialCfg(
+                # Native cable authoring uses material moduli [Pa]. These values preserve the
+                # validated per-joint 1e6 N/m stretch and 0.3 N.m/rad bend stiffness for the
+                # authored 3 mm-radius cable with a 7.226 mm mean segment length. The small
+                # per-joint damping values are retained by the scoped builder extension.
+                thickness=0.006,
+                stretch_stiffness=2.555704133829127e8,
+                bend_stiffness=3.4076054525320105e7,
                 density=100.0,
             ),
         ),
@@ -699,11 +699,6 @@ class EventCfg:
         func=mdp.reset_scene_to_default,
         mode="reset",
         params={"reset_joint_targets": True},
-    )
-    reset_cable = EventTerm(
-        func=reset_cable_to_default,
-        mode="reset",
-        params={"asset_cfg": SceneEntityCfg("cable1")},
     )
 
 
@@ -778,10 +773,6 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
         self.viewer.origin_type = "world"
         self.viewer.resolution = (1600, 1000)
 
-        # Resolution of `--video` recordings (independent of the on-screen visualizer windows above).
-        self.video_recorder.window_width = 1600
-        self.video_recorder.window_height = 1600
-
         # Coupled physics: MuJoCo-Warp (MJWarp) solves the articulated rby1df robot, VBD solves the
         # deformable cable, its compound connector head, and the welded tail anchor. The two are joined
         # by proxy coupling: the gripper bodies are mirrored as proxy bodies in the VBD solver so the
@@ -807,11 +798,6 @@ class WaterhoseEnvCfg(ManagerBasedRLEnvCfg):
                             nconmax=4096,
                             njmax=1024,
                         ),
-                        # Keep the authored finger mass/inertia for this small compliant grasp.
-                        # MJWarp's whole-articulation effective inertia makes the virtual fingers
-                        # resist commanded wrist rotation and transfers that mismatch into
-                        # connector slip.
-                        use_solver_effective_mass=False,
                         bodies=[_ROBOT_BODY_PATTERN],
                         # Route only the robot's manifold housing. Explicit selection excludes the
                         # canonical SDF socket from the robot view.

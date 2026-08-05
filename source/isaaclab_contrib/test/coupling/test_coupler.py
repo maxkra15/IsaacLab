@@ -28,8 +28,8 @@ from isaaclab_newton.physics import (
     XPBDSolverCfg,
 )
 from isaaclab_newton.physics.newton_manager import NewtonManager
-from newton import ShapeFlags
-from newton.solvers.experimental.coupled import CouplingInterface, SolverCoupledADMM, SolverCoupledProxy
+from newton import ModelBuilder, ShapeFlags
+from newton.solvers.experimental.coupled import SolverCoupledADMM, SolverCoupledProxy
 
 from isaaclab_contrib.coupling import (
     CouplerAdmmCfg,
@@ -455,93 +455,6 @@ def test_entry_build_uses_solver_config_class_type():
     assert solver.solver_cfg is entry.config.solver_cfg
 
 
-class _RecordingCouplingSolver:
-    """Small coupling-capable solver stand-in for effective-mass delegation tests."""
-
-    def __init__(self, model):
-        self.model = model
-        self.calls = []
-
-    def _record(self, name, args, kwargs):
-        self.calls.append((name, args, kwargs))
-        return f"specialized-{name}"
-
-    def __getattr__(self, name):
-        if not name.startswith("coupling_"):
-            raise AttributeError(name)
-        return lambda *args, **kwargs: self._record(name, args, kwargs)
-
-    def coupling_eval_effective_mass(self, *args, **kwargs):
-        return self._record("mass", args, kwargs)
-
-    def coupling_eval_effective_mass_block(self, *args, **kwargs):
-        return self._record("mass-block", args, kwargs)
-
-
-def test_entry_can_use_generic_model_view_effective_mass(monkeypatch):
-    """An entry may bypass only its solver's specialized effective-mass hooks."""
-
-    class _RecordingManager:
-        @classmethod
-        def _create_solver(cls, model, solver_cfg):
-            del solver_cfg
-            return _RecordingCouplingSolver(model)
-
-    monkeypatch.setattr(
-        CouplingInterface,
-        "coupling_eval_effective_mass",
-        lambda self, *args, **kwargs: "generic-mass",
-    )
-    monkeypatch.setattr(
-        CouplingInterface,
-        "coupling_eval_effective_mass_block",
-        lambda self, *args, **kwargs: "generic-mass-block",
-    )
-    solver_cfg = XPBDSolverCfg()
-    solver_cfg.class_type = _RecordingManager
-    entry = NewtonCouplerManager._ResolvedEntry(
-        config=CouplerEntryCfg(
-            name="entry",
-            solver_cfg=solver_cfg,
-            use_solver_effective_mass=False,
-        ),
-        bodies=[],
-        particles=[],
-        joints=[],
-        shapes=[],
-    )
-
-    solver = NewtonCouplerManager._build_entry(entry).solver("entry-view")
-
-    assert solver.model == "entry-view"
-    assert solver.coupling_eval_effective_mass("mass-args") == "generic-mass"
-    assert solver.coupling_eval_effective_mass_block("block-args") == "generic-mass-block"
-    assert solver.coupling_notify_input_state_update("state") == "specialized-coupling_notify_input_state_update"
-    assert solver._solver.calls == [("coupling_notify_input_state_update", ("state",), {})]
-
-
-@pytest.mark.parametrize(
-    "hook_name",
-    [
-        "coupling_notify_input_state_update",
-        "coupling_supports_inertial_property_refresh",
-        "coupling_eval_gravity_acceleration",
-        "coupling_rewind_proxy_body",
-        "coupling_rewind_proxy_particle",
-        "coupling_harvest_proxy_wrenches",
-        "coupling_harvest_proxy_particle_forces",
-        "coupling_prepare_proxy_contacts",
-    ],
-)
-def test_generic_effective_mass_adapter_delegates_other_hooks(hook_name):
-    """The effective-mass adapter changes no other coupling behavior."""
-    nested_solver = _RecordingCouplingSolver("entry-view")
-    solver = coupler._GenericEffectiveMassSolver(nested_solver)
-
-    assert getattr(solver, hook_name)("arg", option=True) == f"specialized-{hook_name}"
-    assert nested_solver.calls == [(hook_name, ("arg",), {"option": True})]
-
-
 @pytest.mark.parametrize(
     "solver_cfg",
     [
@@ -608,32 +521,10 @@ def test_mpm_grid_controls_cuda_graph_support(monkeypatch, grid_type, expected):
     assert NewtonCouplerManager._supports_cuda_graph_capture() is expected
 
 
-def test_coupled_solver_defers_cuda_graph_capture(monkeypatch):
-    """Coupled entries finish lazy setup before their first graph warmup."""
-    monkeypatch.setattr(
-        coupler.PhysicsManager,
-        "_cfg",
-        SimpleNamespace(use_cuda_graph=True, solver_cfg=CouplerProxyCfg()),
-    )
-    monkeypatch.setattr(coupler.PhysicsManager, "_device", "cuda:1")
-    monkeypatch.setattr(NewtonManager, "_graph", object())
-    monkeypatch.setattr(NewtonManager, "_graph_capture_pending", False)
-    monkeypatch.setattr(
-        NewtonCouplerManager,
-        "_capture_standard_graph",
-        classmethod(lambda cls, device: pytest.fail(f"unexpected immediate capture on {device}")),
-    )
-
-    NewtonCouplerManager._capture_or_defer_graph()
-
-    assert NewtonManager._graph is None
-    assert NewtonManager._graph_capture_pending is True
-
-
 def test_mpm_entry_reuses_builder_lifecycle_hooks(monkeypatch):
     """Coupled MPM entries register attributes and normalize kinematic colliders."""
     events: list[tuple[str, object]] = []
-    builder = object()
+    builder = ModelBuilder()
     solver_cfg = CouplerProxyCfg(
         entries=[CouplerEntryCfg(name="media", solver_cfg=MPMSolverCfg())],
     )
@@ -902,3 +793,48 @@ def test_admm_build_auto_detects_symmetric_contact_pairs_by_default(monkeypatch)
     cfg.contact_pairs = []
     solver = NewtonCouplerManager._build_admm_coupled_solver(model, entries, cfg)
     assert list(solver.coupling.contact_pairs) == []
+
+
+def test_coupled_vbd_contact_history_defers_graph_capture_for_eager_warmup(monkeypatch):
+    """Proxy-local history storage must be allocated before entering CUDA capture."""
+    solver_cfg = CouplerProxyCfg(
+        entries=[CouplerEntryCfg(name="vbd", solver_cfg=VBDSolverCfg(rigid_contact_history=True))]
+    )
+    monkeypatch.setattr(
+        coupler.PhysicsManager,
+        "_cfg",
+        SimpleNamespace(solver_cfg=solver_cfg, use_cuda_graph=True),
+        raising=False,
+    )
+    monkeypatch.setattr(coupler.PhysicsManager, "_device", "cuda:1", raising=False)
+    monkeypatch.setattr(coupler.NewtonManager, "_graph", object(), raising=False)
+    monkeypatch.setattr(coupler.NewtonManager, "_graph_capture_pending", False, raising=False)
+
+    NewtonCouplerManager._capture_or_defer_graph()
+
+    assert coupler.NewtonManager._graph is None
+    assert coupler.NewtonManager._graph_capture_pending is True
+
+
+def test_coupler_uses_standard_capture_without_vbd_contact_history(monkeypatch):
+    """Configurations that need no lazy proxy allocation keep upstream capture behavior."""
+    solver_cfg = CouplerProxyCfg(
+        entries=[CouplerEntryCfg(name="vbd", solver_cfg=VBDSolverCfg(rigid_contact_history=False))]
+    )
+    calls: list[type] = []
+    monkeypatch.setattr(
+        coupler.PhysicsManager,
+        "_cfg",
+        SimpleNamespace(solver_cfg=solver_cfg, use_cuda_graph=True),
+        raising=False,
+    )
+    monkeypatch.setattr(coupler.PhysicsManager, "_device", "cuda:1", raising=False)
+    monkeypatch.setattr(
+        coupler.NewtonVBDManager,
+        "_capture_or_defer_graph",
+        classmethod(lambda cls: calls.append(cls)),
+    )
+
+    NewtonCouplerManager._capture_or_defer_graph()
+
+    assert calls == [NewtonCouplerManager]

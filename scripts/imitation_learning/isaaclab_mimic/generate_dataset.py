@@ -88,6 +88,7 @@ from isaaclab.envs import ManagerBasedRLMimicEnv
 import isaaclab_mimic.envs  # noqa: F401
 from isaaclab_mimic.datagen.generation import env_loop, setup_async_generation, setup_env_config
 from isaaclab_mimic.datagen.utils import get_env_name_from_dataset, setup_output_paths
+from isaaclab_mimic.task_capabilities import validate_skillgen_task_support
 
 # import logger
 logger = logging.getLogger(__name__)
@@ -113,6 +114,9 @@ def main():
         generation_num_trials=args_cli.generation_num_trials,
         dataset_compression=not args_cli.disable_dataset_compression,
     )
+
+    if args_cli.use_skillgen:
+        validate_skillgen_task_support(env_name, env_cfg)
 
     # Create environment
     env = gym.make(env_name, cfg=env_cfg).unwrapped

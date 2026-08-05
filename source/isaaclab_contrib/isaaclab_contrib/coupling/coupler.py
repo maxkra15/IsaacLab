@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from functools import partial
 
@@ -20,17 +21,12 @@ from isaaclab_newton.physics import (
 from isaaclab_newton.physics.mpm_manager import NewtonMPMManager
 from isaaclab_newton.physics.newton_manager import NewtonManager
 from newton import CollisionPipeline, Model, ModelBuilder, ShapeFlags
-from newton.solvers import SolverBase
-from newton.solvers.experimental.coupled import (
-    CouplingInterface,
-    SolverCoupled,
-    SolverCoupledADMM,
-    SolverCoupledProxy,
-)
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
 
 from isaaclab.physics import PhysicsManager
 from isaaclab.utils.string import resolve_matching_names
 
+from ..deformable.newton_manager_cfg import VBDSolverCfg
 from ..deformable.vbd_manager import NewtonVBDManager
 from .coupler_cfg import (
     CouplerAdmmCfg,
@@ -40,45 +36,7 @@ from .coupler_cfg import (
     CouplerProxyMappingCfg,
 )
 
-
-class _GenericEffectiveMassSolver(CouplingInterface):
-    """Use model-view inertia while delegating every other coupling operation."""
-
-    def __init__(self, solver: SolverBase):
-        self._solver = solver
-
-    def __getattr__(self, name):
-        return getattr(self._solver, name)
-
-    def coupling_eval_effective_mass(self, *args, **kwargs):
-        return CouplingInterface.coupling_eval_effective_mass(self, *args, **kwargs)
-
-    def coupling_eval_effective_mass_block(self, *args, **kwargs):
-        return CouplingInterface.coupling_eval_effective_mass_block(self, *args, **kwargs)
-
-    def coupling_notify_input_state_update(self, *args, **kwargs):
-        return self._solver.coupling_notify_input_state_update(*args, **kwargs)
-
-    def coupling_supports_inertial_property_refresh(self, *args, **kwargs):
-        return self._solver.coupling_supports_inertial_property_refresh(*args, **kwargs)
-
-    def coupling_eval_gravity_acceleration(self, *args, **kwargs):
-        return self._solver.coupling_eval_gravity_acceleration(*args, **kwargs)
-
-    def coupling_rewind_proxy_body(self, *args, **kwargs):
-        return self._solver.coupling_rewind_proxy_body(*args, **kwargs)
-
-    def coupling_rewind_proxy_particle(self, *args, **kwargs):
-        return self._solver.coupling_rewind_proxy_particle(*args, **kwargs)
-
-    def coupling_harvest_proxy_wrenches(self, *args, **kwargs):
-        return self._solver.coupling_harvest_proxy_wrenches(*args, **kwargs)
-
-    def coupling_harvest_proxy_particle_forces(self, *args, **kwargs):
-        return self._solver.coupling_harvest_proxy_particle_forces(*args, **kwargs)
-
-    def coupling_prepare_proxy_contacts(self, *args, **kwargs):
-        return self._solver.coupling_prepare_proxy_contacts(*args, **kwargs)
+logger = logging.getLogger(__name__)
 
 
 class NewtonCouplerManager(NewtonVBDManager):
@@ -265,9 +223,35 @@ class NewtonCouplerManager(NewtonVBDManager):
         )
 
     @classmethod
-    def _should_defer_cuda_graph_capture(cls) -> bool:
-        """Wait until environment managers and controller prototypes are initialized."""
-        return True
+    def _capture_or_defer_graph(cls) -> None:
+        """Warm up contact-history buffers before capturing a coupled VBD solve.
+
+        Proxy-local collision pipelines are constructed after their destination ``SolverVBD``.
+        Consequently, the solver cannot preallocate persistent contact-history arrays from the
+        pipeline capacity in its constructor.  Newton deliberately rejects allocating those arrays
+        inside graph capture because doing so would record a per-replay zero-fill and erase the warm
+        start.  Defer this one configuration to the normal relaxed-capture path, whose eager warmup
+        sizes the buffers before beginning capture.
+        """
+        cfg = PhysicsManager._cfg
+        device = PhysicsManager._device
+        solver_cfg = getattr(cfg, "solver_cfg", None)
+        needs_contact_history_warmup = any(
+            isinstance(entry.solver_cfg, VBDSolverCfg) and entry.solver_cfg.rigid_contact_history
+            for entry in getattr(solver_cfg, "entries", ())
+        )
+        if (
+            cfg is not None
+            and device is not None
+            and cfg.use_cuda_graph
+            and "cuda" in device
+            and needs_contact_history_warmup
+        ):
+            NewtonManager._graph = None
+            NewtonManager._graph_capture_pending = True
+            logger.info("Newton coupled VBD graph capture deferred for contact-history warmup")
+            return
+        super()._capture_or_defer_graph()
 
     @classmethod
     def _resolve_entry(
@@ -380,13 +364,9 @@ class NewtonCouplerManager(NewtonVBDManager):
     @classmethod
     def _build_entry(cls, entry: _ResolvedEntry) -> SolverCoupled.Entry:
         entry_cfg = entry.config
-        use_solver_effective_mass = entry_cfg.use_solver_effective_mass
 
         def solver_factory(model_view):
-            solver = entry_cfg.solver_cfg.class_type._create_solver(model_view, entry_cfg.solver_cfg)
-            if not use_solver_effective_mass:
-                solver = _GenericEffectiveMassSolver(solver)
-            return solver
+            return entry_cfg.solver_cfg.class_type._create_solver(model_view, entry_cfg.solver_cfg)
 
         return SolverCoupled.Entry(
             name=entry_cfg.name,

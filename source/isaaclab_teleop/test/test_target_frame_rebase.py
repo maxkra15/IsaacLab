@@ -293,7 +293,9 @@ class TestAdvanceTargetFrameSafety:
         action = device.advance()
 
         assert action is None
-        device._session_lifecycle.step.assert_not_called()
+        device._session_lifecycle.step.assert_called_once()
+        assert device._session_lifecycle.step.call_args.kwargs["target_T_world"] is None
+        device._dispatch_control_callbacks.assert_called_once()
 
     def test_configured_target_frame_resolved_is_passed_to_session(self, translation_matrix: np.ndarray):
         device = self._make_device_shell()

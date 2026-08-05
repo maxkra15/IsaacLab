@@ -24,7 +24,8 @@ from ..deformable.newton_manager_cfg import NewtonModelSolverCfg
 
 if TYPE_CHECKING:
     from isaaclab_newton.physics import NewtonManager
-    from newton import CollisionPipeline, ModelView
+    from newton import CollisionPipeline
+    from newton.solvers.experimental.coupled import ModelView
 
 
 @configclass
@@ -41,15 +42,6 @@ class CouplerEntryCfg:
 
     solver_cfg: NewtonSolverCfg = MISSING
     """Configuration used to construct this entry's Newton solver."""
-
-    use_solver_effective_mass: bool = True
-    """Whether coupling uses the nested solver's effective-mass hooks.
-
-    Set to ``False`` to use the body and particle inertia stored on the entry's
-    model view. This is useful for small virtual contact proxies whose authored
-    inertia should be preserved instead of using the articulated-system
-    effective mass reported by a nested solver.
-    """
 
     bodies: list[str] = field(default_factory=list)
     """Bodies owned by this entry.

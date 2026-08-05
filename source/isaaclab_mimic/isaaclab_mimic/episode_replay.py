@@ -15,6 +15,15 @@ from isaaclab.envs.mimic_env_cfg import SubTaskConfig
 from isaaclab.utils.datasets import EpisodeData
 
 
+def should_reset_sim_buffer_for_annotation(env_cfg: object) -> bool:
+    """Return whether annotation replay should hard-reset simulation buffers.
+
+    Configurations predating the task-aware option retain the historical hard
+    reset behavior.
+    """
+    return bool(getattr(env_cfg, "annotation_reset_sim_buffer_each_episode", True))
+
+
 def resolve_episode_replay_actions(
     episode: EpisodeData,
     action_key: str = "actions",

@@ -13,17 +13,22 @@ import sys
 import time
 from pathlib import Path
 
-import gymnasium as gym
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize
 
 from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab.envs import DirectMARLEnvCfg
-from isaaclab.utils.dict import print_dict
 from isaaclab.utils.seed import configure_seed
 
-from isaaclab_rl.entrypoints.common import CHECKPOINT_SELECTORS, resolve_checkpoint_selector, resolve_play_task_name
+from isaaclab_rl.entrypoints.common import (
+    CHECKPOINT_SELECTORS,
+    add_frontend_args,
+    apply_video_recording,
+    create_isaaclab_env,
+    resolve_checkpoint_selector,
+    resolve_play_task_name,
+)
 from isaaclab_rl.sb3 import Sb3VecEnvWrapper, process_sb3_cfg
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
@@ -41,7 +46,18 @@ with contextlib.suppress(ImportError):
 # -- argparse ----------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Play a checkpoint of an RL agent from Stable-Baselines3.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during play.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
+parser.add_argument(
+    "--video_length",
+    type=int,
+    default=None,
+    help="Length of each recorded video clip in env steps. Overrides the value in VideoRecorderCfg.",
+)
+parser.add_argument(
+    "--video_interval",
+    type=int,
+    default=None,
+    help="Interval between video clips in env steps. Overrides the value in VideoRecorderCfg.",
+)
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
@@ -71,7 +87,8 @@ parser.add_argument(
     help="Play with the training environment configuration as-is, skipping play-mode overrides.",
 )
 add_launcher_args(parser)
-args_cli, hydra_args = setup_preset_cli(parser)
+add_frontend_args(parser)
+args_cli, hydra_args = setup_preset_cli(parser, agent_library="sb3")
 args_cli.task = resolve_play_task_name(args_cli.task)
 
 if args_cli.video:
@@ -122,26 +139,17 @@ def main():
         log_dir = os.path.dirname(checkpoint_path)
 
         env_cfg.log_dir = log_dir
+        apply_video_recording(env_cfg, log_dir, args_cli, subdir="play")
 
-        env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+        env = create_isaaclab_env(
+            args_cli.task,
+            env_cfg,
+            args_cli,
+            convert_marl_to_single_agent=isinstance(env_cfg, DirectMARLEnvCfg),
+        )
 
         agent_cfg = process_sb3_cfg(agent_cfg, env.unwrapped.num_envs)
 
-        if isinstance(env.unwrapped.cfg, DirectMARLEnvCfg):
-            from isaaclab.envs import multi_agent_to_single_agent
-
-            env = multi_agent_to_single_agent(env)
-
-        if args_cli.video:
-            video_kwargs = {
-                "video_folder": os.path.join(log_dir, "videos", "play"),
-                "step_trigger": lambda step: step == 0,
-                "video_length": args_cli.video_length,
-                "disable_logger": True,
-            }
-            print("[INFO] Recording videos during play.")
-            print_dict(video_kwargs, nesting=4)
-            env = gym.wrappers.RecordVideo(env, **video_kwargs)
         env = Sb3VecEnvWrapper(env, fast_variant=not args_cli.keep_all_info)
 
         vec_norm_path = checkpoint_path.replace("/model", "/model_vecnormalize").replace(".zip", ".pkl")
@@ -178,7 +186,11 @@ def main():
                     obs, _, _, _ = env.step(actions)
                 if args_cli.video:
                     timestep += 1
-                    if timestep == args_cli.video_length:
+                    video_stop = args_cli.video_length
+                    if video_stop is None:
+                        recorders = getattr(env_cfg, "video_recorders", [])
+                        video_stop = recorders[0].video_length if recorders else None
+                    if video_stop is not None and timestep >= video_stop:
                         break
 
                 sleep_time = dt - (time.time() - start_time)

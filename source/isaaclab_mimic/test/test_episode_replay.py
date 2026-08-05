@@ -22,6 +22,7 @@ from isaaclab_mimic.episode_replay import (
     has_manual_subtask_annotations,
     resolve_episode_replay_actions,
     resolve_episode_subtask_term_signals,
+    should_reset_sim_buffer_for_annotation,
 )
 
 
@@ -32,6 +33,39 @@ def _make_episode() -> EpisodeData:
         "processed_actions": torch.arange(12, dtype=torch.float32).reshape(4, 3),
     }
     return episode
+
+
+@pytest.mark.parametrize(
+    ("env_cfg", "expected"),
+    [
+        (SimpleNamespace(), True),
+        (SimpleNamespace(annotation_reset_sim_buffer_each_episode=True), True),
+        (SimpleNamespace(annotation_reset_sim_buffer_each_episode=False), False),
+    ],
+)
+def test_annotation_sim_buffer_reset_is_task_aware(env_cfg, expected):
+    """Annotation reset policy honors task config and defaults to compatibility."""
+    assert should_reset_sim_buffer_for_annotation(env_cfg) is expected
+
+
+def test_waterhose_annotation_preserves_solver_buffers():
+    """The Waterhose Mimic config explicitly opts out of annotation hard resets."""
+    repo_root = Path(__file__).resolve().parents[3]
+    config_path = repo_root / "source/isaaclab_tasks/isaaclab_tasks/contrib/waterhose/config/rby1df/mimic_env_cfg.py"
+    tree = ast.parse(config_path.read_text(), filename=str(config_path))
+    waterhose_class = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "WaterhoseMimicEnvCfg"
+    )
+    reset_assignment = next(
+        node
+        for node in waterhose_class.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "annotation_reset_sim_buffer_each_episode"
+    )
+
+    assert isinstance(reset_assignment.value, ast.Constant)
+    assert reset_assignment.value.value is False
 
 
 def test_resolve_episode_replay_actions_defaults_to_canonical_actions():
@@ -202,6 +236,7 @@ def test_annotation_script_has_no_hardcoded_episode_action_source():
         node.name: ast.unparse(node) for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     assert "_get_episode_replay_actions(env, episode)" in function_sources["replay_episode"]
+    assert "should_reset_sim_buffer_for_annotation(env.cfg)" in function_sources["replay_episode"]
     assert function_sources["annotate_episode_in_manual_mode"].count("_get_episode_replay_actions(env, episode)") == 2
     assert "has_manual_subtask_annotations" in function_sources["annotate_episode_in_manual_mode"]
     assert function_sources["annotate_episode_in_manual_mode"].count("replay_episode(env, episode, success_term)") == 2

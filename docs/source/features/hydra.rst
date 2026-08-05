@@ -245,11 +245,14 @@ override is given:
 
 .. code-block:: python
 
+    from isaaclab.physics import PhysxAutoCfg
     from isaaclab_tasks.utils import PresetCfg
 
     @configclass
     class PhysicsCfg(PresetCfg):
-        default: PhysxCfg = PhysxCfg()
+        isaacsim_physx: PhysxCfg = PhysxCfg()
+        physx: PhysxAutoCfg = PhysxAutoCfg(isaacsim_physx=isaacsim_physx)
+        default: PhysxCfg = isaacsim_physx
         newton_mjwarp: NewtonCfg = NewtonCfg()
 
     @configclass
@@ -260,6 +263,14 @@ override is given:
 
     # Use Newton physics backend
     python train.py --task=Isaac-Reach-Franka env.physics=newton_mjwarp
+
+The concrete ``isaacsim_physx`` variant is the default in this example. Select
+``physics=physx`` to enable automatic PhysX-family selection at launch time:
+Isaac Sim PhysX is used when a Kit renderer or Kit viewer is requested. For fully
+kit-less runs, OvPhysX is used when the task configures an OvPhysX alternative;
+otherwise selection falls back to Isaac Sim PhysX and requires Kit. This matches
+renderer selection, where ``isaacsim_rtx`` is the concrete default and
+``renderer=rtx`` is automatic.
 
 The ``default`` field can be set to ``None`` to make an optional feature that is
 disabled unless explicitly selected:
@@ -295,15 +306,24 @@ Physics backend selection uses the same preset system. A task can define a
 
 .. code-block:: python
 
-    from isaaclab.utils.configclass import configclass
     from isaaclab_newton.physics import KaminoSolverCfg, MJWarpSolverCfg, NewtonCfg
+    from isaaclab_ovphysx.physics import OvPhysxCfg
     from isaaclab_physx.physics import PhysxCfg
+
+    from isaaclab.physics import PhysxAutoCfg
+    from isaaclab.utils.configclass import configclass
+
     from isaaclab_tasks.utils import PresetCfg
 
     @configclass
     class CartpolePhysicsCfg(PresetCfg):
-        default: PhysxCfg = PhysxCfg()
-        physx: PhysxCfg = PhysxCfg()
+        isaacsim_physx: PhysxCfg = PhysxCfg()
+        ovphysx: OvPhysxCfg = OvPhysxCfg()
+        physx: PhysxAutoCfg = PhysxAutoCfg(
+            isaacsim_physx=isaacsim_physx,
+            ovphysx=ovphysx,
+        )
+        default: PhysxCfg = isaacsim_physx
         newton_mjwarp: NewtonCfg = NewtonCfg(
             solver_cfg=MJWarpSolverCfg(njmax=5, nconmax=3),
             num_substeps=1,
@@ -459,7 +479,9 @@ to make intent explicit on the command line.
 
 Domain presets (observation modes, camera configurations, etc.) are task-specific.
 Pass ``--task=<task-name> --help`` to a training command to see all presets available
-for that task, grouped by selector type:
+for that task, grouped by selector type. Reinforcement-learning commands also list
+the registered ``--agent`` values for the selected library. When a task declares
+preset-to-agent compatibility, the compatible presets appear beneath each agent:
 
 .. tab-set::
 
@@ -468,14 +490,18 @@ for that task, grouped by selector type:
       .. code-block:: bash
 
           uv run isaaclab train --rl_library rsl_rl \
-              --task Isaac-Cartpole-Camera-Direct --help
+               --task Isaac-Cartpole-Camera --help
 
    .. tab-item:: isaaclab.sh / isaaclab.bat
 
       .. code-block:: bash
 
           ./isaaclab.sh train --rl_library rsl_rl \
-              --task Isaac-Cartpole-Camera-Direct --help
+               --task Isaac-Cartpole-Camera --help
+
+Preset and agent selection are otherwise independent. A task may use an alternate
+agent for symmetry, recurrence, or another algorithm without changing its environment
+preset.
 
 .. note::
 

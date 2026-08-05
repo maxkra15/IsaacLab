@@ -18,3 +18,15 @@ def test_annotation_replay_action_key_accepts_processed_actions():
     cfg = MimicEnvCfg(annotation_replay_action_key="processed_actions")
 
     assert cfg.annotation_replay_action_key == "processed_actions"
+
+
+def test_annotation_sim_buffer_reset_defaults_to_enabled():
+    """Existing annotation tasks retain the historical hard-reset behavior."""
+    assert MimicEnvCfg().annotation_reset_sim_buffer_each_episode
+
+
+def test_annotation_sim_buffer_reset_can_be_disabled():
+    """Tasks can preserve backend solver buffers across annotation episodes."""
+    cfg = MimicEnvCfg(annotation_reset_sim_buffer_each_episode=False)
+
+    assert not cfg.annotation_reset_sim_buffer_each_episode
