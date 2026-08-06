@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -175,21 +174,36 @@ class NewtonInverseKinematicsAction(ActionTerm):
         if not pose_cfgs:
             raise ValueError("NewtonInverseKinematicsAction requires at least one pose objective.")
 
-        # Resolve the controlled asset to its clone-plan source and finalize the
-        # single-env prototype builder the cloner already retained -- the same
-        # source resolution other Newton consumers use, no bespoke registry.
+        # Resolve the controlled asset to its clone-plan source and build a
+        # single-articulation IK prototype from the asset's USD subtree.
         plan = sim_utils.SimulationContext.instance().get_clone_plan()
         source_path, _, asset_suffix = cloner.query.path_to_source(plan, self._asset.cfg.prim_path)
-        # The proto builder is keyed by the bare clone source; the articulation
-        # lives at the asset suffix below it (e.g. ".../env_0" + "/Robot"), optionally
-        # deeper when the asset authors its articulation root on a child prim.
+        # The articulation lives at the asset suffix below the clone source
+        # (e.g. ".../env_0" + "/Robot"), optionally deeper when the asset
+        # authors its articulation root on a child prim.
         articulation_root = getattr(self._asset.cfg, "articulation_root_prim_path", None) or ""
-        self._source_path = source_path + asset_suffix + articulation_root
-        # Finalizing the shared prototype builder replaces its shape-source
-        # geometry in place, invalidating the already-finalized main model's
-        # shared mesh handles. Finalize a geometry-isolated shallow copy.
-        proto_builder = copy.copy(NewtonManager._cl_protos[source_path])
-        proto_builder.shape_source = [copy.copy(geo) if geo is not None else None for geo in proto_builder.shape_source]
+        source_asset_path = source_path + asset_suffix
+        self._source_path = source_asset_path + articulation_root
+
+        from newton import ModelBuilder  # noqa: PLC0415
+        from newton.usd import SchemaResolverNewton, SchemaResolverPhysx  # noqa: PLC0415
+
+        from pxr import UsdGeom  # noqa: PLC0415
+
+        from isaaclab.sim.utils.stage import get_current_stage  # noqa: PLC0415
+
+        stage = get_current_stage()
+        if stage is None:
+            raise RuntimeError("Newton IK requires an active USD stage to build its articulation prototype.")
+        proto_builder = ModelBuilder(up_axis=UsdGeom.GetStageUpAxis(stage))
+        proto_builder.add_usd(
+            stage,
+            root_path=source_asset_path,
+            load_visual_shapes=False,
+            load_static_visual_shapes=False,
+            skip_mesh_approximation=True,
+            schema_resolvers=[SchemaResolverNewton(), SchemaResolverPhysx()],
+        )
         prototype_model = proto_builder.finalize(device=NewtonManager.get_model().device)
         prototype_view = ArticulationView(
             prototype_model,
