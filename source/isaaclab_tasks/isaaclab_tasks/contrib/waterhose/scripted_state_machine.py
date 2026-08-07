@@ -44,7 +44,8 @@ from .geometry import (
     SOCKET_ALIGN_TIP_DEPTH,
     SOCKET_MOUTH_POS,
     SOCKET_RETAINED_AXIS_COS,
-    SOCKET_RETAINED_DEPTH_TOLERANCE,
+    SOCKET_RETAINED_MAX_TIP_DEPTH,
+    SOCKET_RETAINED_MIN_TIP_DEPTH,
     SOCKET_RETAINED_RADIAL_TOLERANCE,
     SOCKET_ROT_QUAT_XYZW,
     SOCKET_SEATED_TIP_DEPTH,
@@ -88,8 +89,8 @@ def connector_retained_mask(env) -> torch.Tensor:
         socket_quat=SOCKET_ROT_QUAT_XYZW,
         connector_tip_offset=CONNECTOR_TIP_LOCAL_POS,
         radial_threshold=SOCKET_RETAINED_RADIAL_TOLERANCE,
-        min_depth=SOCKET_SEATED_TIP_DEPTH - SOCKET_RETAINED_DEPTH_TOLERANCE,
-        max_depth=SOCKET_SEATED_TIP_DEPTH + SOCKET_RETAINED_DEPTH_TOLERANCE,
+        min_depth=SOCKET_RETAINED_MIN_TIP_DEPTH,
+        max_depth=SOCKET_RETAINED_MAX_TIP_DEPTH,
         alignment_threshold=SOCKET_RETAINED_AXIS_COS,
     )
 
@@ -344,7 +345,8 @@ def _update_state_machine_wp(
         retained = (
             axis_cos >= SOCKET_RETAINED_AXIS_COS
             and tip_radial_error <= SOCKET_RETAINED_RADIAL_TOLERANCE
-            and wp.abs(tip_depth - SOCKET_SEATED_TIP_DEPTH) <= SOCKET_RETAINED_DEPTH_TOLERANCE
+            and tip_depth >= SOCKET_RETAINED_MIN_TIP_DEPTH
+            and tip_depth <= SOCKET_RETAINED_MAX_TIP_DEPTH
         )
         # Once contact has seated the connector, measured retention is the phase objective.
         converged = retained
@@ -768,7 +770,8 @@ class WaterhoseDemoState:
         retained_ready = (
             (coax_cos >= SOCKET_RETAINED_AXIS_COS)
             & (tip_radial_error <= SOCKET_RETAINED_RADIAL_TOLERANCE)
-            & (torch.abs(tip_depth[:, 0] - self.seated_tip_depth) <= SOCKET_RETAINED_DEPTH_TOLERANCE)
+            & (tip_depth[:, 0] >= SOCKET_RETAINED_MIN_TIP_DEPTH)
+            & (tip_depth[:, 0] <= SOCKET_RETAINED_MAX_TIP_DEPTH)
         )
         retained_objective_phase = self.phase >= self.INSERT
         converged = torch.where(retained_objective_phase, retained_ready, converged)

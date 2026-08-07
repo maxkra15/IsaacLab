@@ -73,8 +73,11 @@ from .geometry import (
     SOCKET_COLLISION_MESH_PATTERN,
     SOCKET_COLLISION_MESH_SUFFIX,
     SOCKET_MOUTH_POS,
+    SOCKET_RETAINED_AXIS_COS,
+    SOCKET_RETAINED_MAX_TIP_DEPTH,
+    SOCKET_RETAINED_MIN_TIP_DEPTH,
+    SOCKET_RETAINED_RADIAL_TOLERANCE,
     SOCKET_ROT_QUAT_XYZW,
-    SOCKET_SEATED_TIP_DEPTH,
 )
 from .mdp.actions import WaterhoseDirectGripperJointPositionActionCfg, WaterhoseGripperPositionActionCfg
 from .mdp.terminations import plug_inserted_in_socket
@@ -625,11 +628,13 @@ class WaterhoseSceneCfg(InteractiveSceneCfg):
             physics_material=sim_utils.CableMaterialCfg(
                 # Native cable authoring uses material moduli [Pa]. These values preserve the
                 # validated per-joint 1e6 N/m stretch and 0.3 N.m/rad bend stiffness for the
-                # authored 3 mm-radius cable with a 7.226 mm mean segment length. The small
-                # per-joint damping values are retained by the scoped builder extension.
+                # uniformly sampled 3 mm-radius cable. Torsion is intentionally three tenths of
+                # bending so the hose bends as before without over-driving the light connector.
+                # The small per-joint damping values are retained by the scoped builder extension.
                 thickness=0.006,
-                stretch_stiffness=2.555704133829127e8,
-                bend_stiffness=3.4076054525320105e7,
+                stretch_stiffness=2.5552039425301313e8,
+                bend_stiffness=3.406938590040175e7,
+                twist_stiffness=5.110407885060262e6,
                 density=100.0,
             ),
         ),
@@ -718,11 +723,11 @@ class TerminationsCfg:
             "cable_cfg": SceneEntityCfg("cable1"),
             "socket_pos": SOCKET_MOUTH_POS,
             "socket_quat": SOCKET_ROT_QUAT_XYZW,
-            "radial_threshold": 0.001,
+            "radial_threshold": SOCKET_RETAINED_RADIAL_TOLERANCE,
             "connector_tip_offset": CONNECTOR_TIP_LOCAL_POS,
-            "min_depth": SOCKET_SEATED_TIP_DEPTH - 0.004,
-            "max_depth": SOCKET_SEATED_TIP_DEPTH + 0.004,
-            "alignment_threshold": 0.95,
+            "min_depth": SOCKET_RETAINED_MIN_TIP_DEPTH,
+            "max_depth": SOCKET_RETAINED_MAX_TIP_DEPTH,
+            "alignment_threshold": SOCKET_RETAINED_AXIS_COS,
         },
     )
 

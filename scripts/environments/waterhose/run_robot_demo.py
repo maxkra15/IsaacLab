@@ -212,6 +212,14 @@ def _run_env(env_cfg) -> None:
         )
         control_graph_captured = bool(getattr(scripted_state, "is_control_graph_captured", False))
 
+        def connector_is_retained() -> bool:
+            # The graph-native fast path intentionally bypasses InteractiveScene.update(). Refresh
+            # only the cable before an infrequent terminal poll so the acceptance check reads the
+            # same live Newton state as the captured controller rather than a stale manager buffer.
+            if control_graph_captured:
+                env.scene["cable1"].update(env.step_dt)
+            return bool(connector_retained_mask(env).all().item())
+
         if args_cli.profile and "cuda" in str(env.device):
             import warp as wp  # noqa: PLC0415
 
@@ -243,11 +251,11 @@ def _run_env(env_cfg) -> None:
                 else:
                     is_done = bool((scripted_state.phase == scripted_state.DONE).all().item())
                 if is_done:
-                    if not bool(connector_retained_mask(env).all().item()):
+                    if not connector_is_retained():
                         raise RuntimeError("Scripted waterhose reached DONE without a retained connector.")
                     done_linger_steps = max(1, int(round(1.0 / env.step_dt)))
             if done_linger_steps is not None:
-                if not bool(connector_retained_mask(env).all().item()):
+                if not connector_is_retained():
                     raise RuntimeError("Waterhose connector was lost during the final retention check.")
                 done_linger_steps -= 1
                 if done_linger_steps <= 0:

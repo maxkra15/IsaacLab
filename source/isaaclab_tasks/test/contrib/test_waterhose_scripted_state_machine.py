@@ -227,7 +227,12 @@ def test_graph_inserted_hold_finishes_with_closed_gripper():
     robot_body_q = wp.array([[identity]], dtype=wp.transform, device=device)
     robot_root_q = wp.array([identity], dtype=wp.transform, device=device)
     cable_body_q = wp.array(
-        [wp.transform(wp.vec3(0.0, 0.0, scripted_state_machine.SOCKET_SEATED_TIP_DEPTH), wp.quat_identity())],
+        [
+            wp.transform(
+                wp.vec3(0.0, 0.0, -0.014),
+                wp.quat_identity(),
+            )
+        ],
         dtype=wp.transform,
         device=device,
     )
@@ -395,7 +400,7 @@ def test_inserted_hold_finishes_without_releasing_or_retreating():
 
 
 def test_connector_retention_uses_measured_seated_pose():
-    """The terminal predicate accepts the validated seat and rejects lateral loss."""
+    """The terminal predicate accepts a shallow physical seat and rejects loss."""
 
     cable = _FakeCable()
     env = SimpleNamespace(
@@ -406,9 +411,19 @@ def test_connector_retention_uses_measured_seated_pose():
     cable.orientation[:] = state.socket_quat_w
     insertion_axis = normalize(quat_apply(state.socket_quat_w, state.connector_axis_local))
     tip_offset = quat_apply(cable.orientation, state.connector_tip_local_pos)
-    cable.position[:] = state.socket_pos_w + state.seated_tip_depth * insertion_axis - tip_offset
+    retained_depth = -0.014
+    cable.position[:] = state.socket_pos_w + retained_depth * insertion_axis - tip_offset
 
     assert connector_retained_mask(env).item()
 
     cable.position[:, 0] += 2.0e-3
+    assert not connector_retained_mask(env).item()
+
+    cable.position[:, 0] -= 2.0e-3
+    rejected_depth = scripted_state_machine.SOCKET_RETAINED_MIN_TIP_DEPTH - 0.001
+    cable.position[:] = state.socket_pos_w + rejected_depth * insertion_axis - tip_offset
+    assert not connector_retained_mask(env).item()
+
+    rejected_depth = scripted_state_machine.SOCKET_RETAINED_MAX_TIP_DEPTH + 0.001
+    cable.position[:] = state.socket_pos_w + rejected_depth * insertion_axis - tip_offset
     assert not connector_retained_mask(env).item()

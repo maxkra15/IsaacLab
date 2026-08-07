@@ -32,6 +32,10 @@ from isaaclab_tasks.contrib.waterhose.geometry import (
     CONNECTOR_TIP_LOCAL_POS,
     SOCKET_ALIGN_TIP_DEPTH,
     SOCKET_COLLISION_MESH_PATTERN,
+    SOCKET_RETAINED_AXIS_COS,
+    SOCKET_RETAINED_MAX_TIP_DEPTH,
+    SOCKET_RETAINED_MIN_TIP_DEPTH,
+    SOCKET_RETAINED_RADIAL_TOLERANCE,
     SOCKET_SEATED_TIP_DEPTH,
 )
 
@@ -444,13 +448,22 @@ def test_waterhose_native_material_converts_to_validated_per_joint_stiffness():
         cable_cfg.spawn.func("/World/Cable1", cable_cfg.spawn)
     curve = UsdGeom.BasisCurves(cable_stage.GetPrimAtPath("/World/Cable1/curve_0"))
     points = np.asarray(curve.GetPointsAttr().Get(), dtype=np.float64)
-    mean_segment_length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).mean())
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    mean_segment_length = float(segment_lengths.mean())
+    flexible_segment_length = float(segment_lengths[1:].mean())
     radius = 0.5 * material.thickness
     area = np.pi * radius**2
     area_moment = np.pi * radius**4 / 4.0
+    polar_moment = 2.0 * area_moment
 
-    assert material.stretch_stiffness * area / mean_segment_length == pytest.approx(1.0e6, rel=1.0e-6)
-    assert material.bend_stiffness * area_moment / mean_segment_length == pytest.approx(3.0e-1, rel=1.0e-6)
+    # The long head segment is the rigid span inside the connector. Only the flexible tail should be
+    # uniformly sampled; splitting the head would attach the plug to a body that no longer spans it.
+    assert segment_lengths[0] > 5.0 * flexible_segment_length
+    np.testing.assert_allclose(segment_lengths[1:], flexible_segment_length, rtol=0.0, atol=5.0e-6)
+    # Resampling a curved polyline changes its total chord length by a few parts in 100,000.
+    assert material.stretch_stiffness * area / mean_segment_length == pytest.approx(1.0e6, rel=5.0e-5)
+    assert material.bend_stiffness * area_moment / mean_segment_length == pytest.approx(3.0e-1, rel=5.0e-5)
+    assert material.twist_stiffness * polar_moment / mean_segment_length == pytest.approx(9.0e-2, rel=5.0e-5)
     assert cable_cfg.stretch_shear_damping == pytest.approx(1.0e-2)
     assert cable_cfg.bend_twist_damping == pytest.approx(2.0e-2)
     assert material.density == pytest.approx(100.0)
@@ -488,12 +501,22 @@ def test_spawn_adapter_authors_native_schema_without_modifying_the_asset():
     assert material_prim.GetAttribute("physics:density").Get() == pytest.approx(material_cfg.density)
     assert material_prim.GetAttribute("physics:stretchStiffness").Get() == pytest.approx(material_cfg.stretch_stiffness)
     assert material_prim.GetAttribute("physics:bendStiffness").Get() == pytest.approx(material_cfg.bend_stiffness)
+    assert material_prim.GetAttribute("physics:twistStiffness").Get() == pytest.approx(material_cfg.twist_stiffness)
 
     # The adapter changes the parent from the old segment-start frame to the
     # native segment-center frame, but counter-translates the visual child.
     spawned_connector = stage.GetPrimAtPath("/World/Cable1/cable_edge_body_0/connector")
     spawned_connector_world = np.asarray(UsdGeom.XformCache().GetLocalToWorldTransform(spawned_connector))
     np.testing.assert_allclose(spawned_connector_world, source_connector_world, rtol=0.0, atol=5.0e-8)
+
+    # The connector origin must remain inside its rigid head segment. Resampling the complete curve
+    # shortens this segment to about 7 mm while leaving the connector about 25 mm from its start,
+    # causing the plug to overlap independently moving cable bodies and appear to detach under bend.
+    points = curve.GetPointsAttr().Get()
+    head_length = float((points[1] - points[0]).GetLength())
+    connector_local = spawned_connector.GetAttribute("xformOp:translate").Get()
+    connector_from_head_start = float(connector_local[2]) + 0.5 * head_length
+    assert 0.0 < connector_from_head_start < head_length
 
 
 def test_compound_connector_aligns_clear_of_the_success_region():
@@ -502,9 +525,11 @@ def test_compound_connector_aligns_clear_of_the_success_region():
 
     assert pytest.approx(-0.030) == SOCKET_ALIGN_TIP_DEPTH
     assert pytest.approx(-0.004) == SOCKET_SEATED_TIP_DEPTH
-    assert success["min_depth"] > SOCKET_ALIGN_TIP_DEPTH
-    assert success["min_depth"] < SOCKET_SEATED_TIP_DEPTH < success["max_depth"]
-    assert success["radial_threshold"] == pytest.approx(0.001)
+    assert success["min_depth"] == pytest.approx(SOCKET_RETAINED_MIN_TIP_DEPTH)
+    assert success["max_depth"] == pytest.approx(SOCKET_RETAINED_MAX_TIP_DEPTH)
+    assert SOCKET_ALIGN_TIP_DEPTH < success["min_depth"] < SOCKET_SEATED_TIP_DEPTH < success["max_depth"]
+    assert success["radial_threshold"] == pytest.approx(SOCKET_RETAINED_RADIAL_TOLERANCE)
+    assert success["alignment_threshold"] == pytest.approx(SOCKET_RETAINED_AXIS_COS)
 
 
 def test_canonical_assets_author_socket_sdf_and_render_only_connector():
@@ -675,13 +700,29 @@ def test_native_builder_extension_lumps_offset_connector_into_head(native_waterh
     builder = built.builder
     cfg = built.cable_cfg
     head_body = built.body_start
-    connector_shape = builder.shape_label.index(f"/World/envs/env_0/Cable1/{waterhose_env_cfg._CONNECTOR_SHAPE_TOKEN}")
+    connector_prefix = f"/World/envs/env_0/Cable1/{waterhose_env_cfg._CONNECTOR_SHAPE_TOKEN}_"
+    connector_shapes = [
+        shape_id for shape_id, label in enumerate(builder.shape_label) if str(label).startswith(connector_prefix)
+    ]
 
     mesh, scale, source_xform, density, is_solid, _ = built.extension._load_connector_geometry()
-    expected_xform = wp.transform_multiply(
+    expected_base_xform = wp.transform_multiply(
         wp.transform((0.0, 0.0, -built.extension.head_segment_half_length), wp.quat_identity()),
         source_xform,
     )
+    for (_, radius, half_height, center_z), shape_id in zip(
+        cfg.connector_collision_primitives, connector_shapes, strict=True
+    ):
+        expected_xform = wp.transform_multiply(
+            expected_base_xform,
+            wp.transform((0.0, 0.0, center_z), wp.quat_identity()),
+        )
+        assert builder.shape_type[shape_id] == GeoType.CYLINDER
+        np.testing.assert_allclose(np.asarray(builder.shape_scale[shape_id]), [radius, half_height, 0.0], atol=1.0e-9)
+        np.testing.assert_allclose(
+            np.asarray(builder.shape_transform[shape_id]), np.asarray(expected_xform), atol=1.0e-8
+        )
+
     connector_mass, connector_com, _ = compute_inertia_shape(
         GeoType.MESH,
         scale,
@@ -690,7 +731,7 @@ def test_native_builder_extension_lumps_offset_connector_into_head(native_waterh
         is_solid,
         cfg.connector_margin,
     )
-    connector_com_head = np.asarray(wp.transform_point(expected_xform, connector_com), dtype=np.float64)
+    connector_com_head = np.asarray(wp.transform_point(expected_base_xform, connector_com), dtype=np.float64)
     expected_mass = built.before.head_mass + connector_mass
     expected_com = (
         built.before.head_mass * built.before.head_com + connector_mass * connector_com_head
@@ -698,16 +739,28 @@ def test_native_builder_extension_lumps_offset_connector_into_head(native_waterh
 
     assert builder.body_count == built.before.body_count
     assert builder.joint_count == built.before.joint_count + 1
-    assert builder.shape_count == built.before.shape_count + 1
-    assert builder.shape_body[connector_shape] == head_body
-    assert builder.shape_collision_group[connector_shape] == -1
-    assert builder.shape_material_ke[connector_shape] == pytest.approx(cfg.connector_ke)
-    assert builder.shape_material_kd[connector_shape] == pytest.approx(cfg.connector_kd)
-    assert builder.shape_material_mu[connector_shape] == pytest.approx(cfg.connector_mu)
-    assert builder.shape_margin[connector_shape] == pytest.approx(cfg.connector_margin)
-    assert builder.shape_gap[connector_shape] == pytest.approx(cfg.connector_gap)
+    assert builder.shape_count == built.before.shape_count + 4
+    assert len(connector_shapes) == 3
+    assert [builder.shape_label[shape_id] for shape_id in connector_shapes] == [
+        f"{connector_prefix}{name}" for name, *_ in cfg.connector_collision_primitives
+    ]
+    for connector_shape in connector_shapes:
+        assert builder.shape_body[connector_shape] == head_body
+        assert builder.shape_collision_group[connector_shape] == -1
+        assert builder.shape_material_ke[connector_shape] == pytest.approx(cfg.connector_ke)
+        assert builder.shape_material_kd[connector_shape] == pytest.approx(cfg.connector_kd)
+        assert builder.shape_material_mu[connector_shape] == pytest.approx(cfg.connector_mu)
+        assert builder.shape_margin[connector_shape] == pytest.approx(cfg.connector_margin)
+        assert builder.shape_gap[connector_shape] == pytest.approx(cfg.connector_gap)
+        assert not int(builder.shape_flags[connector_shape]) & int(ShapeFlags.VISIBLE)
+    dynamic_visual = builder.shape_label.index("/World/envs/env_0/Cable1/waterhose_plug_visual")
+    assert builder.shape_type[dynamic_visual] == GeoType.MESH
+    assert builder.shape_body[dynamic_visual] == head_body
+    assert int(builder.shape_flags[dynamic_visual]) & int(ShapeFlags.VISIBLE)
+    assert not int(builder.shape_flags[dynamic_visual]) & int(ShapeFlags.COLLIDE_SHAPES)
+    assert not int(builder.shape_flags[dynamic_visual]) & int(ShapeFlags.COLLIDE_PARTICLES)
     np.testing.assert_allclose(
-        np.asarray(builder.shape_transform[connector_shape]), np.asarray(expected_xform), atol=1.0e-8
+        np.asarray(builder.shape_transform[dynamic_visual]), np.asarray(expected_base_xform), atol=1.0e-8
     )
     assert connector_mass == pytest.approx(cfg.connector_mass, rel=1.0e-6)
     assert builder.body_mass[head_body] == pytest.approx(expected_mass, rel=1.0e-6)
@@ -717,7 +770,11 @@ def test_native_builder_extension_lumps_offset_connector_into_head(native_waterh
     static_visual = builder.shape_label.index("/World/envs/env_0/Cable1/cable_edge_body_0/connector/plug_mesh")
     assert not int(builder.shape_flags[static_visual]) & int(ShapeFlags.VISIBLE)
     for body_id in range(built.body_start, built.body_end):
-        assert all(builder.shape_collision_group[shape_id] == -1 for shape_id in builder.body_shapes[body_id])
+        assert all(
+            builder.shape_collision_group[shape_id] == -1
+            for shape_id in builder.body_shapes[body_id]
+            if shape_id != dynamic_visual
+        )
 
 
 def test_native_builder_extension_restores_per_dof_cable_damping(native_waterhose_builder):

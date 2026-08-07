@@ -121,7 +121,7 @@ def _segment_body_ids(cable: BaseCableObject) -> torch.Tensor:
 
 
 def _connector_shape_ids(model, num_envs: int) -> torch.Tensor:
-    """Resolve one task-authored connector collision shape per concrete environment."""
+    """Resolve the three task-authored connector collision shapes per concrete environment."""
 
     connector_token = waterhose_env_cfg._CONNECTOR_SHAPE_TOKEN
     shapes_by_env: dict[int, list[int]] = {env_id: [] for env_id in range(num_envs)}
@@ -135,10 +135,10 @@ def _connector_shape_ids(model, num_envs: int) -> torch.Tensor:
         if env_id in shapes_by_env:
             shapes_by_env[env_id].append(shape_id)
 
-    invalid = {env_id: shape_ids for env_id, shape_ids in shapes_by_env.items() if len(shape_ids) != 1}
-    assert not invalid, f"Expected one connector shape per Waterhose environment, found {invalid}"
+    invalid = {env_id: shape_ids for env_id, shape_ids in shapes_by_env.items() if len(shape_ids) != 3}
+    assert not invalid, f"Expected three connector shapes per Waterhose environment, found {invalid}"
     return torch.tensor(
-        [shapes_by_env[env_id][0] for env_id in range(num_envs)],
+        [shapes_by_env[env_id] for env_id in range(num_envs)],
         dtype=torch.long,
         device=wp.to_torch(model.shape_body).device,
     )
@@ -243,11 +243,15 @@ def test_waterhose_connector_is_compound_with_the_matching_cable_head():
         head_body_ids = segment_body_ids[:, 0]
         connector_shape_ids = _connector_shape_ids(model, num_envs=4)
         connector_body_ids = wp.to_torch(model.shape_body)[connector_shape_ids]
-        torch.testing.assert_close(connector_body_ids, head_body_ids, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            connector_body_ids, head_body_ids[:, None].expand_as(connector_body_ids), rtol=0.0, atol=0.0
+        )
         assert torch.unique(connector_body_ids).numel() == 4
 
         body_world = wp.to_torch(model.body_world)[connector_body_ids]
-        expected_world = torch.arange(4, device=body_world.device, dtype=body_world.dtype)
+        expected_world = torch.arange(4, device=body_world.device, dtype=body_world.dtype)[:, None].expand_as(
+            body_world
+        )
         torch.testing.assert_close(body_world, expected_world, rtol=0.0, atol=0.0)
 
         # Connector collision geometry is a shape on the cable head.  Its local
@@ -267,7 +271,7 @@ def test_waterhose_connector_is_compound_with_the_matching_cable_head():
             connector_local_pose[:, :3],
             connector_local_pose[:, 3:7],
         )
-        connector_position_local = connector_position - scene.env_origins
+        connector_position_local = connector_position - scene.env_origins[:, None, :]
         torch.testing.assert_close(
             connector_position_local,
             connector_position_local[0:1].expand_as(connector_position_local),

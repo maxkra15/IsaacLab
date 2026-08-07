@@ -42,6 +42,39 @@ def _find_cable_curve(root_prim):
     return curve
 
 
+def _resample_flexible_tail_by_arc_length(curve) -> None:
+    """Redistribute the flexible tail while preserving the connector-bearing head segment."""
+    from pxr import Vt  # noqa: PLC0415
+
+    points = curve.GetPointsAttr().Get()
+    # Segment 0 spans the rigid cable portion inside the plug. Splitting that deliberately long
+    # segment would leave the plug rigidly attached to body 0 while visually overlapping later,
+    # independently moving cable bodies. Preserve it and regularize only the flexible tail.
+    tail_points = points[1:]
+    segment_lengths = [
+        (tail_points[index + 1] - tail_points[index]).GetLength() for index in range(len(tail_points) - 1)
+    ]
+    total_length = sum(segment_lengths)
+    if total_length <= 0.0:
+        raise RuntimeError(f"Waterhose cable tail at {curve.GetPath()} has zero length.")
+
+    spacing = total_length / (len(tail_points) - 1)
+    samples = [points[0], tail_points[0]]
+    segment_index = 0
+    segment_start_length = 0.0
+    for sample_index in range(1, len(tail_points) - 1):
+        target_length = sample_index * spacing
+        while segment_start_length + segment_lengths[segment_index] < target_length:
+            segment_start_length += segment_lengths[segment_index]
+            segment_index += 1
+        alpha = (target_length - segment_start_length) / segment_lengths[segment_index]
+        samples.append(
+            tail_points[segment_index] + alpha * (tail_points[segment_index + 1] - tail_points[segment_index])
+        )
+    samples.append(tail_points[-1])
+    curve.GetPointsAttr().Set(Vt.Vec3fArray(samples))
+
+
 @clone
 def spawn_waterhose_cable_from_usd(
     prim_path: str,
@@ -67,6 +100,7 @@ def spawn_waterhose_cable_from_usd(
     )
     stage = root_prim.GetStage()
     curve = _find_cable_curve(root_prim)
+    _resample_flexible_tail_by_arc_length(curve)
     curve_path = str(curve.GetPath())
     sim_utils.define_deformable_curve_properties(curve_path, stage=stage)
 
@@ -104,7 +138,7 @@ def spawn_waterhose_cable_from_usd(
 
 @configclass
 class WaterhoseCableObjectCfg(CableObjectCfg):
-    """Native cable plus one connector mesh and one soft fixed tail constraint."""
+    """Native cable plus one compound connector and one soft fixed tail constraint."""
 
     class_type: type | str = "{DIR}.cable:WaterhoseCableObject"
 
@@ -122,6 +156,13 @@ class WaterhoseCableObjectCfg(CableObjectCfg):
 
     connector_shape_label: str = "waterhose_connector"
     """Suffix used to identify the connector collision shape."""
+
+    connector_collision_primitives: tuple[tuple[str, float, float, float], ...] = (
+        ("body", 0.007338, 0.0075880055, 0.0004380645),
+        ("shoulder", 0.006453, 0.0009638235, -0.0081137645),
+        ("nose", 0.005568, 0.0025143230, -0.0115919110),
+    )
+    """Connector cylinders as ``(name, radius, half-height, center-z)`` in the visual plug frame."""
 
     connector_ke: float = 1.0e4
     """Connector contact stiffness [N/m]."""
@@ -336,7 +377,25 @@ class WaterhoseCableBuilderExtension:
             wp.transform((0.0, 0.0, -half_length), wp.quat_identity()),
             connector_xform,
         )
+        primitive_volume = sum(
+            2.0 * math.pi * radius**2 * half_height
+            for _, radius, half_height, _ in self.cfg.connector_collision_primitives
+        )
+        if primitive_volume <= 0.0 or self.cfg.connector_mass <= 0.0:
+            raise ValueError("Waterhose connector primitive dimensions and mass must be positive.")
+        collider_cfg = newton.ModelBuilder.ShapeConfig(
+            density=0.0,
+            ke=float(self.cfg.connector_ke),
+            kd=float(self.cfg.connector_kd),
+            mu=float(self.cfg.connector_mu),
+            margin=float(self.cfg.connector_margin),
+            gap=float(self.cfg.connector_gap),
+            collision_group=cable_collision_group,
+            is_visible=False,
+        )
         mass_before = float(builder.body_mass[head_body])
+        # Keep the authored mesh as a render-only shape and use it to preserve the validated mass,
+        # center of mass, and inertia. Contact generation sees only the three cheap primitives below.
         builder.add_shape_mesh(
             body=head_body,
             xform=connector_xform,
@@ -344,17 +403,28 @@ class WaterhoseCableBuilderExtension:
             scale=scale,
             cfg=newton.ModelBuilder.ShapeConfig(
                 density=density,
-                ke=float(self.cfg.connector_ke),
-                kd=float(self.cfg.connector_kd),
-                mu=float(self.cfg.connector_mu),
-                margin=float(self.cfg.connector_margin),
-                gap=float(self.cfg.connector_gap),
-                collision_group=cable_collision_group,
+                collision_group=0,
+                has_shape_collision=False,
+                has_particle_collision=False,
                 is_solid=is_solid,
             ),
             color=color,
-            label=f"{expanded_path}/{self.cfg.connector_shape_label}",
+            label=f"{expanded_path}/waterhose_plug_visual",
         )
+        for name, radius, half_height, center_z in self.cfg.connector_collision_primitives:
+            primitive_xform = wp.transform_multiply(
+                connector_xform,
+                wp.transform((0.0, 0.0, center_z), wp.quat_identity()),
+            )
+            builder.add_shape_cylinder(
+                body=head_body,
+                xform=primitive_xform,
+                radius=radius,
+                half_height=half_height,
+                cfg=collider_cfg,
+                color=color,
+                label=f"{expanded_path}/{self.cfg.connector_shape_label}_{name}",
+            )
         expected_mass = mass_before + float(self.cfg.connector_mass)
         if not math.isclose(float(builder.body_mass[head_body]), expected_mass, rel_tol=1.0e-5, abs_tol=1.0e-9):
             raise RuntimeError("Newton did not accumulate the requested connector mass onto the cable head.")
