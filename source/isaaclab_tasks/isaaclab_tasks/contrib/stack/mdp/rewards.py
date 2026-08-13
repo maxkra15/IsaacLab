@@ -67,7 +67,7 @@ def irrecoverable_stack_failure(
     env: ManagerBasedRLEnv,
     success_termination_name: str = "success",
 ) -> torch.Tensor:
-    """Return one for a non-timeout terminal failure.
+    """Return a unit-integral pulse for a non-timeout terminal failure.
 
     Intermediate reset rows deliberately include states far from the final
     stack. Treating an ordinary horizon timeout as a failure overwhelms rare
@@ -75,7 +75,10 @@ def irrecoverable_stack_failure(
     out-of-workspace states, and numerical divergence remain penalized.
     """
     succeeded = env.termination_manager.get_term(success_termination_name)
-    return (env.reset_terminated & ~succeeded).float()
+    failed = env.reset_terminated & ~succeeded
+    # RewardManager integrates rates by multiplying every term by step_dt.
+    # Dividing here makes the configured weight the exact episode impulse.
+    return failed.float() / max(float(env.step_dt), 1.0e-6)
 
 
 def cube_com_pair_aligned(
@@ -645,6 +648,6 @@ def stack_success_pulse(
     env: ManagerBasedRLEnv,
     context_term_name: str = "progress_context",
 ) -> torch.Tensor:
-    """Reward the first stable full stack once per episode."""
+    """Return a unit-integral pulse for the first stable stack event."""
     context = env.termination_manager.get_term_cfg(context_term_name).func
-    return context.new_success.float()
+    return context.new_success.float() / max(float(env.step_dt), 1.0e-6)

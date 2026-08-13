@@ -248,6 +248,15 @@ def test_failed_rsl_training_restores_torch_backend_state(monkeypatch) -> None:
     assert _torch_backend_state() == caller_state
 
 
+def test_rsl_distillation_runner_loads_checkpoint_for_custom_algorithm() -> None:
+    """Distillation runners require a teacher checkpoint for custom algorithms too."""
+    from isaaclab_rl.entrypoints.backends.train_rsl_rl import _should_load_checkpoint
+
+    assert _should_load_checkpoint(resume=False, runner_class_name="DistillationRunner")
+    assert not _should_load_checkpoint(resume=False, runner_class_name="OnPolicyRunner")
+    assert _should_load_checkpoint(resume=True, runner_class_name="OnPolicyRunner")
+
+
 def test_skrl_training_restores_jax_backend(monkeypatch) -> None:
     """SKRL training removes the JAX backend setting it created after an exception."""
     skrl = pytest.importorskip("skrl")

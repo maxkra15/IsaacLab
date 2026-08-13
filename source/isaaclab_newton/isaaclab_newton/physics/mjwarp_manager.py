@@ -107,17 +107,22 @@ class NewtonMJWarpManager(NewtonManager):
         step.
 
         Args:
-            world_mask: Per-world bool mask of shape ``(world_count + 1,)``.
-                Entries before the last select local worlds; the final entry
-                selects global entities in world -1. ``None`` is a no-op.
+            world_mask: Canonical Newton bool mask of shape
+                ``(world_count + 1,)``. MJWarp owns only the local worlds, so
+                the final global-world entry is excluded before calling its
+                solver reset. ``None`` is a no-op.
         """
         if world_mask is None:
             return
-        if cls._solver.use_mujoco_cpu and not world_mask.numpy().any():
+        # Newton's canonical mask includes a final world -1 entry for global
+        # entities. SolverMuJoCo has exactly ``world_count`` local MjData
+        # instances and rejects the extra entry.
+        local_world_mask = world_mask[: cls._model.world_count]
+        if cls._solver.use_mujoco_cpu and not local_world_mask.numpy().any():
             return
         # flags=0 skips the joint-state reset to model defaults: IsaacLab owns
         # joint_q/joint_qd and has already written the authored reset pose.
-        cls._solver.reset(cls._state_0, world_mask=world_mask, flags=0)
+        cls._solver.reset(cls._state_0, world_mask=local_world_mask, flags=0)
 
     @classmethod
     def _log_solver_debug(cls) -> None:

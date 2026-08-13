@@ -11,7 +11,7 @@ from torch.distributions import Bernoulli, Normal
 
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlCNNModelCfg, RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
 
 class _StackDeterministicOutput(nn.Module):
@@ -155,6 +155,31 @@ class StackGaussianDistributionCfg(RslRlMLPModelCfg.GaussianDistributionCfg):
     std_range: tuple[float, float] = (0.15, 0.65)
 
 
+@configclass
+class StackSpatialSoftmaxCNNModelCfg(RslRlCNNModelCfg):
+    """Spatial-keypoint camera model introduced by the DexSuite camera task."""
+
+    class_name: str = "isaaclab_tasks.core.lift.config.kuka_allegro.agents.models:SpatialSoftmaxCNNModel"
+    init_temperature: float = 1.0
+
+
+@configclass
+class StackTeacherControllerAdapterPPOModelCfg(StackSpatialSoftmaxCNNModelCfg):
+    """Fine-tunable counterpart of the distilled visual-state adapter."""
+
+    class_name: str = (
+        "isaaclab_tasks.contrib.stack.config.franka.agents.rsl_rl_distillation_cfg:StackTeacherControllerAdapterModel"
+    )
+    teacher_observation_dim: int = 100
+    controller_hidden_dims: list[int] = [512, 256, 128]
+    passthrough_mappings: tuple[tuple[int, int, int], ...] = ((0, 0, 22), (22, 86, 14))
+    structured_object_state: bool = True
+    student_eef_position_start: int = 36
+    teacher_object_start: int = 22
+    cube_height: float = 0.04
+    freeze_controller: bool = False
+
+
 class StackPPO(PPO):
     """PPO with a read-only post-update KL diagnostic.
 
@@ -166,6 +191,26 @@ class StackPPO(PPO):
     """
 
     kl_measurement_samples = 16_384
+
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        """Load PPO checkpoints normally or initialize the actor from distillation.
+
+        A distillation checkpoint intentionally has no compatible critic or
+        PPO optimizer. Loading only ``student_state_dict`` starts camera RL
+        fine-tuning at iteration zero with a fresh asymmetric critic while
+        retaining the complete visual actor and observation normalizer.
+        """
+        if "student_state_dict" not in loaded_dict:
+            return super().load(loaded_dict, load_cfg, strict)
+        if load_cfg is not None:
+            raise ValueError("Explicit load_cfg is not supported when initializing PPO from distillation.")
+        actor_state_dict = {
+            name: parameter
+            for name, parameter in loaded_dict["student_state_dict"].items()
+            if not name.startswith("auxiliary_head.")
+        }
+        self._raw_actor.load_state_dict(actor_state_dict, strict=strict)
+        return False
 
     def update(self) -> dict[str, float]:
         """Update the policy and report its post-update KL divergence."""
@@ -239,4 +284,57 @@ class FrankaStackPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
+    )
+
+
+@configclass
+class FrankaStackCameraPPORunnerCfg(FrankaStackPPORunnerCfg):
+    """Asymmetric PPO configuration for RGB-based Franka stacking."""
+
+    max_iterations = 15000
+    save_interval = 50
+    experiment_name = "franka_stack_camera"
+    obs_groups = {
+        "actor": ["policy", "base_image"],
+        "critic": ["policy", "privileged"],
+    }
+    actor = StackSpatialSoftmaxCNNModelCfg(
+        obs_normalization=True,
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=StackGaussianDistributionCfg(init_std=0.45),
+        cnn_cfg=StackSpatialSoftmaxCNNModelCfg.CNNCfg(
+            output_channels=[16, 32, 32],
+            kernel_size=[8, 4, 3],
+            stride=[4, 2, 1],
+            activation="elu",
+        ),
+    )
+    # DexSuite camera training converges only when encoder updates stay on a
+    # small fixed scale. Eight minibatches preserve its 16,384 samples per
+    # rank/minibatch with the camera task's 4,096 environments.
+    algorithm = FrankaStackPPORunnerCfg().algorithm.replace(
+        entropy_coef=0.005,
+        num_mini_batches=8,
+        learning_rate=7.0e-5,
+        schedule="fixed",
+    )
+
+
+@configclass
+class FrankaStackCameraFineTunePPORunnerCfg(FrankaStackCameraPPORunnerCfg):
+    """Camera PPO initialized from a distilled student checkpoint."""
+
+    run_name = "finetune"
+    actor = StackSpatialSoftmaxCNNModelCfg(
+        obs_normalization=True,
+        hidden_dims=[1024, 512, 256],
+        activation="elu",
+        distribution_cfg=StackGaussianDistributionCfg(init_std=0.45),
+        cnn_cfg=StackSpatialSoftmaxCNNModelCfg.CNNCfg(
+            output_channels=[32, 64, 64],
+            kernel_size=[8, 4, 3],
+            stride=[4, 2, 1],
+            activation="elu",
+        ),
     )

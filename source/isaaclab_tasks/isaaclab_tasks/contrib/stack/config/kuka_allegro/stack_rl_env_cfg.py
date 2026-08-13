@@ -158,7 +158,9 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
         self.actions.arm_action = mdp.WorkspaceBoundedRelativeJointPositionActionCfg(
             asset_name="robot",
             joint_names=_ARM_JOINT_NAMES,
-            scale=0.20,
+            # Keep one normalized action bijective with one physical residual.
+            # A larger scale followed by a smaller cap aliases PPO samples.
+            scale=0.12,
             max_delta=0.12,
             workspace_lower=KUKA_ALLEGRO_STACK_ARM_WORKSPACE_LOWER,
             workspace_upper=KUKA_ALLEGRO_STACK_ARM_WORKSPACE_UPPER,
@@ -239,8 +241,8 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
         self.terminations.nonfinite_robot_state.params["robot_cfg"] = arm_entity_cfg()
 
         self.scene.ee_frame = None
-        self.viewer.eye = (1.5, 1.5, 1.1)
-        self.viewer.lookat = (0.48, 0.0, 0.12)
+        self.sim.default_visualizer_cfg.eye = (1.5, 1.5, 1.1)
+        self.sim.default_visualizer_cfg.lookat = (0.48, 0.0, 0.12)
 
         self._configure_extended_observations()
         self._configure_diverse_resets()
@@ -338,9 +340,6 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
         )
         self.curriculum.reset_sampling.params.update(
             {
-                # Preserve a total active epsilon prior of 3.2768 across the
-                # 49,152 non-table rows.
-                "epsilon": 6.666666666666667e-5,
                 "balance_recipes": True,
                 "balance_reset_modes": True,
             }
@@ -350,8 +349,8 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
         """Adapt geometry, grasps, and reset states to lightweight 8 cm cubes."""
 
         cube_height = KUKA_ALLEGRO_LARGE_CUBE_EDGE_LENGTH
-        # Match the reset bank to the pinned Seattle collision surface. Live
-        # Newton settling measures a stable center height of 36.94 mm.
+        # The shared native contact surface is aligned with the visible table,
+        # so an 8 cm cube rests at its geometric 4 cm half-height.
         resting_cube_height = KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT
 
         pair_closure_params = {
@@ -410,7 +409,7 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
                 resting_cube_height,
             )
 
-        self.viewer.lookat = (0.48, 0.0, 0.18)
+        self.sim.default_visualizer_cfg.lookat = (0.48, 0.0, 0.18)
 
     def _configure_full_hand_control(self) -> None:
         """Install independent control and proprioception for all 23 joints."""
@@ -444,7 +443,7 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
         )
 
         # A complete three-cube stack spans two grasps, two transports, two
-        # placements, and a final release. The adaptive epsilon sampler selects
+        # placements, and a final release. The target-rate sampler selects
         # the competence frontier, but a final-stack-only reward
         # provides no learning signal when the policy crosses the next reset
         # milestone without completing every remaining stage. Emit exactly
@@ -456,7 +455,7 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
         self.rewards.reset_progress = RewTerm(
             func=mdp.stack_success_pulse,
             params={"context_term_name": "learning_progress_context"},
-            weight=25.0,
+            weight=0.5,
         )
 
         # The pair-synergy task needs stiff 20/2 gains because one scalar
@@ -471,7 +470,7 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
         hand_actuator.stiffness[hand_expression] = 20.0
         hand_actuator.damping[hand_expression] = 0.5
 
-        # Use one global epsilon accumulator for the fully actuated policy.
+        # Use one global target-rate monitor for the fully actuated policy.
         # Equal quotas over every recipe/pair/yaw/tilt stratum keep
         # unmastered modes artificially common and prevent the competence
         # frontier from concentrating on reachable transitions.

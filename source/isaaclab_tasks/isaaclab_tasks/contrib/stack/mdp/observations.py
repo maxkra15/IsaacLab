@@ -247,6 +247,21 @@ def franka_ee_axes(
     return tool_axes(env, robot_cfg=robot_cfg)
 
 
+def franka_ee_position(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return the Franka tool-center position relative to its environment.
+
+    This is a deployable kinematic quantity: on hardware it is computed from
+    joint encoders and the calibrated Franka model, just like the tool axes.
+    """
+    from .robot_state import end_effector_pose
+
+    tool_position, _ = end_effector_pose(env, robot_cfg=robot_cfg)
+    return tool_position - env.scene.env_origins
+
+
 def franka_ee_velocity(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -269,6 +284,7 @@ def role_conditioned_stack_obs(
     grasp_pair_tool_offsets: tuple[tuple[float, float, float], ...] | None = None,
     xy_threshold: float = 0.025,
     height_threshold: float = 0.012,
+    role_order: tuple[int, int, int] = (0, 1, 2),
 ) -> torch.Tensor:
     """Return stable base/side-role tracks with randomized cube colors.
 
@@ -293,7 +309,10 @@ def role_conditioned_stack_obs(
     positions = torch.stack(tuple(cube.data.root_pos_w.torch for cube in cubes), dim=1)
     quaternions = torch.stack(tuple(cube.data.root_quat_w.torch for cube in cubes), dim=1)
     velocities = torch.stack(tuple(cube.data.root_vel_w.torch for cube in cubes), dim=1)
+    if tuple(sorted(role_order)) != (0, 1, 2):
+        raise ValueError("role_order must be a permutation of (0, 1, 2).")
     role_to_cube = (reset_state.role_to_cube if reset_state is not None else env.stack_reset_role_to_cube).long()
+    role_to_cube = role_to_cube[:, role_to_cube.new_tensor(role_order)]
 
     def by_role(values: torch.Tensor) -> torch.Tensor:
         gather_index = role_to_cube.view(env.num_envs, 3, *([1] * (values.ndim - 2))).expand_as(values)
@@ -347,6 +366,70 @@ def role_conditioned_stack_obs(
         ),
         dim=1,
     )
+
+
+def stack_camera_state_target(
+    env: ManagerBasedRLEnv,
+    cube_cfgs: tuple[SceneEntityCfg, ...] = (
+        SceneEntityCfg("cube_1"),
+        SceneEntityCfg("cube_2"),
+        SceneEntityCfg("cube_3"),
+    ),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    tool_body_name: str = "panda_hand",
+    tool_offset: tuple[float, float, float] = (0.0, 0.0, 0.1034),
+    workspace_center: tuple[float, float, float] = (0.48, 0.0, 0.08),
+    workspace_scale: tuple[float, float, float] = (0.18, 0.20, 0.12),
+) -> torch.Tensor:
+    """Return a normalized physical-state target for camera representation learning.
+
+    The target is available only while distilling and never enters the camera
+    actor's observation set. Cubes remain in physical asset/color order so the
+    mapping is directly identifiable from RGB. The 28 dimensionless values are
+    normalized cube positions, tool-relative cube positions, cube up axes, and
+    order-invariant stack progress.
+    """
+    from .rewards import order_invariant_stack_progress
+    from .robot_state import end_effector_pose
+
+    cubes: tuple[RigidObject, ...] = tuple(env.scene[cfg.name] for cfg in cube_cfgs)
+    positions = torch.stack(tuple(cube.data.root_pos_w.torch for cube in cubes), dim=1)
+    quaternions = torch.stack(tuple(cube.data.root_quat_w.torch for cube in cubes), dim=1)
+    local_positions = positions - env.scene.env_origins.unsqueeze(1)
+    tool_position, _ = end_effector_pose(
+        env,
+        robot_cfg=robot_cfg,
+        body_name=tool_body_name,
+        body_offset=tool_offset,
+    )
+    tool_position = tool_position - env.scene.env_origins
+    up_axes = math_utils.matrix_from_quat(quaternions.flatten(end_dim=1)).view(env.num_envs, 3, 3, 3)[..., 2]
+
+    center = local_positions.new_tensor(workspace_center)
+    scale = local_positions.new_tensor(workspace_scale)
+    centered_positions = (local_positions - center) / scale
+    tool_relative_positions = (local_positions - tool_position.unsqueeze(1)) / scale
+    progress = order_invariant_stack_progress(env, cube_cfgs=cube_cfgs).unsqueeze(1) / 2.0
+    return torch.cat(
+        (
+            centered_positions.flatten(start_dim=1),
+            tool_relative_positions.flatten(start_dim=1),
+            up_axes.flatten(start_dim=1),
+            progress,
+        ),
+        dim=1,
+    )
+
+
+def stack_reset_recipe_one_hot(env: ManagerBasedRLEnv, recipe_count: int = 9) -> torch.Tensor:
+    """Return privileged reset-recipe labels used only to balance cloning loss."""
+    if recipe_count <= 0:
+        raise ValueError("recipe_count must be positive.")
+    reset_state = getattr(env, "stack_reset_state", None)
+    if reset_state is None:
+        return torch.zeros((env.num_envs, recipe_count), dtype=torch.float32, device=env.device)
+    recipe_ids = reset_state.recipes.long().clamp(min=0, max=recipe_count - 1)
+    return torch.nn.functional.one_hot(recipe_ids, num_classes=recipe_count).float()
 
 
 def role_conditioned_cube_x_axes(

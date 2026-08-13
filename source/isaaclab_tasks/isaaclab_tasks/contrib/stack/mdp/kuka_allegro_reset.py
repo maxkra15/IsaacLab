@@ -218,8 +218,8 @@ KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS: tuple[tuple[float, float, float], ...] = (
 KUKA_ALLEGRO_LARGE_CUBE_EDGE_LENGTH = 0.08
 """Edge length of the large KUKA-Allegro stacking cubes [m]."""
 
-KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT = 0.037
-"""Newton-calibrated center height for an 8 cm cube on the pinned Seattle table [m]."""
+KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT = 0.040
+"""Center height for an 8 cm cube on the visual-top Newton contact surface [m]."""
 
 # These postures were calibrated directly against the composed KUKA-Allegro
 # USD under Newton. Each geometric grasp increases the corresponding proven

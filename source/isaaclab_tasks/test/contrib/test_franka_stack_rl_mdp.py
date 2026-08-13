@@ -12,6 +12,7 @@ import torch
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.contrib.stack.mdp import (
     ResetBufferedGripperAction,
+    SuccessMonitorCfg,
     WorkspaceBoundedRelativeJointPositionAction,
     WorkspaceBoundedRelativeJointPositionActionCfg,
     curriculums,
@@ -144,6 +145,7 @@ def test_stack_success_context_terminates_after_stability_and_emits_one_reward_p
     env = SimpleNamespace(
         num_envs=num_envs,
         device="cpu",
+        step_dt=0.02,
         episode_length_buf=torch.full((num_envs,), 10, dtype=torch.long),
         extras={},
         scene={"robot": object()},
@@ -173,7 +175,7 @@ def test_stack_success_context_terminates_after_stability_and_emits_one_reward_p
         assert context.is_success.all()
         assert context.new_success.all()
         assert context.ever_success.all()
-        assert torch.equal(rewards.stack_success_pulse(env), torch.ones(num_envs))
+        assert torch.equal(rewards.stack_success_pulse(env) * env.step_dt, torch.ones(num_envs))
 
         assert not context(env, minimum_episode_steps=3, hold_steps=5, maximum_cube_velocity=0.1).any()
         assert not context.new_success.any()
@@ -189,13 +191,17 @@ def test_stack_success_context_terminates_after_stability_and_emits_one_reward_p
 
 def test_irrecoverable_stack_failure_ignores_timeout_and_success():
     env = SimpleNamespace(
+        step_dt=0.02,
         reset_terminated=torch.tensor([True, True, False, False]),
         termination_manager=SimpleNamespace(
             get_term=lambda _name: torch.tensor([True, False, False, False]),
         ),
     )
 
-    assert torch.equal(rewards.irrecoverable_stack_failure(env), torch.tensor([0.0, 1.0, 0.0, 0.0]))
+    assert torch.equal(
+        rewards.irrecoverable_stack_failure(env) * env.step_dt,
+        torch.tensor([0.0, 1.0, 0.0, 0.0]),
+    )
 
 
 def test_finite_joint_velocity_penalty_cannot_emit_nan_or_infinity():
@@ -379,6 +385,40 @@ def test_role_conditioned_observation_is_color_invariant_and_temporally_stable()
     assert observation.shape == (2, 64)
     assert torch.allclose(observation[0], observation[1])
     assert torch.allclose(observation[:, :3], role_positions[0].expand(2, -1))
+
+
+def test_stack_camera_state_target_is_normalized_physical_state_not_actor_input():
+    positions = (
+        torch.tensor([[0.48, 0.00, 0.0205]]),
+        torch.tensor([[0.48, -0.10, 0.0205]]),
+        torch.tensor([[0.48, 0.10, 0.0205]]),
+    )
+    env = SimpleNamespace(
+        device="cpu",
+        num_envs=1,
+        scene=_DummyResetScene(1),
+    )
+    env.scene.update(
+        {
+            "cube_1": _dummy_rigid_object(positions[0]),
+            "cube_2": _dummy_rigid_object(positions[1]),
+            "cube_3": _dummy_rigid_object(positions[2]),
+        }
+    )
+
+    with patch(
+        "isaaclab_tasks.contrib.stack.mdp.robot_state.end_effector_pose",
+        return_value=(torch.tensor([[0.48, -0.10, 0.08]]), torch.tensor([[1.0, 0.0, 0.0, 0.0]])),
+    ):
+        target = observations.stack_camera_state_target(env)
+
+    assert target.shape == (1, 28)
+    assert torch.isfinite(target).all()
+    torch.testing.assert_close(target[0, :3], torch.tensor([0.0, 0.0, (0.0205 - 0.08) / 0.12]))
+    up_axes = target[0, 18:27].reshape(3, 3)
+    torch.testing.assert_close(torch.linalg.vector_norm(up_axes, dim=1), torch.ones(3))
+    torch.testing.assert_close(up_axes, up_axes[:1].expand_as(up_axes))
+    assert target[0, -1] == 0.0
 
 
 def test_franka_ee_velocity_reports_the_offset_tool_center_twist():
@@ -853,6 +893,65 @@ def test_reset_table_continuously_randomizes_table_robot_and_cube_states():
         assert torch.allclose(torch.linalg.vector_norm(cube.root_pose[:, 3:7], dim=1), torch.ones(num_envs))
 
 
+def test_reset_table_reserves_table_and_per_recipe_evaluation_prefixes():
+    term = _build_reset_state_table_for_test()
+    num_envs = 32
+    robot = _DummyResetRobot(num_envs)
+    cubes = tuple(_DummyResetCube(num_envs) for _ in range(3))
+    scene = _DummyResetScene(num_envs)
+    non_table_row = int(torch.nonzero(term.recipe_ids == int(reset_events.StackResetRecipe.FIRST_PICK))[0])
+    env = SimpleNamespace(
+        num_envs=num_envs,
+        device="cpu",
+        scene=scene,
+        stack_reset_row_ids=torch.full((num_envs,), non_table_row, dtype=torch.long),
+        stack_reset_recipes=torch.zeros(num_envs, dtype=torch.long),
+        stack_previous_reset_recipes=torch.zeros(num_envs, dtype=torch.long),
+        stack_reset_goal_pairs=torch.zeros(num_envs, dtype=torch.long),
+        stack_reset_target_potentials=torch.zeros(num_envs),
+        stack_continue_to_final=torch.zeros(num_envs, dtype=torch.bool),
+        stack_reset_held_cube_ids=torch.full((num_envs,), -1, dtype=torch.long),
+        stack_reset_role_to_cube=torch.arange(3).repeat(num_envs, 1),
+        stack_reset_initialized=torch.zeros(num_envs, dtype=torch.bool),
+        stack_previous_reset_initialized=torch.zeros(num_envs, dtype=torch.bool),
+        stack_reset_sample_counts=torch.zeros(term.row_count, dtype=torch.long),
+    )
+    term._env = env
+    term._robot = robot
+    term._cubes = cubes
+    term._arm_joint_ids = list(range(7))
+    term._finger_joint_ids = [7, 8]
+    term._role_permutations = torch.tensor(tuple(reset_events.permutations(range(3))), dtype=torch.long)
+
+    term(
+        env,
+        torch.arange(num_envs),
+        fixed_role_permutation=0,
+        force_full_goal=True,
+        table_evaluation_env_fraction=0.25,
+    )
+
+    selected_recipes = term.recipe_ids[env.stack_reset_row_ids]
+    assert torch.all(selected_recipes[:8] == int(reset_events.StackResetRecipe.TABLE))
+    assert torch.all(selected_recipes[8:] == int(reset_events.StackResetRecipe.FIRST_PICK))
+
+    env.stack_reset_row_ids.fill_(non_table_row)
+    term(
+        env,
+        torch.arange(num_envs),
+        fixed_role_permutation=0,
+        force_full_goal=True,
+        evaluation_recipe_ids=tuple(range(len(reset_events.StackResetRecipe))),
+        evaluation_envs_per_recipe=2,
+    )
+
+    selected_recipes = term.recipe_ids[env.stack_reset_row_ids]
+    for recipe in range(len(reset_events.StackResetRecipe)):
+        recipe_slice = slice(2 * recipe, 2 * (recipe + 1))
+        assert torch.all(selected_recipes[recipe_slice] == recipe)
+    assert torch.all(selected_recipes[18:] == int(reset_events.StackResetRecipe.FIRST_PICK))
+
+
 def test_reset_table_joint_randomization_preserves_held_cube_fk_attachment():
     term = _build_reset_state_table_for_test()
     num_envs = 16
@@ -904,14 +1003,15 @@ def test_reset_table_curriculum_records_learning_and_full_task_outcomes_separate
     num_envs = 4
     curriculum = curriculums.StackResetTableCurriculum.__new__(curriculums.StackResetTableCurriculum)
     curriculum._reset_term = reset_term
-    curriculum._sampler = curriculums._EpsilonResetTableSampler(
-        reset_term.row_count,
-        "cpu",
-        monitored_history_len=50,
-        target_success_rate=0.5,
-        kappa=1.0,
-        epsilon=1.0e-4,
+    monitor_cfg = SuccessMonitorCfg(monitored_history_len=50, target_success_rate=0.5, kappa=1.0)
+    curriculum._progress_monitor = monitor_cfg.class_type(
+        monitor_cfg,
+        num_partitions=1,
+        partition_size=reset_term.row_count,
+        device="cpu",
     )
+    curriculum._attempts = torch.zeros(reset_term.row_count, dtype=torch.long)
+    curriculum._progress_successes = torch.zeros_like(curriculum._attempts)
     curriculum._continuation_attempts = torch.zeros((), dtype=torch.long)
     curriculum._continuation_successes = torch.zeros((), dtype=torch.long)
     curriculum._table_sampling_probability = 0.35
@@ -934,10 +1034,10 @@ def test_reset_table_curriculum_records_learning_and_full_task_outcomes_separate
         termination_manager=SimpleNamespace(get_term_cfg=get_context),
     )
 
-    metrics = curriculum(env, torch.arange(num_envs))
+    metrics = curriculum(env, torch.arange(num_envs), success_monitor=monitor_cfg)
 
-    assert torch.equal(curriculum._sampler.total_attempts[:4], torch.tensor([1, 1, 1, 1]))
-    assert torch.equal(curriculum._sampler.total_successes[:4], torch.tensor([1, 1, 0, 0]))
+    assert torch.equal(curriculum._attempts[:4], torch.tensor([1, 1, 1, 1]))
+    assert torch.equal(curriculum._progress_successes[:4], torch.tensor([1, 1, 0, 0]))
     assert metrics["full_task_attempts"] == 4
     assert metrics["full_task_success_rate"] == 0.25
     assert metrics["batch_success_rate"] == 0.5
@@ -953,29 +1053,42 @@ def test_reset_table_curriculum_records_learning_and_full_task_outcomes_separate
         torch.full_like(layout_probability, 0.65 / len(reset_events._STATE_TABLE_LAYOUTS)),
     )
 
+    # A distillation task's deterministic prefix is genuinely held out: its
+    # completed episodes neither update the success monitor nor receive the
+    # curriculum's next-row assignment.
+    curriculum._evaluation_env_count = 2
+    env.stack_reset_row_ids.copy_(torch.arange(num_envs))
+    attempts_before = curriculum._attempts.clone()
+    curriculum(env, torch.arange(num_envs), success_monitor=monitor_cfg)
+    attempt_delta = curriculum._attempts - attempts_before
+    assert torch.equal(attempt_delta[:4], torch.tensor([0, 0, 1, 1]))
+    assert torch.equal(env.stack_reset_row_ids[:2], torch.tensor([0, 1]))
 
-def test_epsilon_reset_sampler_checkpoint_round_trip():
+
+def test_success_monitored_reset_curriculum_checkpoint_round_trip():
     term = _build_reset_state_table_for_test()
-    sampler = curriculums._EpsilonResetTableSampler(
-        term.row_count,
-        "cpu",
-        monitored_history_len=50,
-        target_success_rate=0.5,
-        kappa=1.0,
-        epsilon=1.0e-4,
-    )
-    rows = sampler.sample(41)
-    sampler.record(rows, rows.remainder(3) == 0)
-    state = sampler.get_state()
+    monitor_cfg = SuccessMonitorCfg(monitored_history_len=50, target_success_rate=0.5, kappa=1.0)
 
-    restored = curriculums._EpsilonResetTableSampler(
-        term.row_count,
-        "cpu",
-        monitored_history_len=50,
-        target_success_rate=0.5,
-        kappa=1.0,
-        epsilon=1.0e-4,
-    )
+    def make_curriculum():
+        curriculum = curriculums.StackResetTableCurriculum.__new__(curriculums.StackResetTableCurriculum)
+        curriculum._progress_monitor = monitor_cfg.class_type(monitor_cfg, 1, term.row_count, "cpu")
+        curriculum._attempts = torch.zeros(term.row_count, dtype=torch.long)
+        curriculum._progress_successes = torch.zeros_like(curriculum._attempts)
+        curriculum._continuation_attempts = torch.zeros((), dtype=torch.long)
+        curriculum._continuation_successes = torch.zeros((), dtype=torch.long)
+        curriculum._full_task_attempts_by_row = torch.zeros_like(curriculum._attempts)
+        curriculum._full_task_successes_by_row = torch.zeros_like(curriculum._attempts)
+        return curriculum
+
+    curriculum = make_curriculum()
+    rows = torch.randint(term.row_count, (41,))
+    succeeded = rows.remainder(3) == 0
+    curriculum._progress_monitor.success_update(rows, succeeded)
+    curriculum._attempts.add_(torch.bincount(rows, minlength=term.row_count))
+    curriculum._progress_successes.add_(torch.bincount(rows[succeeded], minlength=term.row_count))
+    state = curriculum.get_state()
+
+    restored = make_curriculum()
     restored.set_state(state)
 
     for key, value in state.items():
@@ -987,44 +1100,32 @@ def test_epsilon_reset_sampler_checkpoint_round_trip():
         restored.set_state(malformed)
 
 
-def test_epsilon_reset_sampler_uses_exact_rolling_success_window():
-    sampler = curriculums._EpsilonResetTableSampler(
-        3,
-        "cpu",
-        monitored_history_len=4,
-        target_success_rate=0.5,
-        kappa=1.0,
-        epsilon=1.0e-4,
-    )
+def test_success_monitor_uses_exact_rolling_success_window():
+    monitor_cfg = SuccessMonitorCfg(monitored_history_len=4, target_success_rate=0.5, kappa=1.0)
+    monitor = monitor_cfg.class_type(monitor_cfg, 1, 3, "cpu")
 
-    sampler.record(
+    monitor.success_update(
         torch.tensor([0, 0, 0, 0, 1, 1]),
         torch.tensor([True, True, False, False, True, True]),
     )
-    assert torch.allclose(sampler.success_rates, torch.tensor([0.5, 1.0, 0.0]))
+    assert torch.allclose(monitor.success_rate, torch.tensor([0.5, 1.0, 0.0]))
 
     # Five new failures replace the complete four-outcome row-0 history.
-    sampler.record(torch.zeros(5, dtype=torch.long), torch.zeros(5, dtype=torch.bool))
-    assert sampler.success_rates[0] == 0.0
-    assert sampler.history_size[0] == 4
-    assert sampler.history_success_count[0] == 0
-    assert torch.equal(sampler.success_history[0], torch.zeros(4, dtype=torch.bool))
+    monitor.success_update(torch.zeros(5, dtype=torch.long), torch.zeros(5, dtype=torch.bool))
+    assert monitor.success_rate[0] == 0.0
+    assert monitor.success_size[0] == 4
+    assert monitor.success_buf[0].sum() == 0
 
 
-def test_epsilon_reset_sampler_focuses_half_solved_rows_without_starving_others():
-    sampler = curriculums._EpsilonResetTableSampler(
-        3,
-        "cpu",
-        monitored_history_len=50,
-        target_success_rate=0.5,
-        kappa=1.0,
-        epsilon=1.0e-4,
-    )
-    sampler.success_rates.copy_(torch.tensor([0.0, 0.5, 1.0]))
+def test_success_monitor_focuses_half_solved_rows_without_starving_others():
+    monitor_cfg = SuccessMonitorCfg(monitored_history_len=50, target_success_rate=0.5, kappa=1.0)
+    monitor = monitor_cfg.class_type(monitor_cfg, 1, 3, "cpu")
+    monitor.success_rate.copy_(torch.tensor([0.0, 0.5, 1.0]))
 
-    probabilities = sampler.probabilities()
+    probabilities = monitor.target_weights()
+    probabilities /= probabilities.sum()
 
-    assert probabilities[1] > 0.999
+    assert probabilities[1] > 0.95
     assert probabilities[0] > 0.0
     assert probabilities[2] > 0.0
     assert torch.isclose(probabilities.sum(), torch.tensor(1.0))

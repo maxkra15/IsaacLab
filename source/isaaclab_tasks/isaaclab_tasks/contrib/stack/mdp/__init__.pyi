@@ -16,6 +16,8 @@ __all__ = [
     "StackResetRuntimeState",
     "StackResetStateTable",
     "StackResetTableCurriculum",
+    "SuccessMonitorCfg",
+    "TemporalNormalizedRgbImage",
     "WorkspaceBoundedRelativeJointPositionAction",
     "WorkspaceBoundedRelativeJointPositionActionCfg",
     "action_term_l2",
@@ -32,6 +34,7 @@ __all__ = [
     "end_effector_velocity",
     "finite_joint_velocity_l2",
     "franka_ee_axes",
+    "franka_ee_position",
     "franka_ee_velocity",
     "franka_end_effector_pose",
     "franka_end_effector_velocity",
@@ -54,19 +57,25 @@ __all__ = [
     "irrecoverable_stack_failure",
     "nonfinite_cube_state",
     "nonfinite_robot_state",
+    "normalized_rgb_image",
     "object_abs_obs_in_base_frame",
     "object_grasped",
     "object_obs",
     "object_stacked",
     "order_invariant_stack_progress",
+    "randomize_camera_calibration",
     "role_conditioned_cube_x_axes",
     "role_conditioned_stack_obs",
+    "stack_camera_state_target",
+    "stack_reset_recipe_one_hot",
     "stack_success_pulse",
     "success_after_minimum_horizon",
     "tool_axes",
     "tool_velocity",
     "two_finger_gripper_posture",
 ]
+
+from isaaclab_tasks.core.lift.mdp.events_cfg import SuccessMonitorCfg
 
 from .actions import (
     ResetBufferedGripperAction,
@@ -78,6 +87,7 @@ from .actions_cfg import (
     ResetPreservingRelativeJointPositionActionCfg,
     WorkspaceBoundedRelativeJointPositionActionCfg,
 )
+from .camera import TemporalNormalizedRgbImage, normalized_rgb_image, randomize_camera_calibration
 from .curriculums import StackResetTableCurriculum
 from .goal_context import StableFullHandOrderInvariantStackGoal, StableOrderInvariantStackGoal, StackResetLearningProgress
 from .observations import (
@@ -89,6 +99,7 @@ from .observations import (
     ee_frame_pose_in_base_frame,
     ee_frame_quat,
     franka_ee_axes,
+    franka_ee_position,
     franka_ee_velocity,
     grasp_pair_gripper_posture,
     grasp_pair_joint_pos,
@@ -105,6 +116,8 @@ from .observations import (
     object_stacked,
     role_conditioned_cube_x_axes,
     role_conditioned_stack_obs,
+    stack_camera_state_target,
+    stack_reset_recipe_one_hot,
     tool_axes,
     tool_velocity,
     two_finger_gripper_posture,

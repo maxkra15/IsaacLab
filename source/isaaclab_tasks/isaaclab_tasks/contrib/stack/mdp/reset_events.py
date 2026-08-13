@@ -171,8 +171,6 @@ _PREGRASP_POSE_INDEX = 1
 _LIFTED_OR_RED_ALIGNED_POSE_INDEX = 2
 _GREEN_ALIGNED_POSE_INDEX = 3
 _GREEN_RELEASE_POSE_INDEX = 4
-_TABLE_CUBE_CENTER_HEIGHT = 0.017
-"""Resting center height [m] for a 4 cm cube on the pinned Seattle table under Newton contacts."""
 
 
 class StackResetRecipe(IntEnum):
@@ -1115,6 +1113,9 @@ class StackResetStateTable(ManagerTermBase):
         table_target_potential: float | None = None,
         fixed_row_id: int | None = None,
         fixed_recipe: int | None = None,
+        table_evaluation_env_fraction: float = 0.0,
+        evaluation_recipe_ids: Sequence[int] = (),
+        evaluation_envs_per_recipe: int = 0,
         fixed_role_permutation: int | None = None,
         continuation_probability: float = 0.25,
         fixed_continue_to_final: bool | None = None,
@@ -1139,6 +1140,18 @@ class StackResetStateTable(ManagerTermBase):
             return
         if not 0.0 <= continuation_probability <= 1.0:
             raise ValueError("continuation_probability must be in [0, 1].")
+        if not 0.0 <= table_evaluation_env_fraction < 1.0:
+            raise ValueError("table_evaluation_env_fraction must be in [0, 1).")
+        if evaluation_envs_per_recipe < 0:
+            raise ValueError("evaluation_envs_per_recipe must be non-negative.")
+        if table_evaluation_env_fraction > 0.0 and evaluation_envs_per_recipe > 0:
+            raise ValueError("TABLE-only and per-recipe evaluation prefixes are mutually exclusive.")
+        resolved_evaluation_recipes = tuple(int(recipe) for recipe in evaluation_recipe_ids)
+        if any(not 0 <= recipe < len(StackResetRecipe) for recipe in resolved_evaluation_recipes):
+            raise ValueError("evaluation_recipe_ids contains an invalid stack reset recipe.")
+        evaluation_env_count = evaluation_envs_per_recipe * len(resolved_evaluation_recipes)
+        if evaluation_env_count > 0 and evaluation_env_count >= env.num_envs:
+            raise ValueError("Per-recipe evaluation prefixes leave no environments for training.")
         if fixed_row_id is not None and fixed_recipe is not None:
             raise ValueError("fixed_row_id and fixed_recipe are mutually exclusive.")
         if (
@@ -1173,6 +1186,38 @@ class StackResetStateTable(ManagerTermBase):
             if recipe_rows.numel() == 0:
                 raise RuntimeError(f"Stack reset cache has no rows for recipe {fixed_recipe}.")
             row_ids = recipe_rows[torch.randint(recipe_rows.numel(), (env_ids.numel(),), device=self.device)]
+            state.row_ids[env_ids] = row_ids
+        if table_evaluation_env_fraction > 0.0:
+            # Reserve a stable prefix for deterministic deployment evaluation.
+            # The curriculum may propose any row for these environments first;
+            # replace it here so completed episodes are still attributed to the
+            # actual TABLE rows placed into physics.
+            evaluation_env_count = max(1, int(env.num_envs * table_evaluation_env_fraction)) if env.num_envs > 1 else 0
+            evaluation_mask = env_ids < evaluation_env_count
+            evaluation_ids = env_ids[evaluation_mask]
+            if evaluation_ids.numel():
+                table_rows = torch.nonzero(self._recipe_ids == int(StackResetRecipe.TABLE), as_tuple=False).flatten()
+                evaluation_rows = table_rows[
+                    torch.randint(table_rows.numel(), (evaluation_ids.numel(),), device=self.device)
+                ]
+                row_ids[evaluation_mask] = evaluation_rows
+                state.row_ids[env_ids] = row_ids
+        elif evaluation_envs_per_recipe > 0:
+            # Reserve one stable prefix block per recipe for deterministic
+            # closed-loop student evaluation. The algorithm uses this exact
+            # ordering and excludes the blocks from behavior-cloning losses.
+            for block_id, recipe in enumerate(resolved_evaluation_recipes):
+                first_env = block_id * evaluation_envs_per_recipe
+                last_env = first_env + evaluation_envs_per_recipe
+                evaluation_mask = (env_ids >= first_env) & (env_ids < last_env)
+                evaluation_ids = env_ids[evaluation_mask]
+                if evaluation_ids.numel() == 0:
+                    continue
+                recipe_rows = torch.nonzero(self._recipe_ids == recipe, as_tuple=False).flatten()
+                evaluation_rows = recipe_rows[
+                    torch.randint(recipe_rows.numel(), (evaluation_ids.numel(),), device=self.device)
+                ]
+                row_ids[evaluation_mask] = evaluation_rows
             state.row_ids[env_ids] = row_ids
         if fixed_role_permutation is None:
             permutation_ids = torch.randint(
@@ -3287,16 +3332,15 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
 class LargeCubeDiverseKukaAllegroStackResetStateTable(DiverseKukaAllegroStackResetStateTable):
     """Pair- and wrist-diverse reset manifold calibrated for 8 cm cubes.
 
-    The row count and epsilon curriculum remain unchanged. Geometry inherited
+    The row count and reset curriculum remain unchanged. Geometry inherited
     from :class:`DiverseKukaAllegroStackResetStateTable` derives pick, carry,
     placement, and approach heights from these cube dimensions, so every
     cached phase remains physically consistent with the larger cube.
     """
 
     _CUBE_HEIGHT = KUKA_ALLEGRO_LARGE_CUBE_EDGE_LENGTH
-    # The pinned Seattle collision mesh sits below its visual origin. Live
-    # Newton settling puts an untouched 8 cm cube at 36.94 mm; authoring it at
-    # the prior 40.5 mm made every cube fall 3.56 mm immediately after reset.
+    # The task's native contact surface is aligned with the visible tabletop,
+    # so supported cubes use their geometric half-height.
     _TABLE_HEIGHT = KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT
     # A square at arbitrary yaw fits inside a circle of diameter sqrt(2) * edge.
     # The additional margin avoids corner contact in table-start rows.

@@ -56,7 +56,7 @@ class StableOrderInvariantStackGoal(_StackSuccessContext):
     """Track stable full-stack success without immediately resetting the scene.
 
     This non-terminating context exposes current, newly reached, and
-    episode-ever success tensors to the reward, epsilon curriculum, and
+    episode-ever success tensors to the reward, reset curriculum, and
     delayed-success termination terms. Returning all false prevents near-goal
     reset rows from producing three-step episodes.
     """

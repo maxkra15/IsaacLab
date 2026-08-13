@@ -5,10 +5,13 @@
 
 """Reinforcement-learning configuration for Franka cube stacking."""
 
+import math
+
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonCollisionPipelineCfg, NewtonShapeCfg
 from isaaclab_newton.sim.schemas import NewtonMaterialPropertiesCfg
 
 import isaaclab.sim as sim_utils
+from isaaclab.assets import AssetBaseCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -17,6 +20,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sim.schemas import CollisionBaseCfg, RigidBodyBaseCfg, UsdPhysicsRigidBodyCfg
 from isaaclab.utils.configclass import configclass
+from isaaclab.visualizers import VisualizerCfg
 
 from isaaclab_tasks.contrib.stack import mdp
 from isaaclab_tasks.contrib.stack.constants import (
@@ -27,6 +31,23 @@ from isaaclab_tasks.contrib.stack.spawners import ColoredCuboidCfg
 
 from . import stack_joint_pos_env_cfg
 from .franka_robot_cfg import FRANKA_PANDA_DEXSUITE_CFG
+
+
+def _positive_finite(value: object, name: str) -> float:
+    """Return a positive finite scalar or raise a configuration error."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be a finite number.")
+    value = float(value)
+    if value <= 0.0:
+        raise ValueError(f"{name} must be positive.")
+    return value
+
+
+def _positive_integer(value: object, name: str) -> int:
+    """Return a positive integer or raise a configuration error."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
+    return value
 
 
 @configclass
@@ -59,6 +80,9 @@ class EventCfg:
             "table_cube_rotation_range": 0.45,
             "fixed_row_id": None,
             "fixed_recipe": None,
+            "table_evaluation_env_fraction": 0.0,
+            "evaluation_recipe_ids": (),
+            "evaluation_envs_per_recipe": 0,
             "fixed_role_permutation": None,
             # Every cached state trains the deployment objective. Cached
             # phases are starting-state data, never local terminal goals.
@@ -76,14 +100,16 @@ class RewardsCfg:
     success = RewTerm(
         func=mdp.stack_success_pulse,
         params={"context_term_name": "progress_context"},
-        # Isaac Lab multiplies this weight by the 20 ms policy step, producing
-        # one +2 terminal pulse.
-        weight=100.0,
+        # The reward function cancels RewardManager's step_dt integration, so
+        # this is an exact +2 episode impulse at any policy frequency.
+        weight=2.0,
     )
     failure = RewTerm(
         func=mdp.irrecoverable_stack_failure,
         params={"success_termination_name": "success"},
-        weight=-0.01,
+        # Preserve the established -0.0002 terminal impulse independently of
+        # the policy timestep.
+        weight=-2.0e-4,
     )
     action_l2 = RewTerm(func=mdp.action_term_l2, params={"action_name": "arm_action"}, weight=-1.0e-4)
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1.0e-4)
@@ -99,30 +125,32 @@ class RewardsCfg:
 
 @configclass
 class CurriculumCfg:
-    """Guaranteed table starts plus adaptive epsilon intermediate states."""
+    """Guaranteed table starts plus target-rate intermediate states."""
 
     reset_sampling = CurrTerm(
         func=mdp.StackResetTableCurriculum,
         params={
             "success_context_name": "learning_progress_context",
             "final_success_context_name": "progress_context",
-            # Each physical reset row owns an exact Boolean rolling window. A
-            # Beta kernel concentrates sampling near 50% success while epsilon
-            # keeps every row alive.
-            "monitored_history_len": 50,
-            "target_success_rate": 0.50,
-            "kappa": 1.0,
-            # Preserve a total epsilon pseudocount mass of 3.2768. Scale it
-            # over the 6,786-row table so additional spatial variants do not
-            # silently increase the exploration prior.
-            "epsilon": 4.83e-4,
+            # Use the same shared rolling-success monitor as Lift and the
+            # conveyor task. Its target-rate weights concentrate sampling near
+            # 50% competence while retaining a floor at both extremes.
+            "success_monitor": mdp.SuccessMonitorCfg(
+                monitored_history_len=50,
+                target_success_rate=0.50,
+                kappa=1.0,
+                temperature=1.0,
+            ),
             # Preserve a deployment-facing learning stream regardless of the
             # adaptive intermediate-state distribution. The remaining 65% is
             # sampled from non-table rows by the rolling-success kernel.
             "table_sampling_probability": 0.35,
             # Keep equal layout coverage by default. Experiments can opt into
-            # one flat Beta-plus-epsilon distribution over active rows.
+            # one flat target-rate distribution over active rows.
             "global_sampling": False,
+            # Distillation tasks may reserve a prefix for held-out student
+            # rollouts. Zero keeps every environment in the training sampler.
+            "evaluation_env_count": 0,
         },
     )
 
@@ -149,6 +177,29 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
         # separately instanced visual and collision subtrees. Keep this
         # compatibility override local to the two RL tasks; Kuka inherits it.
         self.scene.table.spawn.rigid_props = [UsdPhysicsRigidBodyCfg(kinematic_enabled=True)]
+        # The Seattle table's authored collision top is 3 mm below its visible
+        # tabletop. Add an invisible native contact surface at visual z=0 so
+        # cubes rest on what the policy and viewer see. The original collider
+        # remains below as a fallback for the rest of the table geometry.
+        self.scene.table_contact_surface = AssetBaseCfg(
+            prim_path="{ENV_REGEX_NS}/TableContactSurface",
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(0.3439, 0.0, -0.02)),
+            spawn=sim_utils.CuboidCfg(
+                size=(1.28, 0.91, 0.04),
+                visible=False,
+                rigid_props=RigidBodyBaseCfg(kinematic_enabled=True),
+                collision_props=CollisionBaseCfg(contact_offset=0.0, rest_offset=0.0),
+                physics_material=NewtonMaterialPropertiesCfg(
+                    static_friction=1.0,
+                    dynamic_friction=0.8,
+                    restitution=0.0,
+                    torsional_friction=0.002,
+                    rolling_friction=0.0001,
+                    contact_stiffness=1.0e4,
+                    contact_damping=200.0,
+                ),
+            ),
+        )
         # Keep physical world gravity enabled for the arm and cubes. The arm
         # action adds Newton's configuration-dependent g(q) as joint-effort
         # feedforward on top of the DexSuite impedance controller.
@@ -204,8 +255,11 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
         self.actions.arm_action = mdp.WorkspaceBoundedRelativeJointPositionActionCfg(
             asset_name="robot",
             joint_names=["panda_joint.*"],
-            scale=0.25,
-            max_delta=0.15,
+            # At 50 Hz, a 0.05 rad measured-state residual caps the commanded
+            # target slew at 2.5 rad/s. MJWarp does not hard-enforce actuator
+            # velocity-limit fields.
+            scale=0.05,
+            max_delta=0.05,
             workspace_lower=FRANKA_STACK_ARM_WORKSPACE_LOWER,
             workspace_upper=FRANKA_STACK_ARM_WORKSPACE_UPPER,
             gravity_compensation=True,
@@ -249,17 +303,19 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
         self.observations.subtask_terms = None
         self.scene.ee_frame = None
 
-        # Keep the default viewer focused on the task workspace.
-        self.viewer.eye = (1.4, 1.4, 0.9)
-        self.viewer.lookat = (0.5, 0.0, 0.1)
-        self.viewer.origin_type = "env"
-        self.viewer.env_index = 0
+        # Provide one backend-neutral camera hint. The selected Kit or Newton
+        # visualizer receives these values at runtime.
+        self.sim.default_visualizer_cfg = VisualizerCfg(
+            eye=(1.4, 1.4, 0.9),
+            lookat=(0.5, 0.0, 0.1),
+        )
 
         # Native cuboids avoid legacy block materials. Their standard geometry
         # owns both collision and rendering; a USD displayColor keeps the
         # colors available in both Kit and kitless Newton visualization.
         cube_colors = ((0.05, 0.15, 0.80), (0.80, 0.05, 0.05), (0.05, 0.65, 0.10))
         for cube, color in zip((self.scene.cube_1, self.scene.cube_2, self.scene.cube_3), cube_colors, strict=True):
+            semantic_tags = cube.spawn.semantic_tags
             cube.spawn = ColoredCuboidCfg(
                 size=(0.04, 0.04, 0.04),
                 display_color=color,
@@ -278,6 +334,7 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
                     contact_stiffness=1.0e4,
                     contact_damping=200.0,
                 ),
+                semantic_tags=semantic_tags,
             )
 
         self.terminations.progress_context = DoneTerm(
@@ -316,6 +373,119 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
         self.terminations.cube_workspace_invalid = DoneTerm(
             func=mdp.cube_out_of_workspace,
         )
+
+    def validate_config(self) -> None:
+        """Validate the resolved Newton stack configuration."""
+        self._validate_physics_contract()
+        self._validate_action_contract()
+        self._validate_scene_contract()
+        self._validate_camera_contract()
+
+    def _validate_physics_contract(self) -> None:
+        """Validate Newton solver, timing, and contact-refresh invariants."""
+        if not isinstance(self.sim.physics, NewtonCfg):
+            raise TypeError("The Franka and KUKA stack RL tasks require the Newton physics backend.")
+        if not isinstance(self.sim.physics.solver_cfg, MJWarpSolverCfg):
+            raise TypeError("The stack RL contact configuration requires the Newton MJWarp solver.")
+        if not self.scene.replicate_physics:
+            raise ValueError("scene.replicate_physics must be enabled for vectorized stack training.")
+
+        _positive_finite(self.sim.dt, "sim.dt")
+        _positive_integer(self.decimation, "decimation")
+        _positive_integer(self.sim.render_interval, "sim.render_interval")
+        if self.sim.render_interval != self.decimation:
+            raise ValueError("sim.render_interval must equal decimation so every policy observation can be rendered.")
+
+        physics = self.sim.physics
+        _positive_integer(physics.num_substeps, "sim.physics.num_substeps")
+        _positive_integer(physics.collision_decimation, "sim.physics.collision_decimation")
+        if physics.collision_decimation > physics.num_substeps:
+            raise ValueError("collision_decimation cannot exceed num_substeps for contact-rich stacking.")
+        _positive_integer(physics.solver_cfg.njmax, "sim.physics.solver_cfg.njmax")
+        _positive_integer(physics.solver_cfg.nconmax, "sim.physics.solver_cfg.nconmax")
+        if physics.solver_cfg.use_mujoco_contacts:
+            raise ValueError("The stack task requires Newton's external collision pipeline for fresh contacts.")
+        for field_name in ("margin", "gap"):
+            value = getattr(physics.default_shape_cfg, field_name)
+            if not math.isfinite(float(value)) or value < 0.0:
+                raise ValueError(f"sim.physics.default_shape_cfg.{field_name} must be finite and non-negative.")
+
+    def _validate_action_contract(self) -> None:
+        """Validate that policy actions map uniquely to physical targets."""
+        arm_action = self.actions.arm_action
+        if not isinstance(arm_action, mdp.WorkspaceBoundedRelativeJointPositionActionCfg):
+            raise TypeError("actions.arm_action must use bounded measured-state relative joint control.")
+        action_scale = _positive_finite(arm_action.scale, "actions.arm_action.scale")
+        maximum_delta = _positive_finite(arm_action.max_delta, "actions.arm_action.max_delta")
+        if action_scale > maximum_delta:
+            raise ValueError(
+                "actions.arm_action.scale cannot exceed max_delta; hidden saturation aliases distinct PPO actions."
+            )
+        if len(arm_action.workspace_lower) != len(arm_action.workspace_upper) or not arm_action.workspace_lower:
+            raise ValueError("The arm workspace bounds must have equal, non-zero lengths.")
+        if any(
+            not math.isfinite(float(lower))
+            or not math.isfinite(float(upper))
+            or lower + arm_action.joint_limit_margin >= upper - arm_action.joint_limit_margin
+            for lower, upper in zip(arm_action.workspace_lower, arm_action.workspace_upper, strict=True)
+        ):
+            raise ValueError("Every arm workspace interval must be finite and wider than twice the joint-limit margin.")
+
+        gripper_action = self.actions.gripper_action
+        if isinstance(gripper_action, mdp.ResetBufferedGripperActionCfg):
+            if (
+                isinstance(gripper_action.force_close_steps, bool)
+                or not isinstance(gripper_action.force_close_steps, int)
+                or gripper_action.force_close_steps < 0
+            ):
+                raise ValueError("actions.gripper_action.force_close_steps must be a non-negative integer.")
+        elif isinstance(gripper_action, mdp.ResetPreservingRelativeJointPositionActionCfg):
+            gripper_scale = _positive_finite(gripper_action.scale, "actions.gripper_action.scale")
+            gripper_maximum_delta = _positive_finite(
+                gripper_action.max_delta,
+                "actions.gripper_action.max_delta",
+            )
+            if gripper_scale > gripper_maximum_delta:
+                raise ValueError(
+                    "actions.gripper_action.scale cannot exceed max_delta; hidden saturation aliases distinct "
+                    "PPO actions."
+                )
+        else:
+            raise TypeError("The stack gripper action must preserve reset-authored grasp state.")
+
+    def _validate_scene_contract(self) -> None:
+        """Validate cube semantics and explicit Newton contact materials."""
+        for cube_name in ("cube_1", "cube_2", "cube_3"):
+            cube = getattr(self.scene, cube_name)
+            if not cube.spawn.semantic_tags:
+                raise ValueError(f"scene.{cube_name}.spawn.semantic_tags must identify the cube for perception tools.")
+            material = cube.spawn.physics_material
+            if not isinstance(material, NewtonMaterialPropertiesCfg):
+                raise TypeError(f"scene.{cube_name} must use an explicit Newton contact material.")
+            _positive_finite(material.contact_stiffness, f"scene.{cube_name}.contact_stiffness")
+            _positive_finite(material.contact_damping, f"scene.{cube_name}.contact_damping")
+
+        table_surface = getattr(self.scene, "table_contact_surface", None)
+        if table_surface is None:
+            raise ValueError("scene.table_contact_surface must align contacts with the visible tabletop.")
+        table_material = table_surface.spawn.physics_material
+        if not isinstance(table_material, NewtonMaterialPropertiesCfg):
+            raise TypeError("scene.table_contact_surface must use an explicit Newton contact material.")
+        _positive_finite(table_material.contact_stiffness, "scene.table_contact_surface.contact_stiffness")
+        _positive_finite(table_material.contact_damping, "scene.table_contact_surface.contact_damping")
+
+    def _validate_camera_contract(self) -> None:
+        """Validate the reset-safe RGB observation cadence when a camera exists."""
+        camera = getattr(self.scene, "base_camera", None)
+        if camera is not None:
+            if camera.update_period != 0.0:
+                raise ValueError("The policy camera update_period must be zero so it refreshes at every render.")
+            _positive_integer(camera.height, "scene.base_camera.height")
+            _positive_integer(camera.width, "scene.base_camera.width")
+            if "rgb" not in camera.data_types:
+                raise ValueError("The camera stack actor requires RGB observations.")
+            if self.num_rerenders_on_reset < 1:
+                raise ValueError("Camera stack tasks require num_rerenders_on_reset >= 1 to avoid stale reset frames.")
 
     def play_mode(self) -> None:
         """Configure randomized table starts for policy evaluation."""

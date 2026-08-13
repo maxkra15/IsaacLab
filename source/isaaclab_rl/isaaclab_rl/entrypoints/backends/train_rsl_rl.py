@@ -69,6 +69,11 @@ def _check_rsl_rl_version() -> str:
     return installed_version
 
 
+def _should_load_checkpoint(resume: bool, runner_class_name: str) -> bool:
+    """Return whether the runner requires an input checkpoint."""
+    return resume or runner_class_name == "DistillationRunner"
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse RSL-RL training arguments."""
     from isaaclab.utils.string import list_intersection, string_to_callable
@@ -178,6 +183,9 @@ def _run(args_cli: argparse.Namespace) -> None:
                 convert_marl_to_single_agent=isinstance(env_cfg, DirectMARLEnvCfg),
             )
 
+            should_load_checkpoint = bool(args_cli.checkpoint) or _should_load_checkpoint(
+                agent_cfg.resume, agent_cfg.class_name
+            )
             if args_cli.checkpoint in CHECKPOINT_SELECTORS:
                 resume_path = resolve_checkpoint_selector(
                     log_root_path,
@@ -195,8 +203,8 @@ def _run(args_cli: argparse.Namespace) -> None:
                 )
             elif args_cli.checkpoint:
                 resume_path = retrieve_file_path(args_cli.checkpoint)
-            elif agent_cfg.algorithm.class_name == "Distillation":
-                raise ValueError("Distillation training requires --checkpoint.")
+            elif should_load_checkpoint:
+                resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
             env = wrap_training_capture(env, log_dir, args_cli)
 
@@ -220,7 +228,7 @@ def _run(args_cli: argparse.Namespace) -> None:
                 configure_seed(env_cfg.seed, torch_deterministic=True)
 
             runner.add_git_repo_to_log(__file__)
-            if args_cli.checkpoint:
+            if should_load_checkpoint:
                 print(f"[INFO]: Loading model checkpoint from: {resume_path}")
                 runner.load(resume_path)
 

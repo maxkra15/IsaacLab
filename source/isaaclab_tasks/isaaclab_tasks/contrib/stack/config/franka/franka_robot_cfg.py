@@ -15,7 +15,10 @@ FRANKA_PANDA_DEXSUITE_CFG.actuators = {
     "panda_arm": ImplicitActuatorCfg(
         joint_names_expr=["panda_joint[1-7]"],
         effort_limit_sim={"panda_joint[1-4]": 87.0, "panda_joint[5-7]": 12.0},
-        velocity_limit_sim={"panda_joint[1-4]": 20.0, "panda_joint[5-7]": 25.0},
+        # Record the Panda's rated joint-speed envelope. MJWarp exposes but
+        # does not enforce these fields; action scaling, gains, effort limits,
+        # and armature determine the live Newton response.
+        velocity_limit_sim={"panda_joint[1-4]": 2.175, "panda_joint[5-7]": 2.61},
         stiffness={
             "panda_joint[1-4]": 600.0,
             "panda_joint5": 250.0,

@@ -207,14 +207,15 @@ def _small_diverse_reset_curriculum():
     )
     curriculum = curriculums.StackResetTableCurriculum.__new__(curriculums.StackResetTableCurriculum)
     curriculum._reset_term = reset_term
-    curriculum._sampler = curriculums._EpsilonResetTableSampler(
-        reset_term.row_count,
-        "cpu",
-        monitored_history_len=4,
-        target_success_rate=0.5,
-        kappa=1.0,
-        epsilon=1.0e-4,
+    curriculum._monitor_cfg = mdp.SuccessMonitorCfg(monitored_history_len=4, target_success_rate=0.5, kappa=1.0)
+    curriculum._progress_monitor = curriculum._monitor_cfg.class_type(
+        curriculum._monitor_cfg,
+        num_partitions=1,
+        partition_size=reset_term.row_count,
+        device="cpu",
     )
+    curriculum._attempts = torch.zeros(reset_term.row_count, dtype=torch.long)
+    curriculum._progress_successes = torch.zeros_like(curriculum._attempts)
     curriculum._table_sampling_probability = 0.35
     curriculum._balance_recipes = True
     curriculum._balance_reset_modes = True
@@ -276,6 +277,8 @@ def test_kuka_allegro_stack_registration_exposes_production_task_only():
     assert agent_cfg.actor.distribution_cfg.class_name.endswith(":KukaAllegroGaussianDistribution")
 
     assert len(env_cfg.actions.arm_action.joint_names) == 1
+    assert env_cfg.actions.arm_action.scale == pytest.approx(0.12)
+    assert env_cfg.actions.arm_action.max_delta == pytest.approx(0.12)
     assert isinstance(env_cfg.actions.gripper_action, ResetPreservingRelativeJointPositionActionCfg)
     assert tuple(env_cfg.actions.gripper_action.joint_names) == KUKA_ALLEGRO_ALL_HAND_JOINT_NAMES
     assert env_cfg.actions.gripper_action.scale == pytest.approx(0.10)
@@ -293,8 +296,8 @@ def test_kuka_allegro_stack_registration_exposes_production_task_only():
     assert 7 + len(env_cfg.actions.gripper_action.joint_names) == 23
     assert env_cfg.rewards.reset_progress.func is mdp.stack_success_pulse
     assert env_cfg.rewards.reset_progress.params == {"context_term_name": "learning_progress_context"}
-    assert env_cfg.rewards.reset_progress.weight == pytest.approx(25.0)
-    assert env_cfg.rewards.success.weight == pytest.approx(100.0)
+    assert env_cfg.rewards.reset_progress.weight == pytest.approx(0.5)
+    assert env_cfg.rewards.success.weight == pytest.approx(2.0)
 
     actuator = env_cfg.scene.robot.actuators["kuka_allegro_actuators"]
     all_hand_expression = "(index|middle|ring|thumb)_joint_(0|1|2|3)"
@@ -309,6 +312,10 @@ def test_kuka_allegro_stack_registration_exposes_production_task_only():
     assert env_cfg.events.reset_from_state_buffer.params["table_arm_joint_noise_range"] == pytest.approx(0.04)
     assert env_cfg.events.reset_from_state_buffer.params["table_target_potential"] == pytest.approx(1.05)
     assert env_cfg.scene.plane is None
+    assert env_cfg.scene.table_contact_surface is not None
+    assert env_cfg.sim.default_visualizer_cfg.eye == (1.5, 1.5, 1.1)
+    assert env_cfg.sim.default_visualizer_cfg.lookat == (0.48, 0.0, 0.18)
+    env_cfg.validate()
     assert env_cfg.observations.policy.object.params["grasp_pair_tool_offsets"] == (
         KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_TOOL_OFFSETS
     )
@@ -379,15 +386,15 @@ def test_full_hand_success_rejects_nearby_fingertips_and_spinning_cubes():
     num_envs = 3
     identity = torch.tensor((0.0, 0.0, 0.0, 1.0)).repeat(num_envs, 1)
     cube_positions = (
-        torch.tensor((0.45, 0.0, 0.037)).repeat(num_envs, 1),
-        torch.tensor((0.45, 0.0, 0.117)).repeat(num_envs, 1),
-        torch.tensor((0.45, 0.0, 0.197)).repeat(num_envs, 1),
+        torch.tensor((0.45, 0.0, 0.040)).repeat(num_envs, 1),
+        torch.tensor((0.45, 0.0, 0.120)).repeat(num_envs, 1),
+        torch.tensor((0.45, 0.0, 0.200)).repeat(num_envs, 1),
     )
     cubes = tuple(_dummy_cube(positions, identity) for positions in cube_positions)
     cubes[0].data.root_vel_w.torch[2, 3] = 2.0
     fingertip_positions = torch.full((num_envs, 4, 3), 0.8)
     # Five millimeters from cube one's +X face is below the 10 mm release margin.
-    fingertip_positions[1, 0] = torch.tensor((0.495, 0.0, 0.037))
+    fingertip_positions[1, 0] = torch.tensor((0.495, 0.0, 0.040))
     scene = {
         "robot": SimpleNamespace(data=SimpleNamespace(body_pos_w=SimpleNamespace(torch=fingertip_positions))),
         **{f"cube_{cube_id + 1}": cube for cube_id, cube in enumerate(cubes)},
@@ -588,18 +595,18 @@ def test_large_cube_reset_geometry_preserves_clearances_and_yaw_safe_layouts():
 
     assert pytest.approx(KUKA_ALLEGRO_LARGE_CUBE_EDGE_LENGTH) == reset_cls._CUBE_HEIGHT
     assert pytest.approx(KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT) == reset_cls._TABLE_HEIGHT
-    assert reset_cls._pick_pregrasp_height() == pytest.approx(0.1965)
-    assert reset_cls._pick_contact_height() == pytest.approx(0.037)
+    assert reset_cls._pick_pregrasp_height() == pytest.approx(0.1995)
+    assert reset_cls._pick_contact_height() == pytest.approx(0.040)
     assert reset_cls._pick_supported_height() == pytest.approx(0.200)
-    assert reset_cls._transport_height(second_pick=False) == pytest.approx(0.1565)
+    assert reset_cls._transport_height(second_pick=False) == pytest.approx(0.1595)
     expected_second_transport_height = (
         reset_cls._table_surface_height() + 0.5 * reset_cls._CUBE_HEIGHT + reset_cls._SECOND_TRANSPORT_BOTTOM_CLEARANCE
     )
     assert reset_cls._transport_height(second_pick=True) == pytest.approx(expected_second_transport_height)
-    assert reset_cls._transport_height(second_pick=True) == pytest.approx(0.2262842712)
-    assert reset_cls._pair_ready_source_height() == pytest.approx(0.1965)
-    assert reset_cls._table_approach_minimum_height() == pytest.approx(0.1965)
-    assert reset_cls._ring_transport_minimum_height() == pytest.approx(0.1115)
+    assert reset_cls._transport_height(second_pick=True) == pytest.approx(0.2292842712)
+    assert reset_cls._pair_ready_source_height() == pytest.approx(0.1995)
+    assert reset_cls._table_approach_minimum_height() == pytest.approx(0.1995)
+    assert reset_cls._ring_transport_minimum_height() == pytest.approx(0.1145)
     assert pytest.approx(torch.deg2rad(torch.tensor(45.0)).item()) == reset_cls._GLOBAL_TILT_LIMIT
     assert pytest.approx(torch.deg2rad(torch.tensor(45.0)).item()) == reset_cls._PLACE_TILT_LIMIT
 
@@ -617,21 +624,10 @@ def test_large_cube_reset_geometry_preserves_clearances_and_yaw_safe_layouts():
 
 
 def test_large_cube_pick_separates_partial_supported_states_from_safe_held_resets():
-    source_positions = torch.tensor(
-        (
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-            (0.50, 0.00, 0.037),
-        )
-    )
     progress = torch.tensor((0.0, 0.25, 0.50, 0.625, 0.70, 0.75, 0.8125, 0.875, 0.9375, 1.0))
+    source_positions = (
+        torch.tensor((0.50, 0.00, KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT)).expand(progress.numel(), -1).clone()
+    )
     ring_pair_ids = torch.full((progress.numel(),), 2, dtype=torch.long)
     large_term = reset_events.LargeCubeDiverseKukaAllegroStackResetStateTable.__new__(
         reset_events.LargeCubeDiverseKukaAllegroStackResetStateTable
@@ -650,7 +646,7 @@ def test_large_cube_pick_separates_partial_supported_states_from_safe_held_reset
     )
     assert torch.allclose(
         targets[:, 2],
-        torch.tensor((0.1965, 0.19825, 0.2000, 0.2000, 0.2000, 0.1050, 0.106625, 0.10825, 0.109875, 0.1115)),
+        torch.tensor((0.1995, 0.19975, 0.2000, 0.2000, 0.2000, 0.1050, 0.107375, 0.10975, 0.112125, 0.1145)),
     )
     assert torch.allclose(
         torch.rad2deg(maximum_tilt),
@@ -674,17 +670,19 @@ def test_full_hand_pick_bridge_is_continuous_and_uses_object_axis_approach():
     reset_cls = reset_events.FullHandLargeCubeDiverseKukaAllegroStackResetStateTable
     term = reset_cls.__new__(reset_cls)
     progress = torch.tensor((0.0, 0.25, 0.50, 0.625, 0.75, 0.875, 1.0))
-    source_positions = torch.tensor((0.50, 0.00, 0.037)).expand(progress.numel(), -1).clone()
+    source_positions = (
+        torch.tensor((0.50, 0.00, KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT)).expand(progress.numel(), -1).clone()
+    )
     pair_ids = torch.zeros(progress.numel(), dtype=torch.long)
 
     targets, closure, held, maximum_tilt = term._pick_phase(source_positions, progress, pair_ids)
 
     assert torch.allclose(closure, torch.tensor((0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0)))
     assert torch.equal(held, torch.tensor((False, False, False, False, True, True, True)))
-    assert targets[3, 2] == pytest.approx(0.0405)
-    assert targets[4, 2] == pytest.approx(0.0405)
-    assert targets[5, 2] == pytest.approx(0.0655)
-    assert targets[6, 2] == pytest.approx(0.1115)
+    assert targets[3, 2] == pytest.approx(0.0435)
+    assert targets[4, 2] == pytest.approx(0.0435)
+    assert targets[5, 2] == pytest.approx(0.0685)
+    assert targets[6, 2] == pytest.approx(0.1145)
     assert torch.allclose(maximum_tilt, torch.zeros_like(maximum_tilt))
 
     term._recipe_ids = torch.full((progress.numel(),), int(reset_events.StackResetRecipe.FIRST_PICK))
@@ -725,7 +723,9 @@ def test_full_hand_pick_bridge_densely_covers_contact_to_retained_lift():
     reset_cls = reset_events.FullHandLargeCubeDiverseKukaAllegroStackResetStateTable
     term = reset_cls.__new__(reset_cls)
     progress = torch.linspace(0.75, 0.875, 33)
-    source_positions = torch.tensor((0.50, 0.00, 0.037)).expand(progress.numel(), -1).clone()
+    source_positions = (
+        torch.tensor((0.50, 0.00, KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT)).expand(progress.numel(), -1).clone()
+    )
     pair_ids = torch.zeros(progress.numel(), dtype=torch.long)
 
     targets, closure, held, maximum_tilt = term._pick_phase(source_positions, progress, pair_ids)
@@ -1239,7 +1239,7 @@ def test_large_cube_pair_rotations_map_nominal_palm_to_upright_cube():
 def test_large_cube_progress_uses_eight_centimeter_stack_spacing():
     positions = torch.tensor(
         (
-            ((0.45, 0.0, 0.037), (0.45, 0.0, 0.117), (0.45, 0.0, 0.197)),
+            ((0.45, 0.0, 0.040), (0.45, 0.0, 0.120), (0.45, 0.0, 0.200)),
             ((0.45, 0.0, 0.0205), (0.45, 0.0, 0.0605), (0.45, 0.0, 0.1005)),
         )
     )
@@ -1376,7 +1376,11 @@ def test_diverse_reset_curriculum_balances_every_authored_reset_mode():
     assert torch.isclose(probabilities[curriculum._table_rows].sum(), torch.tensor(0.35))
     assert torch.isclose(probabilities.sum(), torch.tensor(1.0))
 
-    metrics = curriculum(SimpleNamespace(device="cpu"), torch.empty(0, dtype=torch.long))
+    metrics = curriculum(
+        SimpleNamespace(device="cpu"),
+        torch.empty(0, dtype=torch.long),
+        success_monitor=curriculum._monitor_cfg,
+    )
     assert torch.isclose(metrics["tilt_azimuth_0_probability"], torch.tensor(4 * 0.65 / 5))
     assert torch.isclose(metrics["tilt_azimuth_1_probability"], expected_mode_mass)
     assert torch.isclose(metrics["tilt_azimuth_7_probability"], torch.tensor(0.35))
@@ -1403,13 +1407,18 @@ def test_diverse_reset_curriculum_can_use_global_row_sampling():
 
 def test_diverse_reset_curriculum_reports_tilt_magnitude_metrics():
     curriculum = _small_diverse_reset_curriculum()
-    curriculum._sampler.record(
-        torch.tensor((0, 0, 3, 3, 3, 3, 4, 5, 6)),
-        torch.tensor((True, False, True, True, True, False, False, True, False)),
-    )
+    rows = torch.tensor((0, 0, 3, 3, 3, 3, 4, 5, 6))
+    succeeded = torch.tensor((True, False, True, True, True, False, False, True, False))
+    curriculum._progress_monitor.success_update(rows, succeeded)
+    curriculum._attempts.add_(torch.bincount(rows, minlength=curriculum._reset_term.row_count))
+    curriculum._progress_successes.add_(torch.bincount(rows[succeeded], minlength=curriculum._reset_term.row_count))
     curriculum._full_task_attempts_by_row[3] = 4
     curriculum._full_task_successes_by_row[3] = 3
-    metrics = curriculum(SimpleNamespace(device="cpu"), torch.empty(0, dtype=torch.long))
+    metrics = curriculum(
+        SimpleNamespace(device="cpu"),
+        torch.empty(0, dtype=torch.long),
+        success_monitor=curriculum._monitor_cfg,
+    )
 
     assert metrics["recipe_phase_attempts"] == 9
     assert metrics["recipe_phase_full_stack_attempts"] == 4
