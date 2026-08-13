@@ -19,6 +19,7 @@ from .robot_state import (
     grasp_pair_posture_closure,
     two_finger_posture_closure,
 )
+from .runtime_state import get_stack_reset_runtime_state
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, RigidObject
@@ -547,12 +548,10 @@ def role_conditioned_stack_potential(
     Role zero remains the base while the maximum over ``1→2`` and ``2→1``
     makes the two movable cubes interchangeable.
     """
-    reset_state = getattr(env, "stack_reset_state", None)
-    if reset_state is None and not hasattr(env, "stack_reset_role_to_cube"):
-        raise AttributeError("Role-conditioned stack potential requires stack reset runtime state.")
+    reset_state = get_stack_reset_runtime_state(env)
 
     positions, _ = _order_invariant_cube_state(env, cube_cfgs)
-    role_to_cube = (reset_state.role_to_cube if reset_state is not None else env.stack_reset_role_to_cube).long()
+    role_to_cube = reset_state.role_to_cube.long()
     gather_index = role_to_cube.unsqueeze(-1).expand(-1, -1, 3)
     role_positions = torch.gather(positions, 1, gather_index)
     robot: Articulation = env.scene[robot_cfg.name]

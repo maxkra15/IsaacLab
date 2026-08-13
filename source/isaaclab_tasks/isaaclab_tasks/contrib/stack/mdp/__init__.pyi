@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 __all__ = [
-    "FullHandLargeCubeDiverseKukaAllegroStackResetStateTable",
+    "KukaAllegroResetStateTable",
     "ResetBufferedGripperAction",
     "ResetBufferedGripperActionCfg",
     "ResetPreservingRelativeJointPositionAction",
@@ -36,19 +36,9 @@ __all__ = [
     "franka_ee_axes",
     "franka_ee_position",
     "franka_ee_velocity",
-    "franka_end_effector_pose",
-    "franka_end_effector_velocity",
     "grasp_pair_end_effector_pose",
     "grasp_pair_end_effector_velocity",
     "grasp_pair_gripper_posture",
-    "grasp_pair_joint_pos",
-    "grasp_pair_joint_positions",
-    "grasp_pair_joint_vel",
-    "grasp_pair_joint_velocities",
-    "grasp_pair_one_hot",
-    "grasp_pair_posture_closure",
-    "grasp_pair_tip_positions",
-    "grasp_pair_tip_positions_relative_to_tool",
     "grasp_pair_tool_velocity",
     "gripper_pos",
     "instance_randomize_cube_orientations_in_world_frame",
@@ -66,13 +56,11 @@ __all__ = [
     "randomize_camera_calibration",
     "role_conditioned_cube_x_axes",
     "role_conditioned_stack_obs",
-    "stack_camera_state_target",
     "stack_reset_recipe_one_hot",
     "stack_success_pulse",
     "success_after_minimum_horizon",
     "tool_axes",
     "tool_velocity",
-    "two_finger_gripper_posture",
 ]
 
 from isaaclab_tasks.core.lift.mdp.events_cfg import SuccessMonitorCfg
@@ -102,9 +90,6 @@ from .observations import (
     franka_ee_position,
     franka_ee_velocity,
     grasp_pair_gripper_posture,
-    grasp_pair_joint_pos,
-    grasp_pair_joint_vel,
-    grasp_pair_tip_positions_relative_to_tool,
     grasp_pair_tool_velocity,
     gripper_pos,
     instance_randomize_cube_orientations_in_world_frame,
@@ -116,14 +101,12 @@ from .observations import (
     object_stacked,
     role_conditioned_cube_x_axes,
     role_conditioned_stack_obs,
-    stack_camera_state_target,
     stack_reset_recipe_one_hot,
     tool_axes,
     tool_velocity,
-    two_finger_gripper_posture,
 )
 from .reset_events import (
-    FullHandLargeCubeDiverseKukaAllegroStackResetStateTable,
+    KukaAllegroResetStateTable,
     StackResetRecipe,
     StackResetStateTable,
 )
@@ -137,15 +120,8 @@ from .rewards import (
 from .robot_state import (
     end_effector_pose,
     end_effector_velocity,
-    franka_end_effector_pose,
-    franka_end_effector_velocity,
     grasp_pair_end_effector_pose,
     grasp_pair_end_effector_velocity,
-    grasp_pair_joint_positions,
-    grasp_pair_joint_velocities,
-    grasp_pair_one_hot,
-    grasp_pair_posture_closure,
-    grasp_pair_tip_positions,
 )
 from .runtime_state import StackResetRuntimeState
 from .terminations import (

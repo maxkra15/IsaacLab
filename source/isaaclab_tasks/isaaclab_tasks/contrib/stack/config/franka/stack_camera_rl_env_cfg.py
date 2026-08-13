@@ -150,7 +150,7 @@ class FrankaStackTeacherObservationsCfg(stack_env_cfg.ObservationsCfg.PolicyCfg)
     The inherited term order is intentionally preserved because the teacher's
     empirical normalizer and first MLP layer are tied to this layout. This
     group exists only in the distillation task and is never exposed to the
-    camera student or its RL fine-tuning environment.
+    camera student.
     """
 
     joint_pos = ObsTerm(

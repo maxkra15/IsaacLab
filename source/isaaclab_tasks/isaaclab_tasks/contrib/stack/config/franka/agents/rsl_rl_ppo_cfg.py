@@ -163,23 +163,6 @@ class StackSpatialSoftmaxCNNModelCfg(RslRlCNNModelCfg):
     init_temperature: float = 1.0
 
 
-@configclass
-class StackTeacherControllerAdapterPPOModelCfg(StackSpatialSoftmaxCNNModelCfg):
-    """Fine-tunable counterpart of the distilled visual-state adapter."""
-
-    class_name: str = (
-        "isaaclab_tasks.contrib.stack.config.franka.agents.rsl_rl_distillation_cfg:StackTeacherControllerAdapterModel"
-    )
-    teacher_observation_dim: int = 100
-    controller_hidden_dims: list[int] = [512, 256, 128]
-    passthrough_mappings: tuple[tuple[int, int, int], ...] = ((0, 0, 22), (22, 86, 14))
-    structured_object_state: bool = True
-    student_eef_position_start: int = 36
-    teacher_object_start: int = 22
-    cube_height: float = 0.04
-    freeze_controller: bool = False
-
-
 class StackPPO(PPO):
     """PPO with a read-only post-update KL diagnostic.
 
@@ -191,26 +174,6 @@ class StackPPO(PPO):
     """
 
     kl_measurement_samples = 16_384
-
-    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        """Load PPO checkpoints normally or initialize the actor from distillation.
-
-        A distillation checkpoint intentionally has no compatible critic or
-        PPO optimizer. Loading only ``student_state_dict`` starts camera RL
-        fine-tuning at iteration zero with a fresh asymmetric critic while
-        retaining the complete visual actor and observation normalizer.
-        """
-        if "student_state_dict" not in loaded_dict:
-            return super().load(loaded_dict, load_cfg, strict)
-        if load_cfg is not None:
-            raise ValueError("Explicit load_cfg is not supported when initializing PPO from distillation.")
-        actor_state_dict = {
-            name: parameter
-            for name, parameter in loaded_dict["student_state_dict"].items()
-            if not name.startswith("auxiliary_head.")
-        }
-        self._raw_actor.load_state_dict(actor_state_dict, strict=strict)
-        return False
 
     def update(self) -> dict[str, float]:
         """Update the policy and report its post-update KL divergence."""
@@ -318,23 +281,4 @@ class FrankaStackCameraPPORunnerCfg(FrankaStackPPORunnerCfg):
         num_mini_batches=8,
         learning_rate=7.0e-5,
         schedule="fixed",
-    )
-
-
-@configclass
-class FrankaStackCameraFineTunePPORunnerCfg(FrankaStackCameraPPORunnerCfg):
-    """Camera PPO initialized from a distilled student checkpoint."""
-
-    run_name = "finetune"
-    actor = StackSpatialSoftmaxCNNModelCfg(
-        obs_normalization=True,
-        hidden_dims=[1024, 512, 256],
-        activation="elu",
-        distribution_cfg=StackGaussianDistributionCfg(init_std=0.45),
-        cnn_cfg=StackSpatialSoftmaxCNNModelCfg.CNNCfg(
-            output_channels=[32, 64, 64],
-            kernel_size=[8, 4, 3],
-            stride=[4, 2, 1],
-            activation="elu",
-        ),
     )

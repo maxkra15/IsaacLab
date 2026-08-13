@@ -58,16 +58,6 @@ gym.register(
 )
 
 gym.register(
-    id="IsaacContrib-Stack-Cube-Franka-RL-Camera-Finetune",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.stack_camera_rl_env_cfg:FrankaCubeStackCameraRLEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaStackCameraFineTunePPORunnerCfg",
-    },
-    disable_env_checker=True,
-)
-
-gym.register(
     id="IsaacContrib-Stack-Cube-Instance-Randomize-Franka",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={

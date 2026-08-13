@@ -21,6 +21,7 @@ from .rewards import (
     order_invariant_stack_progress,
     role_conditioned_stack_potential,
 )
+from .runtime_state import get_stack_reset_runtime_state
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
@@ -316,11 +317,8 @@ class StackResetLearningProgress(_StackSuccessContext):
             **getattr(self, "_potential_kwargs", {}),
         )
         self._initial_potential[env_ids] = initial[env_ids]
-        reset_state = getattr(self._env, "stack_reset_state", None)
-        target_potentials = (
-            reset_state.target_potentials if reset_state is not None else self._env.stack_reset_target_potentials
-        )
-        row_target = target_potentials[env_ids]
+        reset_state = get_stack_reset_runtime_state(self._env)
+        row_target = reset_state.target_potentials[env_ids]
         self._target_potential[env_ids] = torch.maximum(
             row_target,
             initial[env_ids] + 0.25,

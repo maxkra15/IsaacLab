@@ -82,15 +82,3 @@ class WorkspaceBoundedRelativeJointPositionActionCfg(JointActionCfg):
 
     gravity_compensation: bool = False
     """Whether to add model-based gravity feedforward to the controlled joints."""
-
-    grasp_close_interlock_steps: int = 0
-    """Number of policy steps that hold the arm still while a nearby grasp closes."""
-
-    grasp_close_distance: float = 0.04
-    """Maximum tool-to-cube distance that activates the close interlock [m]."""
-
-    grasp_cube_names: tuple[str, ...] = ("cube_2", "cube_3")
-    """Scene entities that can activate the close interlock."""
-
-    gripper_action_index: int = -1
-    """Index of the binary gripper command in the complete action vector."""

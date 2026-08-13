@@ -14,6 +14,8 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import math as math_utils
 
+from .runtime_state import get_stack_reset_runtime_state
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
     from isaaclab.envs import ManagerBasedRLEnv
@@ -21,59 +23,30 @@ if TYPE_CHECKING:
 
 def _active_grasp_pair_ids(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return the episode-long active grasp-pair indices."""
-    reset_state = getattr(env, "stack_reset_state", None)
-    if reset_state is not None:
-        return reset_state.grasp_pair_ids.long()
-    pair_ids = getattr(env, "stack_reset_grasp_pair_ids", None)
-    if pair_ids is None:
-        raise AttributeError("Pair-conditioned hand state requires stack reset grasp-pair metadata.")
-    return pair_ids.long()
-
-
-def grasp_pair_one_hot(
-    env: ManagerBasedRLEnv,
-    num_pairs: int = 3,
-) -> torch.Tensor:
-    """Return the episode's selected grasp pair as a one-hot observation."""
-    if num_pairs < 1:
-        raise ValueError("num_pairs must be positive.")
-    pair_ids = _active_grasp_pair_ids(env)
-    if torch.any((pair_ids < 0) | (pair_ids >= num_pairs)):
-        invalid_ids = torch.unique(pair_ids[(pair_ids < 0) | (pair_ids >= num_pairs)]).tolist()
-        raise ValueError(f"Grasp-pair IDs must lie in [0, {num_pairs - 1}]; found {invalid_ids}.")
-    return torch.nn.functional.one_hot(pair_ids, num_classes=num_pairs).to(dtype=torch.float32)
+    return get_stack_reset_runtime_state(env).grasp_pair_ids.long()
 
 
 def _resolve_grasp_pair_entity_ids(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg,
     names_by_pair: tuple[tuple[str, ...], ...],
-    *,
-    entity_type: str,
 ) -> tuple[Articulation, torch.Tensor]:
-    """Resolve and cache an equally sized joint or body selection per pair."""
+    """Resolve and cache an equally sized joint selection per pair."""
     robot: Articulation = env.scene[robot_cfg.name]
     cache = getattr(env, "_stack_grasp_pair_entity_cache", None)
     if cache is None:
         cache = {}
         env._stack_grasp_pair_entity_cache = cache
-    cache_key = (robot_cfg.name, entity_type, names_by_pair)
+    cache_key = (robot_cfg.name, names_by_pair)
     entity_ids = cache.get(cache_key)
     if entity_ids is None:
         if len(names_by_pair) < 1:
             raise ValueError("At least one grasp pair must be configured.")
         resolved: list[list[int]] = []
         for names in names_by_pair:
-            if entity_type == "joint":
-                ids, _ = robot.find_joints(names, preserve_order=True)
-            elif entity_type == "body":
-                ids, _ = robot.find_bodies(names, preserve_order=True)
-            else:
-                raise ValueError(f"Unsupported grasp-pair entity type: {entity_type}.")
+            ids, _ = robot.find_joints(names, preserve_order=True)
             if len(ids) != len(names):
-                raise ValueError(
-                    f"Grasp pair {names} resolved to {len(ids)} {entity_type}s; expected exactly {len(names)}."
-                )
+                raise ValueError(f"Grasp pair {names} resolved to {len(ids)} joints; expected exactly {len(names)}.")
             resolved.append(ids)
         widths = {len(ids) for ids in resolved}
         if len(widths) != 1:
@@ -110,7 +83,8 @@ def _grasp_pair_value_table(
 def grasp_pair_joint_positions(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    joint_names_by_pair: tuple[tuple[str, ...], ...] | None = None,
+    *,
+    joint_names_by_pair: tuple[tuple[str, ...], ...],
 ) -> torch.Tensor:
     """Return active two-finger joint positions in canonical pair-role order.
 
@@ -119,38 +93,9 @@ def grasp_pair_joint_positions(
     while this semantic ordering keeps the policy interface fixed at eight
     entries as the physical opposing finger changes.
     """
-    if joint_names_by_pair is None:
-        from .kuka_allegro_reset import KUKA_ALLEGRO_GRASP_PAIR_JOINT_NAMES
-
-        joint_names_by_pair = KUKA_ALLEGRO_GRASP_PAIR_JOINT_NAMES
-    robot, joint_ids_by_pair = _resolve_grasp_pair_entity_ids(
-        env,
-        robot_cfg,
-        joint_names_by_pair,
-        entity_type="joint",
-    )
+    robot, joint_ids_by_pair = _resolve_grasp_pair_entity_ids(env, robot_cfg, joint_names_by_pair)
     joint_ids = _gather_active_pair_rows(joint_ids_by_pair, _active_grasp_pair_ids(env))
     return torch.gather(robot.data.joint_pos.torch, 1, joint_ids)
-
-
-def grasp_pair_joint_velocities(
-    env: ManagerBasedRLEnv,
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    joint_names_by_pair: tuple[tuple[str, ...], ...] | None = None,
-) -> torch.Tensor:
-    """Return active two-finger joint velocities in canonical pair-role order."""
-    if joint_names_by_pair is None:
-        from .kuka_allegro_reset import KUKA_ALLEGRO_GRASP_PAIR_JOINT_NAMES
-
-        joint_names_by_pair = KUKA_ALLEGRO_GRASP_PAIR_JOINT_NAMES
-    robot, joint_ids_by_pair = _resolve_grasp_pair_entity_ids(
-        env,
-        robot_cfg,
-        joint_names_by_pair,
-        entity_type="joint",
-    )
-    joint_ids = _gather_active_pair_rows(joint_ids_by_pair, _active_grasp_pair_ids(env))
-    return torch.gather(robot.data.joint_vel.torch, 1, joint_ids)
 
 
 def two_finger_posture_closure(
@@ -209,25 +154,13 @@ def two_finger_posture_closure(
 def grasp_pair_posture_closure(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    joint_names_by_pair: tuple[tuple[str, ...], ...] | None = None,
-    open_joint_positions_by_pair: tuple[tuple[float, ...], ...] | None = None,
-    closed_joint_positions_by_pair: tuple[tuple[float, ...], ...] | None = None,
+    *,
+    joint_names_by_pair: tuple[tuple[str, ...], ...],
+    open_joint_positions_by_pair: tuple[tuple[float, ...], ...],
+    closed_joint_positions_by_pair: tuple[tuple[float, ...], ...],
     finger_joint_counts: tuple[int, int] = (4, 4),
 ) -> torch.Tensor:
     """Return the two closure projections for each environment's active pair."""
-    if joint_names_by_pair is None:
-        from .kuka_allegro_reset import KUKA_ALLEGRO_GRASP_PAIR_JOINT_NAMES
-
-        joint_names_by_pair = KUKA_ALLEGRO_GRASP_PAIR_JOINT_NAMES
-    if open_joint_positions_by_pair is None:
-        from .kuka_allegro_reset import KUKA_ALLEGRO_GRASP_PAIR_OPEN_POSES
-
-        open_joint_positions_by_pair = KUKA_ALLEGRO_GRASP_PAIR_OPEN_POSES
-    if closed_joint_positions_by_pair is None:
-        from .kuka_allegro_reset import KUKA_ALLEGRO_GRASP_PAIR_CLOSED_POSES
-
-        closed_joint_positions_by_pair = KUKA_ALLEGRO_GRASP_PAIR_CLOSED_POSES
-
     joint_positions = grasp_pair_joint_positions(
         env,
         robot_cfg=robot_cfg,
@@ -325,17 +258,14 @@ def grasp_pair_end_effector_pose(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     body_name: str = "palm_link",
-    tool_offsets_by_pair: tuple[tuple[float, float, float], ...] | None = None,
+    *,
+    tool_offsets_by_pair: tuple[tuple[float, float, float], ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the active grasp pair's tool-center pose.
 
     Pair-specific offsets account for the different opposing-finger geometry
     without changing the six-dimensional palm orientation representation.
     """
-    if tool_offsets_by_pair is None:
-        from .kuka_allegro_reset import KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS
-
-        tool_offsets_by_pair = KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS
     robot, body_id, _ = _end_effector_cache_entry(env, robot_cfg, body_name, (0.0, 0.0, 0.0))
     body_position = robot.data.body_pos_w.torch[:, body_id]
     body_orientation = robot.data.body_quat_w.torch[:, body_id]
@@ -351,13 +281,10 @@ def grasp_pair_end_effector_velocity(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     body_name: str = "palm_link",
-    tool_offsets_by_pair: tuple[tuple[float, float, float], ...] | None = None,
+    *,
+    tool_offsets_by_pair: tuple[tuple[float, float, float], ...],
 ) -> torch.Tensor:
     """Return active grasp-pair tool-center linear/angular velocity."""
-    if tool_offsets_by_pair is None:
-        from .kuka_allegro_reset import KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS
-
-        tool_offsets_by_pair = KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS
     robot, body_id, _ = _end_effector_cache_entry(env, robot_cfg, body_name, (0.0, 0.0, 0.0))
     body_orientation = robot.data.body_quat_w.torch[:, body_id]
     body_velocity = robot.data.body_vel_w.torch[:, body_id]
@@ -368,70 +295,3 @@ def grasp_pair_end_effector_velocity(
     offset_world = math_utils.quat_apply(body_orientation, offsets)
     linear_velocity = body_velocity[:, :3] + torch.linalg.cross(body_velocity[:, 3:], offset_world)
     return torch.cat((linear_velocity, body_velocity[:, 3:]), dim=1)
-
-
-def grasp_pair_tip_positions(
-    env: ManagerBasedRLEnv,
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    tip_body_names_by_pair: tuple[tuple[str, ...], ...] | None = None,
-    tool_body_name: str = "palm_link",
-    tool_offsets_by_pair: tuple[tuple[float, float, float], ...] | None = None,
-) -> torch.Tensor:
-    """Return active opposing-finger/thumb tips relative to their tool center.
-
-    The result always contains six values in ``opposing tip, thumb tip`` order,
-    independent of whether index, middle, or ring is active.
-    """
-    if tip_body_names_by_pair is None:
-        from .kuka_allegro_reset import KUKA_ALLEGRO_GRASP_PAIR_BODY_NAMES
-
-        tip_body_names_by_pair = KUKA_ALLEGRO_GRASP_PAIR_BODY_NAMES
-    robot, body_ids_by_pair = _resolve_grasp_pair_entity_ids(
-        env,
-        robot_cfg,
-        tip_body_names_by_pair,
-        entity_type="body",
-    )
-    body_ids = _gather_active_pair_rows(body_ids_by_pair, _active_grasp_pair_ids(env))
-    body_positions = torch.gather(
-        robot.data.body_pos_w.torch,
-        1,
-        body_ids.unsqueeze(-1).expand(-1, -1, 3),
-    )
-    tool_position, _ = grasp_pair_end_effector_pose(
-        env,
-        robot_cfg=robot_cfg,
-        body_name=tool_body_name,
-        tool_offsets_by_pair=tool_offsets_by_pair,
-    )
-    return (body_positions - tool_position.unsqueeze(1)).flatten(start_dim=1)
-
-
-def franka_end_effector_pose(
-    env: ManagerBasedRLEnv,
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    hand_body_name: str = "panda_hand",
-    hand_offset: tuple[float, float, float] = (0.0, 0.0, 0.1034),
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the Franka tool-center pose using the legacy argument names."""
-    return end_effector_pose(
-        env,
-        robot_cfg=robot_cfg,
-        body_name=hand_body_name,
-        body_offset=hand_offset,
-    )
-
-
-def franka_end_effector_velocity(
-    env: ManagerBasedRLEnv,
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    hand_body_name: str = "panda_hand",
-    hand_offset: tuple[float, float, float] = (0.0, 0.0, 0.1034),
-) -> torch.Tensor:
-    """Return the Franka tool-center velocity using the legacy argument names."""
-    return end_effector_velocity(
-        env,
-        robot_cfg=robot_cfg,
-        body_name=hand_body_name,
-        body_offset=hand_offset,
-    )

@@ -53,279 +53,6 @@ class StackDistillationDistributionCfg(StackGaussianDistributionCfg):
     )
 
 
-class _TeacherControllerAdapter(nn.Module):
-    """Map camera features into the frozen teacher's normalized state space.
-
-    Values measured on the real robot are copied into their exact teacher
-    slots and normalized with the teacher checkpoint's statistics. The visual
-    adapter predicts only the remaining simulator-state slots.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        teacher_observation_dim: int,
-        output_dim: int,
-        adapter_hidden_dims: tuple[int, ...] | list[int],
-        controller_hidden_dims: tuple[int, ...] | list[int],
-        passthrough_mappings: tuple[tuple[int, int, int], ...] | list[tuple[int, int, int]],
-        structured_object_state: bool = False,
-        student_eef_position_start: int = 0,
-        teacher_object_start: int = 0,
-        cube_height: float = 0.04,
-        activation: str = "elu",
-        freeze_controller: bool = True,
-    ) -> None:
-        super().__init__()
-        student_indices: list[int] = []
-        teacher_indices: list[int] = []
-        for student_start, teacher_start, length in passthrough_mappings:
-            if student_start < 0 or teacher_start < 0 or length <= 0:
-                raise ValueError("Passthrough mappings must contain non-negative starts and positive lengths.")
-            if student_start + length > input_dim or teacher_start + length > teacher_observation_dim:
-                raise ValueError("A passthrough mapping lies outside the student or teacher observation vector.")
-            student_indices.extend(range(student_start, student_start + length))
-            teacher_indices.extend(range(teacher_start, teacher_start + length))
-        if len(set(student_indices)) != len(student_indices) or len(set(teacher_indices)) != len(teacher_indices):
-            raise ValueError("Passthrough mappings must not overlap.")
-        missing_indices = [index for index in range(teacher_observation_dim) if index not in set(teacher_indices)]
-        if not missing_indices:
-            raise ValueError("The visual adapter must predict at least one teacher observation.")
-        self.structured_object_state = bool(structured_object_state)
-        self.student_eef_position_start = int(student_eef_position_start)
-        self.teacher_object_start = int(teacher_object_start)
-        self.cube_height = float(cube_height)
-        if self.structured_object_state:
-            expected_object_indices = list(range(self.teacher_object_start, self.teacher_object_start + 64))
-            if missing_indices != expected_object_indices:
-                raise ValueError("Structured object reconstruction requires one contiguous 64-value teacher block.")
-            if self.student_eef_position_start < 0 or self.student_eef_position_start + 3 > input_dim:
-                raise ValueError("student_eef_position_start does not select a three-value student input.")
-            # The network estimates only independent primitives: three cube
-            # positions, three up axes, three spatial velocities, and progress.
-            visual_target_indices = [
-                *range(self.teacher_object_start, self.teacher_object_start + 9),
-                *range(self.teacher_object_start + 18, self.teacher_object_start + 45),
-                self.teacher_object_start + 63,
-            ]
-        else:
-            visual_target_indices = missing_indices
-
-        self.state_adapter = MLP(
-            input_dim,
-            len(visual_target_indices),
-            adapter_hidden_dims,
-            activation,
-        )
-        self.controller = MLP(
-            teacher_observation_dim,
-            output_dim,
-            controller_hidden_dims,
-            activation,
-        )
-        self.freeze_controller = bool(freeze_controller)
-        self.controller.requires_grad_(not self.freeze_controller)
-        self.register_buffer("student_passthrough_indices", torch.tensor(student_indices, dtype=torch.long))
-        self.register_buffer("teacher_passthrough_indices", torch.tensor(teacher_indices, dtype=torch.long))
-        self.register_buffer("teacher_missing_indices", torch.tensor(missing_indices, dtype=torch.long))
-        self.register_buffer("teacher_visual_target_indices", torch.tensor(visual_target_indices, dtype=torch.long))
-        self.register_buffer("teacher_observation_mean", torch.zeros(teacher_observation_dim))
-        self.register_buffer("teacher_observation_std", torch.ones(teacher_observation_dim))
-        self.register_buffer("teacher_normalization_eps", torch.tensor(1.0e-2))
-        self.register_buffer("teacher_normalizer_initialized", torch.tensor(False))
-        self.register_buffer("controller_initialized", torch.tensor(False))
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """Run the learned state adapter followed by the copied teacher controller."""
-        return self.controller(self.predict_teacher_state(latent))
-
-    def predict_teacher_state(self, latent: torch.Tensor) -> torch.Tensor:
-        """Assemble the exact normalized vector consumed by the state teacher."""
-        predicted_visual_state = self.state_adapter(latent)
-        if self.structured_object_state:
-            predicted_state = self._reconstruct_normalized_object_state(latent, predicted_visual_state)
-        else:
-            predicted_state = predicted_visual_state
-        teacher_state = latent.new_zeros((*latent.shape[:-1], self.teacher_observation_mean.numel()))
-        teacher_state.index_copy_(-1, self.teacher_missing_indices, predicted_state)
-        if self.student_passthrough_indices.numel() > 0:
-            if not bool(self.teacher_normalizer_initialized):
-                raise RuntimeError("Teacher normalization must be initialized before using proprioception passthrough.")
-            raw_values = latent.index_select(-1, self.student_passthrough_indices)
-            mean = self.teacher_observation_mean.index_select(0, self.teacher_passthrough_indices)
-            std = self.teacher_observation_std.index_select(0, self.teacher_passthrough_indices)
-            normalized_values = (raw_values - mean) / (std + self.teacher_normalization_eps)
-            teacher_state.index_copy_(-1, self.teacher_passthrough_indices, normalized_values)
-        return teacher_state
-
-    def _reconstruct_normalized_object_state(
-        self,
-        latent: torch.Tensor,
-        normalized_primitives: torch.Tensor,
-    ) -> torch.Tensor:
-        """Rebuild the teacher's redundant 64-value object block analytically."""
-        primitive_indices = self.teacher_visual_target_indices
-        mean = self.teacher_observation_mean.index_select(0, primitive_indices)
-        std = self.teacher_observation_std.index_select(0, primitive_indices)
-        raw_primitives = normalized_primitives * (std + self.teacher_normalization_eps) + mean
-
-        positions = raw_primitives[..., :9].reshape(*raw_primitives.shape[:-1], 3, 3)
-        up_axes = raw_primitives[..., 9:18].reshape(*raw_primitives.shape[:-1], 3, 3)
-        velocities = raw_primitives[..., 18:36].reshape(*raw_primitives.shape[:-1], 3, 6)
-        progress = raw_primitives[..., 36:37].clamp(0.0, 1.0)
-        tool_position = latent[..., self.student_eef_position_start : self.student_eef_position_start + 3]
-        tool_relative = positions - tool_position.unsqueeze(-2)
-
-        vertical_offset = positions.new_tensor((0.0, 0.0, self.cube_height))
-        pair_errors = []
-        for upper_id in range(3):
-            for lower_id in range(3):
-                if upper_id != lower_id:
-                    pair_errors.append(positions[..., lower_id, :] + vertical_offset - positions[..., upper_id, :])
-        raw_object_state = torch.cat(
-            (
-                positions.flatten(start_dim=-2),
-                tool_relative.flatten(start_dim=-2),
-                up_axes.flatten(start_dim=-2),
-                velocities.flatten(start_dim=-2),
-                torch.cat(pair_errors, dim=-1),
-                progress,
-            ),
-            dim=-1,
-        )
-        object_indices = self.teacher_missing_indices
-        object_mean = self.teacher_observation_mean.index_select(0, object_indices)
-        object_std = self.teacher_observation_std.index_select(0, object_indices)
-        return (raw_object_state - object_mean) / (object_std + self.teacher_normalization_eps)
-
-    def predict_visual_state(self, latent: torch.Tensor) -> torch.Tensor:
-        """Predict only the teacher values unavailable from real proprioception."""
-        return self.state_adapter(latent)
-
-    def select_visual_target(self, normalized_teacher_state: torch.Tensor) -> torch.Tensor:
-        """Select the simulator-state targets corresponding to the visual head."""
-        return normalized_teacher_state.index_select(-1, self.teacher_visual_target_indices)
-
-    def initialize_teacher_normalizer(self, teacher: MLPModel) -> None:
-        """Copy normalization statistics required by the passthrough slots."""
-        if self.student_passthrough_indices.numel() == 0 and not self.structured_object_state:
-            self.teacher_normalizer_initialized.fill_(True)
-            return
-        normalizer = teacher.obs_normalizer
-        if not all(hasattr(normalizer, name) for name in ("mean", "std", "eps")):
-            raise TypeError("Proprioception passthrough requires a normalized teacher observation model.")
-        mean = normalizer.mean.reshape(-1)
-        std = normalizer.std.reshape(-1)
-        if mean.numel() != self.teacher_observation_mean.numel() or std.numel() != mean.numel():
-            raise ValueError("Teacher normalization statistics do not match teacher_observation_dim.")
-        self.teacher_observation_mean.copy_(mean)
-        self.teacher_observation_std.copy_(std)
-        self.teacher_normalization_eps.fill_(float(normalizer.eps))
-        self.teacher_normalizer_initialized.fill_(True)
-
-
-class StackTeacherControllerAdapterModel(SpatialSoftmaxCNNModel):
-    """Deployable visual adapter backed by a copied state-teacher controller.
-
-    Direct action cloning asks a randomly initialized camera policy to relearn
-    perception and the entire long-horizon controller simultaneously. This
-    model instead predicts the teacher's normalized state vector and feeds it
-    through an exact frozen copy of the proven controller. The only trainable
-    distillation path is therefore the deployable RGB-plus-proprio adapter.
-    """
-
-    def __init__(
-        self,
-        obs: TensorDict,
-        obs_groups: dict[str, list[str]],
-        obs_set: str,
-        output_dim: int,
-        hidden_dims: tuple[int, ...] | list[int] = (512, 512, 256),
-        activation: str = "elu",
-        obs_normalization: bool = False,
-        distribution_cfg: dict | None = None,
-        cnn_cfg: dict | None = None,
-        init_temperature: float = 1.0,
-        teacher_observation_dim: int = 100,
-        controller_hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
-        passthrough_mappings: tuple[tuple[int, int, int], ...] | list[tuple[int, int, int]] = (),
-        structured_object_state: bool = False,
-        student_eef_position_start: int = 0,
-        teacher_object_start: int = 0,
-        cube_height: float = 0.04,
-        freeze_controller: bool = True,
-    ) -> None:
-        if teacher_observation_dim <= 0:
-            raise ValueError("teacher_observation_dim must be positive.")
-        if passthrough_mappings and obs_normalization:
-            raise ValueError(
-                "Student observation normalization must be disabled when raw proprioception is passed through."
-            )
-        super().__init__(
-            obs,
-            obs_groups,
-            obs_set,
-            output_dim,
-            hidden_dims=hidden_dims,
-            activation=activation,
-            obs_normalization=obs_normalization,
-            distribution_cfg=distribution_cfg,
-            cnn_cfg=cnn_cfg,
-            init_temperature=init_temperature,
-        )
-        self.teacher_observation_dim = int(teacher_observation_dim)
-        self.mlp = _TeacherControllerAdapter(
-            self._get_latent_dim(),
-            self.teacher_observation_dim,
-            output_dim,
-            hidden_dims,
-            controller_hidden_dims,
-            passthrough_mappings,
-            structured_object_state,
-            student_eef_position_start,
-            teacher_object_start,
-            cube_height,
-            activation,
-            freeze_controller,
-        )
-
-    def initialize_teacher_controller(self, teacher: MLPModel) -> None:
-        """Copy and freeze the controller MLP from the loaded state teacher."""
-        self.mlp.controller.load_state_dict(teacher.mlp.state_dict(), strict=True)
-        self.mlp.initialize_teacher_normalizer(teacher)
-        self.mlp.controller.requires_grad_(not self.mlp.freeze_controller)
-        self.mlp.controller_initialized.fill_(True)
-
-    def predict_visual_state(self, latent: torch.Tensor) -> torch.Tensor:
-        """Predict normalized teacher values unavailable from proprioception."""
-        return self.mlp.predict_visual_state(latent)
-
-    def select_visual_target(self, normalized_teacher_state: torch.Tensor) -> torch.Tensor:
-        """Select the matching visual-supervision values from teacher state."""
-        return self.mlp.select_visual_target(normalized_teacher_state)
-
-
-@configclass
-class StackTeacherControllerAdapterModelCfg(StackSpatialSoftmaxCNNModelCfg):
-    """Camera adapter that reuses the proven state-controller MLP."""
-
-    class_name: str = (
-        "isaaclab_tasks.contrib.stack.config.franka.agents.rsl_rl_distillation_cfg:StackTeacherControllerAdapterModel"
-    )
-    teacher_observation_dim: int = 100
-    controller_hidden_dims: list[int] = [512, 256, 128]
-    # Student policy: actions[0:8], arm q[8:15], arm qd[15:22],
-    # gripper[22:24], end-effector velocity[24:30], and axes[30:36].
-    # Teacher: the first 22 are identical, followed by the 64-value object
-    # state, then the same remaining 14 deployable values at [86:100].
-    passthrough_mappings: tuple[tuple[int, int, int], ...] = ((0, 0, 22), (22, 86, 14))
-    structured_object_state: bool = True
-    student_eef_position_start: int = 36
-    teacher_object_start: int = 22
-    cube_height: float = 0.04
-    freeze_controller: bool = True
-
-
 class StackVisualDistillationModel(SpatialSoftmaxCNNModel):
     """Direct visual behavior-cloning policy with physical-state supervision.
 
@@ -402,11 +129,9 @@ class StackVisualDistillationModelCfg(StackSpatialSoftmaxCNNModelCfg):
 class StackDistillation(Distillation):
     """Feedback-controlled DAgger for the direct visual student policy.
 
-    Teacher-only behavior cloning provides a short warm-up. A small, fixed
-    target fraction of student-controlled states is then collected with
-    teacher labels; this is essential for correcting behavior-cloning
-    covariate shift. Held-out easy-reset success gates only the subsequent
-    increase in student-state occupancy. Independent per-step controller
+    Teacher-only behavior cloning provides a short warm-up. A fixed fraction
+    of student-controlled states is then collected with teacher labels; this
+    corrects behavior-cloning covariate shift. Independent per-step controller
     mixing gives the requested occupancy without bias from unequal episode
     lengths, while evaluation environments remain student-controlled for
     complete episodes.
@@ -423,15 +148,7 @@ class StackDistillation(Distillation):
         teacher: MLPModel,
         storage: RolloutStorage,
         teacher_pretrain_updates: int = 40,
-        dagger_gate_recipe_ids: tuple[int, ...] = (0,),
-        dagger_gate_success_rate: float = 0.95,
-        dagger_gate_min_attempts: int = 32,
-        dagger_success_gate: bool = False,
-        student_control_fraction_start: float = 0.25,
-        student_control_fraction_end: float = 0.25,
-        student_control_anneal_updates: int = 900,
-        student_control_feedback_gain: float = 0.5,
-        stepwise_student_control: bool = True,
+        student_control_fraction: float = 0.25,
         evaluation_success_ema_alpha: float = 0.25,
         arm_loss_weight: float = 1.0,
         gripper_loss_weight: float = 1.0,
@@ -454,7 +171,6 @@ class StackDistillation(Distillation):
         recipe_balance: bool = True,
         table_recipe_weight: float = 3.0,
         student_state_loss_weight: float = 3.0,
-        controller_warmup_updates: int = 40,
         distillation_context_obs_group: str = "distillation_context",
         table_recipe_id: int = 8,
         schedule: str = "fixed",
@@ -468,18 +184,8 @@ class StackDistillation(Distillation):
         super().__init__(student, teacher, storage, **kwargs)
         if teacher_pretrain_updates < 0:
             raise ValueError("teacher_pretrain_updates must be non-negative.")
-        if not dagger_gate_recipe_ids:
-            raise ValueError("dagger_gate_recipe_ids must not be empty.")
-        if not 0.0 < dagger_gate_success_rate <= 1.0:
-            raise ValueError("dagger_gate_success_rate must be in (0, 1].")
-        if dagger_gate_min_attempts <= 0:
-            raise ValueError("dagger_gate_min_attempts must be positive.")
-        if not 0.0 < student_control_fraction_start <= student_control_fraction_end <= 1.0:
-            raise ValueError("Student-control fractions must satisfy 0 < start <= end <= 1.")
-        if student_control_anneal_updates <= 0:
-            raise ValueError("student_control_anneal_updates must be positive.")
-        if not 0.0 < student_control_feedback_gain <= 1.0:
-            raise ValueError("student_control_feedback_gain must be in (0, 1].")
+        if not 0.0 < student_control_fraction <= 1.0:
+            raise ValueError("student_control_fraction must be in (0, 1].")
         if not 0.0 < evaluation_success_ema_alpha <= 1.0:
             raise ValueError("evaluation_success_ema_alpha must be in (0, 1].")
         if arm_loss_weight <= 0.0 or gripper_loss_weight <= 0.0 or auxiliary_loss_weight < 0.0:
@@ -494,9 +200,8 @@ class StackDistillation(Distillation):
             or not 0 <= table_recipe_id < recipe_count
             or table_recipe_weight <= 0.0
             or student_state_loss_weight < 1.0
-            or controller_warmup_updates < 0
         ):
-            raise ValueError("Recipe, loss-weight, or controller-warm-up settings are inconsistent.")
+            raise ValueError("Recipe and loss-weight settings are inconsistent.")
         if evaluation_envs_per_recipe <= 0:
             raise ValueError("evaluation_envs_per_recipe must be positive.")
         if schedule not in ("fixed", "adaptive"):
@@ -521,22 +226,8 @@ class StackDistillation(Distillation):
             raise ValueError("StackDistillation currently supports only feed-forward teacher and student models.")
         if auxiliary_loss_weight > 0.0 and not callable(getattr(self.student, "predict_visual_state", None)):
             raise TypeError("Auxiliary supervision requires a student with predict_visual_state().")
-        if any(not 0 <= recipe < recipe_count for recipe in dagger_gate_recipe_ids):
-            raise ValueError("dagger_gate_recipe_ids contains an invalid recipe.")
-        initialize_controller = getattr(self.student, "initialize_teacher_controller", None)
-        if callable(initialize_controller):
-            initialize_controller(self.teacher)
-
         self.teacher_pretrain_updates = int(teacher_pretrain_updates)
-        self.dagger_gate_recipe_ids = tuple(int(recipe) for recipe in dagger_gate_recipe_ids)
-        self.dagger_gate_success_rate = float(dagger_gate_success_rate)
-        self.dagger_gate_min_attempts = int(dagger_gate_min_attempts)
-        self.dagger_success_gate = bool(dagger_success_gate)
-        self.student_control_fraction_start = float(student_control_fraction_start)
-        self.student_control_fraction_end = float(student_control_fraction_end)
-        self.student_control_anneal_updates = int(student_control_anneal_updates)
-        self.student_control_feedback_gain = float(student_control_feedback_gain)
-        self.stepwise_student_control = bool(stepwise_student_control)
+        self.student_control_fraction = float(student_control_fraction)
         self.evaluation_success_ema_alpha = float(evaluation_success_ema_alpha)
         self.arm_loss_weight = float(arm_loss_weight)
         self.gripper_loss_weight = float(gripper_loss_weight)
@@ -550,7 +241,6 @@ class StackDistillation(Distillation):
         self.recipe_balance = bool(recipe_balance)
         self.table_recipe_weight = float(table_recipe_weight)
         self.student_state_loss_weight = float(student_state_loss_weight)
-        self.controller_warmup_updates = int(controller_warmup_updates)
         self.distillation_context_obs_group = distillation_context_obs_group
         self.table_recipe_id = int(table_recipe_id)
         self.schedule = schedule
@@ -559,12 +249,8 @@ class StackDistillation(Distillation):
         self.adaptive_learning_rate_max = float(adaptive_learning_rate_max)
         self.adaptive_learning_rate_factor = float(adaptive_learning_rate_factor)
         self.kl_measurement_samples = int(kl_measurement_samples)
-        self._dagger_unlocked = False
-        self._dagger_unlock_update = -1
-        self._student_episode_probability = 0.0
 
         self._teacher_control_mask: torch.Tensor | None = None
-        self._controller_initialized: torch.Tensor | None = None
         self._teacher_control_count = torch.zeros((), device=self.device)
         self._total_control_count = torch.zeros((), device=self.device)
         self._evaluation_successes = torch.zeros(self.recipe_count, device=self.device)
@@ -592,13 +278,6 @@ class StackDistillation(Distillation):
         weights_by_recipe[present] = recipe_ids.numel() * recipe_mass[present] / (present_mass * counts[present])
         return weights_by_recipe[recipe_ids]
 
-    def _dagger_progress(self) -> float:
-        """Return DAgger target-occupancy progress after validation unlock."""
-        if not self._dagger_unlocked:
-            return 0.0
-        elapsed_updates = self.num_updates - self._dagger_unlock_update
-        return min(elapsed_updates / self.student_control_anneal_updates, 1.0)
-
     def _dagger_collection_started(self) -> bool:
         """Return whether teacher-only behavior-cloning warm-up is complete."""
         return self.num_updates >= self.teacher_pretrain_updates
@@ -607,106 +286,23 @@ class StackDistillation(Distillation):
         """Return the probability that the student controls a training step."""
         if not self._dagger_collection_started():
             return 0.0
-        if self.stepwise_student_control:
-            return self._target_student_control_fraction()
-        return self._student_episode_probability
-
-    def _target_student_control_fraction(self) -> float:
-        """Return the desired fraction of collected states controlled by the student."""
-        if not self._dagger_collection_started():
-            return 0.0
-        # Before validation unlock, retain just enough on-policy data to teach
-        # recovery from the student's own small errors. Success unlocks the
-        # gradual ramp toward the configured final occupancy.
-        if not self._dagger_unlocked:
-            return self.student_control_fraction_start
-        progress = self._dagger_progress()
-        return (
-            self.student_control_fraction_start
-            + (self.student_control_fraction_end - self.student_control_fraction_start) * progress
-        )
-
-    def _maybe_unlock_dagger(self) -> None:
-        """Unlock the occupancy ramp after warm-up and any optional success gate."""
-        if self._dagger_unlocked or self.num_updates < self.teacher_pretrain_updates:
-            return
-        if not self.dagger_success_gate:
-            self._dagger_unlocked = True
-            self._dagger_unlock_update = self.num_updates
-            return
-        gate_ids = torch.as_tensor(self.dagger_gate_recipe_ids, device=self.device, dtype=torch.long)
-        enough_attempts = self._evaluation_cumulative_attempts[gate_ids] >= self.dagger_gate_min_attempts
-        successful = self._evaluation_success_ema[gate_ids] >= self.dagger_gate_success_rate
-        initialized = self._evaluation_ema_initialized[gate_ids]
-        if bool(torch.all(enough_attempts & successful & initialized)):
-            self._dagger_unlocked = True
-            self._dagger_unlock_update = self.num_updates
-            # Failed student episodes were about twenty times longer than
-            # successful teacher episodes in the direct-cloning experiment.
-            # Start conservatively; feedback below corrects this from measured
-            # occupancy rather than relying on that empirical ratio.
-            self._student_episode_probability = max(
-                self._student_episode_probability,
-                1.0e-5,
-                self.student_control_fraction_start / 20.0,
-            )
-
-    def _update_student_episode_probability(self, observed_student_fraction: float) -> None:
-        """Steer episode sampling toward the requested state occupancy."""
-        if not self._dagger_collection_started():
-            self._student_episode_probability = 0.0
-            return
-        target = self._target_student_control_fraction()
-        if self.stepwise_student_control:
-            # Independent per-step sampling already makes expected occupancy
-            # equal to the requested fraction. Episode-duration feedback is
-            # needed only by the legacy persistent-controller mode.
-            self._student_episode_probability = target
-            return
-        if self._student_episode_probability <= 0.0:
-            self._student_episode_probability = max(1.0e-5, target / 20.0)
-            return
-        if observed_student_fraction <= 1.0e-8:
-            self._student_episode_probability = min(
-                max(2.0 * self._student_episode_probability, 1.0e-5),
-                target,
-            )
-            return
-        ratio = target / observed_student_fraction
-        correction = ratio**self.student_control_feedback_gain
-        self._student_episode_probability = float(min(max(self._student_episode_probability * correction, 1.0e-5), 1.0))
+        return self.student_control_fraction
 
     def _assign_pending_controllers(self, obs: TensorDict) -> None:
-        """Choose per-step controllers, or persistent controllers in legacy mode."""
+        """Choose a teacher or student independently for every training step."""
         if self.distillation_context_obs_group not in obs.keys():
             raise KeyError(f"Missing DAgger recipe observation group: {self.distillation_context_obs_group}")
         context = obs[self.distillation_context_obs_group]
         count = context.shape[0]
         if self._teacher_control_mask is None or self._teacher_control_mask.shape[0] != count:
             self._teacher_control_mask = torch.ones((count, 1), dtype=torch.bool, device=context.device)
-            self._controller_initialized = torch.zeros_like(self._teacher_control_mask)
-        if self._controller_initialized is None:
-            raise RuntimeError("Controller initialization state is unavailable.")
 
         # Evaluation slots are always deterministic student rollouts and never
         # enter the optimization slice.
         self._teacher_control_mask[: self.evaluation_env_count] = False
-        self._controller_initialized[: self.evaluation_env_count] = True
-
-        if self.stepwise_student_control:
-            training_count = count - self.evaluation_env_count
-            student_control = torch.rand(training_count, device=context.device) < self._student_control_probability()
-            self._teacher_control_mask[self.evaluation_env_count :, 0] = ~student_control
-            self._controller_initialized[self.evaluation_env_count :, 0] = True
-            return
-
-        pending = ~self._controller_initialized[:, 0]
-        pending[: self.evaluation_env_count] = False
-        pending_count = int(pending.sum())
-        if pending_count > 0:
-            student_control = torch.rand(pending_count, device=context.device) < self._student_control_probability()
-            self._teacher_control_mask[pending, 0] = ~student_control
-            self._controller_initialized[pending, 0] = True
+        training_count = count - self.evaluation_env_count
+        student_control = torch.rand(training_count, device=context.device) < self._student_control_probability()
+        self._teacher_control_mask[self.evaluation_env_count :, 0] = ~student_control
 
     def _update_evaluation_statistics(self, outcomes: torch.Tensor) -> None:
         """Update held-out success estimates without gating data collection."""
@@ -771,8 +367,6 @@ class StackDistillation(Distillation):
         super().process_env_step(obs, rewards, dones, extras)
         done_mask = dones.reshape(-1).bool()
         self._episode_success_seen[done_mask] = False
-        if self._controller_initialized is not None:
-            self._controller_initialized[done_mask] = False
 
     def _behavior_terms(
         self,
@@ -892,16 +486,6 @@ class StackDistillation(Distillation):
                 alignment = torch.stack(candidate_correlations).amax()
         return torch.stack((environment_variation, dynamic_range, temporal_delta, alignment))
 
-    def _freeze_controller_update_during_warmup(self) -> None:
-        """Keep the copied teacher controller fixed while perception initializes."""
-        if self.num_updates > self.controller_warmup_updates:
-            return
-        controller = getattr(getattr(self.student, "mlp", None), "controller", None)
-        if controller is None:
-            return
-        for parameter in controller.parameters():
-            parameter.grad = None
-
     def _capture_policy_distribution(self) -> tuple[TensorDict, tuple[torch.Tensor, ...]]:
         """Snapshot the student distribution on a representative rollout subset.
 
@@ -1003,7 +587,7 @@ class StackDistillation(Distillation):
                 if self.auxiliary_loss_weight > 0.0:
                     # Supervise independent physical primitives in addition to
                     # the teacher actions. The state head is representation
-                    # training only and is discarded before PPO fine-tuning.
+                    # training only and does not participate in inference.
                     with torch.no_grad():
                         normalized_teacher_state = self.teacher.get_latent(batch.observations)
                         auxiliary_targets = self.student.select_visual_target(normalized_teacher_state)
@@ -1054,7 +638,6 @@ class StackDistillation(Distillation):
                     accumulated_loss.backward()
                     if self.is_multi_gpu:
                         self.reduce_parameters()
-                    self._freeze_controller_update_during_warmup()
                     if self.max_grad_norm:
                         nn.utils.clip_grad_norm_(self.student.parameters(), self.max_grad_norm)
                     self.optimizer.step()
@@ -1072,7 +655,6 @@ class StackDistillation(Distillation):
             accumulated_loss.backward()
             if self.is_multi_gpu:
                 self.reduce_parameters()
-            self._freeze_controller_update_during_warmup()
             if self.max_grad_norm:
                 nn.utils.clip_grad_norm_(self.student.parameters(), self.max_grad_norm)
             self.optimizer.step()
@@ -1104,15 +686,12 @@ class StackDistillation(Distillation):
             rollout_metrics /= self.gpu_world_size
 
         self._update_evaluation_statistics(evaluation_outcomes)
-        self._maybe_unlock_dagger()
         evaluation_success_rates = evaluation_outcomes[0] / evaluation_outcomes[1].clamp_min(1.0)
         evaluation_cumulative_success_rates = self._evaluation_cumulative_successes / (
             self._evaluation_cumulative_attempts.clamp_min(1.0)
         )
         observed_student_fraction = 1.0 - rollout_metrics[0].item()
-        self._update_student_episode_probability(observed_student_fraction)
         student_control_probability = self._student_control_probability()
-        target_student_control_fraction = self._target_student_control_fraction()
 
         self.storage.clear()
         self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
@@ -1139,14 +718,8 @@ class StackDistillation(Distillation):
             "teacher_control_fraction": rollout_metrics[0].item(),
             "student_control_fraction": observed_student_fraction,
             "student_control_probability": student_control_probability,
-            "student_control_probability_mean": student_control_probability,
-            "student_control_fraction_target": target_student_control_fraction,
-            "dagger_active": float(self._dagger_unlocked),
-            "dagger_progress": self._dagger_progress(),
-            "dagger_gate_success": min(
-                self._evaluation_success_ema[recipe].item() for recipe in self.dagger_gate_recipe_ids
-            ),
-            "controller_update_active": float(self.num_updates > self.controller_warmup_updates),
+            "student_control_fraction_target": student_control_probability,
+            "dagger_active": float(self._dagger_collection_started()),
             "kl": kl_mean.item(),
         }
         for recipe, name in enumerate(self.recipe_names):
@@ -1157,7 +730,6 @@ class StackDistillation(Distillation):
             metrics[f"recipe_{name}_eval_cumulative_success_rate"] = evaluation_cumulative_success_rates[recipe].item()
             metrics[f"recipe_{name}_eval_success_ema"] = self._evaluation_success_ema[recipe].item()
             metrics[f"recipe_{name}_eval_attempts"] = evaluation_outcomes[1, recipe].item()
-            metrics[f"recipe_{name}_student_control_probability"] = student_control_probability
 
         table_metrics = evaluation_metric_sums[self.table_recipe_id]
         metrics.update(
@@ -1177,14 +749,10 @@ class StackDistillation(Distillation):
         saved = super().save()
         saved["stack_distillation_state"] = {
             "num_updates": self.num_updates,
-            "dagger_unlocked": self._dagger_unlocked,
-            "dagger_unlock_update": self._dagger_unlock_update,
-            "student_episode_probability": self._student_episode_probability,
             "evaluation_cumulative_successes": self._evaluation_cumulative_successes.tolist(),
             "evaluation_cumulative_attempts": self._evaluation_cumulative_attempts.tolist(),
             "evaluation_success_ema": self._evaluation_success_ema.tolist(),
             "evaluation_ema_initialized": self._evaluation_ema_initialized.tolist(),
-            "learning_rate": self.learning_rate,
         }
         return saved
 
@@ -1192,32 +760,27 @@ class StackDistillation(Distillation):
         """Resume collection scheduling, while PPO checkpoints still load only the teacher."""
         load_iteration = super().load(loaded_dict, load_cfg, strict)
         self.learning_rate = float(self.optimizer.param_groups[0]["lr"])
-        initialize_controller = getattr(self.student, "initialize_teacher_controller", None)
-        if callable(initialize_controller):
-            initialize_controller(self.teacher)
         if load_iteration:
-            state = loaded_dict.get("stack_distillation_state", {})
-            self.num_updates = int(state.get("num_updates", int(loaded_dict.get("iter", -1)) + 1))
-            self._dagger_unlocked = bool(state.get("dagger_unlocked", False))
-            self._dagger_unlock_update = int(state.get("dagger_unlock_update", -1))
-            self._student_episode_probability = float(state.get("student_episode_probability", 0.0))
+            state = loaded_dict["stack_distillation_state"]
+            self.num_updates = int(state["num_updates"])
             for key, target in (
                 ("evaluation_cumulative_successes", self._evaluation_cumulative_successes),
                 ("evaluation_cumulative_attempts", self._evaluation_cumulative_attempts),
                 ("evaluation_success_ema", self._evaluation_success_ema),
             ):
-                value = torch.as_tensor(state.get(key, []), dtype=target.dtype, device=target.device).flatten()
-                if value.numel() == target.numel():
-                    target.copy_(value)
+                value = torch.as_tensor(state[key], dtype=target.dtype, device=target.device).flatten()
+                if value.numel() != target.numel():
+                    raise ValueError(f"Saved {key} does not match the configured recipe count.")
+                target.copy_(value)
             initialized = torch.as_tensor(
-                state.get("evaluation_ema_initialized", []),
+                state["evaluation_ema_initialized"],
                 dtype=torch.bool,
                 device=self.device,
             ).flatten()
-            if initialized.numel() == self._evaluation_ema_initialized.numel():
-                self._evaluation_ema_initialized.copy_(initialized)
+            if initialized.numel() != self._evaluation_ema_initialized.numel():
+                raise ValueError("Saved evaluation EMA state does not match the configured recipe count.")
+            self._evaluation_ema_initialized.copy_(initialized)
             self._teacher_control_mask = None
-            self._controller_initialized = None
             self._episode_success_seen.zero_()
             self._rollout_student_control_masks.clear()
         return load_iteration
@@ -1229,15 +792,7 @@ class StackDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
 
     class_name: str = "isaaclab_tasks.contrib.stack.config.franka.agents.rsl_rl_distillation_cfg:StackDistillation"
     teacher_pretrain_updates: int = 40
-    dagger_gate_recipe_ids: tuple[int, ...] = (0,)
-    dagger_gate_success_rate: float = 0.95
-    dagger_gate_min_attempts: int = 32
-    dagger_success_gate: bool = False
-    student_control_fraction_start: float = 0.25
-    student_control_fraction_end: float = 0.25
-    student_control_anneal_updates: int = 900
-    student_control_feedback_gain: float = 0.5
-    stepwise_student_control: bool = True
+    student_control_fraction: float = 0.25
     evaluation_success_ema_alpha: float = 0.25
     arm_loss_weight: float = 1.0
     gripper_loss_weight: float = 2.0
@@ -1260,7 +815,6 @@ class StackDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     recipe_balance: bool = True
     table_recipe_weight: float = 3.0
     student_state_loss_weight: float = 3.0
-    controller_warmup_updates: int = 40
     distillation_context_obs_group: str = "distillation_context"
     table_recipe_id: int = 8
     schedule: str = "fixed"
@@ -1290,9 +844,8 @@ class FrankaStackCameraDistillationRunnerCfg(RslRlDistillationRunnerCfg):
         obs_normalization=True,
         hidden_dims=[1024, 512, 256],
         activation="elu",
-        # Distillation collection is deterministic. Retain a valid narrow
-        # distribution only for checkpoint compatibility with the deployable
-        # stochastic actor used during subsequent PPO fine-tuning.
+        # Distillation collection is deterministic, but the RSL-RL model and
+        # exported policy still require a valid action distribution.
         distribution_cfg=StackDistillationDistributionCfg(init_std=0.05, std_range=(0.02, 0.12)),
         cnn_cfg=StackVisualDistillationModelCfg.CNNCfg(
             output_channels=[32, 64, 64],

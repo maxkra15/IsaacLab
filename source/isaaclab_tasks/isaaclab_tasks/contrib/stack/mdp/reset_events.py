@@ -26,16 +26,8 @@ from .kuka_allegro_reset import (
     KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_OPEN_COMMANDS,
     KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_TOOL_OFFSETS,
     KUKA_ALLEGRO_FULL_HAND_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW,
-    KUKA_ALLEGRO_GRASP_PAIR_OPEN_COMMANDS,
-    KUKA_ALLEGRO_GRASP_PAIR_RESET_CLOSED_COMMANDS,
-    KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS,
     KUKA_ALLEGRO_LARGE_CUBE_EDGE_LENGTH,
-    KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_OPEN_COMMANDS,
-    KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_RESET_CLOSED_COMMANDS,
-    KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_TOOL_OFFSETS,
-    KUKA_ALLEGRO_LARGE_CUBE_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW,
     KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT,
-    KUKA_ALLEGRO_PALM_TO_HELD_CUBE_QUATERNION_XYZW,
     KUKA_ALLEGRO_STACK_ARM_POSES,
     kuka_allegro_grasp_pair_pose,
     kuka_allegro_pinch_pose,
@@ -43,7 +35,7 @@ from .kuka_allegro_reset import (
     quaternion_xyzw_from_matrix,
     solve_kuka_allegro_reset_ik,
 )
-from .runtime_state import create_stack_reset_runtime_state, get_stack_reset_runtime_state
+from .runtime_state import create_stack_reset_runtime_state
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, RigidObject
@@ -431,9 +423,6 @@ class StackResetStateTable(ManagerTermBase):
         self._cubes: tuple[RigidObject, ...] = tuple(env.scene[name] for name in ("cube_1", "cube_2", "cube_3"))
         self._arm_joint_ids = self._robot.find_joints(self._ARM_JOINT_NAMES, preserve_order=True)[0]
         self._hand_joint_ids = self._robot.find_joints(self._HAND_JOINT_NAMES, preserve_order=True)[0]
-        # Retain the old private name for local diagnostics that inspect the
-        # Franka table. New code treats this as an arbitrary active hand.
-        self._finger_joint_ids = self._hand_joint_ids
         if (
             len(self._arm_joint_ids) != self._EXPECTED_ARM_JOINTS
             or len(self._hand_joint_ids) != self._EXPECTED_HAND_JOINTS
@@ -454,18 +443,10 @@ class StackResetStateTable(ManagerTermBase):
             closed_finger_position=float(cfg.params.get("closed_finger_position", 0.020)),
             placed_finger_position=float(cfg.params.get("placed_finger_position", 0.021)),
             open_finger_position=float(cfg.params.get("open_finger_position", 0.040)),
-            closed_hand_positions=cfg.params.get("closed_hand_positions"),
-            open_hand_positions=cfg.params.get("open_hand_positions"),
             table_rows_per_layout=int(cfg.params.get("table_rows_per_layout", self._TABLE_ROWS_PER_LAYOUT)),
         )
-        self._apply_table_target_potential(cfg.params.get("table_target_potential"))
         self._validate_table()
-        # Epsilon sampling does not require a neighbor graph. Keep the graph
-        # lazy for reset-table diagnostics.
-        self._neighbor_count = int(cfg.params.get("neighbor_count", 8))
-        self._neighbor_indices = None
-
-        self._runtime_state = create_stack_reset_runtime_state(env, self.row_count)
+        self._runtime_state = create_stack_reset_runtime_state(env)
 
     @property
     def row_count(self) -> int:
@@ -492,35 +473,8 @@ class StackResetStateTable(ManagerTermBase):
         """Stable diagnostic names for reset recipes."""
         return tuple(recipe.name.lower() for recipe in StackResetRecipe)
 
-    @property
-    def neighbor_indices(self) -> torch.Tensor:
-        """Feature-space nearest neighbors, built lazily for diagnostics."""
-        if self._neighbor_indices is None:
-            self._neighbor_indices = self._build_neighbor_graph(
-                k=self._neighbor_count,
-                partition_by_goal=False,
-            )
-        return self._neighbor_indices
-
-    @property
-    def feature_coordinates(self) -> torch.Tensor:
-        """Normalized physical coordinates used by frontier sampling."""
-        return self._features
-
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         """Keep the immutable reset table across environment resets."""
-
-    def _apply_table_target_potential(self, target_potential: float | None) -> None:
-        """Override the TABLE-row curriculum milestone without changing the reset bank."""
-        if target_potential is None:
-            return
-        target_potential = float(target_potential)
-        if not math.isfinite(target_potential) or not 0.0 < target_potential <= 10.0:
-            raise ValueError("table_target_potential must be finite and lie in (0, 10].")
-        table_rows = self._recipe_ids == int(StackResetRecipe.TABLE)
-        if not bool(torch.any(table_rows)):
-            raise RuntimeError("Stack reset table has no TABLE rows to receive a target-potential override.")
-        self._target_potentials[table_rows] = target_potential
 
     @staticmethod
     def _held_position(arm_position: torch.Tensor) -> torch.Tensor:
@@ -542,8 +496,6 @@ class StackResetStateTable(ManagerTermBase):
         closed_finger_position: float,
         placed_finger_position: float,
         open_finger_position: float,
-        closed_hand_positions: Sequence[float] | None = None,
-        open_hand_positions: Sequence[float] | None = None,
         table_rows_per_layout: int = _TABLE_ROWS_PER_LAYOUT,
     ) -> None:
         """Construct dense pick, transport, place, release, and table rows."""
@@ -551,22 +503,8 @@ class StackResetStateTable(ManagerTermBase):
             raise ValueError("table_rows_per_layout must be positive.")
         if not closed_finger_position < open_finger_position:
             raise ValueError("closed_finger_position must be less than open_finger_position.")
-        hand_joint_count = getattr(self, "_EXPECTED_HAND_JOINTS", 2)
-        closed_hand = (
-            self._arm_anchors.new_full((hand_joint_count,), closed_finger_position)
-            if closed_hand_positions is None
-            else self._arm_anchors.new_tensor(tuple(closed_hand_positions))
-        )
-        open_hand = (
-            self._arm_anchors.new_full((hand_joint_count,), open_finger_position)
-            if open_hand_positions is None
-            else self._arm_anchors.new_tensor(tuple(open_hand_positions))
-        )
-        if closed_hand.shape != (hand_joint_count,) or open_hand.shape != (hand_joint_count,):
-            raise ValueError(
-                "closed_hand_positions and open_hand_positions must each contain "
-                f"{hand_joint_count} active-hand joint values."
-            )
+        closed_hand = self._arm_anchors.new_full((self._EXPECTED_HAND_JOINTS,), closed_finger_position)
+        open_hand = self._arm_anchors.new_full((self._EXPECTED_HAND_JOINTS,), open_finger_position)
 
         def hand_position_from_scalar(finger_position: float) -> torch.Tensor:
             closed_fraction = (open_finger_position - finger_position) / (open_finger_position - closed_finger_position)
@@ -579,7 +517,6 @@ class StackResetStateTable(ManagerTermBase):
         recipe_rows: list[int] = []
         progress_rows: list[float] = []
         held_role_rows: list[int] = []
-        goal_rows: list[int] = []
         layout_rows: list[int] = []
         current_layout_id = -1
 
@@ -590,7 +527,6 @@ class StackResetStateTable(ManagerTermBase):
             role_positions: torch.Tensor,
             finger_position: float,
             held_role: int,
-            goal_pairs: int,
         ) -> None:
             resolved_role_positions = role_positions.clone()
             if held_role >= 0:
@@ -606,7 +542,6 @@ class StackResetStateTable(ManagerTermBase):
             recipe_rows.append(int(recipe))
             progress_rows.append(progress)
             held_role_rows.append(held_role)
-            goal_rows.append(goal_pairs)
             layout_rows.append(current_layout_id)
 
         pick_progress = torch.linspace(0.0, 1.0, self._PICK_PROGRESS_BINS, device=self.device)
@@ -655,7 +590,6 @@ class StackResetStateTable(ManagerTermBase):
                 torch.stack((base_position, first_stack_position, second_stack_position)),
                 closed_finger_position,
                 2,
-                2,
             )
 
             # Reset sampling must cover the terminal transition, not only the
@@ -677,7 +611,6 @@ class StackResetStateTable(ManagerTermBase):
                     full_stack_positions,
                     placed_finger_position + value * (open_finger_position - placed_finger_position),
                     -1,
-                    2,
                 )
 
             for progress in place_progress:
@@ -699,7 +632,6 @@ class StackResetStateTable(ManagerTermBase):
                     torch.stack((base_position, first_stack_position, second_position)),
                     placed_finger_position if is_supported_endpoint else closed_finger_position,
                     -1 if is_supported_endpoint else 2,
-                    2,
                 )
 
             second_pick_positions = torch.stack((base_position, first_stack_position, second_source))
@@ -721,7 +653,6 @@ class StackResetStateTable(ManagerTermBase):
                     ),
                     second_pick_positions,
                     closed_finger_position,
-                    2,
                     2,
                 )
 
@@ -745,7 +676,6 @@ class StackResetStateTable(ManagerTermBase):
                     torch.stack((base_position, first_stack_position, second_position)),
                     closed_finger_position,
                     2,
-                    2,
                 )
 
             for progress in pick_progress:
@@ -761,7 +691,6 @@ class StackResetStateTable(ManagerTermBase):
                     second_pick_positions,
                     open_finger_position,
                     -1,
-                    2,
                 )
 
             # The reset manifold is continuous through the actuator transition
@@ -783,7 +712,6 @@ class StackResetStateTable(ManagerTermBase):
                     second_pick_positions,
                     open_finger_position + value * (closed_finger_position - open_finger_position),
                     2 if is_contact_endpoint else -1,
-                    2,
                 )
 
             # Bridge the only long action-space discontinuity in the table:
@@ -804,7 +732,6 @@ class StackResetStateTable(ManagerTermBase):
                     second_pick_positions,
                     open_finger_position,
                     -1,
-                    2,
                 )
 
             for progress in place_progress:
@@ -826,7 +753,6 @@ class StackResetStateTable(ManagerTermBase):
                     torch.stack((base_position, first_position, second_source)),
                     placed_finger_position if is_supported_endpoint else closed_finger_position,
                     -1 if is_supported_endpoint else 1,
-                    1,
                 )
 
             # Mirror the same held vertical-lift bridge for the first movable
@@ -844,7 +770,6 @@ class StackResetStateTable(ManagerTermBase):
                     ),
                     table_positions,
                     closed_finger_position,
-                    1,
                     1,
                 )
 
@@ -866,7 +791,6 @@ class StackResetStateTable(ManagerTermBase):
                     torch.stack((base_position, first_position, second_source)),
                     closed_finger_position,
                     1,
-                    1,
                 )
 
             for progress in pick_progress:
@@ -882,7 +806,6 @@ class StackResetStateTable(ManagerTermBase):
                     table_positions,
                     open_finger_position,
                     -1,
-                    1,
                 )
 
             for progress in grasp_progress[1:]:
@@ -895,7 +818,6 @@ class StackResetStateTable(ManagerTermBase):
                     table_positions,
                     open_finger_position + value * (closed_finger_position - open_finger_position),
                     1 if is_contact_endpoint else -1,
-                    1,
                 )
 
             # Deployment starts independently sample all three roles over the
@@ -952,7 +874,6 @@ class StackResetStateTable(ManagerTermBase):
                     randomized_table_positions,
                     open_finger_position,
                     -1,
-                    2,
                 )
 
         self._arm_positions = torch.stack(arm_rows)
@@ -963,15 +884,6 @@ class StackResetStateTable(ManagerTermBase):
         self._progress = torch.tensor(progress_rows, dtype=torch.float32, device=self.device)
         self._held_roles = torch.tensor(held_role_rows, dtype=torch.long, device=self.device)
         self._layout_ids = torch.tensor(layout_rows, dtype=torch.long, device=self.device)
-        # Every row now trains the same deployment objective: both stacked
-        # pairs released and stable. Keep the tensor for checkpoint/logging
-        # compatibility with earlier local-goal caches.
-        self._goal_pairs = torch.full(
-            (len(goal_rows),),
-            2,
-            dtype=torch.long,
-            device=self.device,
-        )
         self._target_potentials = torch.tensor(
             tuple(_RECIPE_TARGET_POTENTIAL[StackResetRecipe(recipe)] for recipe in recipe_rows),
             dtype=torch.float32,
@@ -997,16 +909,6 @@ class StackResetStateTable(ManagerTermBase):
                 (0.0, 0.0, 0.0, 1.0)
             )
 
-        centered_positions = self._role_positions - self._role_positions[:, :1]
-        self._features = torch.cat(
-            (
-                centered_positions.flatten(start_dim=1) / 0.15,
-                0.25 * self._arm_positions,
-                self._finger_positions.unsqueeze(1) / 0.04,
-            ),
-            dim=1,
-        )
-
     def _validate_table(self) -> None:
         """Reject non-finite, penetrating, or semantically inconsistent rows."""
         tensors = (
@@ -1015,7 +917,6 @@ class StackResetStateTable(ManagerTermBase):
             self._hand_positions,
             self._role_positions,
             self._role_quaternions,
-            self._features,
         )
         if any(not bool(torch.isfinite(value).all()) for value in tensors):
             raise RuntimeError("Stack reset table contains non-finite values.")
@@ -1042,9 +943,6 @@ class StackResetStateTable(ManagerTermBase):
                     f"(roles={first_role}/{second_role}, rows={invalid_rows[:8].tolist()}, "
                     f"count={invalid_rows.numel()})."
                 )
-        if bool(torch.any((self._goal_pairs < 1) | (self._goal_pairs > 2))):
-            raise RuntimeError("Stack reset goals must request one or two stacked pairs.")
-
         # Every phase after the first placement assumes role one is already
         # supported on role zero. A geometrically valid row with role one at
         # its source makes the second-stage target potential impossible.
@@ -1065,40 +963,6 @@ class StackResetStateTable(ManagerTermBase):
         if bool(torch.any(torch.abs(first_support_delta - expected_support_delta) > 1.0e-5)):
             raise RuntimeError("A second-stage stack reset row does not place the first movable cube on the base.")
 
-    def _build_neighbor_graph(self, k: int, *, partition_by_goal: bool = True) -> torch.Tensor:
-        """Build a deterministic kNN graph, optionally within local-goal partitions."""
-        if k < 1:
-            raise ValueError("neighbor_count must be positive.")
-        neighbor_indices = torch.arange(self.row_count, device=self.device).unsqueeze(1).repeat(1, k)
-        partitions = (
-            tuple(torch.nonzero(self._goal_pairs == goal_pairs, as_tuple=False).flatten() for goal_pairs in (1, 2))
-            if partition_by_goal
-            else (torch.arange(self.row_count, device=self.device),)
-        )
-        for members in partitions:
-            if members.numel() <= 1:
-                continue
-            k_effective = min(k, members.numel() - 1)
-            distances = torch.cdist(self._features[members], self._features[members])
-            distances.fill_diagonal_(torch.inf)
-            local_neighbors = torch.topk(
-                distances,
-                k=k_effective,
-                largest=False,
-                sorted=True,
-            ).indices
-            mapped = members[local_neighbors]
-            if k_effective < k:
-                mapped = torch.cat(
-                    (
-                        mapped,
-                        members.unsqueeze(1).expand(-1, k - k_effective),
-                    ),
-                    dim=1,
-                )
-            neighbor_indices[members] = mapped
-        return neighbor_indices
-
     def __call__(
         self,
         env: ManagerBasedRLEnv,
@@ -1106,20 +970,11 @@ class StackResetStateTable(ManagerTermBase):
         closed_finger_position: float = 0.020,
         placed_finger_position: float = 0.021,
         open_finger_position: float = 0.040,
-        closed_hand_positions: Sequence[float] | None = None,
-        open_hand_positions: Sequence[float] | None = None,
-        neighbor_count: int = 8,
         table_rows_per_layout: int = _TABLE_ROWS_PER_LAYOUT,
-        table_target_potential: float | None = None,
-        fixed_row_id: int | None = None,
         fixed_recipe: int | None = None,
-        table_evaluation_env_fraction: float = 0.0,
         evaluation_recipe_ids: Sequence[int] = (),
         evaluation_envs_per_recipe: int = 0,
         fixed_role_permutation: int | None = None,
-        continuation_probability: float = 0.25,
-        fixed_continue_to_final: bool | None = None,
-        force_full_goal: bool = False,
         arm_joint_noise_range: float = 0.0,
         table_arm_joint_noise_range: float = 0.0,
         table_cube_planar_translation_range: float = 0.0,
@@ -1130,30 +985,18 @@ class StackResetStateTable(ManagerTermBase):
             closed_finger_position,
             placed_finger_position,
             open_finger_position,
-            closed_hand_positions,
-            open_hand_positions,
-            neighbor_count,
             table_rows_per_layout,
-            table_target_potential,
         )
         if env_ids is None or env_ids.numel() == 0:
             return
-        if not 0.0 <= continuation_probability <= 1.0:
-            raise ValueError("continuation_probability must be in [0, 1].")
-        if not 0.0 <= table_evaluation_env_fraction < 1.0:
-            raise ValueError("table_evaluation_env_fraction must be in [0, 1).")
         if evaluation_envs_per_recipe < 0:
             raise ValueError("evaluation_envs_per_recipe must be non-negative.")
-        if table_evaluation_env_fraction > 0.0 and evaluation_envs_per_recipe > 0:
-            raise ValueError("TABLE-only and per-recipe evaluation prefixes are mutually exclusive.")
         resolved_evaluation_recipes = tuple(int(recipe) for recipe in evaluation_recipe_ids)
         if any(not 0 <= recipe < len(StackResetRecipe) for recipe in resolved_evaluation_recipes):
             raise ValueError("evaluation_recipe_ids contains an invalid stack reset recipe.")
         evaluation_env_count = evaluation_envs_per_recipe * len(resolved_evaluation_recipes)
         if evaluation_env_count > 0 and evaluation_env_count >= env.num_envs:
             raise ValueError("Per-recipe evaluation prefixes leave no environments for training.")
-        if fixed_row_id is not None and fixed_recipe is not None:
-            raise ValueError("fixed_row_id and fixed_recipe are mutually exclusive.")
         if (
             min(
                 arm_joint_noise_range,
@@ -1164,21 +1007,9 @@ class StackResetStateTable(ManagerTermBase):
             < 0.0
         ):
             raise ValueError("Reset-state randomization ranges must be non-negative.")
-        state = getattr(self, "_runtime_state", None)
-        if state is None:
-            state = self._runtime_state = get_stack_reset_runtime_state(env)
-        if fixed_row_id is None and fixed_recipe is None:
+        state = self._runtime_state
+        if fixed_recipe is None:
             row_ids = state.row_ids[env_ids]
-        elif fixed_row_id is not None:
-            if not 0 <= fixed_row_id < self.row_count:
-                raise ValueError(f"fixed_row_id must be in [0, {self.row_count - 1}].")
-            row_ids = torch.full(
-                (env_ids.numel(),),
-                fixed_row_id,
-                dtype=torch.long,
-                device=self.device,
-            )
-            state.row_ids[env_ids] = row_ids
         else:
             if not 0 <= fixed_recipe < len(StackResetRecipe):
                 raise ValueError(f"fixed_recipe must be in [0, {len(StackResetRecipe) - 1}].")
@@ -1187,22 +1018,7 @@ class StackResetStateTable(ManagerTermBase):
                 raise RuntimeError(f"Stack reset cache has no rows for recipe {fixed_recipe}.")
             row_ids = recipe_rows[torch.randint(recipe_rows.numel(), (env_ids.numel(),), device=self.device)]
             state.row_ids[env_ids] = row_ids
-        if table_evaluation_env_fraction > 0.0:
-            # Reserve a stable prefix for deterministic deployment evaluation.
-            # The curriculum may propose any row for these environments first;
-            # replace it here so completed episodes are still attributed to the
-            # actual TABLE rows placed into physics.
-            evaluation_env_count = max(1, int(env.num_envs * table_evaluation_env_fraction)) if env.num_envs > 1 else 0
-            evaluation_mask = env_ids < evaluation_env_count
-            evaluation_ids = env_ids[evaluation_mask]
-            if evaluation_ids.numel():
-                table_rows = torch.nonzero(self._recipe_ids == int(StackResetRecipe.TABLE), as_tuple=False).flatten()
-                evaluation_rows = table_rows[
-                    torch.randint(table_rows.numel(), (evaluation_ids.numel(),), device=self.device)
-                ]
-                row_ids[evaluation_mask] = evaluation_rows
-                state.row_ids[env_ids] = row_ids
-        elif evaluation_envs_per_recipe > 0:
+        if evaluation_envs_per_recipe > 0:
             # Reserve one stable prefix block per recipe for deterministic
             # closed-loop student evaluation. The algorithm uses this exact
             # ordering and excludes the blocks from behavior-cloning losses.
@@ -1237,42 +1053,12 @@ class StackResetStateTable(ManagerTermBase):
         role_to_cube = self._role_permutations[permutation_ids]
         state.role_to_cube[env_ids] = role_to_cube
 
-        state.previous_recipes[env_ids] = state.recipes[env_ids]
-        state.previous_initialized[env_ids] = state.initialized[env_ids]
         state.recipes[env_ids] = self._recipe_ids[row_ids]
-        if force_full_goal:
-            continue_to_final = torch.ones(env_ids.numel(), dtype=torch.bool, device=self.device)
-        elif fixed_continue_to_final is not None:
-            continue_to_final = torch.full(
-                (env_ids.numel(),),
-                fixed_continue_to_final,
-                dtype=torch.bool,
-                device=self.device,
-            )
-        else:
-            continue_to_final = torch.rand(env_ids.numel(), device=self.device) < continuation_probability
-        state.continue_to_final[env_ids] = continue_to_final
-        state.goal_pairs[env_ids] = torch.where(
-            continue_to_final,
-            2,
-            self._goal_pairs[row_ids],
-        )
-        # Preserve the next meaningful forward target for curriculum evidence
-        # even when every episode continues to the final stack. The terminal
-        # objective is controlled by ``stack_continue_to_final``; overwriting
-        # this value with ten made early reset rows impossible to promote until
-        # the policy already knew the complete multi-pick sequence.
         state.target_potentials[env_ids] = self._target_potentials[row_ids]
         state.initialized[env_ids] = True
         row_grasp_pair_ids = getattr(self, "_grasp_pair_ids", None)
         grasp_pair_ids = torch.zeros_like(row_ids) if row_grasp_pair_ids is None else row_grasp_pair_ids[row_ids]
-        if hasattr(state, "grasp_pair_ids"):
-            state.grasp_pair_ids[env_ids] = grasp_pair_ids
-        state.sample_counts.scatter_add_(
-            0,
-            row_ids,
-            torch.ones_like(row_ids),
-        )
+        state.grasp_pair_ids[env_ids] = grasp_pair_ids
 
         held_roles = self._held_roles[row_ids]
         has_held_cube = held_roles >= 0
@@ -1283,10 +1069,7 @@ class StackResetStateTable(ManagerTermBase):
         joint_positions = self._robot.data.default_joint_pos.torch[env_ids].clone()
         joint_velocities = torch.zeros_like(joint_positions)
         joint_positions[:, self._arm_joint_ids] = self._arm_positions[row_ids]
-        # ``_finger_joint_ids`` is retained for older diagnostics that build
-        # this term without calling ``__init__``.
-        hand_joint_ids = getattr(self, "_hand_joint_ids", self._finger_joint_ids)
-        joint_positions[:, hand_joint_ids] = self._hand_positions[row_ids]
+        joint_positions[:, self._hand_joint_ids] = self._hand_positions[row_ids]
         table_rows = self._recipe_ids[row_ids] == int(StackResetRecipe.TABLE)
         arm_noise_scale = torch.full(
             (env_ids.numel(), 1),
@@ -1383,15 +1166,15 @@ class StackResetStateTable(ManagerTermBase):
             cube.write_root_velocity_to_sim_index(root_velocity=root_velocity, env_ids=env_ids)
 
 
-class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
-    """Large pair- and wrist-conditioned KUKA-Allegro reset manifold.
+class KukaAllegroResetStateTable(StackResetStateTable):
+    """Physics-validated reset manifold for the fully actuated KUKA-Allegro task.
 
     The immutable bank contains exactly 65,536 rows. Each non-table recipe has
-    6,144 rows (256 layouts by three grasp pairs by eight wrist-yaw bins),
-    while deployment table starts have 16,384 independently scattered
-    layouts. Within every pair/yaw stratum, eight tilt azimuths and four tilt
-    magnitudes cover broad, phase-safe palm rotations. A batched DLS solve
-    holds the active pair center fixed while applying the requested rotation.
+    6,144 rows over 256 layouts and broad wrist-orientation bins, while table
+    starts have 16,384 independently scattered layouts. Reset-authored grasps
+    use the validated index/thumb side pinch; the policy still controls and
+    observes all 16 hand joints. A batched DLS solve holds the pair center
+    fixed while applying each requested wrist rotation.
     """
 
     _ARM_WORKSPACE_LOWER = KUKA_ALLEGRO_DIVERSE_ARM_WORKSPACE_LOWER
@@ -1400,57 +1183,76 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
     _HAND_JOINT_NAMES = KUKA_ALLEGRO_ALL_HAND_JOINT_NAMES
     _EXPECTED_HAND_JOINTS = 16
     _ARM_POSE_VALUES = KUKA_ALLEGRO_STACK_ARM_POSES
+
+    _CUBE_HEIGHT = KUKA_ALLEGRO_LARGE_CUBE_EDGE_LENGTH
+    _TABLE_HEIGHT = KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT
     _ROWS_PER_RECIPE = 6144
     _TABLE_ROWS = 16384
     _SEMANTIC_LAYOUT_COUNT = 256
     _EXPECTED_ROW_COUNT = 65536
+
+    _GRASP_PAIR_OPEN_COMMANDS = KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_OPEN_COMMANDS
+    _GRASP_PAIR_RESET_CLOSED_COMMANDS = KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_CONTACT_COMMANDS
+    _GRASP_PAIR_TOOL_OFFSETS = KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_TOOL_OFFSETS
+    _PALM_TO_HELD_CUBE_QUATERNIONS_XYZW = KUKA_ALLEGRO_FULL_HAND_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW
+
     _RESET_CLEARANCE_MARGIN = 2.5e-4
     _FIRST_PLACE_SUPPORT_MARGIN = 0.015
-    _FIRST_PLACE_RING_SUPPORT_MARGIN = 0.017
     _SECOND_PLACE_SUPPORT_MARGIN = 0.010
     _PAIR_READY_CLEARANCE_ARC_HEIGHT = 0.10
-    _LAYOUT_MINIMUM_SEPARATION = 0.085
-    _PICK_PREGRASP_TOP_CLEARANCE = 0.0495
-    _PICK_CONTACT_CENTER_LIFT = 0.0195
-    _PICK_SUPPORTED_TOOL_HEIGHT: float | None = None
+    _LAYOUT_MINIMUM_SEPARATION = 0.12
+    _PICK_PREGRASP_TOP_CLEARANCE = 0.1195
+    _PICK_CONTACT_CENTER_LIFT = 0.0035
     _FIRST_TRANSPORT_BOTTOM_CLEARANCE = 0.1195
-    _SECOND_TRANSPORT_BOTTOM_CLEARANCE = 0.1245
     _FIRST_PLACE_CENTER_CLEARANCE = 0.080
     _SECOND_PLACE_CENTER_CLEARANCE = 0.070
-    _PAIR_READY_SOURCE_TOP_CLEARANCE = 0.0695
-    _TABLE_APPROACH_TOP_CLEARANCE = 0.0445
-    _TABLE_APPROACH_HEIGHT_RANGE = 0.075
-    _RING_TRANSPORT_BOTTOM_CLEARANCE = 0.0545
-    _TRANSPORT_FLOOR_PAIR_IDS = (2,)
-    _SEMANTIC_X_LOWER = 0.40
-    _SEMANTIC_X_EXTENT = 0.16
-    _SEMANTIC_Y_LOWER = -0.18
-    _SEMANTIC_Y_EXTENT = 0.36
-    _TABLE_X_LOWER = 0.39
-    _TABLE_X_EXTENT = 0.18
-    _TABLE_Y_LOWER = -0.20
-    _TABLE_Y_EXTENT = 0.40
-    _FIX_BASE_DURING_LAYOUT_REJECTION = False
+    _PAIR_READY_SOURCE_TOP_CLEARANCE = 0.1195
+    _TABLE_APPROACH_TOP_CLEARANCE = 0.1195
+    _TABLE_APPROACH_HEIGHT_RANGE = 0.050
+    _RING_TRANSPORT_BOTTOM_CLEARANCE = 0.0745
+    _SEMANTIC_X_LOWER = 0.48
+    _SEMANTIC_X_EXTENT = 0.14
+    _SEMANTIC_Y_LOWER = -0.14
+    _SEMANTIC_Y_EXTENT = 0.28
+    _TABLE_X_LOWER = _SEMANTIC_X_LOWER
+    _TABLE_X_EXTENT = _SEMANTIC_X_EXTENT
+    _TABLE_Y_LOWER = _SEMANTIC_Y_LOWER
+    _TABLE_Y_EXTENT = _SEMANTIC_Y_EXTENT
     _FINAL_IK_POSITION_RESIDUAL_LIMIT = 8.0e-4
-    _FINAL_CLEARANCE_MAX_PASSES = 6
-    _COUPLE_CONTACT_CUBE_YAW = False
-    _GLOBAL_TILT_LIMIT = math.radians(110.0)
-    _PICK_GRASP_PROGRESS_BY_PAIR: tuple[float, ...] | None = None
-    _PICK_HELD_PROGRESS_BY_PAIR: tuple[float, ...] | None = None
-    _PICK_HELD_START_HEIGHT_BY_PAIR: tuple[float, ...] | None = None
-    _PICK_HELD_TILT_DEGREES_BY_PAIR: tuple[float, ...] | None = None
-    _PICK_SUPPORTED_CLOSURE_LIMIT_BY_PAIR: tuple[float, ...] | None = None
+    _FINAL_CLEARANCE_MAX_PASSES = 12
+    _GLOBAL_TILT_LIMIT = math.radians(45.0)
+    _SECOND_TRANSPORT_BOTTOM_CLEARANCE = (
+        1.5 * _CUBE_HEIGHT
+        + 0.5 * _CUBE_HEIGHT * (math.cos(_GLOBAL_TILT_LIMIT) + math.sqrt(2.0) * math.sin(_GLOBAL_TILT_LIMIT))
+        + 4.0 * _RESET_CLEARANCE_MARGIN
+    )
+    _PICK_GRASP_PROGRESS_BY_PAIR = (0.75,)
+    _PICK_HELD_PROGRESS_BY_PAIR = (0.75,)
+    _PICK_HELD_START_HEIGHT_BY_PAIR = (_TABLE_HEIGHT + 0.0035,)
+    _PICK_HELD_TILT_DEGREES_BY_PAIR = (0.0,)
+    _PICK_LIFT_BRIDGE_END_PROGRESS = 0.875
+    _PICK_LIFT_BRIDGE_HEIGHT = 0.025
     _TRANSPORT_INITIAL_TILT_DEGREES = 15.0
-    _RESPECT_HELD_PICK_TILT_LIMIT_DURING_IK_REPAIR = False
-    _RESPECT_PICK_TILT_LIMIT_DURING_IK_REPAIR = False
-    _SAFE_SEMANTIC_YAW_RECIPES: tuple[StackResetRecipe, ...] = ()
-    _TABLE_USES_OBJECT_AXIS_APPROACH = False
-    _PLACE_TILT_LIMIT = math.radians(110.0)
-    _GRASP_PAIR_OPEN_COMMANDS = KUKA_ALLEGRO_GRASP_PAIR_OPEN_COMMANDS
-    _GRASP_PAIR_RESET_CLOSED_COMMANDS = KUKA_ALLEGRO_GRASP_PAIR_RESET_CLOSED_COMMANDS
-    _GRASP_PAIR_TOOL_OFFSETS = KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS
-    _PALM_TO_HELD_CUBE_QUATERNIONS_XYZW = (KUKA_ALLEGRO_PALM_TO_HELD_CUBE_QUATERNION_XYZW,) * 3
-    _ACTIVE_GRASP_PAIR_IDS = (0, 1, 2)
+    _PLACE_TILT_LIMIT = math.radians(45.0)
+    _OBJECT_AXIS_APPROACH_DISTANCE = 0.10
+    _PICK_APPROACH_DISTANCES_BY_YAW = (0.10,) * 8
+    _MINIMUM_ACQUISITION_CORRIDOR_CENTER_DISTANCE = 0.15
+    _MINIMUM_SEMANTIC_BASE_SOURCE_DISTANCE = 0.13
+    _SECOND_TRANSPORT_HAND_STACK_CLEARANCE = 0.020
+    _SECOND_TRANSPORT_CUBE_STACK_CLEARANCE = 0.015
+    _SECOND_TRANSPORT_IK_REPAIR_BUFFER = 0.002
+    _FINAL_RELEASE_INDEX_LINK_2_CLOSED_OFFSET = (0.08886563, -0.05273560, 0.02398680)
+    _FINAL_RELEASE_INDEX_LINK_2_OPEN_OFFSET = (0.08809996, -0.05582009, 0.02321215)
+    _FINAL_RELEASE_MIDDLE_LINK_2_OFFSET = (0.08730662, 0.00877876, 0.03099778)
+    _FINAL_RELEASE_INDEX_LINK_2_CLEARANCE = 0.030
+    _FINAL_RELEASE_MIDDLE_LINK_2_CLEARANCE = 0.030
+    _FINAL_RELEASE_LOWER_STACK_HAND_CLEARANCE = 0.020
+    _FINAL_RELEASE_RETREAT_CANDIDATES = (0.0, 0.010, 0.020, 0.030, 0.040, 0.050, 0.060)
+    _SAFE_SEMANTIC_YAW_RECIPES = (
+        StackResetRecipe.FIRST_PICK,
+        StackResetRecipe.PAIR_READY,
+        StackResetRecipe.SECOND_PICK,
+    )
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
         # RSL-RL enables TF32 before manager terms are resolved. Keep the
@@ -1474,11 +1276,6 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
     def orientation_bin_ids(self) -> torch.Tensor:
         """Wrist-orientation bin ID for every reset row."""
         return self._orientation_ids
-
-    @property
-    def orientation_ids(self) -> torch.Tensor:
-        """Backward-compatible alias for :attr:`orientation_bin_ids`."""
-        return self.orientation_bin_ids
 
     @property
     def tilt_azimuth_bin_ids(self) -> torch.Tensor:
@@ -1518,9 +1315,7 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
     @classmethod
     def _pick_supported_height(cls) -> float:
         """Return the tool height for non-held PICK rows [m]."""
-        if cls._PICK_SUPPORTED_TOOL_HEIGHT is None:
-            return cls._pick_contact_height()
-        return cls._PICK_SUPPORTED_TOOL_HEIGHT
+        return cls._pick_contact_height()
 
     @classmethod
     def _transport_height(cls, *, second_pick: bool) -> float:
@@ -1541,12 +1336,12 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         return cls._TABLE_HEIGHT + 0.5 * cls._CUBE_HEIGHT + cls._TABLE_APPROACH_TOP_CLEARANCE
 
     @classmethod
-    def _ring_transport_minimum_height(cls) -> float:
-        """Return the ring/thumb carry floor that preserves bottom clearance [m]."""
+    def _transport_minimum_height(cls) -> float:
+        """Return the carry floor that preserves bottom clearance [m]."""
         return cls._table_surface_height() + 0.5 * cls._CUBE_HEIGHT + cls._RING_TRANSPORT_BOTTOM_CLEARANCE
 
     @classmethod
-    def _target_potential(cls, recipe: StackResetRecipe) -> float:
+    def _default_target_potential(cls, recipe: StackResetRecipe) -> float:
         """Return the curriculum completion potential for one reset recipe."""
         return _RECIPE_TARGET_POTENTIAL[recipe]
 
@@ -1562,15 +1357,7 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             self._GRASP_PAIR_TOOL_OFFSETS,
         )
 
-    def _pick_endpoint_heights(
-        self,
-        grasp_pair_ids: torch.Tensor,
-        reference: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return the held height reached by the end of a PICK recipe."""
-        return reference.new_full(grasp_pair_ids.shape, self._pick_contact_height())
-
-    def _pick_phase(
+    def _base_pick_phase(
         self,
         source_positions: torch.Tensor,
         progress: torch.Tensor,
@@ -1579,22 +1366,15 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         """Author open-approach, supported closure, and optional held lift states."""
         approach_progress = torch.clamp(2.0 * progress, max=1.0)
         target_positions = source_positions.clone()
-        contact_height = self._pick_contact_height()
         target_positions[:, 2] = torch.lerp(
             target_positions.new_full(progress.shape, self._pick_pregrasp_height()),
             target_positions.new_full(progress.shape, self._pick_supported_height()),
             approach_progress,
         )
-        if self._PICK_GRASP_PROGRESS_BY_PAIR is None:
-            grasp_progress = torch.ones_like(progress)
-        else:
-            grasp_progress = progress.new_tensor(self._PICK_GRASP_PROGRESS_BY_PAIR)[grasp_pair_ids]
+        grasp_progress = progress.new_tensor(self._PICK_GRASP_PROGRESS_BY_PAIR)[grasp_pair_ids]
         if bool(torch.any(grasp_progress <= 0.5)) or bool(torch.any(grasp_progress > 1.0)):
             raise RuntimeError("PICK grasp progress must lie in (0.5, 1.0].")
-        if self._PICK_HELD_PROGRESS_BY_PAIR is None:
-            held_progress = grasp_progress
-        else:
-            held_progress = progress.new_tensor(self._PICK_HELD_PROGRESS_BY_PAIR)[grasp_pair_ids]
+        held_progress = progress.new_tensor(self._PICK_HELD_PROGRESS_BY_PAIR)[grasp_pair_ids]
         if bool(torch.any(held_progress < grasp_progress)) or bool(torch.any(held_progress > 1.0)):
             raise RuntimeError("PICK held progress must lie between grasp completion and 1.0.")
 
@@ -1604,25 +1384,13 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             max=1.0,
         )
         held = progress >= held_progress - 1.0e-6
-        if self._PICK_SUPPORTED_CLOSURE_LIMIT_BY_PAIR is not None:
-            supported_closure_limit = progress.new_tensor(self._PICK_SUPPORTED_CLOSURE_LIMIT_BY_PAIR)[grasp_pair_ids]
-            if bool(torch.any((supported_closure_limit < 0.0) | (supported_closure_limit >= 1.0))):
-                raise RuntimeError("Supported PICK closure limits must lie in [0.0, 1.0).")
-            closure = torch.where(
-                held,
-                torch.ones_like(closure),
-                torch.minimum(closure, supported_closure_limit),
-            )
         lift_progress = torch.clamp(
             (progress - held_progress) / (1.0 - held_progress).clamp_min(1.0e-6),
             min=0.0,
             max=1.0,
         )
         endpoint_heights = self._pick_endpoint_heights(grasp_pair_ids, progress)
-        if self._PICK_HELD_START_HEIGHT_BY_PAIR is None:
-            held_start_heights = progress.new_full(progress.shape, contact_height)
-        else:
-            held_start_heights = progress.new_tensor(self._PICK_HELD_START_HEIGHT_BY_PAIR)[grasp_pair_ids]
+        held_start_heights = progress.new_tensor(self._PICK_HELD_START_HEIGHT_BY_PAIR)[grasp_pair_ids]
         if bool(torch.any(held_start_heights > endpoint_heights)):
             raise RuntimeError("PICK held-start heights must not exceed their endpoint heights.")
         target_positions[:, 2] = torch.where(
@@ -1635,9 +1403,8 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             target_positions[:, 2],
         )
         maximum_tilt = torch.deg2rad(45.0 * (1.0 - torch.clamp(progress / grasp_progress, max=1.0)))
-        if self._PICK_HELD_TILT_DEGREES_BY_PAIR is not None:
-            held_maximum_tilt = torch.deg2rad(progress.new_tensor(self._PICK_HELD_TILT_DEGREES_BY_PAIR)[grasp_pair_ids])
-            maximum_tilt = torch.where(held, held_maximum_tilt, maximum_tilt)
+        held_maximum_tilt = torch.deg2rad(progress.new_tensor(self._PICK_HELD_TILT_DEGREES_BY_PAIR)[grasp_pair_ids])
+        maximum_tilt = torch.where(held, held_maximum_tilt, maximum_tilt)
         return target_positions, closure, held, maximum_tilt
 
     def _palm_to_held_cube_rotations(
@@ -1650,44 +1417,14 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         return matrix_from_quaternion_xyzw(quaternions[grasp_pair_ids], reference)
 
     def _active_grasp_pair_ids(self, grasp_pair_ids: torch.Tensor) -> torch.Tensor:
-        """Map deterministic reset-mode slots onto enabled grasp pairs."""
-        active_pair_ids = grasp_pair_ids.new_tensor(self._ACTIVE_GRASP_PAIR_IDS)
-        if active_pair_ids.ndim != 1 or active_pair_ids.numel() == 0:
-            raise RuntimeError("At least one active KUKA-Allegro reset grasp pair is required.")
-        if bool(torch.any((active_pair_ids < 0) | (active_pair_ids >= 3))):
-            raise RuntimeError("Active KUKA-Allegro reset grasp-pair IDs must lie in [0, 2].")
-        if torch.unique(active_pair_ids).numel() != active_pair_ids.numel():
-            raise RuntimeError("Active KUKA-Allegro reset grasp-pair IDs must be unique.")
-        return active_pair_ids[torch.remainder(grasp_pair_ids, active_pair_ids.numel())]
+        """Select the validated index/thumb reset grasp."""
+        return torch.zeros_like(grasp_pair_ids)
 
     @classmethod
-    def _orientation_ids_for_recipe(cls, recipe: StackResetRecipe) -> tuple[int, ...]:
+    def _default_orientation_ids_for_recipe(cls, recipe: StackResetRecipe) -> tuple[int, ...]:
         """Return wrist-yaw bins represented by one semantic recipe."""
         del recipe
         return tuple(range(8))
-
-    def _prepare_semantic_reset_plans(self, semantic_layouts: torch.Tensor) -> None:
-        """Prepare optional layout-conditioned reset plans before row expansion."""
-        del semantic_layouts
-
-    def _semantic_orientation_assignments(
-        self,
-        recipe: StackResetRecipe,
-        layout_ids: torch.Tensor,
-        default_orientation_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return wrist-yaw IDs for one expanded semantic recipe."""
-        del recipe, layout_ids
-        return default_orientation_ids
-
-    def _adjust_target_positions_for_rotation(
-        self,
-        target_positions: torch.Tensor,
-        target_rotations: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply a subclass-specific object-axis approach after wrist rotation is known."""
-        del target_rotations
-        return target_positions
 
     @classmethod
     def _table_approach_role_ids(cls, row_ids: torch.Tensor) -> torch.Tensor:
@@ -1701,25 +1438,9 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         permuted = torch.remainder(row_ids * 40503 + 17, cls._TABLE_ROWS)
         return 1 + (permuted >= cls._TABLE_ROWS // 2).long()
 
-    def _table_approach_assignments(
-        self,
-        row_ids: torch.Tensor,
-        layouts: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return target roles and wrist-yaw bins for table-start rows."""
-        del layouts
-        orientation_choices = row_ids.new_tensor(self._orientation_ids_for_recipe(StackResetRecipe.TABLE))
-        if orientation_choices.numel() == 0:
-            raise RuntimeError("The TABLE recipe must enable at least one wrist-yaw bin.")
-        orientation_ids = orientation_choices[torch.remainder(row_ids, orientation_choices.numel())]
-        return self._table_approach_role_ids(row_ids), orientation_ids
-
     def _resolved_table_approach_role_ids(self, row_ids: torch.Tensor) -> torch.Tensor:
         """Return the target roles selected while the immutable table was built."""
-        roles_by_row = getattr(self, "_table_approach_role_ids_by_row", None)
-        if roles_by_row is None:
-            return self._table_approach_role_ids(row_ids)
-        return roles_by_row[row_ids]
+        return self._table_approach_role_ids_by_row[row_ids]
 
     @staticmethod
     def _radical_inverse(index: int, base: int) -> float:
@@ -1734,7 +1455,7 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         return value
 
     @classmethod
-    def _sample_layout(cls, sample_id: int, *, table_start: bool) -> tuple[tuple[float, float], ...]:
+    def _sample_layout_candidate(cls, sample_id: int, *, table_start: bool) -> tuple[tuple[float, float], ...]:
         """Sample three separated cube centers from a low-discrepancy layout."""
         x_lower, x_extent = (
             (cls._TABLE_X_LOWER, cls._TABLE_X_EXTENT)
@@ -1748,27 +1469,6 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         )
         minimum_separation = cls._LAYOUT_MINIMUM_SEPARATION
         layout_count = cls._TABLE_ROWS if table_start else cls._SEMANTIC_LAYOUT_COUNT
-        if not cls._FIX_BASE_DURING_LAYOUT_REJECTION:
-            for attempt in range(96):
-                sequence_id = sample_id + 1 + attempt * layout_count
-                layout = tuple(
-                    (
-                        # Reset-mode IDs use binary factors. Odd Halton bases
-                        # keep their low-order digits from becoming a shortcut.
-                        x_lower + x_extent * cls._radical_inverse(sequence_id + 11 * role_id, 5),
-                        y_lower + y_extent * cls._radical_inverse(sequence_id + 17 * role_id, 7),
-                    )
-                    for role_id in range(3)
-                )
-                if all(
-                    math.dist(layout[first], layout[second]) >= minimum_separation
-                    for first in range(3)
-                    for second in range(first + 1, 3)
-                ):
-                    return layout
-            center_y = -0.10 + 0.20 * cls._radical_inverse(sample_id + 1, 5)
-            return ((0.42, center_y), (0.50, center_y + 0.10), (0.56, center_y - 0.10))
-
         sample_index = sample_id + 1
         # Keep the designated base on its own complete Halton sequence. Varying
         # all three roles during rejection heavily biased accepted large-cube
@@ -1916,7 +1616,7 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         target_rotation = torch.matmul(torch.matmul(yaw_rotation, nominal_rotation), tilt_rotation)
         return target_rotation, yaw_angles
 
-    def _collision_free_wrist_rotations(
+    def _screen_wrist_rotations(
         self,
         row_ids: torch.Tensor,
         target_positions: torch.Tensor,
@@ -2010,7 +1710,7 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         current_bottom = tool_positions[..., 2] - vertical_half_extent
         return torch.clamp(required_bottom + clearance_margin - current_bottom, min=0.0)
 
-    def _solve_diverse_arm_targets(
+    def _solve_arm_targets(
         self,
         seed_positions: torch.Tensor,
         target_positions: torch.Tensor,
@@ -2145,40 +1845,6 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             3,
         )
         within_tilt_limit = candidate_tilt_angles <= self._resolved_tilt_limits[failed_rows, None] + 1.0e-6
-        failed_middle_transport_rows = (
-            (self._recipe_ids[failed_rows] == int(StackResetRecipe.FIRST_TRANSPORT))
-            | (self._recipe_ids[failed_rows] == int(StackResetRecipe.SECOND_TRANSPORT))
-        ) & (self._grasp_pair_ids[failed_rows] == 1)
-        within_tilt_limit &= ~(
-            failed_middle_transport_rows[:, None]
-            & (candidate_azimuth_ids == 2)
-            & (candidate_tilt_angles > math.radians(60.0) + 1.0e-6)
-        )
-        within_tilt_limit &= ~(
-            failed_middle_transport_rows[:, None]
-            & (candidate_azimuth_ids == 6)
-            & (candidate_tilt_angles > math.radians(75.0) + 1.0e-6)
-        )
-        failed_place_rows = (self._recipe_ids[failed_rows] == int(StackResetRecipe.FIRST_PLACE)) | (
-            self._recipe_ids[failed_rows] == int(StackResetRecipe.SECOND_PLACE)
-        )
-        failed_middle_place_rows = failed_place_rows & (self._grasp_pair_ids[failed_rows] == 1)
-        within_tilt_limit &= ~(
-            failed_middle_place_rows[:, None]
-            & (candidate_azimuth_ids == 2)
-            & (candidate_tilt_angles > math.radians(60.0) + 1.0e-6)
-        )
-        within_tilt_limit &= ~(
-            failed_middle_place_rows[:, None]
-            & (candidate_azimuth_ids == 6)
-            & (candidate_tilt_angles > math.radians(75.0) + 1.0e-6)
-        )
-        failed_ring_place_rows = failed_place_rows & (self._grasp_pair_ids[failed_rows] == 2)
-        within_tilt_limit &= ~(
-            failed_ring_place_rows[:, None]
-            & ((candidate_azimuth_ids == 5) | (candidate_azimuth_ids == 6))
-            & (candidate_tilt_angles > math.radians(5.0) + 1.0e-6)
-        )
         failed_index_first_place_rows = (self._recipe_ids[failed_rows] == int(StackResetRecipe.FIRST_PLACE)) & (
             self._grasp_pair_ids[failed_rows] == 0
         )
@@ -2354,10 +2020,6 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         clearance_margins[held_recipe_ids == int(StackResetRecipe.FIRST_PLACE)] = (
             self._FIRST_PLACE_SUPPORT_MARGIN + 2.0e-5
         )
-        first_place_ring = (held_recipe_ids == int(StackResetRecipe.FIRST_PLACE)) & (
-            self._grasp_pair_ids[held_rows] == 2
-        )
-        clearance_margins[first_place_ring] = self._FIRST_PLACE_RING_SUPPORT_MARGIN + 2.0e-5
         clearance_margins[held_recipe_ids == int(StackResetRecipe.SECOND_PLACE)] = (
             self._SECOND_PLACE_SUPPORT_MARGIN + 2.0e-5
         )
@@ -2483,12 +2145,10 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         closed_finger_position: float,
         placed_finger_position: float,
         open_finger_position: float,
-        closed_hand_positions: Sequence[float] | None = None,
-        open_hand_positions: Sequence[float] | None = None,
         table_rows_per_layout: int = StackResetStateTable._TABLE_ROWS_PER_LAYOUT,
     ) -> None:
         """Build the exact-size pair-conditioned reset bank."""
-        del closed_hand_positions, open_hand_positions, table_rows_per_layout
+        del table_rows_per_layout
         if not closed_finger_position < placed_finger_position < open_finger_position:
             raise ValueError("Diverse hand scalars must satisfy closed < placed < open.")
 
@@ -2754,10 +2414,7 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         layout_rows.append(self._SEMANTIC_LAYOUT_COUNT + table_local_rows)
         pair_rows.append(table_pair_ids)
         orientation_rows.append(table_orientation_ids)
-        table_maximum_tilt = torch.deg2rad(30.0 + 80.0 * table_progress)
-        if self._TABLE_USES_OBJECT_AXIS_APPROACH:
-            table_maximum_tilt.zero_()
-        maximum_tilt_rows.append(table_maximum_tilt)
+        maximum_tilt_rows.append(torch.zeros_like(table_progress))
         closure_rows.append(torch.zeros_like(table_progress))
 
         target_positions = torch.cat(arm_targets)
@@ -2807,19 +2464,11 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         place_rows = (self._recipe_ids == int(StackResetRecipe.FIRST_PLACE)) | (
             self._recipe_ids == int(StackResetRecipe.SECOND_PLACE)
         )
-        transport_floor_pair_ids = torch.tensor(
-            self._TRANSPORT_FLOOR_PAIR_IDS,
-            dtype=self._grasp_pair_ids.dtype,
-            device=self.device,
-        )
-        floored_transport_rows = transport_rows & torch.isin(
-            self._grasp_pair_ids,
-            transport_floor_pair_ids,
-        )
+        floored_transport_rows = transport_rows
         # Dynamically fragile low carries begin at the first repeatedly
         # validated one-second retention height.
         target_positions[floored_transport_rows, 2] = target_positions[floored_transport_rows, 2].clamp_min(
-            self._ring_transport_minimum_height()
+            self._transport_minimum_height()
         )
 
         tilt_scales = (self._tilt_magnitude_ids.to(self._arm_anchors.dtype) + 1.0) / 4.0
@@ -2831,28 +2480,12 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             ),
         )
         tilt_angles = phase_tilt_limits * tilt_scales
-        # Preserve the phase-safe envelope for rows whose low target height is
-        # deliberately rewound. Other rows retain the legacy broad fallback
-        # unless a validated pair-specific cap below applies.
-        if self._RESPECT_HELD_PICK_TILT_LIMIT_DURING_IK_REPAIR:
-            self._resolved_tilt_limits = torch.full_like(phase_tilt_limits, self._GLOBAL_TILT_LIMIT)
-            # Held PICK rows must preserve the table-contact envelope authored
-            # by that phase. Other rows retain the broader repair search; their
-            # support clearance is validated separately below.
-            held_pick_rows = (self._held_roles >= 0) & (
-                (self._recipe_ids == int(StackResetRecipe.FIRST_PICK))
-                | (self._recipe_ids == int(StackResetRecipe.SECOND_PICK))
-            )
-            self._resolved_tilt_limits[held_pick_rows] = phase_tilt_limits[held_pick_rows]
-            self._resolved_tilt_limits[floored_transport_rows] = phase_tilt_limits[floored_transport_rows]
-        else:
-            self._resolved_tilt_limits = torch.full_like(phase_tilt_limits, self._GLOBAL_TILT_LIMIT)
-            self._resolved_tilt_limits[floored_transport_rows] = phase_tilt_limits[floored_transport_rows]
-        if self._RESPECT_PICK_TILT_LIMIT_DURING_IK_REPAIR:
-            pick_rows = (self._recipe_ids == int(StackResetRecipe.FIRST_PICK)) | (
-                self._recipe_ids == int(StackResetRecipe.SECOND_PICK)
-            )
-            self._resolved_tilt_limits[pick_rows] = phase_tilt_limits[pick_rows]
+        self._resolved_tilt_limits = torch.full_like(phase_tilt_limits, self._GLOBAL_TILT_LIMIT)
+        self._resolved_tilt_limits[floored_transport_rows] = phase_tilt_limits[floored_transport_rows]
+        pick_rows = (self._recipe_ids == int(StackResetRecipe.FIRST_PICK)) | (
+            self._recipe_ids == int(StackResetRecipe.SECOND_PICK)
+        )
+        self._resolved_tilt_limits[pick_rows] = phase_tilt_limits[pick_rows]
         tilt_angles[place_rows] = torch.minimum(
             tilt_angles[place_rows],
             torch.full_like(tilt_angles[place_rows], self._PLACE_TILT_LIMIT),
@@ -2861,53 +2494,6 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             self._resolved_tilt_limits[place_rows],
             torch.full_like(self._resolved_tilt_limits[place_rows], self._PLACE_TILT_LIMIT),
         )
-        # Newton retention screening found one narrow, gravity-adverse
-        # middle/thumb transport envelope. Capping only this pair/axis at
-        # 60 degrees eliminated all >20 mm one-second slips while every other
-        # axis and pair retains the full 110-degree coverage.
-        middle_transport_cap = (
-            transport_rows
-            & (self._grasp_pair_ids == 1)
-            & (self._tilt_azimuth_ids == 2)
-            & (tilt_angles > math.radians(60.0))
-        )
-        tilt_angles[middle_transport_cap] = math.radians(60.0)
-        middle_transport_secondary_cap = (
-            transport_rows
-            & (self._grasp_pair_ids == 1)
-            & (self._tilt_azimuth_ids == 6)
-            & (tilt_angles > math.radians(75.0))
-        )
-        tilt_angles[middle_transport_secondary_cap] = math.radians(75.0)
-        # The ring/thumb pair retains broad orientations but not the small
-        # gravity-adverse tail above 90 degrees. Both transport phases keep a
-        # conservative 75-degree cap for those authored rows.
-        ring_transport_cap = floored_transport_rows & (self._grasp_pair_ids == 2) & (tilt_angles > math.radians(90.0))
-        tilt_angles[ring_transport_cap] = math.radians(75.0)
-        ring_transport_rows = floored_transport_rows & (self._grasp_pair_ids == 2)
-        self._resolved_tilt_limits[ring_transport_rows] = torch.minimum(
-            phase_tilt_limits[ring_transport_rows],
-            torch.maximum(
-                tilt_angles[ring_transport_rows],
-                torch.full_like(tilt_angles[ring_transport_rows], math.radians(75.0)),
-            ),
-        )
-        middle_place_rows = place_rows & (self._grasp_pair_ids == 1)
-        middle_place_primary_cap = (
-            middle_place_rows & (self._tilt_azimuth_ids == 2) & (tilt_angles > math.radians(60.0))
-        )
-        tilt_angles[middle_place_primary_cap] = math.radians(60.0)
-        middle_place_secondary_cap = (
-            middle_place_rows & (self._tilt_azimuth_ids == 6) & (tilt_angles > math.radians(75.0))
-        )
-        tilt_angles[middle_place_secondary_cap] = math.radians(75.0)
-        ring_place_cap = (
-            place_rows
-            & (self._grasp_pair_ids == 2)
-            & ((self._tilt_azimuth_ids == 5) | (self._tilt_azimuth_ids == 6))
-            & (tilt_angles > math.radians(5.0))
-        )
-        tilt_angles[ring_place_cap] = math.radians(5.0)
         index_first_place_cap = (
             (self._recipe_ids == int(StackResetRecipe.FIRST_PLACE))
             & (self._grasp_pair_ids == 0)
@@ -2972,49 +2558,47 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         )
         self._role_quaternions[..., 2] = torch.sin(half_yaw)
         self._role_quaternions[..., 3] = torch.cos(half_yaw)
-        if self._COUPLE_CONTACT_CUBE_YAW:
-            # Closing/release rows must present the same cube face that the
-            # selected fingertip pair reaches at contact. Keep these supported
-            # cubes upright, but derive their yaw from the achieved palm and
-            # pair-specific palm-to-cube transform. TABLE rows remain fully
-            # randomized and therefore retain deployment-start diversity.
-            contact_roles = torch.full(
-                (self._EXPECTED_ROW_COUNT,),
-                -1,
-                dtype=torch.long,
-                device=self.device,
-            )
-            contact_roles[self._recipe_ids == int(StackResetRecipe.FINAL_RELEASE)] = 2
-            contact_roles[self._recipe_ids == int(StackResetRecipe.SECOND_PLACE)] = 2
-            contact_roles[self._recipe_ids == int(StackResetRecipe.SECOND_PICK)] = 2
-            contact_roles[self._recipe_ids == int(StackResetRecipe.PAIR_READY)] = 2
-            contact_roles[self._recipe_ids == int(StackResetRecipe.FIRST_PLACE)] = 1
-            contact_roles[self._recipe_ids == int(StackResetRecipe.FIRST_PICK)] = 1
-            if self._TABLE_USES_OBJECT_AXIS_APPROACH:
-                table_rows = torch.nonzero(
-                    self._recipe_ids == int(StackResetRecipe.TABLE),
-                    as_tuple=False,
-                ).flatten()
-                table_local_rows = self._layout_ids[table_rows] - self._SEMANTIC_LAYOUT_COUNT
-                contact_roles[table_rows] = self._resolved_table_approach_role_ids(table_local_rows)
-            contact_rows = torch.nonzero(contact_roles >= 0, as_tuple=False).flatten()
-            palm_to_cube = self._palm_to_held_cube_rotations(
-                self._grasp_pair_ids[contact_rows],
-                self._arm_anchors,
-            )
-            contact_rotations = torch.matmul(actual_palm_rotations[contact_rows], palm_to_cube)
-            contact_yaw = torch.atan2(contact_rotations[:, 1, 0], contact_rotations[:, 0, 0])
-            contact_quaternions = torch.zeros(
-                (contact_rows.numel(), 4),
-                dtype=self._arm_anchors.dtype,
-                device=self.device,
-            )
-            contact_quaternions[:, 2] = torch.sin(0.5 * contact_yaw)
-            contact_quaternions[:, 3] = torch.cos(0.5 * contact_yaw)
-            self._role_quaternions[
-                contact_rows,
-                contact_roles[contact_rows],
-            ] = contact_quaternions
+        # Closing/release rows must present the same cube face that the
+        # selected fingertip pair reaches at contact. Keep these supported
+        # cubes upright, but derive their yaw from the achieved palm and
+        # pair-specific palm-to-cube transform. TABLE rows remain fully
+        # randomized and therefore retain deployment-start diversity.
+        contact_roles = torch.full(
+            (self._EXPECTED_ROW_COUNT,),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        contact_roles[self._recipe_ids == int(StackResetRecipe.FINAL_RELEASE)] = 2
+        contact_roles[self._recipe_ids == int(StackResetRecipe.SECOND_PLACE)] = 2
+        contact_roles[self._recipe_ids == int(StackResetRecipe.SECOND_PICK)] = 2
+        contact_roles[self._recipe_ids == int(StackResetRecipe.PAIR_READY)] = 2
+        contact_roles[self._recipe_ids == int(StackResetRecipe.FIRST_PLACE)] = 1
+        contact_roles[self._recipe_ids == int(StackResetRecipe.FIRST_PICK)] = 1
+        table_rows = torch.nonzero(
+            self._recipe_ids == int(StackResetRecipe.TABLE),
+            as_tuple=False,
+        ).flatten()
+        table_local_rows = self._layout_ids[table_rows] - self._SEMANTIC_LAYOUT_COUNT
+        contact_roles[table_rows] = self._resolved_table_approach_role_ids(table_local_rows)
+        contact_rows = torch.nonzero(contact_roles >= 0, as_tuple=False).flatten()
+        palm_to_cube = self._palm_to_held_cube_rotations(
+            self._grasp_pair_ids[contact_rows],
+            self._arm_anchors,
+        )
+        contact_rotations = torch.matmul(actual_palm_rotations[contact_rows], palm_to_cube)
+        contact_yaw = torch.atan2(contact_rotations[:, 1, 0], contact_rotations[:, 0, 0])
+        contact_quaternions = torch.zeros(
+            (contact_rows.numel(), 4),
+            dtype=self._arm_anchors.dtype,
+            device=self.device,
+        )
+        contact_quaternions[:, 2] = torch.sin(0.5 * contact_yaw)
+        contact_quaternions[:, 3] = torch.cos(0.5 * contact_yaw)
+        self._role_quaternions[
+            contact_rows,
+            contact_roles[contact_rows],
+        ] = contact_quaternions
         if held_rows.numel() > 0:
             palm_to_cube = self._palm_to_held_cube_rotations(
                 self._grasp_pair_ids[held_rows],
@@ -3024,32 +2608,13 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             self._role_quaternions[held_rows, self._held_roles[held_rows]] = quaternion_xyzw_from_matrix(held_rotations)
 
         self._finger_positions = open_finger_position + closure * (closed_finger_position - open_finger_position)
-        self._goal_pairs = torch.full(
-            (self._EXPECTED_ROW_COUNT,),
-            2,
-            dtype=torch.long,
-            device=self.device,
-        )
         self._target_potentials = torch.tensor(
             tuple(self._target_potential(StackResetRecipe(int(recipe))) for recipe in self._recipe_ids.cpu()),
             dtype=torch.float32,
             device=self.device,
         )
-        centered_positions = self._role_positions - self._role_positions[:, :1]
-        orientation_angles = self._orientation_ids.to(self._arm_anchors.dtype) * (math.pi / 4.0)
-        self._features = torch.cat(
-            (
-                centered_positions.flatten(start_dim=1) / 0.18,
-                0.25 * self._arm_positions,
-                closure.unsqueeze(1),
-                (self._grasp_pair_ids.to(self._arm_anchors.dtype) / 2.0).unsqueeze(1),
-                torch.sin(orientation_angles).unsqueeze(1),
-                torch.cos(orientation_angles).unsqueeze(1),
-            ),
-            dim=1,
-        )
 
-    def _validate_table(self) -> None:  # noqa: C901
+    def _validate_kuka_table(self) -> None:  # noqa: C901
         """Validate exact balance, IK quality, bounds, and cube clearance."""
         super()._validate_table()
         if self.row_count != self._EXPECTED_ROW_COUNT:
@@ -3100,15 +2665,9 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             expected_orientation_counts,
         ):
             raise RuntimeError("Diverse KUKA reset bank is not balanced across wrist-yaw bins.")
-        active_pair_ids = self._grasp_pair_ids.new_tensor(self._ACTIVE_GRASP_PAIR_IDS)
-        pair_counts = torch.bincount(self._grasp_pair_ids, minlength=3)
-        inactive_pair_mask = torch.ones(3, dtype=torch.bool, device=self.device)
-        inactive_pair_mask[active_pair_ids] = False
-        if bool(torch.any(pair_counts[inactive_pair_mask] != 0)):
-            raise RuntimeError("Diverse KUKA reset bank contains a disabled grasp pair.")
-        active_pair_counts = pair_counts[active_pair_ids]
-        if int(active_pair_counts.max() - active_pair_counts.min()) > 1:
-            raise RuntimeError("Diverse KUKA reset bank grasp-pair counts differ by more than one.")
+        if bool(torch.any(self._grasp_pair_ids != 0)):
+            raise RuntimeError("KUKA reset rows must use the calibrated index/thumb grasp.")
+        active_pair_ids = self._grasp_pair_ids.new_tensor((0,))
         if bool(torch.any((self._tilt_azimuth_ids < 0) | (self._tilt_azimuth_ids >= 8))):
             raise RuntimeError("Diverse KUKA reset bank contains an invalid palm-tilt azimuth.")
         if bool(torch.any((self._tilt_magnitude_ids < 0) | (self._tilt_magnitude_ids >= 4))):
@@ -3118,10 +2677,8 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
             raise RuntimeError(
                 f"Diverse KUKA reset bank contains a palm tilt above {maximum_tilt_degrees:.4g} degrees."
             )
-        pair_ranks = torch.full((3,), -1, dtype=torch.long, device=self.device)
-        pair_ranks[active_pair_ids] = torch.arange(active_pair_ids.numel(), device=self.device)
-        pair_orientation_count = 8 * active_pair_ids.numel()
-        pair_orientation_ids = 8 * pair_ranks[self._grasp_pair_ids] + self._authored_orientation_ids
+        pair_orientation_count = 8
+        pair_orientation_ids = self._authored_orientation_ids
         wrist_orientation_ids = 8 * self._orientation_ids + self._tilt_azimuth_ids
         reset_mode_ids = 4 * (8 * pair_orientation_ids + self._authored_tilt_azimuth_ids) + self._tilt_magnitude_ids
         reset_mode_count = 32 * pair_orientation_count
@@ -3293,8 +2850,6 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
                     clearance.shape,
                     self._FIRST_PLACE_SUPPORT_MARGIN,
                 )
-                first_place_pair_ids = self._grasp_pair_ids[held_rows[first_place]]
-                required_margin[first_place_pair_ids == 2] = self._FIRST_PLACE_RING_SUPPORT_MARGIN
                 invalid = clearance < required_margin - 3.0e-5
                 if bool(torch.any(invalid)):
                     invalid_rows = held_rows[first_place][invalid]
@@ -3328,165 +2883,13 @@ class DiverseKukaAllegroStackResetStateTable(StackResetStateTable):
         held_rotation = torch.matmul(palm_rotation, palm_to_cube)
         return held_position, quaternion_xyzw_from_matrix(held_rotation)
 
-
-class LargeCubeDiverseKukaAllegroStackResetStateTable(DiverseKukaAllegroStackResetStateTable):
-    """Pair- and wrist-diverse reset manifold calibrated for 8 cm cubes.
-
-    The row count and reset curriculum remain unchanged. Geometry inherited
-    from :class:`DiverseKukaAllegroStackResetStateTable` derives pick, carry,
-    placement, and approach heights from these cube dimensions, so every
-    cached phase remains physically consistent with the larger cube.
-    """
-
-    _CUBE_HEIGHT = KUKA_ALLEGRO_LARGE_CUBE_EDGE_LENGTH
-    # The task's native contact surface is aligned with the visible tabletop,
-    # so supported cubes use their geometric half-height.
-    _TABLE_HEIGHT = KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT
-    # A square at arbitrary yaw fits inside a circle of diameter sqrt(2) * edge.
-    # The additional margin avoids corner contact in table-start rows.
-    _LAYOUT_MINIMUM_SEPARATION = 0.12
-    # The live-USD large-cube pair centers sit farther from the palm. Low-X
-    # ring/thumb targets at -45-degree yaw are kinematically singular at table
-    # contact, so preserve range width while moving both reset workspaces into
-    # the calibrated side-grasp reach envelope.
-    _SEMANTIC_X_LOWER = 0.46
-    _TABLE_X_LOWER = 0.45
-    _FIX_BASE_DURING_LAYOUT_REJECTION = True
-    _FINAL_CLEARANCE_MAX_PASSES = 12
-    _COUPLE_CONTACT_CUBE_YAW = True
-    # Large two-finger grasps remain yaw-diverse over the full 360 degrees and
-    # retain all eight tilt axes/four magnitudes, but do not author the
-    # gravity-adverse 60-110 degree poses that fail one-second retention.
-    _GLOBAL_TILT_LIMIT = math.radians(45.0)
-    # During the second carry, the held cube traverses an existing two-cube
-    # stack. Lift it high enough that even the worst 45-degree cube extent
-    # clears that stack before planar motion begins.
-    _SECOND_TRANSPORT_BOTTOM_CLEARANCE = (
-        1.5 * _CUBE_HEIGHT
-        + 0.5 * _CUBE_HEIGHT * (math.cos(_GLOBAL_TILT_LIMIT) + math.sqrt(2.0) * math.sin(_GLOBAL_TILT_LIMIT))
-        + 4.0 * DiverseKukaAllegroStackResetStateTable._RESET_CLEARANCE_MARGIN
-    )
-    _PICK_GRASP_PROGRESS_BY_PAIR = (0.75, 0.75, 0.75)
-    _PICK_HELD_PROGRESS_BY_PAIR = (0.75, 0.75, 0.75)
-    _PICK_HELD_START_HEIGHT_BY_PAIR = (0.105, 0.105, 0.105)
-    _PICK_HELD_TILT_DEGREES_BY_PAIR = (15.0, 15.0, 15.0)
-    # A fully closed hand centered at table height collides with the support
-    # and launches an 8 cm cube. Keep supported acquisition rows partial, then
-    # jump reset sampling (not live dynamics) to a screened suspended grasp.
-    _PICK_SUPPORTED_CLOSURE_LIMIT_BY_PAIR = (0.75, 0.75, 0.75)
-    _TRANSPORT_INITIAL_TILT_DEGREES = 15.0
-    _RESPECT_HELD_PICK_TILT_LIMIT_DURING_IK_REPAIR = True
-    # Newton screening found that any reset-authored Allegro contact at or
-    # below 18 cm can impart a large impulse to a supported 8 cm cube. Keep all
-    # non-held PICK, PAIR_READY, and TABLE approaches at or above the validated
-    # 20 cm tool-center floor. The live policy owns the descent and contact.
-    _PICK_PREGRASP_TOP_CLEARANCE = 0.1195
-    _PICK_CONTACT_CENTER_LIFT = 0.0
-    _PICK_SUPPORTED_TOOL_HEIGHT = 0.200
-    _PAIR_READY_SOURCE_TOP_CLEARANCE = 0.1195
-    _TABLE_APPROACH_TOP_CLEARANCE = 0.1195
-    _TABLE_APPROACH_HEIGHT_RANGE = 0.050
-    # A face-aligned 8 cm cube cannot approach a support at the 4 cm task's
-    # extreme 80-110 degree tilts. Every phase retains the full yaw/tilt-axis
-    # bank while limiting tilt magnitude to a still-broad 45 degrees.
-    _PLACE_TILT_LIMIT = math.radians(45.0)
-    # Every pair needs the cube clear of the support before a reset grasp is
-    # dynamically stable. PICK therefore has two manifolds: table-supported
-    # partial-close rows and screened held rows from 10.5 to 11.5 cm. The
-    # policy, rather than the reset bank, traverses the omitted invalid states.
-    _RING_TRANSPORT_BOTTOM_CLEARANCE = 0.0745
-    _TRANSPORT_FLOOR_PAIR_IDS = (0, 1, 2)
-    _GRASP_PAIR_OPEN_COMMANDS = KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_OPEN_COMMANDS
-    _GRASP_PAIR_RESET_CLOSED_COMMANDS = KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_RESET_CLOSED_COMMANDS
-    _GRASP_PAIR_TOOL_OFFSETS = KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_TOOL_OFFSETS
-    _PALM_TO_HELD_CUBE_QUATERNIONS_XYZW = KUKA_ALLEGRO_LARGE_CUBE_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW
-
     def _pick_endpoint_heights(
         self,
         grasp_pair_ids: torch.Tensor,
         reference: torch.Tensor,
     ) -> torch.Tensor:
         """Return the screened carry-floor endpoint for every held pair."""
-        return reference.new_full(grasp_pair_ids.shape, self._ring_transport_minimum_height())
-
-
-class FullHandLargeCubeDiverseKukaAllegroStackResetStateTable(LargeCubeDiverseKukaAllegroStackResetStateTable):
-    """Physics-validated acquisition bridge for the fully actuated hand.
-
-    The policy controls every Allegro joint independently. Reset demonstrations
-    deliberately use the robust index/thumb grasp until the other pairs pass
-    the same complete reset-bank validation. Open fingers approach along the
-    cube-to-palm axis, close while the cube remains supported, and then use the
-    validated contact posture and live preload while lifting into the retained
-    grasp manifold.
-    """
-
-    _ACTIVE_GRASP_PAIR_IDS = (0,)
-    _GRASP_PAIR_OPEN_COMMANDS = KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_OPEN_COMMANDS
-    _GRASP_PAIR_RESET_CLOSED_COMMANDS = KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_CONTACT_COMMANDS
-    _GRASP_PAIR_TOOL_OFFSETS = KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_TOOL_OFFSETS
-    _PALM_TO_HELD_CUBE_QUATERNIONS_XYZW = KUKA_ALLEGRO_FULL_HAND_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW
-    # The screened side pinch places the pair center 3.5 mm above the settled
-    # cube COM. Keep this world-height correction separate from the calibrated
-    # palm-frame tool offset.
-    _PICK_CONTACT_CENTER_LIFT = 0.0035
-    _PICK_SUPPORTED_TOOL_HEIGHT = None
-    _PICK_SUPPORTED_CLOSURE_LIMIT_BY_PAIR = None
-    _PICK_GRASP_PROGRESS_BY_PAIR = (0.75, 0.75, 0.75)
-    _PICK_HELD_PROGRESS_BY_PAIR = (0.75, 0.75, 0.75)
-    _PICK_HELD_START_HEIGHT_BY_PAIR = (KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT + 0.0035,) * 3
-    _PICK_LIFT_BRIDGE_END_PROGRESS = 0.875
-    _PICK_LIFT_BRIDGE_HEIGHT = 0.025
-    _PICK_HELD_TILT_DEGREES_BY_PAIR = (0.0, 0.0, 0.0)
-    _RESPECT_PICK_TILT_LIMIT_DURING_IK_REPAIR = True
-    _OBJECT_AXIS_APPROACH_DISTANCE = 0.10
-    # The live acquisition sequence was screened from this collision-free
-    # distance. Do not shorten it merely to make a wrist-yaw bin reachable:
-    # those short approaches visibly push supported cubes at reset.
-    _PICK_APPROACH_DISTANCES_BY_YAW = (0.10,) * 8
-    _SEMANTIC_X_LOWER = 0.48
-    _SEMANTIC_X_EXTENT = 0.14
-    _SEMANTIC_Y_LOWER = -0.14
-    _SEMANTIC_Y_EXTENT = 0.28
-    _TABLE_X_LOWER = _SEMANTIC_X_LOWER
-    _TABLE_X_EXTENT = _SEMANTIC_X_EXTENT
-    _TABLE_Y_LOWER = _SEMANTIC_Y_LOWER
-    _TABLE_Y_EXTENT = _SEMANTIC_Y_EXTENT
-    _TABLE_USES_OBJECT_AXIS_APPROACH = True
-    _MINIMUM_ACQUISITION_CORRIDOR_CENTER_DISTANCE = 0.15
-    _MINIMUM_SEMANTIC_BASE_SOURCE_DISTANCE = 0.13
-    # A geometrically valid held cube can still place the palm and proximal
-    # fingers through the completed two-cube stack. The centerline margin is a
-    # conservative capsule proxy for that swept hand volume; the separate SAT
-    # margin leaves room for the small live settling motion of a reset grasp.
-    _SECOND_TRANSPORT_HAND_STACK_CLEARANCE = 0.020
-    _SECOND_TRANSPORT_CUBE_STACK_CLEARANCE = 0.015
-    _SECOND_TRANSPORT_IK_REPAIR_BUFFER = 0.002
-    # FINAL_RELEASE intentionally keeps the selected index/thumb pair close
-    # to the top cube while it opens. A whole-hand Newton audit found that
-    # stack loss instead tracks the origins of the two non-tip link-2 bodies:
-    # their palm-frame locations are deterministic to better than 0.05 mm
-    # over the complete closed-to-open trajectory. Model those link centers
-    # explicitly and keep their empirically calibrated body envelopes clear
-    # without rejecting the intended pair-center or fingertip contact.
-    _FINAL_RELEASE_INDEX_LINK_2_CLOSED_OFFSET = (0.08886563, -0.05273560, 0.02398680)
-    _FINAL_RELEASE_INDEX_LINK_2_OPEN_OFFSET = (0.08809996, -0.05582009, 0.02321215)
-    _FINAL_RELEASE_MIDDLE_LINK_2_OFFSET = (0.08730662, 0.00877876, 0.03099778)
-    # Ring link-2 added no failures beyond the index/middle union in the
-    # exhaustive audit, so omit it rather than widening the repair surface.
-    # The top-only 30 mm envelope caught 62/66 residual collapses after the
-    # first calibrated repair while the removed lower-link box added no
-    # causal signal. Keep the threshold symmetric so the proxy remains a
-    # transparent body-radius guard instead of an orientation-specific rule.
-    _FINAL_RELEASE_INDEX_LINK_2_CLEARANCE = 0.030
-    _FINAL_RELEASE_MIDDLE_LINK_2_CLEARANCE = 0.030
-    _FINAL_RELEASE_LOWER_STACK_HAND_CLEARANCE = 0.020
-    _FINAL_RELEASE_RETREAT_CANDIDATES = (0.0, 0.010, 0.020, 0.030, 0.040, 0.050, 0.060)
-    _SAFE_SEMANTIC_YAW_RECIPES = (
-        StackResetRecipe.FIRST_PICK,
-        StackResetRecipe.PAIR_READY,
-        StackResetRecipe.SECOND_PICK,
-    )
+        return reference.new_full(grasp_pair_ids.shape, self._transport_minimum_height())
 
     @classmethod
     def _target_potential(cls, recipe: StackResetRecipe) -> float:
@@ -3504,7 +2907,7 @@ class FullHandLargeCubeDiverseKukaAllegroStackResetStateTable(LargeCubeDiverseKu
             return 1.25
         if recipe in (StackResetRecipe.PAIR_READY, StackResetRecipe.SECOND_PICK):
             return 6.25
-        return super()._target_potential(recipe)
+        return cls._default_target_potential(recipe)
 
     @classmethod
     def _sample_layout(cls, sample_id: int, *, table_start: bool) -> tuple[tuple[float, float], ...]:
@@ -3516,10 +2919,10 @@ class FullHandLargeCubeDiverseKukaAllegroStackResetStateTable(LargeCubeDiverseKu
         augmentation. TABLE layouts use their separate corridor planner.
         """
         if table_start:
-            return super()._sample_layout(sample_id, table_start=True)
+            return cls._sample_layout_candidate(sample_id, table_start=True)
         for attempt in range(64):
             candidate_id = sample_id + attempt * cls._SEMANTIC_LAYOUT_COUNT
-            layout = super()._sample_layout(candidate_id, table_start=False)
+            layout = cls._sample_layout_candidate(candidate_id, table_start=False)
             if all(
                 math.dist(layout[0], layout[role_id]) >= cls._MINIMUM_SEMANTIC_BASE_SOURCE_DISTANCE
                 for role_id in (1, 2)
@@ -3537,7 +2940,7 @@ class FullHandLargeCubeDiverseKukaAllegroStackResetStateTable(LargeCubeDiverseKu
             return (2, 6)
         if recipe == StackResetRecipe.TABLE:
             return (2, 3, 6)
-        return super()._orientation_ids_for_recipe(recipe)
+        return cls._default_orientation_ids_for_recipe(recipe)
 
     @staticmethod
     def _corridor_center_clearance(
@@ -4042,7 +3445,7 @@ class FullHandLargeCubeDiverseKukaAllegroStackResetStateTable(LargeCubeDiverseKu
             position_residuals,
             rotation_residuals,
             target_rotations,
-        ) = super()._solve_diverse_arm_targets(
+        ) = self._solve_arm_targets(
             seed_positions,
             target_positions,
             target_rotations,
@@ -4224,7 +3627,7 @@ class FullHandLargeCubeDiverseKukaAllegroStackResetStateTable(LargeCubeDiverseKu
         tool_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Also keep a held second cube and the swept hand clear of the stack."""
-        valid = super()._collision_free_wrist_rotations(
+        valid = self._screen_wrist_rotations(
             row_ids,
             target_positions,
             palm_rotations,
@@ -4419,7 +3822,7 @@ class FullHandLargeCubeDiverseKukaAllegroStackResetStateTable(LargeCubeDiverseKu
         grasp_pair_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Author the contact-to-retained-lift bridge without roll or pitch."""
-        target_positions, closure, held, maximum_tilt = super()._pick_phase(
+        target_positions, closure, held, maximum_tilt = self._base_pick_phase(
             source_positions,
             progress,
             grasp_pair_ids,
@@ -4514,7 +3917,7 @@ class FullHandLargeCubeDiverseKukaAllegroStackResetStateTable(LargeCubeDiverseKu
 
     def _validate_table(self) -> None:
         """Validate the final achieved hand/cube stack-clearance envelope."""
-        super()._validate_table()
+        self._validate_kuka_table()
         row_ids = torch.arange(self.row_count, device=self.device)
         actual_tool_positions, actual_palm_rotations = self._grasp_pair_pose(
             self._arm_positions,

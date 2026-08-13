@@ -15,7 +15,7 @@ import torch
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
 from isaaclab.envs.mdp.actions.joint_actions import JointAction
 
-from .robot_state import franka_end_effector_pose
+from .runtime_state import get_stack_reset_runtime_state
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -44,10 +44,7 @@ class ResetBufferedGripperAction(BinaryJointPositionAction):
     def process_actions(self, actions: torch.Tensor) -> None:
         """Map binary policy actions and protect reset-assisted acquisition."""
         super().process_actions(actions)
-        held_cube_ids = getattr(self._env, "stack_reset_held_cube_ids", None)
-        if held_cube_ids is None:
-            return
-
+        held_cube_ids = get_stack_reset_runtime_state(self._env).held_cube_ids
         force_close = (held_cube_ids >= 0) & (self._env.episode_length_buf < self.cfg.force_close_steps)
         self._processed_actions[force_close] = self._close_command
 
@@ -143,59 +140,47 @@ class ResetPreservingRelativeJointPositionAction(JointAction):
         position_targets = current_position + target_delta
 
         if self._pair_reset_preload_commands is not None:
-            reset_state = getattr(self._env, "stack_reset_state", None)
-            grasp_pair_ids = (
-                reset_state.grasp_pair_ids
-                if reset_state is not None
-                else getattr(self._env, "stack_reset_grasp_pair_ids", None)
+            grasp_pair_ids = get_stack_reset_runtime_state(self._env).grasp_pair_ids.long()
+            safe_pair_ids = torch.clamp(
+                grasp_pair_ids,
+                min=0,
+                max=self._pair_reset_preload_commands.shape[0] - 1,
             )
-            if grasp_pair_ids is None:
-                if torch.any(self._preload_assist_active):
-                    raise AttributeError("Pair-conditioned reset preload requires stack reset grasp-pair metadata.")
-            else:
-                grasp_pair_ids = grasp_pair_ids.long()
-                safe_pair_ids = torch.clamp(
-                    grasp_pair_ids,
-                    min=0,
-                    max=self._pair_reset_preload_commands.shape[0] - 1,
+            invalid_pair_ids = self._preload_assist_active & (grasp_pair_ids != safe_pair_ids)
+            if torch.any(invalid_pair_ids):
+                invalid_values = torch.unique(grasp_pair_ids[invalid_pair_ids]).tolist()
+                raise ValueError(
+                    f"Held reset rows reference grasp-pair IDs without preload commands: {invalid_values}."
                 )
-                invalid_pair_ids = self._preload_assist_active & (grasp_pair_ids != safe_pair_ids)
-                if torch.any(invalid_pair_ids):
-                    invalid_values = torch.unique(grasp_pair_ids[invalid_pair_ids]).tolist()
-                    raise ValueError(
-                        f"Held reset rows reference grasp-pair IDs without preload commands: {invalid_values}."
-                    )
-                preload_targets = torch.clamp(
-                    self._pair_reset_preload_commands[safe_pair_ids],
-                    min=lower,
-                    max=upper,
-                )
-                open_targets = torch.clamp(
-                    self._pair_reset_open_commands[safe_pair_ids],
-                    min=lower,
-                    max=upper,
-                )
-                opening_direction = open_targets - preload_targets
-                opening_fraction = torch.sum(target_delta * opening_direction, dim=1) / torch.sum(
-                    torch.square(opening_direction),
-                    dim=1,
-                ).clamp_min(1.0e-12)
-                opening_intent = self._preload_assist_active & (opening_fraction >= self.cfg.preload_release_threshold)
-                self._preload_open_intent_steps = torch.where(
-                    opening_intent,
-                    self._preload_open_intent_steps + 1,
-                    torch.zeros_like(self._preload_open_intent_steps),
-                )
-                release = self._preload_assist_active & (
-                    self._preload_open_intent_steps >= self.cfg.preload_release_steps
-                )
-                self._preload_assist_active[release] = False
-                self._preload_open_intent_steps[release] = 0
-                position_targets = torch.where(
-                    self._preload_assist_active.unsqueeze(-1),
-                    preload_targets + target_delta,
-                    position_targets,
-                )
+            preload_targets = torch.clamp(
+                self._pair_reset_preload_commands[safe_pair_ids],
+                min=lower,
+                max=upper,
+            )
+            open_targets = torch.clamp(
+                self._pair_reset_open_commands[safe_pair_ids],
+                min=lower,
+                max=upper,
+            )
+            opening_direction = open_targets - preload_targets
+            opening_fraction = torch.sum(target_delta * opening_direction, dim=1) / torch.sum(
+                torch.square(opening_direction),
+                dim=1,
+            ).clamp_min(1.0e-12)
+            opening_intent = self._preload_assist_active & (opening_fraction >= self.cfg.preload_release_threshold)
+            self._preload_open_intent_steps = torch.where(
+                opening_intent,
+                self._preload_open_intent_steps + 1,
+                torch.zeros_like(self._preload_open_intent_steps),
+            )
+            release = self._preload_assist_active & (self._preload_open_intent_steps >= self.cfg.preload_release_steps)
+            self._preload_assist_active[release] = False
+            self._preload_open_intent_steps[release] = 0
+            position_targets = torch.where(
+                self._preload_assist_active.unsqueeze(-1),
+                preload_targets + target_delta,
+                position_targets,
+            )
 
         self._position_targets = torch.clamp(position_targets, min=lower, max=upper)
         self._processed_actions = self._position_targets
@@ -217,16 +202,8 @@ class ResetPreservingRelativeJointPositionAction(JointAction):
         else:
             self._position_targets[env_ids] = current_position[env_ids]
             self._processed_actions[env_ids] = current_position[env_ids]
-        reset_state = getattr(self._env, "stack_reset_state", None)
-        held_cube_ids = (
-            reset_state.held_cube_ids
-            if reset_state is not None
-            else getattr(self._env, "stack_reset_held_cube_ids", None)
-        )
-        if held_cube_ids is None:
-            self._preload_assist_active[env_ids] = False
-        else:
-            self._preload_assist_active[env_ids] = held_cube_ids[env_ids] >= 0
+        held_cube_ids = get_stack_reset_runtime_state(self._env).held_cube_ids
+        self._preload_assist_active[env_ids] = held_cube_ids[env_ids] >= 0
         self._preload_open_intent_steps[env_ids] = 0
 
 
@@ -260,42 +237,10 @@ class WorkspaceBoundedRelativeJointPositionAction(JointAction):
             )
         if torch.any(self._workspace_lower >= self._workspace_upper):
             raise ValueError("Every workspace_lower value must be less than workspace_upper.")
-        if cfg.grasp_close_interlock_steps < 0:
-            raise ValueError("grasp_close_interlock_steps must be non-negative.")
-        if cfg.grasp_close_distance <= 0.0:
-            raise ValueError("grasp_close_distance must be positive.")
-        self._grasp_close_steps = torch.zeros(env.num_envs, dtype=torch.long, device=self.device)
-
-    def _apply_grasp_close_interlock(self, actions: torch.Tensor) -> torch.Tensor:
-        """Hold all arm joints briefly while a nearby commanded grasp closes."""
-        if self.cfg.grasp_close_interlock_steps == 0:
-            return actions
-
-        tool_position, _ = franka_end_effector_pose(self._env)
-        cube_is_near = torch.stack(
-            tuple(
-                torch.linalg.vector_norm(
-                    self._env.scene[cube_name].data.root_pos_w.torch - tool_position,
-                    dim=1,
-                )
-                < self.cfg.grasp_close_distance
-                for cube_name in self.cfg.grasp_cube_names
-            ),
-            dim=1,
-        ).any(dim=1)
-        commands_close = self._env.action_manager.action[:, self.cfg.gripper_action_index] < 0.0
-        closing_near_cube = commands_close & cube_is_near
-        self._grasp_close_steps = torch.where(
-            closing_near_cube,
-            self._grasp_close_steps + 1,
-            torch.zeros_like(self._grasp_close_steps),
-        )
-        interlocked = closing_near_cube & (self._grasp_close_steps <= self.cfg.grasp_close_interlock_steps)
-        return torch.where(interlocked.unsqueeze(1), torch.zeros_like(actions), actions)
 
     def process_actions(self, actions: torch.Tensor) -> None:
         """Create one bounded position target from the measured joint pose."""
-        super().process_actions(self._apply_grasp_close_interlock(actions))
+        super().process_actions(actions)
         target_delta = torch.clamp(
             self._processed_actions,
             min=-self.cfg.max_delta,
@@ -313,8 +258,6 @@ class WorkspaceBoundedRelativeJointPositionAction(JointAction):
         )
         self._position_targets = torch.clamp(current_position + target_delta, min=lower, max=upper)
         self._processed_actions = self._position_targets
-        # The interlock changes only physical authority. Retain the policy's
-        # original output for observations and action-rate regularization.
         self._raw_actions[:] = actions
 
     def apply_actions(self) -> None:
@@ -334,6 +277,3 @@ class WorkspaceBoundedRelativeJointPositionAction(JointAction):
         else:
             self._position_targets[env_ids] = current_position[env_ids]
         self._processed_actions = self._position_targets
-        if env_ids is None:
-            env_ids = slice(None)
-        self._grasp_close_steps[env_ids] = 0

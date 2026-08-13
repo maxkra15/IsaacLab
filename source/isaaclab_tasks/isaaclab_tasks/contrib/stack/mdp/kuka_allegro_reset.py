@@ -3,33 +3,11 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""KUKA-Allegro kinematics and reset poses for cube stacking."""
+"""KUKA-Allegro kinematics and production reset calibration for cube stacking."""
 
 from __future__ import annotations
 
 import torch
-
-KUKA_ALLEGRO_STACK_ARM_WORKSPACE_LOWER: tuple[float, ...] = (
-    -1.0,
-    -1.2,
-    -0.5,
-    1.4,
-    -1.0,
-    -1.6,
-    1.3,
-)
-"""Lower joint-position boundary of the validated KUKA stacking workspace [rad]."""
-
-KUKA_ALLEGRO_STACK_ARM_WORKSPACE_UPPER: tuple[float, ...] = (
-    0.8,
-    0.4,
-    1.2,
-    2.0694,
-    0.8,
-    0.2,
-    3.03,
-)
-"""Upper joint-position boundary of the validated KUKA stacking workspace [rad]."""
 
 KUKA_ALLEGRO_DIVERSE_ARM_WORKSPACE_LOWER: tuple[float, ...] = (
     -2.7,
@@ -40,7 +18,7 @@ KUKA_ALLEGRO_DIVERSE_ARM_WORKSPACE_LOWER: tuple[float, ...] = (
     -1.9,
     -3.05,
 )
-"""Lower joint boundary for the collision-safe, wrist-diverse reset bank [rad]."""
+"""Lower joint boundary for the collision-safe wrist-diverse reset bank [rad]."""
 
 KUKA_ALLEGRO_DIVERSE_ARM_WORKSPACE_UPPER: tuple[float, ...] = (
     2.7,
@@ -51,509 +29,77 @@ KUKA_ALLEGRO_DIVERSE_ARM_WORKSPACE_UPPER: tuple[float, ...] = (
     1.9,
     3.05,
 )
-"""Upper joint boundary for the collision-safe, wrist-diverse reset bank [rad]."""
-
-KUKA_ALLEGRO_OPEN_PINCH_POSE: tuple[float, ...] = (
-    0.0,
-    0.3,
-    0.3,
-    0.3,
-    1.5,
-    0.60147215,
-    0.33795027,
-    0.60845138,
-)
-"""Collision-free index/thumb release posture in articulation joint order [rad]."""
-
-KUKA_ALLEGRO_CLOSED_PINCH_POSE: tuple[float, ...] = (
-    0.3613458,
-    0.3817917,
-    1.1306732,
-    1.3861521,
-    1.4463348,
-    0.0654246,
-    0.7491139,
-    1.0012995,
-)
-"""Index/thumb posture geometrically matched to the 4 cm stack cubes [rad]."""
-
-KUKA_ALLEGRO_PARKED_FINGER_POSE: tuple[float, ...] = (0.0, 0.3, 0.3, 0.3)
-"""Safe fixed posture for each policy-inactive middle/ring finger [rad]."""
+"""Upper joint boundary for the collision-safe wrist-diverse reset bank [rad]."""
 
 KUKA_ALLEGRO_ALL_HAND_JOINT_NAMES: tuple[str, ...] = tuple(
     f"{finger}_joint_{joint_id}" for finger in ("index", "middle", "ring", "thumb") for joint_id in range(4)
 )
-"""Canonical all-hand joint order used by pair-conditioned reset rows."""
+"""Canonical 16-joint Allegro hand order."""
 
-KUKA_ALLEGRO_GRASP_PAIR_JOINT_NAMES: tuple[tuple[str, ...], ...] = tuple(
-    tuple(f"{finger}_joint_{joint_id}" for joint_id in range(4))
-    + tuple(f"thumb_joint_{joint_id}" for joint_id in range(4))
-    for finger in ("index", "middle", "ring")
+KUKA_ALLEGRO_GRASP_PAIR_JOINT_NAMES: tuple[tuple[str, ...], ...] = (
+    tuple(f"index_joint_{joint_id}" for joint_id in range(4))
+    + tuple(f"thumb_joint_{joint_id}" for joint_id in range(4)),
 )
-"""Policy-active joint names for index/thumb, middle/thumb, and ring/thumb."""
-
-KUKA_ALLEGRO_GRASP_PAIR_BODY_NAMES: tuple[tuple[str, str], ...] = (
-    ("index_biotac_tip", "thumb_biotac_tip"),
-    ("middle_biotac_tip", "thumb_biotac_tip"),
-    ("ring_biotac_tip", "thumb_biotac_tip"),
-)
-"""BioTac tip-body names for each opposing-finger/thumb pair."""
-
-_KUKA_ALLEGRO_OPEN_OPPOSING_POSES = (
-    (0.5296183140, 0.3979187765, 1.2150535135, 1.2160220165),
-    (-0.5356683264, 0.3970270825, 1.2143756330, 1.2160268708),
-    (0.2477232307, 0.3388578580, 1.2785558049, 1.3187666717),
-)
-_KUKA_ALLEGRO_OPEN_THUMB_POSES = (
-    (1.4141895030, 0.1855092121, 0.8870616225, 0.8186566839),
-    (1.2549744398, 0.0906844953, 0.8621962838, 0.8286570609),
-    (1.2553279094, 0.0918773641, 0.8610153952, 0.8247256727),
-)
-_KUKA_ALLEGRO_CLOSED_THUMB_POSE = (1.4463348, 0.0654246, 0.7491139, 1.0012995)
-_KUKA_ALLEGRO_CLOSED_OPPOSING_POSES = (
-    (0.3613458, 0.3817917, 1.1306732, 1.3861521),
-    (-0.3672754784, 0.3817917, 1.1306732, 1.3861521),
-    (0.3000, 0.4800, 1.1306732, 1.3861521),
-)
-_KUKA_ALLEGRO_CLOSE_TARGET_OPPOSING_POSES = (
-    (0.3613458, 0.4217917, 1.1306732, 1.3861521),
-    (-0.3472754784, 0.4217917, 1.1306732, 1.3861521),
-    (0.3200, 0.4800, 1.1306732, 1.3861521),
-)
-"""Physics-screened close targets with a small contact preload for each pair."""
-
-KUKA_ALLEGRO_GRASP_PAIR_OPEN_POSES: tuple[tuple[float, ...], ...] = tuple(
-    opposing_pose + thumb_pose
-    for opposing_pose, thumb_pose in zip(
-        _KUKA_ALLEGRO_OPEN_OPPOSING_POSES,
-        _KUKA_ALLEGRO_OPEN_THUMB_POSES,
-        strict=True,
-    )
-)
-"""Open eight-joint posture for each active opposing-finger/thumb pair [rad]."""
-
-KUKA_ALLEGRO_GRASP_PAIR_CLOSED_POSES: tuple[tuple[float, ...], ...] = tuple(
-    opposing_pose + _KUKA_ALLEGRO_CLOSED_THUMB_POSE for opposing_pose in _KUKA_ALLEGRO_CLOSED_OPPOSING_POSES
-)
-"""Cube-matched eight-joint posture for each opposing-finger/thumb pair [rad]."""
-
-KUKA_ALLEGRO_GRASP_PAIR_OPEN_COMMANDS: tuple[tuple[float, ...], ...] = (
-    (
-        *_KUKA_ALLEGRO_OPEN_OPPOSING_POSES[0],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_OPEN_THUMB_POSES[0],
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_OPEN_OPPOSING_POSES[1],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_OPEN_THUMB_POSES[1],
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_OPEN_OPPOSING_POSES[2],
-        *_KUKA_ALLEGRO_OPEN_THUMB_POSES[2],
-    ),
-)
-"""Open all-hand command for each active pair in canonical 16-joint order [rad]."""
-
-KUKA_ALLEGRO_GRASP_PAIR_RESET_CLOSED_COMMANDS: tuple[tuple[float, ...], ...] = (
-    (
-        *_KUKA_ALLEGRO_CLOSED_OPPOSING_POSES[0],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_CLOSED_THUMB_POSE,
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_CLOSED_OPPOSING_POSES[1],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_CLOSED_THUMB_POSE,
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_CLOSED_OPPOSING_POSES[2],
-        *_KUKA_ALLEGRO_CLOSED_THUMB_POSE,
-    ),
-)
-"""Geometric reset posture for each pair in canonical 16-joint order [rad]."""
-
-KUKA_ALLEGRO_GRASP_PAIR_CLOSED_COMMANDS: tuple[tuple[float, ...], ...] = (
-    (
-        *_KUKA_ALLEGRO_CLOSE_TARGET_OPPOSING_POSES[0],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_CLOSED_THUMB_POSE,
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_CLOSE_TARGET_OPPOSING_POSES[1],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_CLOSED_THUMB_POSE,
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_CLOSE_TARGET_OPPOSING_POSES[2],
-        *_KUKA_ALLEGRO_CLOSED_THUMB_POSE,
-    ),
-)
-"""Physics-screened close target for each pair in canonical 16-joint order [rad].
-
-The reset posture remains exactly centered on the cube.  Once simulation
-starts, these slightly deeper targets establish contact force without
-teleporting an initially interpenetrating hand.
-"""
-
-KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS: tuple[tuple[float, float, float], ...] = (
-    (0.0570965, -0.0375159, 0.0498749),
-    (0.05912294, 0.00993658, 0.04981165),
-    (0.05592355, 0.01348271, 0.04234107),
-)
-"""Geometric held-cube centers in the palm frame for the three pairs [m]."""
+"""Joint names for the reset-authored index/thumb grasp."""
 
 KUKA_ALLEGRO_LARGE_CUBE_EDGE_LENGTH = 0.08
-"""Edge length of the large KUKA-Allegro stacking cubes [m]."""
+"""Edge length of the KUKA-Allegro stacking cubes [m]."""
 
 KUKA_ALLEGRO_LARGE_CUBE_RESTING_HEIGHT = 0.040
-"""Center height for an 8 cm cube on the visual-top Newton contact surface [m]."""
+"""Center height for an 8 cm cube on the tabletop contact surface [m]."""
 
-# These postures were calibrated directly against the composed KUKA-Allegro
-# USD under Newton. Each geometric grasp increases the corresponding proven
-# 4 cm grasp's BioTac tip-center separation by 4 cm (within 0.3 mm). The
-# policy close target then adds the same small inward preload as the 4 cm task.
-_KUKA_ALLEGRO_LARGE_CUBE_CLOSED_OPPOSING_POSES = (
-    (0.1427316070, 0.3323077261, 0.6281159520, 0.7290301323),
-    (-0.0982462093, 0.3218792975, 0.5222051144, 0.5905457139),
-    (-0.0562135726, 0.8763250709, 0.3747565448, 0.9327623844),
+_FULL_HAND_INACTIVE_FINGER_POSE = (0.0, 0.9, 1.3, 1.3)
+_FULL_HAND_OPEN_POSES = (
+    (0.4395595789, 0.7841927409, 0.8926416039, 0.4153704941, 1.5507498789, 0.2781451344, 0.3000894189, 0.5697273612),
 )
-_KUKA_ALLEGRO_LARGE_CUBE_CLOSED_THUMB_POSES = (
-    (1.4788022041, 0.3888427317, 0.4774000347, 0.5770133138),
-    (1.4856445789, 0.4570010900, 0.4201380014, 0.4875976443),
-    (1.3960189819, -0.0143822422, 0.5568988919, 0.4697011113),
+_FULL_HAND_CONTACT_POSES = (
+    (0.3552525342, 0.7711680532, 0.9140521884, 0.4398036003, 1.5507498789, 0.2582621574, 0.2845720053, 0.6348888874),
 )
-_KUKA_ALLEGRO_LARGE_CUBE_OPEN_OPPOSING_POSES = (
-    (0.0894330889, 0.3202434480, 0.5055916309, 0.5688226819),
-    (-0.0606004409, 0.3134956360, 0.4370610416, 0.4792150557),
-    (0.0559405573, 0.5575460792, 0.9175643325, 0.7363257408),
+_FULL_HAND_PRELOAD_POSES = (
+    (0.3468218446, 0.7698655725, 0.9161932468, 0.4422469139, 1.5507498789, 0.2562738657, 0.2830202579, 0.6414050460),
 )
-_KUKA_ALLEGRO_LARGE_CUBE_OPEN_THUMB_POSES = (
-    (1.4867178202, 0.4676926136, 0.4111557007, 0.4735716283),
-    (1.4911452532, 0.5117951035, 0.3741037846, 0.4157144129),
-    (1.1793874502, -0.0838212296, 0.5235490203, 0.8774294853),
-)
-_KUKA_ALLEGRO_LARGE_CUBE_CLOSE_TARGET_POSES = (
-    (
-        0.1284602433,
-        0.3458622694,
-        0.6391493678,
-        0.7358406782,
-        1.4615169764,
-        0.3728368878,
-        0.4831784964,
-        0.5794684291,
-    ),
-    (
-        -0.0975372866,
-        0.3346096873,
-        0.5317831635,
-        0.5963883996,
-        1.4883375168,
-        0.4539676011,
-        0.4305939972,
-        0.4927742779,
-    ),
-    (
-        -0.0258874390,
-        0.8787521124,
-        0.3774819970,
-        0.9350826144,
-        1.4298405647,
-        0.0101333885,
-        0.5573173165,
-        0.4706675410,
-    ),
-)
-"""Physics-screened large-cube close targets for index, middle, and ring pairs."""
-
-KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_OPEN_POSES: tuple[tuple[float, ...], ...] = tuple(
-    opposing_pose + thumb_pose
-    for opposing_pose, thumb_pose in zip(
-        _KUKA_ALLEGRO_LARGE_CUBE_OPEN_OPPOSING_POSES,
-        _KUKA_ALLEGRO_LARGE_CUBE_OPEN_THUMB_POSES,
-        strict=True,
-    )
-)
-"""Open eight-joint posture for each large-cube grasp pair [rad]."""
-
-KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_CLOSED_POSES: tuple[tuple[float, ...], ...] = tuple(
-    opposing_pose + thumb_pose
-    for opposing_pose, thumb_pose in zip(
-        _KUKA_ALLEGRO_LARGE_CUBE_CLOSED_OPPOSING_POSES,
-        _KUKA_ALLEGRO_LARGE_CUBE_CLOSED_THUMB_POSES,
-        strict=True,
-    )
-)
-"""Geometric eight-joint posture for each large-cube grasp pair [rad]."""
-
-KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_OPEN_COMMANDS: tuple[tuple[float, ...], ...] = (
-    (
-        *_KUKA_ALLEGRO_LARGE_CUBE_OPEN_OPPOSING_POSES[0],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_OPEN_THUMB_POSES[0],
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_OPEN_OPPOSING_POSES[1],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_OPEN_THUMB_POSES[1],
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_OPEN_OPPOSING_POSES[2],
-        *_KUKA_ALLEGRO_LARGE_CUBE_OPEN_THUMB_POSES[2],
-    ),
-)
-"""Open large-cube command for each pair in canonical 16-joint order [rad]."""
-
-KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_RESET_CLOSED_COMMANDS: tuple[tuple[float, ...], ...] = (
-    (
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSED_OPPOSING_POSES[0],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSED_THUMB_POSES[0],
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSED_OPPOSING_POSES[1],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSED_THUMB_POSES[1],
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSED_OPPOSING_POSES[2],
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSED_THUMB_POSES[2],
-    ),
-)
-"""Geometric large-cube reset command in canonical 16-joint order [rad]."""
-
-KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_CLOSED_COMMANDS: tuple[tuple[float, ...], ...] = (
-    (
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSE_TARGET_POSES[0][:4],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSE_TARGET_POSES[0][4:],
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSE_TARGET_POSES[1][:4],
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSE_TARGET_POSES[1][4:],
-    ),
-    (
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *KUKA_ALLEGRO_PARKED_FINGER_POSE,
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSE_TARGET_POSES[2][:4],
-        *_KUKA_ALLEGRO_LARGE_CUBE_CLOSE_TARGET_POSES[2][4:],
-    ),
-)
-"""Preloaded large-cube close target in canonical 16-joint order [rad]."""
-
-KUKA_ALLEGRO_LARGE_CUBE_GRASP_PAIR_TOOL_OFFSETS: tuple[tuple[float, float, float], ...] = (
-    (0.0769180581, -0.0242043127, 0.1027781461),
-    (0.0812333971, 0.0168038607, 0.1007822081),
-    (0.0556258336, 0.0153970700, 0.0993711054),
-)
-"""Live-USD-calibrated large-cube centers in the palm frame [m]."""
-
-KUKA_ALLEGRO_LARGE_CUBE_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW: tuple[tuple[float, ...], ...] = (
-    (0.0569160655, -0.7048124671, -0.0569160655, 0.7048124671),
-    (-0.4493502676, -0.5459710360, 0.4493502676, 0.5459710360),
-    (0.0, -0.70710678, 0.0, 0.70710678),
-)
-"""Upright, pair-conditioned large-cube rotations in the palm frame.
-
-Index and middle yaw the cube so opposing faces meet their live-USD tip
-lines. Ring retains the common cube frame, which is dynamically more stable
-for its pad-normal-aligned posture. All three keep cube local Z on palm -X,
-so the proven downward wrist leaves the cube upright.
-"""
-
-KUKA_ALLEGRO_FULL_HAND_INACTIVE_FINGER_POSE: tuple[float, ...] = (0.0, 0.9, 1.3, 1.3)
-"""Table-clearance posture for fingers outside the reset grasp [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_INDEX_OPEN_POSE: tuple[float, ...] = (
-    0.4395595789,
-    0.7841927409,
-    0.8926416039,
-    0.4153704941,
-    1.5507498789,
-    0.2781451344,
-    0.3000894189,
-    0.5697273612,
-)
-"""Dynamically validated open index/thumb posture for an 8 cm cube [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_INDEX_CONTACT_POSE: tuple[float, ...] = (
-    0.3552525342,
-    0.7711680532,
-    0.9140521884,
-    0.4398036003,
-    1.5507498789,
-    0.2582621574,
-    0.2845720053,
-    0.6348888874,
-)
-"""Dynamically validated zero-preload index/thumb contact posture [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_INDEX_PRELOAD_POSE: tuple[float, ...] = (
-    0.3468218446,
-    0.7698655725,
-    0.9161932468,
-    0.4422469139,
-    1.5507498789,
-    0.2562738657,
-    0.2830202579,
-    0.6414050460,
-)
-"""Index/thumb target with a 2 mm matched pad contraction [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_MIDDLE_OPEN_POSE: tuple[float, ...] = (
-    -0.1126626208,
-    1.1612354517,
-    0.0356466472,
-    1.0079627037,
-    1.1089358330,
-    -0.0512844585,
-    0.4461947381,
-    0.5214459896,
-)
-"""Dynamically validated open middle/thumb posture for an 8 cm cube [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_MIDDLE_CONTACT_POSE: tuple[float, ...] = (
-    -0.0642692149,
-    1.1480723619,
-    0.0463260673,
-    1.0345040560,
-    1.1439181566,
-    -0.0377482809,
-    0.4246944189,
-    0.5680713654,
-)
-"""Dynamically validated zero-preload middle/thumb contact posture [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_MIDDLE_PRELOAD_POSE: tuple[float, ...] = (
-    -0.0562036447,
-    1.1458785534,
-    0.0481059663,
-    1.0389276743,
-    1.1497485638,
-    -0.0354922004,
-    0.4211110175,
-    0.5758422613,
-)
-"""Middle/thumb target with a 2 mm matched pad contraction [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_RING_OPEN_POSE: tuple[float, ...] = (
-    -0.1077019572,
-    0.8797462583,
-    0.3677168190,
-    0.9215257168,
-    1.3629801273,
-    -0.0330471992,
-    0.5727698207,
-    0.4418382645,
-)
-"""Dynamically validated open ring/thumb posture for an 8 cm cube [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_RING_CONTACT_POSE: tuple[float, ...] = (
-    -0.0562135726,
-    0.8763250709,
-    0.3747565448,
-    0.9327623844,
-    1.3960189819,
-    -0.0143822422,
-    0.5568988919,
-    0.4697011113,
-)
-"""Dynamically validated zero-preload ring/thumb contact posture [rad]."""
-
-KUKA_ALLEGRO_FULL_HAND_RING_PRELOAD_POSE: tuple[float, ...] = (
-    -0.0390507765,
-    0.8751846552,
-    0.3771031201,
-    0.9365079403,
-    1.4070318937,
-    -0.0081605213,
-    0.5516085625,
-    0.4789887369,
-)
-"""Ring/thumb target with a 4 mm matched pad contraction [rad]."""
 
 
 def _full_hand_pair_command(active_pose: tuple[float, ...], pair_id: int) -> tuple[float, ...]:
     """Return one canonical all-hand command with two tucked fingers."""
-    opposing_poses = [KUKA_ALLEGRO_FULL_HAND_INACTIVE_FINGER_POSE] * 3
+    opposing_poses = [_FULL_HAND_INACTIVE_FINGER_POSE] * 3
     opposing_poses[pair_id] = active_pose[:4]
     return (*opposing_poses[0], *opposing_poses[1], *opposing_poses[2], *active_pose[4:])
 
 
-KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_OPEN_POSES: tuple[tuple[float, ...], ...] = (
-    KUKA_ALLEGRO_FULL_HAND_INDEX_OPEN_POSE,
-    KUKA_ALLEGRO_FULL_HAND_MIDDLE_OPEN_POSE,
-    KUKA_ALLEGRO_FULL_HAND_RING_OPEN_POSE,
-)
-"""Dynamically validated open posture for each reset grasp pair [rad]."""
+KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_OPEN_POSES: tuple[tuple[float, ...], ...] = _FULL_HAND_OPEN_POSES
+"""Dynamically validated open posture for the reset grasp [rad]."""
 
-KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_CONTACT_POSES: tuple[tuple[float, ...], ...] = (
-    KUKA_ALLEGRO_FULL_HAND_INDEX_CONTACT_POSE,
-    KUKA_ALLEGRO_FULL_HAND_MIDDLE_CONTACT_POSE,
-    KUKA_ALLEGRO_FULL_HAND_RING_CONTACT_POSE,
-)
-"""Dynamically validated contact posture for each reset grasp pair [rad]."""
+KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_CONTACT_POSES: tuple[tuple[float, ...], ...] = _FULL_HAND_CONTACT_POSES
+"""Dynamically validated zero-preload contact posture for the reset grasp [rad]."""
 
 KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_OPEN_COMMANDS: tuple[tuple[float, ...], ...] = tuple(
-    _full_hand_pair_command(active_pose, pair_id)
-    for pair_id, active_pose in enumerate(KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_OPEN_POSES)
+    _full_hand_pair_command(active_pose, pair_id) for pair_id, active_pose in enumerate(_FULL_HAND_OPEN_POSES)
 )
-"""Open all-hand command for the physics-validated reset grasp [rad]."""
+"""Open all-hand command for the calibrated reset grasp [rad]."""
 
 KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_CONTACT_COMMANDS: tuple[tuple[float, ...], ...] = tuple(
-    _full_hand_pair_command(active_pose, pair_id)
-    for pair_id, active_pose in enumerate(KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_CONTACT_POSES)
+    _full_hand_pair_command(active_pose, pair_id) for pair_id, active_pose in enumerate(_FULL_HAND_CONTACT_POSES)
 )
-"""Contact all-hand command for the physics-validated reset grasp [rad]."""
+"""Contact all-hand command for the calibrated reset grasp [rad]."""
 
 KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_PRELOAD_COMMANDS: tuple[tuple[float, ...], ...] = tuple(
-    _full_hand_pair_command(active_pose, pair_id)
-    for pair_id, active_pose in enumerate(
-        (
-            KUKA_ALLEGRO_FULL_HAND_INDEX_PRELOAD_POSE,
-            KUKA_ALLEGRO_FULL_HAND_MIDDLE_PRELOAD_POSE,
-            KUKA_ALLEGRO_FULL_HAND_RING_PRELOAD_POSE,
-        )
-    )
+    _full_hand_pair_command(active_pose, pair_id) for pair_id, active_pose in enumerate(_FULL_HAND_PRELOAD_POSES)
 )
 """Preloaded all-hand target for reset-authored held cubes [rad]."""
 
 KUKA_ALLEGRO_FULL_HAND_GRASP_PAIR_TOOL_OFFSETS: tuple[tuple[float, float, float], ...] = (
     (0.0669180581, -0.0325941718, 0.1014142311),
-    (0.0712333971, -0.0259738126, 0.0996330045),
-    (0.0806258321, 0.0129970703, 0.0993711054),
 )
-"""Cube-center offsets for the validated mid-face reset grasps [m]."""
+"""Cube-center offset for the calibrated index/thumb mid-face grasp [m]."""
 
-KUKA_ALLEGRO_FULL_HAND_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW = KUKA_ALLEGRO_LARGE_CUBE_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW
-"""Pair-conditioned cube orientations for the validated reset grasps."""
+KUKA_ALLEGRO_FULL_HAND_PALM_TO_HELD_CUBE_QUATERNIONS_XYZW: tuple[tuple[float, ...], ...] = (
+    (0.0569160655, -0.7048124671, -0.0569160655, 0.7048124671),
+)
+"""Cube orientation for the calibrated reset grasp."""
 
-KUKA_ALLEGRO_PALM_TO_HELD_CUBE_QUATERNION_XYZW = (0.0, -0.70710678, 0.0, 0.70710678)
-"""Nominal rigid rotation from the palm frame to a held cube, in XYZW order."""
+# Retained for the reset bank's nominal palm rotation and anchor validation.
+_KUKA_ALLEGRO_NOMINAL_PINCH_OFFSET = (0.0570965, -0.0375159, 0.0498749)
 
 # The same nine XY anchors and five tool heights used by the Franka reset
 # table, solved for a KUKA base rotated pi radians around world Z. Columns are
@@ -803,7 +349,7 @@ def kuka_allegro_tool_pose(
 def kuka_allegro_grasp_pair_pose(
     joint_positions: torch.Tensor,
     pair_ids: torch.Tensor | int,
-    tool_offsets_by_pair: tuple[tuple[float, float, float], ...] = KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS,
+    tool_offsets_by_pair: tuple[tuple[float, float, float], ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the calibrated tool pose selected by each grasp-pair ID.
 
@@ -826,13 +372,8 @@ def kuka_allegro_grasp_pair_pose(
 
 
 def kuka_allegro_pinch_pose(joint_positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the legacy index/thumb pinch-center pose."""
-    return kuka_allegro_tool_pose(joint_positions, KUKA_ALLEGRO_GRASP_PAIR_TOOL_OFFSETS[0])
-
-
-def kuka_allegro_pinch_position(joint_positions: torch.Tensor) -> torch.Tensor:
-    """Compute the configured Allegro pinch-center position from seven KUKA joints."""
-    return kuka_allegro_pinch_pose(joint_positions)[0]
+    """Compute the nominal index/thumb pinch-center pose used by reset planning."""
+    return kuka_allegro_tool_pose(joint_positions, _KUKA_ALLEGRO_NOMINAL_PINCH_OFFSET)
 
 
 def solve_kuka_allegro_reset_ik(

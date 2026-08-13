@@ -63,14 +63,10 @@ class EventCfg:
             "closed_finger_position": 0.020,
             "placed_finger_position": 0.021,
             "open_finger_position": 0.04,
-            "neighbor_count": 8,
             # Eighteen balanced workspace/source-order layouts each receive 64
             # independently scattered table starts. This yields 1,152 broad
             # deployment starts without making the table family dominate.
             "table_rows_per_layout": 64,
-            # Optional per-task override for the curriculum milestone assigned
-            # to TABLE rows. None preserves each reset-table class's default.
-            "table_target_potential": None,
             # Cached intermediate states are authored hand-object contacts and
             # must remain exact. Deployment-like table starts receive broad
             # robot variation and coherent planar cube transforms instead.
@@ -78,17 +74,10 @@ class EventCfg:
             "table_arm_joint_noise_range": 0.080,
             "table_cube_planar_translation_range": 0.015,
             "table_cube_rotation_range": 0.45,
-            "fixed_row_id": None,
             "fixed_recipe": None,
-            "table_evaluation_env_fraction": 0.0,
             "evaluation_recipe_ids": (),
             "evaluation_envs_per_recipe": 0,
             "fixed_role_permutation": None,
-            # Every cached state trains the deployment objective. Cached
-            # phases are starting-state data, never local terminal goals.
-            "continuation_probability": 1.0,
-            "fixed_continue_to_final": True,
-            "force_full_goal": True,
         },
     )
 
@@ -145,8 +134,8 @@ class CurriculumCfg:
             # adaptive intermediate-state distribution. The remaining 65% is
             # sampled from non-table rows by the rolling-success kernel.
             "table_sampling_probability": 0.35,
-            # Keep equal layout coverage by default. Experiments can opt into
-            # one flat target-rate distribution over active rows.
+            # Keep equal layout coverage by default. The KUKA task opts into
+            # one flat target-rate distribution over its active rows.
             "global_sampling": False,
             # Distillation tasks may reserve a prefix for held-out student
             # rollouts. Zero keeps every environment in the training sampler.
@@ -175,7 +164,7 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
         self.scene.robot.spawn.semantic_tags = robot_semantic_tags
         # Newton needs a fixed rigid root to discover the Seattle table's
         # separately instanced visual and collision subtrees. Keep this
-        # compatibility override local to the two RL tasks; Kuka inherits it.
+        # backend-specific override local to the RL tasks; Kuka inherits it.
         self.scene.table.spawn.rigid_props = [UsdPhysicsRigidBodyCfg(kinematic_enabled=True)]
         # The Seattle table's authored collision top is 3 mm below its visible
         # tabletop. Add an invisible native contact surface at visual z=0 so
@@ -310,7 +299,7 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
             lookat=(0.5, 0.0, 0.1),
         )
 
-        # Native cuboids avoid legacy block materials. Their standard geometry
+        # Native cuboids avoid asset-specific block materials. Their standard geometry
         # owns both collision and rendering; a USD displayColor keeps the
         # colors available in both Kit and kitless Newton visualization.
         cube_colors = ((0.05, 0.15, 0.80), (0.80, 0.05, 0.05), (0.05, 0.65, 0.10))
@@ -494,7 +483,5 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
         self.episode_length_s = 30.0
         # Sample only from the randomized table partition. Avoid a brittle
         # numeric row ID so evaluation follows cache-size changes.
-        self.events.reset_from_state_buffer.params["fixed_row_id"] = None
         self.events.reset_from_state_buffer.params["fixed_recipe"] = int(mdp.StackResetRecipe.TABLE)
-        self.events.reset_from_state_buffer.params["force_full_goal"] = True
         self.curriculum = None

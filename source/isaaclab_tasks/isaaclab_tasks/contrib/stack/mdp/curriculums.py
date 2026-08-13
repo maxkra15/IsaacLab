@@ -17,6 +17,8 @@ from isaaclab.managers import CurriculumTermCfg, ManagerTermBase
 
 from isaaclab_tasks.core.lift.mdp.events_cfg import SuccessMonitorCfg
 
+from .runtime_state import get_stack_reset_runtime_state
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -44,14 +46,10 @@ class StackResetTableCurriculum(ManagerTermBase):
         self._table_sampling_probability = float(cfg.params.get("table_sampling_probability", 0.35))
         if not 0.0 < self._table_sampling_probability < 1.0:
             raise ValueError("table_sampling_probability must lie strictly between zero and one.")
-        self._balance_recipes = bool(cfg.params.get("balance_recipes", False))
-        self._balance_reset_modes = bool(cfg.params.get("balance_reset_modes", False))
         self._global_sampling = bool(cfg.params.get("global_sampling", False))
         self._evaluation_env_count = int(cfg.params.get("evaluation_env_count", 0))
         if not 0 <= self._evaluation_env_count < env.num_envs:
             raise ValueError("evaluation_env_count must leave at least one curriculum-controlled environment.")
-        if self._global_sampling and (self._balance_recipes or self._balance_reset_modes):
-            raise ValueError("global_sampling cannot be combined with recipe or reset-mode balancing.")
         table_recipe_id = reset_term.recipe_names.index("table")
         self._table_rows = reset_term.recipe_ids == table_recipe_id
         if not bool(torch.any(self._table_rows)) or bool(torch.all(self._table_rows)):
@@ -59,7 +57,7 @@ class StackResetTableCurriculum(ManagerTermBase):
         self._layout_count = reset_term.layout_count
         self._recipe_rows = tuple(reset_term.recipe_ids == recipe for recipe in range(len(reset_term.recipe_names)))
         pair_ids = getattr(reset_term, "grasp_pair_ids", None)
-        self._grasp_pair_rows = tuple(pair_ids == pair_id for pair_id in range(3)) if pair_ids is not None else None
+        self._grasp_pair_rows = (pair_ids == 0,) if pair_ids is not None else None
         orientation_ids = getattr(reset_term, "orientation_bin_ids", None)
         self._orientation_rows = (
             tuple(orientation_ids == orientation_id for orientation_id in range(8))
@@ -95,51 +93,19 @@ class StackResetTableCurriculum(ManagerTermBase):
         """Return mixture probabilities and target-rate weights.
 
         Layout-balanced tasks normalize within each workspace layout. Reset
-        banks may instead normalize within recipe-layout strata or, for
-        pair-conditioned hands, within recipe/pair/yaw/tilt strata. The latter
-        guarantees that a hard finger or wrist mode cannot disappear while the
-        target-rate weight selects the useful progress frontier inside that
-        mode.
+        KUKA uses one flat distribution over active rows because its reset bank
+        already contains a balanced wrist/layout grid.
         """
         target_weights = self._progress_monitor.target_weights()
         adaptive = target_weights.clone()
         adaptive[self._table_rows] = 0.0
         layout_ids = self._reset_term.layout_ids
-        layout_count = getattr(self, "_layout_count", self._reset_term.layout_count)
-        if getattr(self, "_global_sampling", False):
+        if self._global_sampling:
             # Normalize one target-rate weight vector over the complete active
-            # table without layout, recipe, or mode quotas.
+            # table without layout quotas.
             pass
-        elif getattr(self, "_balance_reset_modes", False):
-            pair_ids = self._reset_term.grasp_pair_ids
-            orientation_ids = self._reset_term.orientation_bin_ids
-            # Balance the deliberately authored reset modes. IK may repair an
-            # infeasible row to a nearby physical azimuth; mixing that resolved
-            # azimuth with an authored magnitude would create incoherent,
-            # potentially empty strata.
-            tilt_azimuth_ids = getattr(
-                self._reset_term,
-                "authored_tilt_azimuth_bin_ids",
-                self._reset_term.tilt_azimuth_bin_ids,
-            )
-            tilt_magnitude_ids = self._reset_term.tilt_magnitude_bin_ids
-            recipe_ids = self._reset_term.recipe_ids
-            stratum_ids = (
-                4 * (8 * (8 * (3 * recipe_ids + pair_ids) + orientation_ids) + tilt_azimuth_ids) + tilt_magnitude_ids
-            )
-            stratum_count = len(self._reset_term.recipe_names) * 3 * 8 * 8 * 4
-            stratum_mass = torch.zeros(stratum_count, dtype=adaptive.dtype, device=adaptive.device)
-            stratum_mass.scatter_add_(0, stratum_ids, adaptive)
-            adaptive /= stratum_mass[stratum_ids].clamp_min(torch.finfo(adaptive.dtype).tiny)
-        elif getattr(self, "_balance_recipes", False):
-            recipe_ids = self._reset_term.recipe_ids
-            stratum_ids = recipe_ids * layout_count + layout_ids
-            stratum_count = len(self._reset_term.recipe_names) * layout_count
-            stratum_mass = torch.zeros(stratum_count, dtype=adaptive.dtype, device=adaptive.device)
-            stratum_mass.scatter_add_(0, stratum_ids, adaptive)
-            adaptive /= stratum_mass[stratum_ids].clamp_min(torch.finfo(adaptive.dtype).tiny)
         else:
-            layout_mass = torch.zeros(layout_count, dtype=adaptive.dtype, device=adaptive.device)
+            layout_mass = torch.zeros(self._layout_count, dtype=adaptive.dtype, device=adaptive.device)
             layout_mass.scatter_add_(0, layout_ids, adaptive)
             adaptive /= layout_mass[layout_ids].clamp_min(torch.finfo(adaptive.dtype).tiny)
         adaptive[self._table_rows] = 0.0
@@ -161,8 +127,6 @@ class StackResetTableCurriculum(ManagerTermBase):
         success_context_name: str = "learning_progress_context",
         final_success_context_name: str = "progress_context",
         table_sampling_probability: float = 0.35,
-        balance_recipes: bool = False,
-        balance_reset_modes: bool = False,
         global_sampling: bool = False,
         evaluation_env_count: int = 0,
     ) -> dict[str, torch.Tensor]:
@@ -170,8 +134,6 @@ class StackResetTableCurriculum(ManagerTermBase):
         del (
             success_monitor,
             table_sampling_probability,
-            balance_recipes,
-            balance_reset_modes,
             global_sampling,
             evaluation_env_count,
         )
@@ -179,15 +141,15 @@ class StackResetTableCurriculum(ManagerTermBase):
         # A fixed prefix can be owned by deterministic student evaluation.
         # Those rollouts are assigned directly by the reset event and must not
         # affect either the adaptive sampler's evidence or its next-row draws.
-        training_ids = ids[ids >= getattr(self, "_evaluation_env_count", 0)]
+        training_ids = ids[ids >= self._evaluation_env_count]
         batch_success_rate = torch.zeros((), device=env.device)
         batch_full_task_success_rate = torch.zeros((), device=env.device)
         batch_table_full_task_success_rate = torch.zeros((), device=env.device)
         batch_table_full_task_attempts = torch.zeros((), device=env.device)
         if training_ids.numel():
-            state = getattr(env, "stack_reset_state", None)
-            initialized = state.initialized if state is not None else env.stack_reset_initialized
-            row_ids = state.row_ids if state is not None else env.stack_reset_row_ids
+            state = get_stack_reset_runtime_state(env)
+            initialized = state.initialized
+            row_ids = state.row_ids
             completed = initialized[training_ids] & (env.episode_length_buf[training_ids] > 0)
             completed_ids = training_ids[completed]
             if completed_ids.numel():
@@ -254,12 +216,7 @@ class StackResetTableCurriculum(ManagerTermBase):
             / self._full_task_attempts_by_row[self._table_rows].sum().clamp_min(1),
             "table_full_task_attempts": self._full_task_attempts_by_row[self._table_rows].sum().float(),
         }
-        recipe_rows_by_id = getattr(
-            self,
-            "_recipe_rows",
-            tuple(self._reset_term.recipe_ids == recipe for recipe in range(len(self._reset_term.recipe_names))),
-        )
-        for recipe, recipe_rows in enumerate(recipe_rows_by_id):
+        for recipe, recipe_rows in enumerate(self._recipe_rows):
             recipe_attempts = attempts[recipe_rows].sum()
             recipe_full_task_attempts = self._full_task_attempts_by_row[recipe_rows].sum()
             recipe_name = self._reset_term.recipe_names[recipe]
@@ -274,11 +231,7 @@ class StackResetTableCurriculum(ManagerTermBase):
             metrics[f"recipe_{self._reset_term.recipe_names[recipe]}_probability"] = probabilities[recipe_rows].sum()
         pair_rows_by_id = getattr(self, "_grasp_pair_rows", None)
         if pair_rows_by_id is not None:
-            for pair_rows, pair_name in zip(
-                pair_rows_by_id,
-                ("index_thumb", "middle_thumb", "ring_thumb"),
-                strict=True,
-            ):
+            for pair_rows, pair_name in zip(pair_rows_by_id, ("index_thumb",), strict=True):
                 pair_attempts = attempts[pair_rows].sum()
                 pair_full_attempts = self._full_task_attempts_by_row[pair_rows].sum()
                 metrics[f"pair_{pair_name}_probability"] = probabilities[pair_rows].sum()
@@ -339,19 +292,13 @@ class StackResetTableCurriculum(ManagerTermBase):
         return metrics
 
     def get_state(self) -> dict[str, torch.Tensor]:
-        """Return monitor evidence and replay coverage for an RL checkpoint.
-
-        The field names intentionally match checkpoints written by the former
-        stack-local monitor so existing policies can resume with the shared
-        :class:`SuccessMonitor` implementation.
-        """
+        """Return monitor evidence and replay coverage for an RL checkpoint."""
         history = self._progress_monitor.success_buf.bool()
         return {
             "success_rates": self._progress_monitor.success_rate.clone(),
             "success_history": history.clone(),
             "history_pointer": self._progress_monitor.success_pointer.clone(),
             "history_size": self._progress_monitor.success_size.clone(),
-            "history_success_count": history.sum(dim=1).long(),
             "total_successes": self._progress_successes.clone(),
             "total_attempts": self._attempts.clone(),
             "continuation_attempts": self._continuation_attempts.clone(),
@@ -369,6 +316,10 @@ class StackResetTableCurriculum(ManagerTermBase):
             "history_size": self._progress_monitor.success_size,
             "total_successes": self._progress_successes,
             "total_attempts": self._attempts,
+            "continuation_attempts": self._continuation_attempts,
+            "continuation_successes": self._continuation_successes,
+            "full_task_attempts_by_row": self._full_task_attempts_by_row,
+            "full_task_successes_by_row": self._full_task_successes_by_row,
         }
         for name, target in targets.items():
             if name not in state:
@@ -385,28 +336,3 @@ class StackResetTableCurriculum(ManagerTermBase):
             raise ValueError("Reset-table curriculum checkpoint contains an invalid history size.")
         for name, target in targets.items():
             target.copy_(state[name].to(device=target.device, dtype=target.dtype))
-        # Older checkpoints predate mixed local/full table resets.
-        self._continuation_attempts.copy_(
-            state.get("continuation_attempts", torch.zeros_like(self._continuation_attempts)).to(
-                device=self._continuation_attempts.device,
-                dtype=self._continuation_attempts.dtype,
-            )
-        )
-        self._continuation_successes.copy_(
-            state.get("continuation_successes", torch.zeros_like(self._continuation_successes)).to(
-                device=self._continuation_successes.device,
-                dtype=self._continuation_successes.dtype,
-            )
-        )
-        self._full_task_attempts_by_row.copy_(
-            state.get("full_task_attempts_by_row", torch.zeros_like(self._full_task_attempts_by_row)).to(
-                device=self._full_task_attempts_by_row.device,
-                dtype=self._full_task_attempts_by_row.dtype,
-            )
-        )
-        self._full_task_successes_by_row.copy_(
-            state.get("full_task_successes_by_row", torch.zeros_like(self._full_task_successes_by_row)).to(
-                device=self._full_task_successes_by_row.device,
-                dtype=self._full_task_successes_by_row.dtype,
-            )
-        )
