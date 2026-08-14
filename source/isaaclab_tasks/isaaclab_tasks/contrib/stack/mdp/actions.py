@@ -140,18 +140,12 @@ class ResetPreservingRelativeJointPositionAction(JointAction):
         position_targets = current_position + target_delta
 
         if self._pair_reset_preload_commands is not None:
-            grasp_pair_ids = get_stack_reset_runtime_state(self._env).grasp_pair_ids.long()
+            grasp_pair_ids = self._reset_grasp_pair_ids().long()
             safe_pair_ids = torch.clamp(
                 grasp_pair_ids,
                 min=0,
                 max=self._pair_reset_preload_commands.shape[0] - 1,
             )
-            invalid_pair_ids = self._preload_assist_active & (grasp_pair_ids != safe_pair_ids)
-            if torch.any(invalid_pair_ids):
-                invalid_values = torch.unique(grasp_pair_ids[invalid_pair_ids]).tolist()
-                raise ValueError(
-                    f"Held reset rows reference grasp-pair IDs without preload commands: {invalid_values}."
-                )
             preload_targets = torch.clamp(
                 self._pair_reset_preload_commands[safe_pair_ids],
                 min=lower,
@@ -202,9 +196,17 @@ class ResetPreservingRelativeJointPositionAction(JointAction):
         else:
             self._position_targets[env_ids] = current_position[env_ids]
             self._processed_actions[env_ids] = current_position[env_ids]
-        held_cube_ids = get_stack_reset_runtime_state(self._env).held_cube_ids
-        self._preload_assist_active[env_ids] = held_cube_ids[env_ids] >= 0
+        preload_active = self._reset_preload_active_mask()
+        self._preload_assist_active[env_ids] = preload_active[env_ids]
         self._preload_open_intent_steps[env_ids] = 0
+
+    def _reset_grasp_pair_ids(self) -> torch.Tensor:
+        """Return the reset grasp-pair identity for every environment."""
+        return get_stack_reset_runtime_state(self._env).grasp_pair_ids
+
+    def _reset_preload_active_mask(self) -> torch.Tensor:
+        """Return environments whose sampled reset needs preload assistance."""
+        return get_stack_reset_runtime_state(self._env).held_cube_ids >= 0
 
 
 class WorkspaceBoundedRelativeJointPositionAction(JointAction):

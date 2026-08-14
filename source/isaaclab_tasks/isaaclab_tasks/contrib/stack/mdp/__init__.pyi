@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 __all__ = [
+    "AdaptiveResetSamplerCfg",
     "KukaAllegroResetStateTable",
     "ResetBufferedGripperAction",
     "ResetBufferedGripperActionCfg",
@@ -16,7 +17,7 @@ __all__ = [
     "StackResetRuntimeState",
     "StackResetStateTable",
     "StackResetTableCurriculum",
-    "SuccessMonitorCfg",
+    "RollingOutcomeMonitorCfg",
     "TemporalNormalizedRgbImage",
     "WorkspaceBoundedRelativeJointPositionAction",
     "WorkspaceBoundedRelativeJointPositionActionCfg",
@@ -63,7 +64,7 @@ __all__ = [
     "tool_velocity",
 ]
 
-from isaaclab_tasks.core.lift.mdp.events_cfg import SuccessMonitorCfg
+from isaaclab_tasks.utils.reset_sampling import AdaptiveResetSamplerCfg, RollingOutcomeMonitorCfg
 
 from .actions import (
     ResetBufferedGripperAction,
@@ -105,11 +106,8 @@ from .observations import (
     tool_axes,
     tool_velocity,
 )
-from .reset_events import (
-    KukaAllegroResetStateTable,
-    StackResetRecipe,
-    StackResetStateTable,
-)
+from .kuka_reset_events import KukaAllegroResetStateTable
+from .reset_events import StackResetRecipe, StackResetStateTable
 from .rewards import (
     action_term_l2,
     finite_joint_velocity_l2,

@@ -11,8 +11,8 @@ Added
   and proprioception for all 7 arm and 16 hand joints, and a wrist-diverse
   65,536-row reset table.
 * Added validated physical reset tables with randomized table layouts,
-  intermediate manipulation states, role permutations, and target-rate
-  sampling through the shared success monitor.
+  intermediate manipulation states, role permutations, and an explicit mix
+  of table starts, exact reset-row coverage, and target-rate frontier sampling.
 
 Changed
 ^^^^^^^
@@ -24,6 +24,9 @@ Changed
   cuboids with semantic labels for consistent physics and rendering.
 * Centralized episode reset metadata in one typed runtime-state owner shared by
   observations, rewards, success contexts, and curriculum terms.
+* Split Franka and KUKA-Allegro reset-state generation into focused modules and
+  migrated both tasks to the reusable adaptive reset sampler with smoothed
+  priors for unseen states.
 * Configured the camera task with a reset-safe two-frame 128 by 128 RGB history,
   fixed visible cube roles, camera-calibration randomization, and a
   spatial-softmax policy encoder.

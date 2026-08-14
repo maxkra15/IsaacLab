@@ -15,7 +15,13 @@ import torch
 
 from isaaclab.managers import CurriculumTermCfg, ManagerTermBase
 
-from isaaclab_tasks.core.lift.mdp.events_cfg import SuccessMonitorCfg
+from isaaclab_tasks.utils.reset_sampling import (
+    AdaptiveResetSampler,
+    AdaptiveResetSamplerCfg,
+    ResetStateCatalog,
+    RollingOutcomeMonitor,
+    RollingOutcomeMonitorCfg,
+)
 
 from .runtime_state import get_stack_reset_runtime_state
 
@@ -24,38 +30,91 @@ if TYPE_CHECKING:
 
 
 class StackResetTableCurriculum(ManagerTermBase):
-    """Mix guaranteed table starts with target-rate reset sampling."""
+    """Mix table starts, exact intermediate coverage, and adaptive frontier resets."""
 
     def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         reset_term = env.event_manager.get_term_cfg("reset_from_state_buffer").func
-        if not hasattr(reset_term, "row_count"):
+        catalog = getattr(reset_term, "catalog", None)
+        if not isinstance(catalog, ResetStateCatalog):
             raise RuntimeError("StackResetTableCurriculum requires StackResetStateTable.")
         self._reset_term = reset_term
-        monitor_cfg = cfg.params.get("success_monitor")
-        if not isinstance(monitor_cfg, SuccessMonitorCfg):
-            raise TypeError("StackResetTableCurriculum requires a SuccessMonitorCfg.")
-        self._progress_monitor = monitor_cfg.class_type(
+        self._catalog = catalog
+        if catalog.item_count != catalog.row_count:
+            raise ValueError("Stack reset sampling currently requires one competence item per physical row.")
+        monitor_cfg = cfg.params.get("outcome_monitor")
+        if not isinstance(monitor_cfg, RollingOutcomeMonitorCfg):
+            raise TypeError("StackResetTableCurriculum requires a RollingOutcomeMonitorCfg.")
+        sampler_cfg = cfg.params.get("adaptive_sampler")
+        if not isinstance(sampler_cfg, AdaptiveResetSamplerCfg):
+            raise TypeError("StackResetTableCurriculum requires an AdaptiveResetSamplerCfg.")
+        self._progress_monitor = RollingOutcomeMonitor(
+            catalog.item_count,
             monitor_cfg,
-            num_partitions=1,
-            partition_size=reset_term.row_count,
-            device=env.device,
+            env.device,
+            prior_success_rate=sampler_cfg.target_success_rate,
         )
-        self._attempts = torch.zeros(reset_term.row_count, dtype=torch.long, device=env.device)
+        self._attempts = torch.zeros(catalog.row_count, dtype=torch.long, device=env.device)
         self._progress_successes = torch.zeros_like(self._attempts)
         self._table_sampling_probability = float(cfg.params.get("table_sampling_probability", 0.35))
         if not 0.0 < self._table_sampling_probability < 1.0:
             raise ValueError("table_sampling_probability must lie strictly between zero and one.")
+        expected_intermediate_fraction = 1.0 - self._table_sampling_probability
+        if not math.isclose(
+            expected_intermediate_fraction * sampler_cfg.coverage_fraction,
+            0.15,
+            rel_tol=0.0,
+            abs_tol=1.0e-6,
+        ):
+            raise ValueError(
+                "The stack reset mixture must reserve exactly 15% overall probability for intermediate coverage."
+            )
         self._global_sampling = bool(cfg.params.get("global_sampling", False))
         self._evaluation_env_count = int(cfg.params.get("evaluation_env_count", 0))
         if not 0 <= self._evaluation_env_count < env.num_envs:
             raise ValueError("evaluation_env_count must leave at least one curriculum-controlled environment.")
+        recipe_ids = catalog.metadata.get("recipe_ids")
+        layout_ids = catalog.metadata.get("layout_ids")
+        if recipe_ids is None or layout_ids is None:
+            raise ValueError("The stack reset catalog must provide recipe_ids and layout_ids metadata.")
         table_recipe_id = reset_term.recipe_names.index("table")
-        self._table_rows = reset_term.recipe_ids == table_recipe_id
+        self._table_rows = recipe_ids == table_recipe_id
         if not bool(torch.any(self._table_rows)) or bool(torch.all(self._table_rows)):
             raise RuntimeError("The stack reset table must contain both table and intermediate rows.")
         self._layout_count = reset_term.layout_count
-        self._recipe_rows = tuple(reset_term.recipe_ids == recipe for recipe in range(len(reset_term.recipe_names)))
+        self._recipe_rows = tuple(recipe_ids == recipe for recipe in range(len(reset_term.recipe_names)))
+        eligible_rows = ~self._table_rows
+        base_weights = torch.zeros(catalog.item_count, dtype=torch.float32, device=env.device)
+        if self._global_sampling:
+            # KUKA authors exactly 6,144 rows for every non-table recipe, so
+            # uniform row weights also give every recipe equal initial mass.
+            base_weights[eligible_rows] = 1.0
+        else:
+            # Franka motion recipes intentionally use different interpolation
+            # densities. Normalize each recipe/layout cell so authored row
+            # count cannot make the two transport families dominate the
+            # adaptive frontier merely because they contain more waypoints.
+            cell_ids = recipe_ids * self._layout_count + layout_ids
+            cell_count = len(reset_term.recipe_names) * self._layout_count
+            eligible_per_cell = torch.zeros(cell_count, dtype=torch.float32, device=env.device)
+            eligible_per_cell.scatter_add_(
+                0,
+                cell_ids[eligible_rows],
+                torch.ones_like(cell_ids[eligible_rows], dtype=torch.float32),
+            )
+            base_weights[eligible_rows] = eligible_per_cell[cell_ids[eligible_rows]].reciprocal()
+        self._sampler = AdaptiveResetSampler(
+            catalog.item_count,
+            sampler_cfg,
+            env.device,
+            eligible_mask=eligible_rows,
+            base_weights=base_weights,
+        )
+        self._table_row_ids = torch.where(self._table_rows)[0]
+        self._table_credit = 0.0
+        self._table_assignments = 0
+        self._table_generator = torch.Generator(device=env.device)
+        self._table_generator.manual_seed(int(torch.randint(0, torch.iinfo(torch.int64).max, ()).item()))
         pair_ids = getattr(reset_term, "grasp_pair_ids", None)
         self._grasp_pair_rows = (pair_ids == 0,) if pair_ids is not None else None
         orientation_ids = getattr(reset_term, "orientation_bin_ids", None)
@@ -86,44 +145,56 @@ class StackResetTableCurriculum(ManagerTermBase):
         )
         self._continuation_attempts = torch.zeros((), dtype=torch.long, device=env.device)
         self._continuation_successes = torch.zeros((), dtype=torch.long, device=env.device)
-        self._full_task_attempts_by_row = torch.zeros(reset_term.row_count, dtype=torch.long, device=env.device)
+        self._full_task_attempts_by_row = torch.zeros(catalog.row_count, dtype=torch.long, device=env.device)
         self._full_task_successes_by_row = torch.zeros_like(self._full_task_attempts_by_row)
 
     def _sampling_distribution(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return mixture probabilities and target-rate weights.
-
-        Layout-balanced tasks normalize within each workspace layout. Reset
-        KUKA uses one flat distribution over active rows because its reset bank
-        already contains a balanced wrist/layout grid.
-        """
-        target_weights = self._progress_monitor.target_weights()
-        adaptive = target_weights.clone()
-        adaptive[self._table_rows] = 0.0
-        layout_ids = self._reset_term.layout_ids
-        if self._global_sampling:
-            # Normalize one target-rate weight vector over the complete active
-            # table without layout quotas.
-            pass
-        else:
-            layout_mass = torch.zeros(self._layout_count, dtype=adaptive.dtype, device=adaptive.device)
-            layout_mass.scatter_add_(0, layout_ids, adaptive)
-            adaptive /= layout_mass[layout_ids].clamp_min(torch.finfo(adaptive.dtype).tiny)
-        adaptive[self._table_rows] = 0.0
-        adaptive /= adaptive.sum()
-        table = self._table_rows.to(dtype=adaptive.dtype)
+        """Return the long-run 35/15/50 mixture and posterior success rates."""
+        success_rates = self._progress_monitor.success_rates
+        intermediate = self._sampler.sampling_probabilities(success_rates)
+        table = self._table_rows.to(dtype=intermediate.dtype)
         table /= table.sum()
-        probabilities = (1.0 - self._table_sampling_probability) * adaptive + self._table_sampling_probability * table
-        return probabilities, target_weights
+        probabilities = (1.0 - self._table_sampling_probability) * intermediate
+        probabilities += self._table_sampling_probability * table
+        return probabilities, success_rates
 
     def _sampling_probabilities(self) -> torch.Tensor:
-        """Return the fixed-table/adaptive-intermediate sampling mixture."""
+        """Return the table/coverage/frontier sampling mixture."""
         return self._sampling_distribution()[0]
+
+    def _sample_rows(self, count: int) -> torch.Tensor:
+        """Draw rows with exact long-run table and intermediate-stream fractions."""
+        rows = torch.empty(count, dtype=torch.long, device=self.device)
+        if count == 0:
+            return rows
+        table_credit = self._table_credit + self._table_sampling_probability * count
+        table_count = min(count, math.floor(table_credit + 1.0e-12))
+        self._table_credit = table_credit - table_count
+        assignment_order = torch.randperm(count, device=self.device, generator=self._table_generator)
+        table_positions = assignment_order[:table_count]
+        intermediate_positions = assignment_order[table_count:]
+        if table_count:
+            table_indices = torch.randint(
+                self._table_row_ids.numel(),
+                (table_count,),
+                device=self.device,
+                generator=self._table_generator,
+            )
+            rows[table_positions] = self._table_row_ids[table_indices]
+            self._table_assignments += table_count
+        if intermediate_positions.numel():
+            rows[intermediate_positions] = self._sampler.sample(
+                int(intermediate_positions.numel()),
+                self._progress_monitor.success_rates,
+            )
+        return rows
 
     def __call__(
         self,
         env: ManagerBasedRLEnv,
         env_ids: Sequence[int],
-        success_monitor: SuccessMonitorCfg,
+        outcome_monitor: RollingOutcomeMonitorCfg,
+        adaptive_sampler: AdaptiveResetSamplerCfg,
         success_context_name: str = "learning_progress_context",
         final_success_context_name: str = "progress_context",
         table_sampling_probability: float = 0.35,
@@ -132,7 +203,8 @@ class StackResetTableCurriculum(ManagerTermBase):
     ) -> dict[str, torch.Tensor]:
         """Record training outcomes, select new rows, and report coverage."""
         del (
-            success_monitor,
+            outcome_monitor,
+            adaptive_sampler,
             table_sampling_probability,
             global_sampling,
             evaluation_env_count,
@@ -166,23 +238,20 @@ class StackResetTableCurriculum(ManagerTermBase):
                 batch_table_full_task_attempts = completed_table.sum()
                 if bool(torch.any(completed_table)):
                     batch_table_full_task_success_rate = final_succeeded[completed_table].float().mean()
-                self._progress_monitor.success_update(completed_rows, succeeded)
-                self._attempts.add_(torch.bincount(completed_rows, minlength=self._reset_term.row_count))
+                completed_items = self._catalog.item_ids_for_rows(completed_rows)
+                self._progress_monitor.record(completed_items, succeeded)
+                self._attempts.add_(torch.bincount(completed_rows, minlength=self._catalog.row_count))
                 self._progress_successes.add_(
-                    torch.bincount(completed_rows[succeeded], minlength=self._reset_term.row_count)
+                    torch.bincount(completed_rows[succeeded], minlength=self._catalog.row_count)
                 )
-                self._full_task_attempts_by_row.add_(
-                    torch.bincount(completed_rows, minlength=self._reset_term.row_count)
-                )
+                self._full_task_attempts_by_row.add_(torch.bincount(completed_rows, minlength=self._catalog.row_count))
                 self._full_task_successes_by_row.add_(
-                    torch.bincount(completed_rows[final_succeeded], minlength=self._reset_term.row_count)
+                    torch.bincount(completed_rows[final_succeeded], minlength=self._catalog.row_count)
                 )
 
-            probabilities, _ = self._sampling_distribution()
-            rows = torch.multinomial(probabilities, training_ids.numel(), replacement=True)
+            rows = self._sample_rows(training_ids.numel())
             row_ids[training_ids] = rows
-        else:
-            probabilities, _ = self._sampling_distribution()
+        probabilities, _ = self._sampling_distribution()
 
         attempts = self._attempts
         observed = attempts > 0
@@ -191,7 +260,7 @@ class StackResetTableCurriculum(ManagerTermBase):
         entropy /= math.log(probabilities.numel())
         active_rows = ~self._table_rows
         unseen_rows = active_rows & ~observed
-        rolling_rates = self._progress_monitor.success_rate
+        rolling_rates = self._progress_monitor.success_rates
         observed_count = observed.sum().clamp_min(1)
         metrics: dict[str, torch.Tensor] = {
             "row_coverage": observed.float().mean(),
@@ -205,7 +274,7 @@ class StackResetTableCurriculum(ManagerTermBase):
             "unseen_row_probability_mass": probabilities[unseen_rows].sum(),
             "table_probability": probabilities[self._table_rows].sum(),
             "target_band_fraction": (
-                ((rolling_rates - self._progress_monitor.cfg.target_success_rate).abs() <= 0.1) & observed
+                ((rolling_rates - self._sampler.cfg.target_success_rate).abs() <= 0.1) & observed
             ).sum()
             / observed_count,
             "full_task_attempts": self._continuation_attempts.float(),
@@ -216,6 +285,14 @@ class StackResetTableCurriculum(ManagerTermBase):
             / self._full_task_attempts_by_row[self._table_rows].sum().clamp_min(1),
             "table_full_task_attempts": self._full_task_attempts_by_row[self._table_rows].sum().float(),
         }
+        for name, value in self._sampler.metrics(rolling_rates).items():
+            metrics[f"sampler_{name}"] = torch.tensor(value, dtype=torch.float32, device=env.device)
+        metrics["sampler_table_assignments"] = torch.tensor(
+            self._table_assignments,
+            dtype=torch.float32,
+            device=env.device,
+        )
+        frontier_probabilities = self._sampler.adaptive_probabilities(rolling_rates)
         for recipe, recipe_rows in enumerate(self._recipe_rows):
             recipe_attempts = attempts[recipe_rows].sum()
             recipe_full_task_attempts = self._full_task_attempts_by_row[recipe_rows].sum()
@@ -229,6 +306,7 @@ class StackResetTableCurriculum(ManagerTermBase):
                 recipe_rows
             ].sum().float() / recipe_full_task_attempts.clamp_min(1)
             metrics[f"recipe_{self._reset_term.recipe_names[recipe]}_probability"] = probabilities[recipe_rows].sum()
+            metrics[f"recipe_{recipe_name}_frontier_probability"] = frontier_probabilities[recipe_rows].sum()
         pair_rows_by_id = getattr(self, "_grasp_pair_rows", None)
         if pair_rows_by_id is not None:
             for pair_rows, pair_name in zip(pair_rows_by_id, ("index_thumb",), strict=True):
@@ -292,28 +370,25 @@ class StackResetTableCurriculum(ManagerTermBase):
         return metrics
 
     def get_state(self) -> dict[str, torch.Tensor]:
-        """Return monitor evidence and replay coverage for an RL checkpoint."""
-        history = self._progress_monitor.success_buf.bool()
-        return {
-            "success_rates": self._progress_monitor.success_rate.clone(),
-            "success_history": history.clone(),
-            "history_pointer": self._progress_monitor.success_pointer.clone(),
-            "history_size": self._progress_monitor.success_size.clone(),
+        """Return monitor evidence and replay coverage for an explicit state snapshot."""
+        state = {
             "total_successes": self._progress_successes.clone(),
             "total_attempts": self._attempts.clone(),
             "continuation_attempts": self._continuation_attempts.clone(),
             "continuation_successes": self._continuation_successes.clone(),
             "full_task_attempts_by_row": self._full_task_attempts_by_row.clone(),
             "full_task_successes_by_row": self._full_task_successes_by_row.clone(),
+            "table_credit": torch.tensor(self._table_credit, dtype=torch.float64, device=self.device),
+            "table_assignments": torch.tensor(self._table_assignments, dtype=torch.long, device=self.device),
+            "table_generator_state": self._table_generator.get_state().clone(),
         }
+        state.update({f"monitor/{name}": value for name, value in self._progress_monitor.state_dict().items()})
+        state.update({f"sampler/{name}": value for name, value in self._sampler.state_dict().items()})
+        return state
 
     def set_state(self, state: dict[str, torch.Tensor]) -> None:
-        """Restore adaptive evidence and replay coverage from an RL checkpoint."""
+        """Restore adaptive evidence and replay coverage from an explicit state snapshot."""
         targets = {
-            "success_rates": self._progress_monitor.success_rate,
-            "success_history": self._progress_monitor.success_buf,
-            "history_pointer": self._progress_monitor.success_pointer,
-            "history_size": self._progress_monitor.success_size,
             "total_successes": self._progress_successes,
             "total_attempts": self._attempts,
             "continuation_attempts": self._continuation_attempts,
@@ -321,18 +396,49 @@ class StackResetTableCurriculum(ManagerTermBase):
             "full_task_attempts_by_row": self._full_task_attempts_by_row,
             "full_task_successes_by_row": self._full_task_successes_by_row,
         }
+        monitor_state = {
+            name.removeprefix("monitor/"): value for name, value in state.items() if name.startswith("monitor/")
+        }
+        sampler_state = {
+            name.removeprefix("sampler/"): value for name, value in state.items() if name.startswith("sampler/")
+        }
+        expected_names = set(targets) | {
+            "table_credit",
+            "table_assignments",
+            "table_generator_state",
+        }
+        expected_names |= {f"monitor/{name}" for name in self._progress_monitor.state_dict()}
+        expected_names |= {f"sampler/{name}" for name in self._sampler.state_dict()}
+        if set(state) != expected_names:
+            raise ValueError("Reset-table curriculum checkpoint does not match the current state schema.")
         for name, target in targets.items():
-            if name not in state:
-                raise KeyError(f"Reset-table curriculum checkpoint is missing '{name}'.")
             if state[name].shape != target.shape:
                 raise ValueError(
                     f"Reset-table curriculum checkpoint '{name}' has shape {state[name].shape}; "
                     f"expected {target.shape}."
                 )
-        history_len = self._progress_monitor.cfg.monitored_history_len
-        if bool(torch.any((state["history_pointer"] < 0) | (state["history_pointer"] >= history_len))):
-            raise ValueError("Reset-table curriculum checkpoint contains an invalid history pointer.")
-        if bool(torch.any((state["history_size"] < 0) | (state["history_size"] > history_len))):
-            raise ValueError("Reset-table curriculum checkpoint contains an invalid history size.")
+        table_credit = state["table_credit"]
+        table_assignments = state["table_assignments"]
+        table_generator_state = state["table_generator_state"]
+        if table_credit.numel() != 1 or not table_credit.is_floating_point():
+            raise ValueError("table_credit must be a scalar floating-point tensor.")
+        resolved_table_credit = float(table_credit.item())
+        if not math.isfinite(resolved_table_credit) or not 0.0 <= resolved_table_credit < 1.0 + 1.0e-9:
+            raise ValueError("table_credit must lie in [0, 1).")
+        if (
+            table_assignments.numel() != 1
+            or table_assignments.dtype == torch.bool
+            or table_assignments.is_floating_point()
+            or table_assignments.is_complex()
+            or int(table_assignments.item()) < 0
+        ):
+            raise ValueError("table_assignments must be a non-negative scalar integer tensor.")
+        if not isinstance(table_generator_state, torch.Tensor):
+            raise TypeError("table_generator_state must be a tensor.")
+        self._progress_monitor.load_state_dict(monitor_state)
+        self._sampler.load_state_dict(sampler_state)
         for name, target in targets.items():
             target.copy_(state[name].to(device=target.device, dtype=target.dtype))
+        self._table_credit = min(resolved_table_credit, math.nextafter(1.0, 0.0))
+        self._table_assignments = int(table_assignments.item())
+        self._table_generator.set_state(table_generator_state.cpu())

@@ -12,6 +12,8 @@ import pytest
 import torch
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 
+from isaaclab.managers import CurriculumTermCfg
+
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.contrib.stack import mdp
 from isaaclab_tasks.contrib.stack.config.franka.agents.rsl_rl_distillation_cfg import (
@@ -33,7 +35,7 @@ from isaaclab_tasks.contrib.stack.mdp.runtime_state import (
     get_stack_reset_runtime_state,
 )
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry, parse_env_cfg
-
+from isaaclab_tasks.utils.reset_sampling import ResetStateCatalog
 
 FRANKA_STATE_TASK = "IsaacContrib-Stack-Cube-Franka-RL"
 FRANKA_CAMERA_TASK = "IsaacContrib-Stack-Cube-Franka-RL-Camera"
@@ -94,6 +96,14 @@ def test_franka_state_task_exposes_the_training_contract(stack_cfgs):
     assert isinstance(cfg.actions.gripper_action, mdp.ResetBufferedGripperActionCfg)
     assert cfg.events.reset_from_state_buffer.func is mdp.StackResetStateTable
     assert cfg.curriculum.reset_sampling.func is mdp.StackResetTableCurriculum
+    assert isinstance(
+        cfg.curriculum.reset_sampling.params["outcome_monitor"],
+        mdp.RollingOutcomeMonitorCfg,
+    )
+    sampler_cfg = cfg.curriculum.reset_sampling.params["adaptive_sampler"]
+    assert isinstance(sampler_cfg, mdp.AdaptiveResetSamplerCfg)
+    assert cfg.curriculum.reset_sampling.params["table_sampling_probability"] == 0.35
+    assert sampler_cfg.coverage_fraction == pytest.approx(3.0 / 13.0)
     assert cfg.terminations.progress_context.func is mdp.StableOrderInvariantStackGoal
     assert cfg.rewards.success.func is mdp.stack_success_pulse
     assert cfg.observations.policy.object.func is mdp.role_conditioned_stack_obs
@@ -142,6 +152,7 @@ def test_kuka_task_has_one_complete_23_dof_state_policy(stack_cfgs):
     runner = load_cfg_from_registry(KUKA_STATE_TASK, "rsl_rl_cfg_entry_point")
 
     assert cfg.events.reset_from_state_buffer.func is mdp.KukaAllegroResetStateTable
+    assert mdp.KukaAllegroResetStateTable.__module__.endswith(".kuka_reset_events")
     assert cfg.actions.arm_action.gravity_compensation
     assert cfg.actions.arm_action.scale == cfg.actions.arm_action.max_delta == 0.12
     assert isinstance(cfg.actions.gripper_action, mdp.ResetPreservingRelativeJointPositionActionCfg)
@@ -171,6 +182,105 @@ def test_play_mode_uses_randomized_table_starts(task_name: str):
     assert cfg.events.reset_from_state_buffer.params["fixed_recipe"] == int(mdp.StackResetRecipe.TABLE)
     assert cfg.curriculum is None
     assert cfg.scene.num_envs == 4
+
+
+def _make_stack_curriculum(num_envs: int = 1000):
+    """Create a simulation-free curriculum with the production Franka row geometry."""
+    recipe_names = tuple(recipe.name.lower() for recipe in mdp.StackResetRecipe)
+    rows_per_layout = (18, 33, 65, 33, 33, 33, 65, 33, 64)
+    recipe_ids = []
+    layout_ids = []
+    for layout_id in range(18):
+        for recipe_id, row_count in enumerate(rows_per_layout):
+            recipe_ids.extend((recipe_id,) * row_count)
+            layout_ids.extend((layout_id,) * row_count)
+    recipe_ids = torch.tensor(recipe_ids, dtype=torch.long)
+    layout_ids = torch.tensor(layout_ids, dtype=torch.long)
+    catalog = ResetStateCatalog(
+        row_count=recipe_ids.numel(),
+        metadata={"recipe_ids": recipe_ids, "layout_ids": layout_ids},
+    )
+    reset_term = SimpleNamespace(
+        catalog=catalog,
+        row_count=catalog.row_count,
+        recipe_ids=recipe_ids,
+        layout_ids=layout_ids,
+        layout_count=18,
+        recipe_names=recipe_names,
+    )
+    env = SimpleNamespace(
+        num_envs=num_envs,
+        device="cpu",
+        episode_length_buf=torch.zeros(num_envs, dtype=torch.long),
+        event_manager=SimpleNamespace(
+            get_term_cfg=lambda _name: SimpleNamespace(func=reset_term),
+        ),
+    )
+    create_stack_reset_runtime_state(env)
+    params = {
+        "outcome_monitor": mdp.RollingOutcomeMonitorCfg(history_length=50, prior_strength=2.0),
+        "adaptive_sampler": mdp.AdaptiveResetSamplerCfg(
+            target_success_rate=0.5,
+            kappa=1.0,
+            temperature=1.0,
+            coverage_fraction=3.0 / 13.0,
+            epsilon=1.0e-4,
+        ),
+        "success_context_name": "learning_progress_context",
+        "final_success_context_name": "progress_context",
+        "table_sampling_probability": 0.35,
+        "global_sampling": False,
+        "evaluation_env_count": 0,
+    }
+    cfg = CurriculumTermCfg(func=mdp.StackResetTableCurriculum, params=params)
+    return env, params, mdp.StackResetTableCurriculum(cfg, env)
+
+
+def test_stack_curriculum_uses_explicit_table_coverage_frontier_mixture():
+    env, params, curriculum = _make_stack_curriculum()
+
+    metrics = curriculum(env, torch.arange(env.num_envs), **params)
+    state = get_stack_reset_runtime_state(env)
+    reset_term = env.event_manager.get_term_cfg("reset_from_state_buffer").func
+    recipe_ids = reset_term.catalog.metadata["recipe_ids"]
+    selected_recipes = recipe_ids[state.row_ids]
+
+    assert torch.count_nonzero(selected_recipes == int(mdp.StackResetRecipe.TABLE)) == 350
+    assert metrics["sampler_table_assignments"] == 350
+    assert metrics["sampler_coverage_assignments"] == 150
+    assert metrics["sampler_adaptive_assignments"] == 500
+    assert metrics["table_probability"] == pytest.approx(0.35)
+
+    # At the smoothed unseen prior, every semantic intermediate recipe has
+    # equal adaptive-frontier mass despite having 18, 33, or 65 rows/layout.
+    frontier_masses = torch.stack(
+        [
+            metrics[f"recipe_{recipe.name.lower()}_frontier_probability"]
+            for recipe in mdp.StackResetRecipe
+            if recipe != mdp.StackResetRecipe.TABLE
+        ]
+    )
+    torch.testing.assert_close(frontier_masses, torch.full((8,), 1.0 / 8.0))
+
+
+def test_stack_curriculum_state_roundtrip_preserves_next_draw():
+    first_env, params, first = _make_stack_curriculum(num_envs=128)
+    first(first_env, torch.arange(first_env.num_envs), **params)
+    saved = first.get_state()
+
+    second_env, second_params, second = _make_stack_curriculum(num_envs=128)
+    second.set_state(saved)
+
+    restored = second.get_state()
+    assert set(restored) == set(saved)
+    for name in saved:
+        torch.testing.assert_close(restored[name], saved[name])
+    first(first_env, torch.arange(first_env.num_envs), **params)
+    second(second_env, torch.arange(second_env.num_envs), **second_params)
+    torch.testing.assert_close(
+        get_stack_reset_runtime_state(first_env).row_ids,
+        get_stack_reset_runtime_state(second_env).row_ids,
+    )
 
 
 def test_mixed_franka_distribution_matches_the_physical_action_space():

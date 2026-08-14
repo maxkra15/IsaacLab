@@ -121,18 +121,26 @@ class CurriculumCfg:
         params={
             "success_context_name": "learning_progress_context",
             "final_success_context_name": "progress_context",
-            # Use the same shared rolling-success monitor as Lift and the
-            # conveyor task. Its target-rate weights concentrate sampling near
-            # 50% competence while retaining a floor at both extremes.
-            "success_monitor": mdp.SuccessMonitorCfg(
-                monitored_history_len=50,
+            # Unseen reset rows begin at the 50% frontier prior instead of
+            # being mistaken for failures. Two pseudo-observations keep the
+            # first noisy episode from immediately polarizing a row.
+            "outcome_monitor": mdp.RollingOutcomeMonitorCfg(
+                history_length=50,
+                prior_strength=2.0,
+            ),
+            "adaptive_sampler": mdp.AdaptiveResetSamplerCfg(
                 target_success_rate=0.50,
                 kappa=1.0,
                 temperature=1.0,
+                # This is conditional on the 65% intermediate stream:
+                # 0.65 * (3 / 13) = 0.15 exact cyclic coverage overall,
+                # leaving 0.50 for the adaptive success frontier.
+                coverage_fraction=3.0 / 13.0,
+                epsilon=1.0e-4,
             ),
             # Preserve a deployment-facing learning stream regardless of the
-            # adaptive intermediate-state distribution. The remaining 65% is
-            # sampled from non-table rows by the rolling-success kernel.
+            # adaptive intermediate-state distribution. The remaining 65%
+            # contains 15% exact row coverage and a 50% rolling-success frontier.
             "table_sampling_probability": 0.35,
             # Keep equal layout coverage by default. The KUKA task opts into
             # one flat target-rate distribution over its active rows.

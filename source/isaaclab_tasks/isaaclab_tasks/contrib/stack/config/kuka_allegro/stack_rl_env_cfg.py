@@ -248,7 +248,7 @@ class KukaAllegroCubeStackRLEnvCfg(FrankaCubeStackRLEnvCfg):
         )
 
     def _configure_objective(self) -> None:
-        """Configure full-hand success, reset progress, and global epsilon sampling."""
+        """Configure full-hand success, reset progress, and global adaptive sampling."""
         self.events = _make_kuka_allegro_event_cfg()
         self.rewards = RewardsCfg()
         self.curriculum = CurriculumCfg()
