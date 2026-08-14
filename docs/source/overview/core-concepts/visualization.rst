@@ -38,10 +38,10 @@ Isaac Lab supports four visualizer backends, each optimized for different use ca
      - Photorealistic rendering, studio lighting *(visualization markers, live plots, and streaming camera panel not yet supported)*
    * - **Rerun**
      - Remote viewing, replay
-     - Webviewer, time scrubbing, recording export, visualization markers
+     - Webviewer, time scrubbing, recording export, visualization markers, live plots
    * - **Viser**
      - Web-based remote visualization, sharing, recording
-     - Warp-based rendering, browser-based, share URL, visualization markers
+     - Warp-based rendering, browser-based, share URL, visualization markers, live plots
 
 
 *The following visualizers are shown training the Isaac-Velocity-Flat-AnymalD environment.*
