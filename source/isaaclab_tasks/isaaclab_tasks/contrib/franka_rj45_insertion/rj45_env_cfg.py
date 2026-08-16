@@ -240,7 +240,10 @@ class RewardsCfg:
     """Sparse success/failure objective with small smooth-control costs."""
 
     success = RewTerm(func=mdp.insertion_success_bonus, weight=10.0)
-    failure = RewTerm(func=mdp.terminal_failure, weight=-1.0, params={"include_time_out": False})
+    # Every reset row is physically validated as recoverable within the five-
+    # second horizon. Treat an unsuccessful timeout as a terminal failure so
+    # holding the cable motionless cannot dominate insertion exploration.
+    failure = RewTerm(func=mdp.terminal_failure, weight=-1.0, params={"include_time_out": True})
     action_magnitude = RewTerm(func=mdp.action_l2, weight=-1.0e-4)
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-2.0e-4)
 

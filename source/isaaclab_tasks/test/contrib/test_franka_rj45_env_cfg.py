@@ -60,6 +60,7 @@ def test_newton_fidelity_and_fixed_goal_contract_are_explicit():
     assert contract["actions"]["arm"]["gravity_compensation"] is False
     assert cfg.scene.robot.actuators["panda_arm"].stiffness["panda_joint[1-4]"] == 600.0
     assert cfg.scene.robot.actuators["panda_hand"].stiffness == 350.0
+    assert cfg.rewards.failure.params["include_time_out"] is True
 
 
 def test_contact_capacity_tracks_late_world_count_override():

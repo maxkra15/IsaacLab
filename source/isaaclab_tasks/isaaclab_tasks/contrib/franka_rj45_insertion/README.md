@@ -86,11 +86,14 @@ uv run python scripts/reinforcement_learning/train.py \
 
 Training and validation share the project log root
 `logs/rsl_rl/franka_rj45_insertion/`. Policy reward is terminal-sparse: stable
-fully seated insertion receives the success pulse, unsafe termination receives
-a failure pulse, and only small action magnitude/rate costs are otherwise
-applied. A separate non-reward progress monitor supplies row-local evidence to
-the adaptive reset sampler. The policy uses Gaussian arm exploration and a true
-Bernoulli gripper distribution so the binary action has the correct likelihood.
+fully seated insertion receives the success pulse, any unsuccessful termination
+or timeout receives a failure pulse, and only small action magnitude/rate costs
+are otherwise applied. Every reset is validated as recoverable within the
+episode horizon, so this prevents a motionless timeout from becoming preferable
+to insertion exploration. A separate non-reward progress monitor supplies
+row-local evidence to the adaptive reset sampler. The policy uses Gaussian arm
+exploration and a true Bernoulli gripper distribution so the binary action has
+the correct likelihood.
 
 Isaac Lab `develop` currently pins Newton 1.5. The task requests the legacy
 `rigid_contact_hard=False` compliant formulation on that release and also sets
