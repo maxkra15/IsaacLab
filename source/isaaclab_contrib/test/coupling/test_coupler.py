@@ -70,6 +70,54 @@ def test_public_coupling_exports_are_importable():
         assert getattr(coupling, name) is not None
 
 
+def test_proxy_contact_data_uses_destination_local_layout(monkeypatch):
+    """Proxy contacts must travel with the view/state that owns their local indices."""
+    contacts = object()
+    destination_view = object()
+    destination_state = object()
+
+    class FakeSolverCoupledProxy:
+        def entry_names(self):
+            return ("rigid", "soft")
+
+        def get_proxy_contacts(self, source, destination):
+            assert (source, destination) == ("rigid", "soft")
+            return contacts
+
+        def view(self, name):
+            assert name == "soft"
+            return destination_view
+
+        def entry_state(self, name, phase="current"):
+            assert (name, phase) == ("soft", "current")
+            return destination_state
+
+    solver = FakeSolverCoupledProxy()
+    monkeypatch.setattr(coupler, "SolverCoupledProxy", FakeSolverCoupledProxy)
+    monkeypatch.setattr(coupler.NewtonManager, "_solver", solver)
+
+    result = NewtonCouplerManager.get_proxy_contact_data("rigid", "soft")
+
+    assert result == (contacts, destination_view, destination_state)
+
+
+def test_proxy_contact_data_rejects_wrong_solver_and_entry(monkeypatch):
+    """Diagnostics should fail loudly instead of mixing incompatible contact layouts."""
+
+    class FakeSolverCoupledProxy:
+        def entry_names(self):
+            return ("rigid", "soft")
+
+    monkeypatch.setattr(coupler, "SolverCoupledProxy", FakeSolverCoupledProxy)
+    monkeypatch.setattr(coupler.NewtonManager, "_solver", object())
+    with pytest.raises(RuntimeError, match="active SolverCoupledProxy"):
+        NewtonCouplerManager.get_proxy_contact_data("rigid", "soft")
+
+    monkeypatch.setattr(coupler.NewtonManager, "_solver", FakeSolverCoupledProxy())
+    with pytest.raises(KeyError, match="Unknown proxy source entry"):
+        NewtonCouplerManager.get_proxy_contact_data("missing", "soft")
+
+
 @dataclass
 class _FakeModel:
     """Fields consulted by the coupler's pure configuration helpers."""

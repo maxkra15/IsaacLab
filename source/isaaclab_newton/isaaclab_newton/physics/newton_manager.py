@@ -3180,6 +3180,17 @@ class NewtonManager(PhysicsManager):
         NewtonManager._state_force_callbacks.append(callback)
 
     @classmethod
+    def unregister_state_force_callback(cls, callback: Callable[[State], None]) -> None:
+        """Remove a previously registered per-substep force callback.
+
+        This is the lifecycle counterpart to :meth:`register_state_force_callback`.
+        It is intentionally tolerant when initialization failed before the
+        callback was registered or a physics-manager clear already removed it.
+        """
+        with contextlib.suppress(ValueError):
+            cls._state_force_callbacks.remove(callback)
+
+    @classmethod
     def register_post_step_callback(cls, callback: Callable[[], None]) -> None:
         """Append a hook to the list invoked after the last solver substep on every step.
 

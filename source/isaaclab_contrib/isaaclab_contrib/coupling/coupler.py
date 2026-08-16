@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+from typing import TYPE_CHECKING
 
 import warp as wp
 from isaaclab_newton.physics import (
@@ -35,6 +36,10 @@ from .coupler_cfg import (
     CouplerProxyCfg,
     CouplerProxyMappingCfg,
 )
+
+if TYPE_CHECKING:
+    from newton import Contacts, State
+    from newton.solvers.experimental.coupled import ModelView
 
 
 class NewtonCouplerManager(NewtonVBDManager):
@@ -69,6 +74,44 @@ class NewtonCouplerManager(NewtonVBDManager):
         if isinstance(solver_cfg, MPMSolverCfg):
             return False
         return True
+
+    @classmethod
+    def get_proxy_contact_data(
+        cls,
+        source: str,
+        destination: str,
+    ) -> tuple[Contacts | None, ModelView, State]:
+        """Return one proxy interface's contacts and matching destination-local layout.
+
+        Proxy collision pipelines operate on the destination entry's
+        :class:`~newton.solvers.experimental.coupled.ModelView`. Consequently,
+        shape/body indices in their contact buffers must be interpreted against
+        that view and its entry-local state, not the parent Newton model/state.
+
+        Args:
+            source: Name of the proxy source entry.
+            destination: Name of the proxy destination entry.
+
+        Returns:
+            The proxy-local contact buffer (or ``None`` when the mapping uses
+            outer contacts), destination model view, and its current state.
+
+        Raises:
+            RuntimeError: If the active Newton solver is not a proxy coupler.
+            KeyError: If either entry name is not present in the active coupler.
+        """
+        solver = NewtonManager._solver
+        if not isinstance(solver, SolverCoupledProxy):
+            raise RuntimeError("Proxy contact data requires an active SolverCoupledProxy.")
+        entry_names = solver.entry_names()
+        for role, name in (("source", source), ("destination", destination)):
+            if name not in entry_names:
+                raise KeyError(f"Unknown proxy {role} entry {name!r}; available entries are {entry_names}.")
+        return (
+            solver.get_proxy_contacts(source, destination),
+            solver.view(destination),
+            solver.entry_state(destination, phase="current"),
+        )
 
     @classmethod
     def _build_solver(cls, model: Model, solver_cfg: CouplerCfg) -> None:

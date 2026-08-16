@@ -61,6 +61,24 @@ class VBDSolverCfg(NewtonSolverCfg):
     rigid_contact_k_start: float = 1.0e2
     """Initial stiffness seed for rigid-body contacts [N/m]."""
 
+    rigid_compliant_alm: bool | None = None
+    """Whether to use compliant ALM for rigid-body contacts and joints.
+
+    ``None`` preserves Newton's default constraint formulation. Set this to
+    ``True`` to select Newton's unified compliant-ALM path explicitly.
+    """
+
+    rigid_contact_hard: bool = True
+    """Whether legacy AVBD rigid contacts use hard constraints.
+
+    This setting is ignored when :attr:`rigid_compliant_alm` selects Newton's
+    unified compliant-ALM path. It remains available for Newton versions where
+    ``False`` selects the legacy penalty-only contact formulation.
+    """
+
+    rigid_body_contact_buffer_size: int = 64
+    """Per-body capacity of the rigid body contact list."""
+
     rigid_body_particle_contact_buffer_size: int = 256
     """Per-body capacity of the particle, edge, and face soft-contact list.
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import isaaclab_newton.physics.newton_manager as newton_manager_module
+import isaaclab_newton.physics.vbd_manager as vbd_manager_module
 import numpy as np
 import pytest
 import warp as wp
@@ -205,6 +206,78 @@ def test_solver_kwargs_include_newton_deterministic_mode(monkeypatch: pytest.Mon
     kwargs = NewtonManager._filter_solver_kwargs(SolverXPBD, XPBDSolverCfg())
 
     assert kwargs["deterministic"] == wp.DeterministicMode.GPU_TO_GPU
+
+
+def test_vbd_solver_cfg_forwards_rigid_contact_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VBD construction should forward only contact settings supported by the installed Newton."""
+    legacy_calls = {}
+
+    class LegacySolverVBD:
+        def __init__(
+            self,
+            model,
+            *,
+            rigid_contact_hard: bool = True,
+            rigid_body_contact_buffer_size: int = 64,
+        ):
+            legacy_calls.update(
+                model=model,
+                rigid_contact_hard=rigid_contact_hard,
+                rigid_body_contact_buffer_size=rigid_body_contact_buffer_size,
+            )
+
+    default_cfg = VBDSolverCfg()
+    assert default_cfg.rigid_compliant_alm is None
+    assert default_cfg.rigid_contact_hard is True
+    assert default_cfg.rigid_body_contact_buffer_size == 64
+
+    model = object()
+    solver_cfg = VBDSolverCfg(
+        rigid_compliant_alm=True,
+        rigid_contact_hard=False,
+        rigid_body_contact_buffer_size=256,
+    )
+    monkeypatch.setattr(vbd_manager_module, "SolverVBD", LegacySolverVBD)
+    legacy_solver = NewtonVBDManager._create_solver(model, solver_cfg)
+
+    assert isinstance(legacy_solver, LegacySolverVBD)
+    assert legacy_calls == {
+        "model": model,
+        "rigid_contact_hard": False,
+        "rigid_body_contact_buffer_size": 256,
+    }
+
+    latest_calls = {}
+
+    class LatestSolverVBD:
+        def __init__(
+            self,
+            model,
+            *,
+            rigid_compliant_alm: bool | None = None,
+            rigid_contact_hard: bool = True,
+            rigid_body_contact_buffer_size: int = 64,
+        ):
+            latest_calls.update(
+                model=model,
+                rigid_compliant_alm=rigid_compliant_alm,
+                rigid_contact_hard=rigid_contact_hard,
+                rigid_body_contact_buffer_size=rigid_body_contact_buffer_size,
+            )
+
+    monkeypatch.setattr(vbd_manager_module, "SolverVBD", LatestSolverVBD)
+    latest_solver = NewtonVBDManager._create_solver(
+        model,
+        solver_cfg,
+    )
+
+    assert isinstance(latest_solver, LatestSolverVBD)
+    assert latest_calls == {
+        "model": model,
+        "rigid_compliant_alm": True,
+        "rigid_contact_hard": False,
+        "rigid_body_contact_buffer_size": 256,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1327,6 +1400,18 @@ def test_state_force_callback_runs_before_every_solver_substep(monkeypatch, use_
             ("force", "state_1"),
             ("step", "state_1", "state_0"),
         ]
+
+
+def test_unregister_state_force_callback_is_idempotent(monkeypatch):
+    def callback(_state):
+        pass
+
+    monkeypatch.setattr(NewtonManager, "_state_force_callbacks", [callback])
+
+    NewtonManager.unregister_state_force_callback(callback)
+    NewtonManager.unregister_state_force_callback(callback)
+
+    assert NewtonManager._state_force_callbacks == []
 
 
 # ---------------------------------------------------------------------------
