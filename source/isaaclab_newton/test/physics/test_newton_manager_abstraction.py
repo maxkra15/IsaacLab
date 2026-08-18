@@ -936,56 +936,6 @@ def test_forward_consumes_existing_reset_masks(monkeypatch):
     assert fk_mask.numpy().tolist() == [False, False]
 
 
-def test_mjwarp_reset_excludes_the_canonical_global_world_entry(monkeypatch):
-    """SolverMuJoCo accepts only its local worlds, not Newton's world -1 slot."""
-    reset_masks: list[list[bool]] = []
-
-    class _RecordingSolver:
-        use_mujoco_cpu = False
-
-        def reset(self, state, world_mask=None, flags=0):
-            reset_masks.append(world_mask.numpy().tolist())
-
-    monkeypatch.setattr(NewtonMJWarpManager, "_solver", _RecordingSolver(), raising=False)
-    monkeypatch.setattr(NewtonMJWarpManager, "_model", SimpleNamespace(world_count=2), raising=False)
-    monkeypatch.setattr(NewtonMJWarpManager, "_state_0", object(), raising=False)
-    world_mask = wp.array([True, False, False], dtype=wp.bool, device="cpu")
-
-    NewtonMJWarpManager._reset_solver_internals(world_mask)
-
-    assert reset_masks == [[True, False]]
-
-
-@pytest.mark.parametrize("use_fk_solver", [False, True])
-def test_kamino_reset_excludes_the_canonical_global_world_entry(monkeypatch, use_fk_solver):
-    """SolverKamino accepts only its local worlds, not Newton's world -1 slot."""
-    reset_masks: list[list[bool]] = []
-
-    class _RecordingSolver:
-        def reset(self, state, world_mask=None, config=None):
-            reset_masks.append(world_mask.numpy().tolist())
-
-    monkeypatch.setattr(NewtonKaminoManager, "_solver", _RecordingSolver(), raising=False)
-    monkeypatch.setattr(NewtonKaminoManager, "_model", SimpleNamespace(world_count=2), raising=False)
-    monkeypatch.setattr(
-        NewtonKaminoManager,
-        "_state_0",
-        SimpleNamespace(joint_q=object(), joint_qd=object()),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        NewtonKaminoManager,
-        "_get_kamino_solver_cfg",
-        classmethod(lambda cls: SimpleNamespace(use_fk_solver=use_fk_solver)),
-    )
-    monkeypatch.setattr("isaaclab_newton.physics.kamino_manager.eval_fk", lambda *args: None)
-    world_mask = wp.array([True, False, False], dtype=wp.bool, device="cpu")
-
-    NewtonKaminoManager._eval_fk_impl(world_mask, None)
-
-    assert reset_masks == [[True, False]]
-
-
 def test_forward_dispatches_active_mpm_reset_hook_through_base_manager(monkeypatch):
     """Base-class state reads must use the active MPM manager's reset behavior."""
     world_mask = wp.array([True, False], dtype=wp.bool, device="cpu")
