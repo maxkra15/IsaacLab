@@ -14,9 +14,19 @@ gym.register(
     entry_point="isaaclab_tasks.contrib.franka_rj45_insertion.rj45_env:FrankaRJ45InsertionEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": (
-            "isaaclab_tasks.contrib.franka_rj45_insertion.rj45_env_cfg:FrankaRJ45InsertionEnvCfg"
-        ),
+        "env_cfg_entry_point": ("isaaclab_tasks.contrib.franka_rj45_insertion.rj45_env_cfg:FrankaRJ45InsertionEnvCfg"),
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaRJ45InsertionPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="IsaacContrib-Franka-RJ45-Pick-Insert",
+    entry_point="isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env:FrankaRJ45PickInsertEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg:FrankaRJ45PickInsertEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.pick_insert_rsl_rl_ppo_cfg:FrankaRJ45PickInsertPPORunnerCfg"),
     },
 )

@@ -18,6 +18,7 @@ import warp as wp
 from isaaclab_newton.cloner import newton_builder_world_hook
 from isaaclab_newton.physics import NewtonManager
 
+import isaaclab.sim as sim_utils
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.physics import PhysicsEvent
 from isaaclab.utils import math as math_utils
@@ -79,9 +80,7 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
     def __init__(self, cfg: FrankaRJ45InsertionEnvCfg, render_mode: str | None = None, **kwargs):
         configure_rj45_capacities(cfg)
         # Import lazily so config/schema tests do not compile Warp kernels or load the USD asset.
-        from .physics.rj45_assembly import Rj45NewtonAssemblyBuilder
-
-        self._rj45_builder = Rj45NewtonAssemblyBuilder()
+        self._rj45_builder = self._create_rj45_builder(cfg)
         self._rj45_runtime = None
         self._rj45_task_translation = tuple(cfg.task_translation)
         self._rj45_task_rotation = tuple(cfg.task_rotation_xyzw)
@@ -101,6 +100,12 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
         except Exception:
             self._clear_rj45_callbacks()
             raise
+
+    def _create_rj45_builder(self, cfg: FrankaRJ45InsertionEnvCfg):
+        """Create the exact default assembly; task variants may override topology."""
+        from .physics.rj45_assembly import Rj45NewtonAssemblyBuilder
+
+        return Rj45NewtonAssemblyBuilder()
 
     def _clear_rj45_callbacks(self) -> None:
         """Release task callbacks after normal close or partial initialization."""
@@ -139,6 +144,8 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
     def _bind_rj45_physics_ready(self, _payload=None) -> None:
         """Allocate task runtime arrays after model finalization and before capture."""
         self._rj45_runtime = self._rj45_builder.bind(NewtonManager.get_model())
+        if not NewtonManager._clone_physics_only:
+            self._rj45_builder.author_render_prims(sim_utils.get_current_stage())
 
     def _prepare_rj45_substep(self, state) -> None:
         """Faithfully align the previous solve, apply forces, and sync four anchors."""
@@ -205,15 +212,26 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
         self._task_body_workspace_upper = torch.as_tensor(
             self.cfg.task_body_workspace_upper, device=self.device, dtype=torch.float32
         )
-        self._cable_observation_body_indices = torch.tensor(
-            (2, 6, 11, 16, 21, 28, 36), device=self.device, dtype=torch.long
-        )
         runtime = self._ensure_rj45_runtime()
+        self._task_layout = runtime.layout
+        self._socket_task_body_index = runtime.layout.socket_body_index
+        self._plug_task_body_index = runtime.layout.plug_body_index
+        self._latch_task_body_index = runtime.layout.latch_body_index
+        self._cable_observation_body_indices = torch.tensor(
+            runtime.layout.cable_sample_body_indices,
+            device=self.device,
+            dtype=torch.long,
+        )
         self._task_body_ids = wp.to_torch(runtime.task_body_ids).to(device=self.device, dtype=torch.long)
-        if tuple(self._task_body_ids.shape) != (self.num_envs, 37):
-            raise RuntimeError(f"RJ45 assembly body map must have shape ({self.num_envs}, 37).")
-        self._task_reset_pose_staging = torch.zeros((self.num_envs, 37, 7), device=self.device, dtype=torch.float32)
-        self._task_reset_velocity_staging = torch.zeros((self.num_envs, 37, 6), device=self.device, dtype=torch.float32)
+        task_body_count = runtime.layout.body_count
+        if tuple(self._task_body_ids.shape) != (self.num_envs, task_body_count):
+            raise RuntimeError(f"RJ45 assembly body map must have shape ({self.num_envs}, {task_body_count}).")
+        self._task_reset_pose_staging = torch.zeros(
+            (self.num_envs, task_body_count, 7), device=self.device, dtype=torch.float32
+        )
+        self._task_reset_velocity_staging = torch.zeros(
+            (self.num_envs, task_body_count, 6), device=self.device, dtype=torch.float32
+        )
         self._task_env_mask_staging = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
     def _load_reset_dataset(self, configured_path: str) -> None:
@@ -281,14 +299,15 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
         return self.task_body_pose_e().clone(), self.task_body_velocity().clone()
 
     def plug_pose_e(self) -> torch.Tensor:
-        return self.task_body_pose_e()[:, 0]
+        return self.task_body_pose_e()[:, getattr(self, "_plug_task_body_index", 0)]
 
     def latch_pose_e(self) -> torch.Tensor:
-        return self.task_body_pose_e()[:, 1]
+        return self.task_body_pose_e()[:, getattr(self, "_latch_task_body_index", 1)]
 
     def plug_goal_translation_error(self) -> torch.Tensor:
         """Return signed plug translation error in the fixed socket frame."""
-        return self.plug_pose_e()[:, :3] - self.goal_task_body_pose[0, :3]
+        plug_index = getattr(self, "_plug_task_body_index", 0)
+        return self.plug_pose_e()[:, :3] - self.goal_task_body_pose[plug_index, :3]
 
     def tcp_pose_e(self) -> torch.Tensor:
         hand = self._robot.data.body_link_pose_w.torch[:, self._tcp_body_idx]
@@ -306,7 +325,7 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
         axial = position_error[:, 1].abs()
         radial_xz = position_error[:, (0, 2)]
         latch = self.latch_pose_e()
-        goal_latch = self.goal_task_body_pose[1]
+        goal_latch = self.goal_task_body_pose[getattr(self, "_latch_task_body_index", 1)]
         goal_inverse = math_utils.quat_conjugate(goal_latch[3:7].repeat(self.num_envs, 1))
         latch_error = math_utils.quat_unique(math_utils.quat_mul(goal_inverse, latch[:, 3:7]))
         latch_angle = torch.linalg.vector_norm(math_utils.axis_angle_from_quat(latch_error), dim=-1)
@@ -315,7 +334,7 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
     def plug_orientation_error(self) -> torch.Tensor:
         """Return the shortest plug-to-fixed-goal rotation angle [rad]."""
         plug = self.plug_pose_e()
-        goal_plug = self.goal_task_body_pose[0]
+        goal_plug = self.goal_task_body_pose[getattr(self, "_plug_task_body_index", 0)]
         goal_inverse = math_utils.quat_conjugate(goal_plug[3:7].repeat(self.num_envs, 1))
         error = math_utils.quat_unique(math_utils.quat_mul(goal_inverse, plug[:, 3:7]))
         return torch.linalg.vector_norm(math_utils.axis_angle_from_quat(error), dim=-1)
@@ -335,6 +354,8 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
             plug_angle_tolerance=self.cfg.success_plug_angle_tolerance,
             latch_angle_tolerance=self.cfg.success_latch_angle_tolerance,
             maximum_plug_spatial_speed=self.cfg.success_max_plug_speed,
+            plug_body_index=getattr(self, "_plug_task_body_index", 0),
+            latch_body_index=getattr(self, "_latch_task_body_index", 1),
         )
         return result.mask
 
@@ -378,8 +399,9 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
     ) -> None:
         """Restore complete RJ45 body state in selected environment frames."""
         env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
-        expected_pose_shape = (env_ids.numel(), 37, 7)
-        expected_velocity_shape = (env_ids.numel(), 37, 6)
+        task_body_count = self._task_layout.body_count
+        expected_pose_shape = (env_ids.numel(), task_body_count, 7)
+        expected_velocity_shape = (env_ids.numel(), task_body_count, 6)
         if tuple(local_pose.shape) != expected_pose_shape or tuple(velocity.shape) != expected_velocity_shape:
             raise ValueError(
                 f"RJ45 state must have shapes {expected_pose_shape}/{expected_velocity_shape}, got "

@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import warp as wp
-
 from newton.math import quat_between_vectors_robust
 
 
@@ -18,16 +17,22 @@ def apply_connector_forces(
     body_qd: wp.array[wp.spatial_vector],
     body_f: wp.array[wp.spatial_vector],
     body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
     gravity: wp.array[wp.vec3],
     world_ids: wp.array[int],
     plug_body_ids: wp.array[int],
     latch_body_ids: wp.array[int],
     drive_enabled: wp.array[wp.bool],
     drive_target_w: wp.array[wp.vec3],
+    orientation_hold_enabled: wp.array[wp.bool],
+    orientation_target_w: wp.array[wp.quat],
+    passive_angular_damping_rate: float,
     drive_stiffness: float,
     drive_damping: float,
+    orientation_stiffness: float,
+    orientation_damping: float,
 ):
-    """Cancel connector gravity and optionally drive each plug toward its target."""
+    """Cancel connector gravity and optionally drive each plug pose."""
     env_id = wp.tid()
     plug_idx = plug_body_ids[env_id]
     latch_idx = latch_body_ids[env_id]
@@ -46,20 +51,43 @@ def apply_connector_forces(
         wp.spatial_vector(-gravity_w * latch_mass, wp.vec3(0.0)),
     )
 
-    if not drive_enabled[env_id]:
-        return
+    if drive_enabled[env_id]:
+        target = drive_target_w[env_id]
+        plug_pos = wp.transform_get_translation(body_q[plug_idx])
+        plug_vel = wp.spatial_top(body_qd[plug_idx])
+        plug_multiplier = 10.0 + plug_mass
+        plug_force = plug_multiplier * (drive_stiffness * (target - plug_pos) - drive_damping * plug_vel)
+        wp.atomic_add(body_f, plug_idx, wp.spatial_vector(plug_force, wp.vec3(0.0)))
 
-    target = drive_target_w[env_id]
-    plug_pos = wp.transform_get_translation(body_q[plug_idx])
-    plug_vel = wp.spatial_top(body_qd[plug_idx])
-    plug_multiplier = 10.0 + plug_mass
-    plug_force = plug_multiplier * (drive_stiffness * (target - plug_pos) - drive_damping * plug_vel)
-    wp.atomic_add(body_f, plug_idx, wp.spatial_vector(plug_force, wp.vec3(0.0)))
+        latch_vel = wp.spatial_top(body_qd[latch_idx])
+        drive_acceleration = (target - plug_pos) * (plug_multiplier * drive_stiffness / plug_mass)
+        latch_force = drive_acceleration * latch_mass - latch_vel * ((10.0 + latch_mass) * drive_damping)
+        wp.atomic_add(body_f, latch_idx, wp.spatial_vector(latch_force, wp.vec3(0.0)))
 
-    latch_vel = wp.spatial_top(body_qd[latch_idx])
-    drive_acceleration = (target - plug_pos) * (plug_multiplier * drive_stiffness / plug_mass)
-    latch_force = drive_acceleration * latch_mass - latch_vel * ((10.0 + latch_mass) * drive_damping)
-    wp.atomic_add(body_f, latch_idx, wp.spatial_vector(latch_force, wp.vec3(0.0)))
+    plug_rot = wp.normalize(wp.transform_get_rotation(body_q[plug_idx]))
+    angular_velocity_w = wp.spatial_bottom(body_qd[plug_idx])
+    angular_velocity_body = wp.quat_rotate_inv(plug_rot, angular_velocity_w)
+    if passive_angular_damping_rate > 0.0:
+        passive_torque_body = -passive_angular_damping_rate * (body_inertia[plug_idx] * angular_velocity_body)
+        passive_torque_w = wp.quat_rotate(plug_rot, passive_torque_body)
+        wp.atomic_add(body_f, plug_idx, wp.spatial_vector(wp.vec3(0.0), passive_torque_w))
+
+    # The free-D6 pick task needs an orientation reference only while deriving
+    # its canonical seated state. Map a body-frame angular-acceleration PD
+    # command through the physical inertia so gains remain well-scaled and the
+    # exact disabled path contributes no torque.
+    if drive_enabled[env_id] and orientation_hold_enabled[env_id]:
+        target_rot = wp.normalize(orientation_target_w[env_id])
+        error_rot = wp.normalize(wp.mul(wp.quat_inverse(plug_rot), target_rot))
+        if error_rot[3] < 0.0:
+            error_rot = wp.quat(-error_rot[0], -error_rot[1], -error_rot[2], -error_rot[3])
+        error_axis_body, error_angle = wp.quat_to_axis_angle(error_rot)
+        angular_acceleration_body = (
+            orientation_stiffness * error_axis_body * error_angle - orientation_damping * angular_velocity_body
+        )
+        torque_body = body_inertia[plug_idx] * angular_acceleration_body
+        torque_w = wp.quat_rotate(plug_rot, torque_body)
+        wp.atomic_add(body_f, plug_idx, wp.spatial_vector(wp.vec3(0.0), torque_w))
 
 
 @wp.kernel(enable_backward=False)
@@ -180,3 +208,27 @@ def write_drive_targets_masked(
     env_id = wp.tid()
     if env_mask[env_id]:
         drive_target_w[env_id] = targets_w[env_id]
+
+
+@wp.kernel(enable_backward=False)
+def restore_orientation_targets_masked(
+    env_mask: wp.array[wp.bool],
+    default_target_w: wp.array[wp.quat],
+    target_w: wp.array[wp.quat],
+):
+    """Restore authored plug-orientation targets for selected worlds."""
+    env_id = wp.tid()
+    if env_mask[env_id]:
+        target_w[env_id] = default_target_w[env_id]
+
+
+@wp.kernel(enable_backward=False)
+def write_orientation_targets_masked(
+    env_mask: wp.array[wp.bool],
+    targets_w: wp.array[wp.quat],
+    target_w: wp.array[wp.quat],
+):
+    """Write world-frame plug-orientation targets for selected worlds."""
+    env_id = wp.tid()
+    if env_mask[env_id]:
+        target_w[env_id] = wp.normalize(targets_w[env_id])

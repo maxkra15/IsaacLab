@@ -52,24 +52,30 @@ def test_newton_fidelity_and_fixed_goal_contract_are_explicit():
     assert cfg.sim.physics.collision_decimation == 1
     assert cfg.sim.dt / cfg.sim.physics.num_substeps == pytest.approx(1.0 / 360.0)
     assert coupled.proxies[0].mode == "staggered"
+    assert tuple(coupled.entries[1].bodies) == (r"/World/envs/env_[^/]+/Rj45Assembly",)
     contract = reset_dataset_task_contract(cfg)
     assert contract["contract_version"] == 3
     assert contract["task_body_count"] == 37
     assert contract["validation_geometry"]["success_predicate_version"] == RJ45_SUCCESS_PREDICATE_VERSION
     assert contract["robot"]["reset_control_convention"]["gravity_compensation"] is False
     assert contract["actions"]["arm"]["gravity_compensation"] is False
+    assert tuple(contract["coupler"]["rj45_entry"]["bodies"]) == (r"/World/envs/env_[^/]+/Rj45Assembly",)
     assert cfg.scene.robot.actuators["panda_arm"].stiffness["panda_joint[1-4]"] == 600.0
     assert cfg.scene.robot.actuators["panda_hand"].stiffness == 350.0
     assert cfg.rewards.failure.params["include_time_out"] is True
 
 
-def test_contact_capacity_tracks_late_world_count_override():
+def test_contact_capacities_track_late_world_count_override():
     cfg = FrankaRJ45InsertionEnvCfg()
-    cfg.scene.num_envs = 19
+    original_contract = reset_dataset_task_contract(cfg)
+    cfg.scene.num_envs = 1536
 
     configure_rj45_capacities(cfg)
 
-    assert cfg.sim.physics.collision_cfg.rigid_contact_max == 19 * 1024
+    assert cfg.sim.physics.collision_cfg.rigid_contact_max == 1536 * 1024
+    assert cfg.sim.physics.collision_cfg.max_triangle_pairs == 1536 * 4096
+    assert cfg.sim.physics.solver_cfg.proxies[0].collision_pipeline.max_triangle_pairs == 1536 * 4096
+    assert reset_dataset_task_contract(cfg) == original_contract
 
 
 def test_reset_dataset_path_error_is_actionable(monkeypatch, tmp_path):
@@ -114,6 +120,47 @@ def test_rj45_callback_cleanup_handles_partial_initialization(monkeypatch):
     assert handle.deregistered
     assert NewtonManager._state_force_callbacks == []
     assert NewtonManager._post_step_callbacks == []
+
+
+def test_physics_ready_authors_kit_visuals_after_model_finalization(monkeypatch):
+    events = []
+    runtime = object()
+    builder = SimpleNamespace(
+        author_render_prims=lambda stage: events.append(("author", stage)),
+        bind=lambda model: events.append(("bind", model)) or runtime,
+    )
+    env = object.__new__(rj45_env.FrankaRJ45InsertionEnv)
+    env._is_closed = True
+    env._rj45_builder = builder
+    env._rj45_runtime = None
+    monkeypatch.setattr(NewtonManager, "_clone_physics_only", False)
+    monkeypatch.setattr(NewtonManager, "get_model", lambda: "finalized-model")
+    monkeypatch.setattr(rj45_env.sim_utils, "get_current_stage", lambda: "live-stage")
+
+    env._bind_rj45_physics_ready()
+
+    assert events == [("bind", "finalized-model"), ("author", "live-stage")]
+    assert env._rj45_runtime is runtime
+
+
+def test_physics_ready_skips_usd_authoring_without_kit(monkeypatch):
+    events = []
+    runtime = object()
+    builder = SimpleNamespace(
+        author_render_prims=lambda stage: events.append(("author", stage)),
+        bind=lambda model: events.append(("bind", model)) or runtime,
+    )
+    env = object.__new__(rj45_env.FrankaRJ45InsertionEnv)
+    env._is_closed = True
+    env._rj45_builder = builder
+    env._rj45_runtime = None
+    monkeypatch.setattr(NewtonManager, "_clone_physics_only", True)
+    monkeypatch.setattr(NewtonManager, "get_model", lambda: "finalized-model")
+
+    env._bind_rj45_physics_ready()
+
+    assert events == [("bind", "finalized-model")]
+    assert env._rj45_runtime is runtime
 
 
 def test_reset_boundary_preserves_terminal_row_and_outcomes(monkeypatch):
@@ -292,6 +339,38 @@ def test_success_requires_plug_orientation_and_rejects_axial_overtravel():
     assert delegated.tolist() == [True, False, False, False, False, False, True]
     assert torch.equal(delegated, result.mask)
     assert result.signed_axial_error.tolist() == pytest.approx([0.0, 5.0e-4, 0.0, 0.0, 0.0, 0.0, -5.0e-4])
+
+
+def test_success_uses_goal_local_axis_and_configurable_body_indices():
+    half_yaw = torch.tensor(torch.pi / 4)
+    yaw_quat = torch.tensor([0.0, 0.0, torch.sin(half_yaw), torch.cos(half_yaw)])
+    goal = torch.zeros((4, 7))
+    goal[:, 6] = 1.0
+    goal[1, 3:7] = yaw_quat
+    goal[2, 3:7] = yaw_quat
+    pose = goal.unsqueeze(0).repeat(2, 1, 1)
+    velocity = torch.zeros((2, 4, 6))
+    # Goal-local +Y points along world -X after a +90 degree yaw.
+    pose[0, 1, 0] = -5.0e-4
+    pose[1, 1, 1] = 5.0e-4
+
+    result = rj45_insertion_success(
+        pose,
+        velocity,
+        goal,
+        axial_tolerance=8.0e-4,
+        axial_overtravel_tolerance=2.0e-4,
+        radial_tolerance=7.5e-4,
+        plug_angle_tolerance=0.05,
+        latch_angle_tolerance=0.05,
+        maximum_plug_spatial_speed=0.01,
+        plug_body_index=1,
+        latch_body_index=2,
+    )
+
+    assert result.mask.tolist() == [False, True]
+    assert result.signed_axial_error.tolist() == pytest.approx([5.0e-4, 0.0], abs=1.0e-7)
+    assert result.radial_error.tolist() == pytest.approx([0.0, 5.0e-4], abs=1.0e-7)
 
 
 def test_plug_orientation_error_uses_fixed_goal_quaternion():

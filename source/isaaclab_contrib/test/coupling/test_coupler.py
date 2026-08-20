@@ -40,6 +40,7 @@ from isaaclab_contrib.coupling import (
     CouplerProxyCfg,
     CouplerProxyMappingCfg,
     NewtonCouplerManager,
+    VBDPoseHistoryRestoreStatus,
     coupler,
 )
 
@@ -68,6 +69,7 @@ def test_public_coupling_exports_are_importable():
 
     for name in coupling.__all__:
         assert getattr(coupling, name) is not None
+    assert coupling.VBDPoseHistoryRestoreStatus is VBDPoseHistoryRestoreStatus
 
 
 def test_proxy_contact_data_uses_destination_local_layout(monkeypatch):
@@ -116,6 +118,29 @@ def test_proxy_contact_data_rejects_wrong_solver_and_entry(monkeypatch):
     monkeypatch.setattr(coupler.NewtonManager, "_solver", FakeSolverCoupledProxy())
     with pytest.raises(KeyError, match="Unknown proxy source entry"):
         NewtonCouplerManager.get_proxy_contact_data("missing", "soft")
+
+
+def test_vbd_pose_history_requires_active_coupler_and_named_vbd_entry(monkeypatch):
+    """The public history API must reject unsupported solvers before reading arrays."""
+    monkeypatch.setattr(coupler.NewtonManager, "_solver", object())
+    with pytest.raises(RuntimeError, match="active SolverCoupledProxy or SolverCoupledADMM"):
+        NewtonCouplerManager.capture_vbd_pose_history("vbd", None, None)
+
+    class FakeSolverCoupledProxy:
+        def entry_names(self):
+            return ("xpbd",)
+
+        def solver(self, name):
+            assert name == "xpbd"
+            return object()
+
+    fake_solver = FakeSolverCoupledProxy()
+    monkeypatch.setattr(coupler, "SolverCoupledProxy", FakeSolverCoupledProxy)
+    monkeypatch.setattr(coupler.NewtonManager, "_solver", fake_solver)
+    with pytest.raises(KeyError, match="Unknown coupled solver entry"):
+        NewtonCouplerManager.capture_vbd_pose_history("missing", None, None)
+    with pytest.raises(RuntimeError, match="not SolverVBD"):
+        NewtonCouplerManager.capture_vbd_pose_history("xpbd", None, None)
 
 
 @dataclass

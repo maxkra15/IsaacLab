@@ -58,6 +58,8 @@ RJ45_TASK_TRANSLATION = (0.55, 0.0, 0.25)
 RJ45_TASK_ROTATION_XYZW = (0.0, 0.0, 0.0, 1.0)
 RJ45_PLUG_GRASP_OFFSET = (0.0, -0.025, 0.0)
 _RIGID_CONTACTS_PER_WORLD = 1024
+_TRIANGLE_PAIRS_PER_WORLD = 4096
+_MIN_TRIANGLE_PAIR_CAPACITY = 1_000_000
 
 _ARM_HOME = (-1.05, 0.55, 0.55, -2.65, 2.35, 1.55, 0.25)
 _ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
@@ -101,6 +103,12 @@ def _stable_contract_value(value: Any) -> Any:
         return float(value)
     if isinstance(value, str):
         return str(value)
+    if isinstance(value, slice):
+        return {
+            "slice_start": _stable_contract_value(value.start),
+            "slice_stop": _stable_contract_value(value.stop),
+            "slice_step": _stable_contract_value(value.step),
+        }
     if isinstance(value, type):
         return f"{value.__module__}:{value.__qualname__}"
     if callable(value):
@@ -109,7 +117,7 @@ def _stable_contract_value(value: Any) -> Any:
         return f"{module}:{qualname}"
     if isinstance(value, Mapping):
         return {str(key): _stable_contract_value(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, tuple | list):
         converted = tuple(_stable_contract_value(item) for item in value)
         return converted if isinstance(value, tuple) else list(converted)
     if hasattr(value, "__dict__"):
@@ -291,6 +299,7 @@ class FrankaRJ45InsertionEnvCfg(ManagerBasedRLEnvCfg):
     task_translation: tuple[float, float, float] = RJ45_TASK_TRANSLATION
     task_rotation_xyzw: tuple[float, float, float, float] = RJ45_TASK_ROTATION_XYZW
     plug_grasp_offset: tuple[float, float, float] = RJ45_PLUG_GRASP_OFFSET
+    rj45_entry_body_patterns: tuple[str, ...] = _RJ45_ENTRY_BODY_PATTERNS
 
     reset_dataset_path: str = "datasets/franka_rj45_insertion/reset_dataset.pt"
     reset_validation_report_path: str = "logs/rsl_rl/franka_rj45_insertion/validation/reset_validation.json"
@@ -360,7 +369,7 @@ class FrankaRJ45InsertionEnvCfg(ManagerBasedRLEnvCfg):
                             rigid_contact_hard=False,
                             rigid_body_contact_buffer_size=256,
                         ),
-                        bodies=list(_RJ45_ENTRY_BODY_PATTERNS),
+                        bodies=list(self.rj45_entry_body_patterns),
                         include_static_shapes=True,
                     ),
                 ],
@@ -437,7 +446,7 @@ class FrankaRJ45InsertionEnvCfg(ManagerBasedRLEnvCfg):
             raise TypeError(f"Coupled entry {RJ45_ENTRY!r} must use VBDSolverCfg.")
         if tuple(rigid_entry.bodies) != _RIGID_ENTRY_BODY_PATTERNS:
             raise ValueError(f"Coupled entry {RIGID_ENTRY!r} body selectors do not match the validated task.")
-        if tuple(rj45_entry.bodies) != _RJ45_ENTRY_BODY_PATTERNS:
+        if tuple(rj45_entry.bodies) != tuple(self.rj45_entry_body_patterns):
             raise ValueError(f"Coupled entry {RJ45_ENTRY!r} body selectors do not match the validated task.")
         if tuple(proxy.bodies) != _PROXY_BODY_PATTERNS:
             raise ValueError("The Franka-to-RJ45 proxy body selectors do not match the validated task.")
@@ -465,6 +474,12 @@ def reset_dataset_task_contract(cfg: FrankaRJ45InsertionEnvCfg) -> dict[str, obj
     rj45_entry = _coupler_entry(coupler, RJ45_ENTRY)
     proxy = _coupler_proxy(coupler)
     outer_collision = _config_contract(cfg.sim.physics.collision_cfg, exclude=("rigid_contact_max",))
+    # Buffer capacities are resolved from the runtime world count and do not
+    # change the physical reset contract when they are large enough.
+    outer_collision["max_triangle_pairs"] = _MIN_TRIANGLE_PAIR_CAPACITY
+    proxy_collision = None if proxy.collision_pipeline is None else _config_contract(proxy.collision_pipeline)
+    if isinstance(proxy.collision_pipeline, NewtonCollisionPipelineCfg):
+        proxy_collision["max_triangle_pairs"] = _MIN_TRIANGLE_PAIR_CAPACITY
     return {
         "contract_version": 3,
         "task_body_count": 37,
@@ -549,9 +564,7 @@ def reset_dataset_task_contract(cfg: FrankaRJ45InsertionEnvCfg) -> dict[str, obj
                 "mode": proxy.mode,
                 "mass_scale": float(proxy.mass_scale),
                 "collide_interval": proxy.collide_interval,
-                "collision_pipeline": (
-                    None if proxy.collision_pipeline is None else _config_contract(proxy.collision_pipeline)
-                ),
+                "collision_pipeline": proxy_collision,
             },
         },
         "validation_geometry": {
@@ -582,4 +595,11 @@ def configure_rj45_capacities(cfg: FrankaRJ45InsertionEnvCfg) -> None:
     collision_cfg = cfg.sim.physics.collision_cfg
     if not isinstance(collision_cfg, NewtonCollisionPipelineCfg):
         raise TypeError("Franka RJ45 requires an explicit NewtonCollisionPipelineCfg.")
-    collision_cfg.rigid_contact_max = _RIGID_CONTACTS_PER_WORLD * int(cfg.scene.num_envs)
+    num_worlds = int(cfg.scene.num_envs)
+    triangle_pair_capacity = max(_MIN_TRIANGLE_PAIR_CAPACITY, _TRIANGLE_PAIRS_PER_WORLD * num_worlds)
+    collision_cfg.rigid_contact_max = _RIGID_CONTACTS_PER_WORLD * num_worlds
+    collision_cfg.max_triangle_pairs = triangle_pair_capacity
+
+    proxy = _coupler_proxy(_coupler_cfg(cfg))
+    if isinstance(proxy.collision_pipeline, NewtonCollisionPipelineCfg):
+        proxy.collision_pipeline.max_triangle_pairs = triangle_pair_capacity

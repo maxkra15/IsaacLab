@@ -17,6 +17,9 @@ from isaaclab_tasks.contrib.franka_pour.mdp.actions_cfg import (  # noqa: F401
 from .actions import *  # noqa: F401, F403
 from .events import *  # noqa: F401, F403
 from .observations import *  # noqa: F401, F403
+from .pick_insert_observations import *  # noqa: F401, F403
+from .pick_insert_rewards import *  # noqa: F401, F403
+from .pick_insert_terminations import *  # noqa: F401, F403
 from .reset_dataset import *  # noqa: F401, F403
 from .rewards import *  # noqa: F401, F403
 from .terminations import *  # noqa: F401, F403

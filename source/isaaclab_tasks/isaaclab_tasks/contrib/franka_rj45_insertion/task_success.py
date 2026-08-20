@@ -16,6 +16,9 @@ from isaaclab.utils import math as math_utils
 RJ45_SUCCESS_PREDICATE_VERSION = 1
 """Version of the geometry, sidedness, orientation, and speed predicate."""
 
+RJ45_GOAL_LOCAL_SUCCESS_PREDICATE_VERSION = 1
+"""Version of the batched, goal-local-axis extension used by pick-and-insert."""
+
 
 @dataclass(frozen=True)
 class RJ45SuccessResult:
@@ -61,12 +64,16 @@ def rj45_insertion_success(
     plug_angle_tolerance: float,
     latch_angle_tolerance: float,
     maximum_plug_spatial_speed: float,
+    plug_body_index: int = 0,
+    latch_body_index: int = 1,
 ) -> RJ45SuccessResult:
     """Evaluate the exact runtime sparse-success geometry from raw task state.
 
-    The insertion axis is local/world ``+Y`` because the validated task frame
-    is identity-rotated. Positive signed axial error is overtravel beyond the
-    fixed goal and therefore receives the tighter sided tolerance.
+    The insertion axis is the goal plug's local ``+Y`` axis. Positive signed
+    axial error is overtravel beyond the goal and therefore receives the
+    tighter sided tolerance. Optional body indices let variants prepend a
+    resettable socket while preserving the original plug/latch body order by
+    default.
     """
     if task_body_pose.ndim != 3 or task_body_pose.shape[-1] != 7 or task_body_pose.shape[1] < 2:
         raise ValueError(f"Task body poses must have shape (N, >=2, 7), got {tuple(task_body_pose.shape)}.")
@@ -80,19 +87,27 @@ def rj45_insertion_success(
             f"got {tuple(task_body_velocity.shape)} for poses {tuple(task_body_pose.shape)}."
         )
 
-    batch_size = task_body_pose.shape[0]
-    plug = task_body_pose[:, 0]
-    latch = task_body_pose[:, 1]
-    goal_plug = _goal_body(goal_task_body_pose, 0, batch_size)
-    goal_latch = _goal_body(goal_task_body_pose, 1, batch_size)
+    body_count = task_body_pose.shape[1]
+    for name, body_index in (("plug_body_index", plug_body_index), ("latch_body_index", latch_body_index)):
+        if isinstance(body_index, bool) or not isinstance(body_index, int) or not 0 <= body_index < body_count:
+            raise ValueError(f"{name} must index one of {body_count} task bodies, got {body_index!r}.")
+    if plug_body_index == latch_body_index:
+        raise ValueError("plug_body_index and latch_body_index must be distinct.")
 
-    translation_error = plug[:, :3] - goal_plug[:, :3]
+    batch_size = task_body_pose.shape[0]
+    plug = task_body_pose[:, plug_body_index]
+    latch = task_body_pose[:, latch_body_index]
+    goal_plug = _goal_body(goal_task_body_pose, plug_body_index, batch_size)
+    goal_latch = _goal_body(goal_task_body_pose, latch_body_index, batch_size)
+
+    translation_error_w = plug[:, :3] - goal_plug[:, :3]
+    translation_error = math_utils.quat_apply_inverse(goal_plug[:, 3:7], translation_error_w)
     signed_axial_error = translation_error[:, 1]
     axial_error = signed_axial_error.abs()
     radial_error = torch.linalg.vector_norm(translation_error[:, (0, 2)], dim=-1)
     plug_angle_error = _orientation_error(plug[:, 3:7], goal_plug[:, 3:7])
     latch_angle_error = _orientation_error(latch[:, 3:7], goal_latch[:, 3:7])
-    plug_spatial_speed = torch.linalg.vector_norm(task_body_velocity[:, 0], dim=-1)
+    plug_spatial_speed = torch.linalg.vector_norm(task_body_velocity[:, plug_body_index], dim=-1)
 
     mask = (
         (axial_error <= float(axial_tolerance))
@@ -113,4 +128,9 @@ def rj45_insertion_success(
     )
 
 
-__all__ = ["RJ45_SUCCESS_PREDICATE_VERSION", "RJ45SuccessResult", "rj45_insertion_success"]
+__all__ = [
+    "RJ45_GOAL_LOCAL_SUCCESS_PREDICATE_VERSION",
+    "RJ45_SUCCESS_PREDICATE_VERSION",
+    "RJ45SuccessResult",
+    "rj45_insertion_success",
+]

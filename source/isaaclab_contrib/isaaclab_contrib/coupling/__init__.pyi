@@ -10,13 +10,15 @@ __all__ = [
     "CouplerProxyMappingCfg",
     "CouplerProxyCfg",
     "NewtonCouplerManager",
+    "VBDPreservedInputPoseProjectionHandle",
+    "VBDPoseHistoryRestoreStatus",
 ]
 
-from .coupler import NewtonCouplerManager
+from .coupler import NewtonCouplerManager, VBDPoseHistoryRestoreStatus, VBDPreservedInputPoseProjectionHandle
 from .coupler_cfg import (
     CouplerAdmmCfg,
     CouplerCfg,
     CouplerEntryCfg,
-    CouplerProxyMappingCfg,
     CouplerProxyCfg,
+    CouplerProxyMappingCfg,
 )

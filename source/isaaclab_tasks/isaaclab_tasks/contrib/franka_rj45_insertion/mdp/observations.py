@@ -40,7 +40,7 @@ def plug_pose_obs(env: FrankaRJ45InsertionEnv) -> torch.Tensor:
 
 def plug_velocity_obs(env: FrankaRJ45InsertionEnv) -> torch.Tensor:
     """Plug angular/linear spatial velocity."""
-    return torch.nan_to_num(env.task_body_velocity()[:, 0]).clamp_(-20.0, 20.0)
+    return torch.nan_to_num(env.task_body_velocity()[:, getattr(env, "_plug_task_body_index", 0)]).clamp_(-20.0, 20.0)
 
 
 def sampled_cable_positions_obs(env: FrankaRJ45InsertionEnv) -> torch.Tensor:

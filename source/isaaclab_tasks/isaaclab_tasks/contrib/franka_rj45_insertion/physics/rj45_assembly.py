@@ -29,16 +29,18 @@ import numpy as np
 import warp as wp
 from newton.solvers import SolverVBD
 
-from pxr import Usd, UsdGeom
+from pxr import Gf, Usd, UsdGeom, Vt
 
 from ._kernels import (
     align_cable_orientations,
     apply_connector_forces,
     reset_task_bodies,
     restore_goal_targets_masked,
+    restore_orientation_targets_masked,
     set_drive_enabled_masked,
     sync_cable_anchors,
     write_drive_targets_masked,
+    write_orientation_targets_masked,
     write_task_body_state,
 )
 
@@ -107,6 +109,9 @@ CABLE_RADIUS = 0.00325
 CABLE_SEGMENT_COUNT = 35
 """Number of rigid capsule segments in the Newton cable."""
 
+CABLE_EXTENSION_SEGMENT_COUNT = 10
+"""Number of additional tail segments used by the pick-and-insert variant."""
+
 CABLE_KINEMATIC_COUNT = 4
 """Number of leading cable segments rigidly synchronized to the plug."""
 
@@ -161,8 +166,115 @@ RJ45_VBD_CONTACT_BUFFER_SIZE = 256
 RJ45_VBD_LEGACY_CONTACT_HARD = False
 """Newton 1.5 soft-contact fallback matching the pre-compliant-ALM example."""
 
+RJ45_PICK_INSERT_PLUG_PASSIVE_ANGULAR_DAMPING_RATE = 2.0
+"""Pick-task plug angular-velocity decay rate [1/s].
+
+The graph-safe body damper applies ``-rate * I * omega`` and therefore gives
+every principal axis the same 0.5 s time constant without an orientation
+spring.  It is needed only by the free-D6, anti-gravity pick topology.
+"""
+
 TASK_BODY_COUNT = 2 + CABLE_SEGMENT_COUNT
 """Number of resettable bodies per world: plug, latch, then cable segments."""
+
+
+@dataclass(frozen=True)
+class Rj45AssemblyTopologyCfg:
+    """Immutable switches that change the RJ45 model/reset topology.
+
+    The defaults describe the validated Newton insertion task exactly.  The
+    pick-and-insert variant opts into a resettable socket, a rotationally free
+    plug, a longer cable, and the host scene's support slab.
+    """
+
+    resettable_socket: bool = False
+    free_plug_rotation: bool = False
+    extra_cable_segments: int = 0
+    include_task_support_plane: bool = True
+    plug_passive_angular_damping_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous values before they can alter a persisted layout."""
+        for name in ("resettable_socket", "free_plug_rotation", "include_task_support_plane"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool.")
+        if (
+            isinstance(self.extra_cable_segments, bool)
+            or not isinstance(self.extra_cable_segments, int)
+            or self.extra_cable_segments < 0
+        ):
+            raise ValueError("extra_cable_segments must be a non-negative integer.")
+        if (
+            isinstance(self.plug_passive_angular_damping_rate, bool)
+            or not isinstance(self.plug_passive_angular_damping_rate, int | float)
+            or not math.isfinite(self.plug_passive_angular_damping_rate)
+            or self.plug_passive_angular_damping_rate < 0.0
+        ):
+            raise ValueError("plug_passive_angular_damping_rate must be finite and non-negative.")
+        if not self.free_plug_rotation and self.plug_passive_angular_damping_rate != 0.0:
+            raise ValueError("plug_passive_angular_damping_rate requires free_plug_rotation=True.")
+
+
+RJ45_DEFAULT_TOPOLOGY = Rj45AssemblyTopologyCfg()
+"""Exact topology of Newton's validated insertion example."""
+
+RJ45_PICK_INSERT_TOPOLOGY = Rj45AssemblyTopologyCfg(
+    resettable_socket=True,
+    free_plug_rotation=True,
+    extra_cable_segments=CABLE_EXTENSION_SEGMENT_COUNT,
+    include_task_support_plane=False,
+    plug_passive_angular_damping_rate=RJ45_PICK_INSERT_PLUG_PASSIVE_ANGULAR_DAMPING_RATE,
+)
+"""Topology used by the full Franka pick, grasp, and insert variant."""
+
+
+@dataclass(frozen=True)
+class Rj45TaskLayout:
+    """Stable task-local body layout derived from one topology configuration."""
+
+    body_names: tuple[str, ...]
+    socket_body_index: int | None
+    plug_body_index: int
+    latch_body_index: int
+    cable_body_slice: slice
+    cable_sample_body_indices: tuple[int, ...]
+
+    @property
+    def body_count(self) -> int:
+        """Number of bodies persisted in each reset row."""
+        return len(self.body_names)
+
+    @property
+    def cable_segment_count(self) -> int:
+        """Number of cable bodies represented by :attr:`cable_body_slice`."""
+        return int(self.cable_body_slice.stop) - int(self.cable_body_slice.start)
+
+
+def make_rj45_task_layout(topology_cfg: Rj45AssemblyTopologyCfg = RJ45_DEFAULT_TOPOLOGY) -> Rj45TaskLayout:
+    """Build the reset/observation layout for an immutable RJ45 topology."""
+    cable_segment_count = CABLE_SEGMENT_COUNT + topology_cfg.extra_cable_segments
+    prefix = ("socket", "plug", "latch") if topology_cfg.resettable_socket else ("plug", "latch")
+    cable_start = len(prefix)
+    body_names = (*prefix, *(f"cable_segment_{index:02d}" for index in range(cable_segment_count)))
+    if topology_cfg == RJ45_DEFAULT_TOPOLOGY:
+        # Preserve the original seven authored sample locations exactly.
+        cable_sample_body_indices = (2, 6, 11, 16, 21, 28, 36)
+    else:
+        # Seven approximately equal arclength bins including both cable ends.
+        sample_segments = tuple(round(index * (cable_segment_count - 1) / 6) for index in range(7))
+        cable_sample_body_indices = tuple(cable_start + index for index in sample_segments)
+    socket_index = 0 if topology_cfg.resettable_socket else None
+    plug_index = 1 if topology_cfg.resettable_socket else 0
+    latch_index = plug_index + 1
+    return Rj45TaskLayout(
+        body_names=body_names,
+        socket_body_index=socket_index,
+        plug_body_index=plug_index,
+        latch_body_index=latch_index,
+        cable_body_slice=slice(cable_start, cable_start + cable_segment_count),
+        cable_sample_body_indices=cable_sample_body_indices,
+    )
+
 
 _CONNECTOR_SHAPE_CFG = newton.ModelBuilder.ShapeConfig(
     mu=0.0,
@@ -201,6 +313,12 @@ _VBD_ATTRIBUTE_NAMES = ("vbd:joint_is_hard", "vbd:dahl_eps_max", "vbd:dahl_tau")
 _FRANKA_HAND_BODY_SUFFIX = "/panda_hand"
 _FRANKA_FINGER_BODY_SUFFIXES = ("/panda_leftfinger", "/panda_rightfinger")
 _FRANKA_GRASP_BODY_SUFFIXES = (_FRANKA_HAND_BODY_SUFFIX, *_FRANKA_FINGER_BODY_SUFFIXES)
+_CONNECTOR_VISUAL_SPECS = (
+    ("Socket", "/World/Socket", (0.10, 0.12, 0.14)),
+    ("Plug", "/World/Plug", (0.62, 0.70, 0.64)),
+    ("Latch", "/World/Latch", (0.42, 0.48, 0.43)),
+)
+_CABLE_VISUAL_COLOR = (0.08, 0.20, 0.62)
 
 
 @dataclass(frozen=True)
@@ -214,10 +332,14 @@ class Rj45InsertionDriveCfg:
     Attributes:
         stiffness: Goal-drive translational stiffness [N/m].
         damping: Goal-drive translational damping [N·s/m].
+        orientation_stiffness: Inertia-scaled orientation stiffness [1/s²].
+        orientation_damping: Inertia-scaled orientation damping [1/s].
     """
 
     stiffness: float = 50.0
     damping: float = 10.0
+    orientation_stiffness: float = 400.0
+    orientation_damping: float = 40.0
 
     def __post_init__(self) -> None:
         """Validate finite non-negative drive gains."""
@@ -225,6 +347,14 @@ class Rj45InsertionDriveCfg:
             raise ValueError(f"RJ45 drive stiffness must be finite and non-negative, got {self.stiffness}.")
         if not math.isfinite(self.damping) or self.damping < 0.0:
             raise ValueError(f"RJ45 drive damping must be finite and non-negative, got {self.damping}.")
+        if not math.isfinite(self.orientation_stiffness) or self.orientation_stiffness < 0.0:
+            raise ValueError(
+                f"RJ45 orientation-drive stiffness must be finite and non-negative, got {self.orientation_stiffness}."
+            )
+        if not math.isfinite(self.orientation_damping) or self.orientation_damping < 0.0:
+            raise ValueError(
+                f"RJ45 orientation-drive damping must be finite and non-negative, got {self.orientation_damping}."
+            )
 
 
 @dataclass(frozen=True)
@@ -232,7 +362,8 @@ class Rj45WorldBodyIds:
     """Stable builder indices for one task-local RJ45 world."""
 
     world_id: int
-    support_plane_shape_id: int
+    support_plane_shape_id: int | None
+    socket_body_id: int | None
     socket_shape_id: int
     plug_body_id: int
     plug_shape_id: int
@@ -247,7 +378,12 @@ class Rj45WorldBodyIds:
     @property
     def task_body_ids(self) -> tuple[int, ...]:
         """Body indices in persisted reset-state order."""
-        return (self.plug_body_id, self.latch_body_id, *self.cable_body_ids)
+        connector_ids = (
+            (self.socket_body_id, self.plug_body_id, self.latch_body_id)
+            if self.socket_body_id is not None
+            else (self.plug_body_id, self.latch_body_id)
+        )
+        return (*connector_ids, *self.cable_body_ids)
 
     @property
     def cable_anchor_body_ids(self) -> tuple[int, ...]:
@@ -361,14 +497,16 @@ def validate_rj45_vbd_solver_cfg(solver_cfg: Any) -> None:
         raise ValueError("Invalid RJ45 VBD solver configuration: " + "; ".join(errors) + ".")
 
 
-def rj45_reset_physics_contract() -> dict[str, object]:
+def rj45_reset_physics_contract(
+    topology_cfg: Rj45AssemblyTopologyCfg = RJ45_DEFAULT_TOPOLOGY,
+) -> dict[str, object]:
     """Return physical constants that invalidate persisted RJ45 reset states.
 
     The result contains only serialization-stable Python scalars and tuples so
     dataset manifests can hash it directly.
     """
     drive_cfg = Rj45InsertionDriveCfg()
-    return {
+    contract: dict[str, object] = {
         "contract_version": 1,
         "newton_source_commit": NEWTON_RJ45_SOURCE_COMMIT,
         "asset_sha256": RJ45_ASSET_SHA256,
@@ -405,7 +543,7 @@ def rj45_reset_physics_contract() -> dict[str, object]:
         "grasp_proxy_density": 0.0,
         "grasp_friction": GRASP_FRICTION,
         "grasp_robot_body_suffixes": _FRANKA_GRASP_BODY_SUFFIXES,
-        "grasp_collision_policy": "finger-proxy-only",
+        "grasp_collision_policy": "finger-proxy-plus-visible-plug-and-cable",
         "goal_drive_stiffness": drive_cfg.stiffness,
         "goal_drive_damping": drive_cfg.damping,
         "vbd_rigid_compliant_alm": True,
@@ -413,6 +551,55 @@ def rj45_reset_physics_contract() -> dict[str, object]:
         "vbd_iterations": RJ45_VBD_ITERATIONS,
         "vbd_rigid_body_contact_buffer_size": RJ45_VBD_CONTACT_BUFFER_SIZE,
     }
+    if topology_cfg != RJ45_DEFAULT_TOPOLOGY:
+        layout = make_rj45_task_layout(topology_cfg)
+        contract.update(
+            {
+                "contract_version": 5 if topology_cfg.free_plug_rotation else 2,
+                "task_body_order": layout.body_names,
+                "task_body_count": layout.body_count,
+                "task_layout": {
+                    "socket_body_index": layout.socket_body_index,
+                    "plug_body_index": layout.plug_body_index,
+                    "latch_body_index": layout.latch_body_index,
+                    "cable_body_range": (layout.cable_body_slice.start, layout.cable_body_slice.stop),
+                    "cable_sample_body_indices": layout.cable_sample_body_indices,
+                },
+                "socket_body_mode": "zero-mass-resettable" if topology_cfg.resettable_socket else "world-static",
+                "plug_root_angular_dofs": 3 if topology_cfg.free_plug_rotation else 0,
+                "task_support_plane_enabled": topology_cfg.include_task_support_plane,
+                "support_plane_robot_collision_policy": (
+                    "all-robot-shapes-filtered"
+                    if topology_cfg.include_task_support_plane
+                    else "task-plane-disabled-host-scene-owned"
+                ),
+                "cable_segment_count": layout.cable_segment_count,
+                "cable_extension_segment_count": topology_cfg.extra_cable_segments,
+                "cable_extension_policy": "authored-terminal-tangent-and-spacing-v1",
+                "connector_gravity_policy": "cancel-plug-and-latch",
+            }
+        )
+        if topology_cfg.free_plug_rotation:
+            contract.update(
+                {
+                    "plug_root_passive_angular_damping_rate_s_inv": (topology_cfg.plug_passive_angular_damping_rate),
+                    "plug_root_angular_damping_model": "body-torque=-rate*inertia*angular-velocity",
+                    "goal_orientation_hold_stiffness": drive_cfg.orientation_stiffness,
+                    "goal_orientation_hold_damping": drive_cfg.orientation_damping,
+                    "goal_orientation_hold_default_enabled": False,
+                    "goal_orientation_hold_requires_translation_drive": True,
+                    "goal_orientation_hold_target": "authored-plug-orientation-per-world",
+                    "cable_alignment_timing": "post-solver-pre-swap-and-collision",
+                    "cable_alignment_segment_range_half_open": (
+                        CABLE_KINEMATIC_COUNT - 1,
+                        layout.cable_segment_count - 1,
+                    ),
+                    "cable_coupled_input_pose_policy": "preserve-q-qd-history-no-delta-or-rewind",
+                    "cable_preserved_input_segment_range_half_open": (0, layout.cable_segment_count - 1),
+                    "cable_pinned_segment_index": layout.cable_segment_count - 1,
+                }
+            )
+    return contract
 
 
 def _current_world_range(builder: newton.ModelBuilder, prefix: str, env_id: int) -> range:
@@ -523,14 +710,19 @@ def _load_mesh(stage: Usd.Stage, prim_path: str) -> tuple[newton.Mesh, wp.vec3]:
     return mesh, prim_position
 
 
-def _load_cable_centerline(stage: Usd.Stage) -> tuple[wp.vec3, ...]:
-    """Load the exact source centerline and apply the unplugged Y offset."""
+def _load_cable_centerline(stage: Usd.Stage, extra_segments: int = 0) -> tuple[wp.vec3, ...]:
+    """Load the source centerline, offset it, and optionally extend its tail.
+
+    Extension points continue the authored terminal tangent with the authored
+    terminal segment spacing.  This is C1 at the join, keeps every added rest
+    span equal, and adds approximately 10 cm for ten segments.
+    """
     prim = stage.GetPrimAtPath("/World/CableCurve")
     if not prim or not prim.IsA(UsdGeom.BasisCurves):
         raise RuntimeError("Newton RJ45 asset is missing /World/CableCurve.")
     points = UsdGeom.BasisCurves(prim).GetPointsAttr().Get()
     prim_position = wp.transform_get_translation(newton.usd.get_transform(prim, local=False))
-    cable_points = tuple(
+    authored_points = tuple(
         wp.vec3(
             float(point[0]) + float(prim_position[0]),
             float(point[1]) + float(prim_position[1]) + PLUG_Y_OFFSET,
@@ -538,12 +730,20 @@ def _load_cable_centerline(stage: Usd.Stage) -> tuple[wp.vec3, ...]:
         )
         for point in points
     )
-    if len(cable_points) != CABLE_SEGMENT_COUNT + 1:
-        raise RuntimeError(f"Newton RJ45 cable must contain {CABLE_SEGMENT_COUNT + 1} points, got {len(cable_points)}.")
-    return cable_points
+    if len(authored_points) != CABLE_SEGMENT_COUNT + 1:
+        raise RuntimeError(
+            f"Newton RJ45 cable must contain {CABLE_SEGMENT_COUNT + 1} points, got {len(authored_points)}."
+        )
+    if extra_segments == 0:
+        return authored_points
+    terminal_step = authored_points[-1] - authored_points[-2]
+    if float(wp.length(terminal_step)) <= 1.0e-8:
+        raise RuntimeError("Newton RJ45 cable has a degenerate terminal segment and cannot be extended.")
+    extension = tuple(authored_points[-1] + float(index) * terminal_step for index in range(1, extra_segments + 1))
+    return (*authored_points, *extension)
 
 
-def _load_geometry(asset_path: Path) -> _Rj45Geometry:
+def _load_geometry(asset_path: Path, topology_cfg: Rj45AssemblyTopologyCfg) -> _Rj45Geometry:
     """Load and validate all immutable task geometry once."""
     verify_rj45_asset(asset_path)
     stage = Usd.Stage.Open(str(asset_path))
@@ -552,7 +752,8 @@ def _load_geometry(asset_path: Path) -> _Rj45Geometry:
     socket_mesh, socket_position = _load_mesh(stage, "/World/Socket")
     plug_mesh, plug_position = _load_mesh(stage, "/World/Plug")
     latch_mesh, latch_position = _load_mesh(stage, "/World/Latch")
-    cable_points = _load_cable_centerline(stage)
+    cable_points = _load_cable_centerline(stage, topology_cfg.extra_cable_segments)
+    cable_segment_count = len(cable_points) - 1
     cable_quaternions = tuple(newton.utils.create_parallel_transport_cable_quaternions(cable_points))
     unplugged_plug_position = plug_position + wp.vec3(0.0, PLUG_Y_OFFSET, 0.0)
     anchor_offsets = tuple(
@@ -563,7 +764,7 @@ def _load_geometry(asset_path: Path) -> _Rj45Geometry:
     align_start = CABLE_KINEMATIC_COUNT - 1
     align_next_start_offsets = tuple(
         wp.vec3(0.0, 0.0, -0.5 * float(wp.length(cable_points[index + 2] - cable_points[index + 1])))
-        for index in range(align_start, CABLE_SEGMENT_COUNT - 1)
+        for index in range(align_start, cable_segment_count - 1)
     )
     return _Rj45Geometry(
         socket_mesh=socket_mesh,
@@ -588,6 +789,44 @@ def _as_transform_tuple(transform: wp.transform) -> tuple[float, ...]:
 def _as_vec3_tuple(vector: wp.vec3) -> tuple[float, float, float]:
     """Convert a Warp vector to a stable tuple without device work."""
     return (float(vector[0]), float(vector[1]), float(vector[2]))
+
+
+def _gf_matrix_from_transform(transform: wp.transform) -> Gf.Matrix4d:
+    """Convert one Newton xyzw transform to a USD matrix."""
+    values = tuple(float(value) for value in transform)
+    matrix = Gf.Matrix4d(1.0)
+    matrix.SetRotate(Gf.Quatd(values[6], Gf.Vec3d(values[3], values[4], values[5])))
+    matrix.SetTranslateOnly(Gf.Vec3d(values[0], values[1], values[2]))
+    return matrix
+
+
+def _define_xform(stage: Usd.Stage, prim_path: str, transform: wp.transform) -> None:
+    """Define an idempotent USD Xform at one Newton body-label path."""
+    xform = UsdGeom.Xform.Define(stage, prim_path)
+    xform.MakeMatrixXform().Set(_gf_matrix_from_transform(transform))
+
+
+def _author_reference_mesh(
+    stage: Usd.Stage,
+    prim_path: str,
+    asset_path: Path,
+    source_prim_path: str,
+    color: tuple[float, float, float],
+) -> None:
+    """Author one render-only instance of a connector mesh."""
+    mesh = UsdGeom.Mesh.Define(stage, prim_path)
+    prim = mesh.GetPrim()
+    # Keep the referenced Mesh leaf non-instanceable. Kit's Fabric bridge gives
+    # an instanceable Gprim reference a zero extent and RTX consequently culls
+    # it. This matches UsdFileCfg's normal reference composition.
+    prim.SetInstanceable(False)
+    references = prim.GetReferences()
+    references.ClearReferences()
+    references.AddReference(str(asset_path), source_prim_path)
+    # The source mesh translation initializes its Newton body. The parent body
+    # Xform already owns that pose here, so suppress the referenced local op.
+    UsdGeom.Xformable(prim).GetXformOpOrderAttr().Set([])
+    mesh.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*color)]))
 
 
 def _world_transform(position: Sequence[float], quaternion: Sequence[float]) -> wp.transform:
@@ -634,6 +873,10 @@ class Rj45NewtonAssemblyBuilder:
         drive_cfg: Optional goal-generation drive gains.
         task_translation: Assembly translation in the environment frame [m].
         task_rotation_xyzw: Assembly orientation in the environment frame.
+        topology_cfg: Immutable task/reset topology. Defaults to the validated
+            Newton insertion topology.
+        grasp_proxy_friction: Friction applied only to the invisible,
+            finger-only grasp proxy. Franka finger materials remain unchanged.
     """
 
     def __init__(
@@ -642,9 +885,23 @@ class Rj45NewtonAssemblyBuilder:
         drive_cfg: Rj45InsertionDriveCfg | None = None,
         task_translation: Sequence[float] = (0.0, 0.0, 0.0),
         task_rotation_xyzw: Sequence[float] = (0.0, 0.0, 0.0, 1.0),
+        topology_cfg: Rj45AssemblyTopologyCfg = RJ45_DEFAULT_TOPOLOGY,
+        grasp_proxy_friction: float = GRASP_FRICTION,
     ) -> None:
         self.asset_path = Path(asset_path).resolve()
         self.drive_cfg = drive_cfg or Rj45InsertionDriveCfg()
+        if not isinstance(topology_cfg, Rj45AssemblyTopologyCfg):
+            raise TypeError("topology_cfg must be Rj45AssemblyTopologyCfg.")
+        self.topology_cfg = topology_cfg
+        if (
+            isinstance(grasp_proxy_friction, bool)
+            or not isinstance(grasp_proxy_friction, int | float)
+            or not math.isfinite(grasp_proxy_friction)
+            or grasp_proxy_friction < 0.0
+        ):
+            raise ValueError("grasp_proxy_friction must be finite and non-negative.")
+        self.grasp_proxy_friction = float(grasp_proxy_friction)
+        self.layout = make_rj45_task_layout(topology_cfg)
         self._task_transform = _world_transform(task_translation, task_rotation_xyzw)
         self._geometry: _Rj45Geometry | None = None
         self._builder: newton.ModelBuilder | None = None
@@ -690,7 +947,7 @@ class Rj45NewtonAssemblyBuilder:
         _ensure_vbd_attributes(builder)
         builder.rigid_gap = RIGID_GAP
         if self._geometry is None:
-            self._geometry = _load_geometry(self.asset_path)
+            self._geometry = _load_geometry(self.asset_path, self.topology_cfg)
         franka_grasp_shape_ids = resolve_franka_grasp_shape_ids(builder, env_id)
         finger_shape_ids = franka_grasp_shape_ids.finger_shape_ids
         for shape_id in finger_shape_ids:
@@ -730,6 +987,71 @@ class Rj45NewtonAssemblyBuilder:
             nonfinger_collision_shape_ids,
         )
 
+    def author_render_prims(self, stage: Usd.Stage) -> None:
+        """Author render-only connector meshes and a synchronized cable curve.
+
+        This method must run after Newton model finalization and before Fabric
+        render discovery. The resulting USD prims therefore cannot become a
+        second set of connector shapes or cable physics.
+
+        Args:
+            stage: Live USD stage consumed by the Kit visualizer.
+
+        Raises:
+            RuntimeError: If no worlds have been built or geometry is missing.
+        """
+        if not self._records:
+            raise RuntimeError("Cannot author RJ45 render prims before building any worlds.")
+        if self._geometry is None:
+            raise RuntimeError("Cannot author RJ45 render prims without loaded geometry.")
+
+        geometry = self._geometry
+        unplugged_plug_position = geometry.plug_position + wp.vec3(0.0, PLUG_Y_OFFSET, 0.0)
+        unplugged_latch_position = geometry.latch_position + wp.vec3(0.0, PLUG_Y_OFFSET, 0.0)
+        connector_transforms = (
+            _compose_transform(self._task_transform, geometry.socket_position, wp.quat_identity()),
+            _compose_transform(self._task_transform, unplugged_plug_position, wp.quat_identity()),
+            _compose_transform(self._task_transform, unplugged_latch_position, wp.quat_identity()),
+        )
+        cable_points = Vt.Vec3fArray(
+            [
+                Gf.Vec3f(*_as_vec3_tuple(wp.transform_point(self._task_transform, point)))
+                for point in geometry.cable_points
+            ]
+        )
+
+        for record in (record for _, record in sorted(self._records.items())):
+            UsdGeom.Xform.Define(stage, record.root_label)
+            for (body_name, source_prim_path, color), transform in zip(
+                _CONNECTOR_VISUAL_SPECS, connector_transforms, strict=True
+            ):
+                body_path = f"{record.root_label}/{body_name}"
+                _define_xform(stage, body_path, transform)
+                UsdGeom.Scope.Define(stage, f"{body_path}/geometry")
+                _author_reference_mesh(
+                    stage,
+                    f"{body_path}/geometry/mesh",
+                    self.asset_path,
+                    source_prim_path,
+                    color,
+                )
+
+            cable_root = f"{record.root_label}/Cable"
+            UsdGeom.Xform.Define(stage, cable_root)
+            UsdGeom.Scope.Define(stage, f"{cable_root}/geometry")
+            curve = UsdGeom.BasisCurves.Define(stage, f"{cable_root}/geometry/mesh")
+            curve.CreatePointsAttr(cable_points)
+            curve.CreateCurveVertexCountsAttr(Vt.IntArray([self.layout.cable_segment_count + 1]))
+            curve.CreateTypeAttr(UsdGeom.Tokens.linear)
+            curve.CreateWrapAttr(UsdGeom.Tokens.nonperiodic)
+            curve.CreateWidthsAttr(Vt.FloatArray([2.0 * CABLE_RADIUS]))
+            curve.SetWidthsInterpolation(UsdGeom.Tokens.constant)
+            curve.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*_CABLE_VISUAL_COLOR)]))
+            curve_prim = curve.GetPrim()
+            if "PhysicsCurvesDeformableSimAPI" not in curve_prim.GetPrimTypeInfo().GetAppliedAPISchemas():
+                if not curve_prim.AddAppliedSchema("PhysicsCurvesDeformableSimAPI"):
+                    raise RuntimeError(f"Failed to tag RJ45 cable render curve {curve_prim.GetPath()}.")
+
     def _add_world(
         self,
         builder: newton.ModelBuilder,
@@ -747,30 +1069,50 @@ class Rj45NewtonAssemblyBuilder:
         world_rotation = wp.transform_get_rotation(world_tf)
         root_label = f"/World/envs/env_{env_id}/Rj45Assembly"
 
-        # The source example places its cable on an infinite ground plane at
-        # assembly-local z=0. Using the complete task transform preserves that
-        # boundary after Isaac Lab translates a world or the task itself.
-        support_plane_shape = builder.add_shape_plane(
-            xform=_compose_transform(world_tf, wp.vec3(0.0, 0.0, SUPPORT_PLANE_LOCAL_HEIGHT), wp.quat_identity()),
-            width=0.0,
-            length=0.0,
-            cfg=_SUPPORT_PLANE_SHAPE_CFG,
-            label=f"{root_label}/SupportPlane/Collision",
-        )
-        # The source plane belongs only to the RJ45 assembly. Its infinite
-        # extent would otherwise cut through the separately coupled Franka,
-        # whose base is below the translated task-local z=0 surface.
-        for robot_shape_id in robot_collision_shape_ids:
-            builder.add_shape_collision_filter_pair(robot_shape_id, support_plane_shape)
+        support_plane_shape = None
+        if self.topology_cfg.include_task_support_plane:
+            # The source example places its cable on an infinite ground plane at
+            # assembly-local z=0. Using the complete task transform preserves that
+            # boundary after Isaac Lab translates a world or the task itself.
+            support_plane_shape = builder.add_shape_plane(
+                xform=_compose_transform(
+                    world_tf,
+                    wp.vec3(0.0, 0.0, SUPPORT_PLANE_LOCAL_HEIGHT),
+                    wp.quat_identity(),
+                ),
+                width=0.0,
+                length=0.0,
+                cfg=_SUPPORT_PLANE_SHAPE_CFG,
+                label=f"{root_label}/SupportPlane/Collision",
+            )
+            # The source plane belongs only to the RJ45 assembly. Its infinite
+            # extent would otherwise cut through the separately coupled Franka,
+            # whose base is below the translated task-local z=0 surface.
+            for robot_shape_id in robot_collision_shape_ids:
+                builder.add_shape_collision_filter_pair(robot_shape_id, support_plane_shape)
 
         socket_tf = _compose_transform(world_tf, geometry.socket_position, wp.quat_identity())
-        socket_shape = builder.add_shape_mesh(
-            -1,
-            mesh=geometry.socket_mesh,
-            xform=socket_tf,
-            cfg=_CONNECTOR_SHAPE_CFG,
-            label=f"{root_label}/Socket/Collision",
-        )
+        socket_body = None
+        if self.topology_cfg.resettable_socket:
+            socket_body = builder.add_link(xform=socket_tf, label=f"{root_label}/Socket")
+            socket_shape = builder.add_shape_mesh(
+                socket_body,
+                mesh=geometry.socket_mesh,
+                cfg=_CONNECTOR_SHAPE_CFG,
+                label=f"{root_label}/Socket/Collision",
+            )
+            builder.body_mass[socket_body] = 0.0
+            builder.body_inv_mass[socket_body] = 0.0
+            builder.body_inertia[socket_body] = wp.mat33(0.0)
+            builder.body_inv_inertia[socket_body] = wp.mat33(0.0)
+        else:
+            socket_shape = builder.add_shape_mesh(
+                -1,
+                mesh=geometry.socket_mesh,
+                xform=socket_tf,
+                cfg=_CONNECTOR_SHAPE_CFG,
+                label=f"{root_label}/Socket/Collision",
+            )
 
         unplugged_plug_position = geometry.plug_position + wp.vec3(0.0, PLUG_Y_OFFSET, 0.0)
         plug_tf = _compose_transform(world_tf, unplugged_plug_position, wp.quat_identity())
@@ -797,7 +1139,7 @@ class Rj45NewtonAssemblyBuilder:
             hx=GRASP_PROXY_HALF_EXTENTS[0],
             hy=GRASP_PROXY_HALF_EXTENTS[1],
             hz=GRASP_PROXY_HALF_EXTENTS[2],
-            cfg=_GRASP_PROXY_SHAPE_CFG,
+            cfg=dataclasses.replace(_GRASP_PROXY_SHAPE_CFG, mu=self.grasp_proxy_friction),
             label=f"{root_label}/Plug/GraspProxy",
         )
         (
@@ -820,6 +1162,13 @@ class Rj45NewtonAssemblyBuilder:
         connector_shapes = (socket_shape, plug_shape, latch_shape)
 
         joint_dof = newton.ModelBuilder.JointDofConfig
+        angular_axes = None
+        if self.topology_cfg.free_plug_rotation:
+            angular_axes = (
+                joint_dof(axis=(1.0, 0.0, 0.0)),
+                joint_dof(axis=(0.0, 1.0, 0.0)),
+                joint_dof(axis=(0.0, 0.0, 1.0)),
+            )
         d6_joint = builder.add_joint_d6(
             parent=-1,
             child=plug_body,
@@ -828,7 +1177,7 @@ class Rj45NewtonAssemblyBuilder:
                 joint_dof(axis=(0.0, 1.0, 0.0)),
                 joint_dof(axis=(0.0, 0.0, 1.0)),
             ),
-            angular_axes=None,
+            angular_axes=angular_axes,
             parent_xform=plug_tf,
             child_xform=wp.transform_identity(),
             label=f"{root_label}/Plug/TranslationJoint",
@@ -873,20 +1222,22 @@ class Rj45NewtonAssemblyBuilder:
             label=f"{root_label}/Cable",
             body_frame_origin="com",
         )
-        if len(cable_bodies) != CABLE_SEGMENT_COUNT or len(cable_joints) != CABLE_SEGMENT_COUNT - 1:
+        cable_segment_count = self.layout.cable_segment_count
+        if len(cable_bodies) != cable_segment_count or len(cable_joints) != cable_segment_count - 1:
             raise RuntimeError(
                 "Newton RJ45 rod topology changed: "
-                f"expected {CABLE_SEGMENT_COUNT} bodies/{CABLE_SEGMENT_COUNT - 1} joints, "
+                f"expected {cable_segment_count} bodies/{cable_segment_count - 1} joints, "
                 f"got {len(cable_bodies)} bodies/{len(cable_joints)} joints."
             )
 
+        cable_visual_path = f"{root_label}/Cable/geometry/mesh"
         for segment_id, body_id in enumerate(cable_bodies):
             segment_label = f"{root_label}/Cable/Segment_{segment_id:02d}"
             builder.body_label[body_id] = segment_label
             segment_shapes = builder.body_shapes[body_id]
             if len(segment_shapes) != 1:
                 raise RuntimeError(f"RJ45 cable segment {segment_id} must own exactly one capsule shape.")
-            builder.shape_label[segment_shapes[0]] = f"{segment_label}/Collision"
+            builder.shape_label[segment_shapes[0]] = f"{cable_visual_path}_edge_capsule_{segment_id}"
         for joint_id, cable_joint_id in enumerate(cable_joints):
             builder.joint_label[cable_joint_id] = f"{root_label}/Cable/Joint_{joint_id:02d}_{joint_id + 1:02d}"
         cable_articulation_id = int(builder.joint_articulation[cable_joints[0]])
@@ -898,22 +1249,26 @@ class Rj45NewtonAssemblyBuilder:
                     builder.add_shape_collision_filter_pair(cable_shape, connector_shape)
 
         # The hand/finger bodies are staggered rigid proxies from the robot's
-        # MJWarp entry. Letting those proxy meshes also collide with Newton's
-        # thin official connector meshes over-constrains a grasp and can eject
-        # the plug after an IK reset. Their only task contact is therefore the
-        # controlled finger-to-GraspProxy interface. Socket clearance is also
-        # filtered so a seated plug cannot transmit a second, coupled impulse
-        # through the nearby hand; socket/plug/latch/cable physics themselves
-        # remain exactly the official Newton assembly.
-        official_task_shapes = [support_plane_shape, socket_shape, plug_shape, latch_shape]
+        # MJWarp entry. Keep the palm clear of the complete task and keep the
+        # fingers clear of the socket/latch, but let the finger collision boxes
+        # contact the visible plug mesh and cable capsules. The latter are the
+        # physical nonpenetration fallback around the smaller, high-friction
+        # GraspProxy patch; filtering them permits visibly incorrect tunneling.
+        official_task_shapes = [socket_shape, plug_shape, latch_shape]
+        if support_plane_shape is not None:
+            official_task_shapes.insert(0, support_plane_shape)
         official_task_shapes.extend(builder.body_shapes[body_id][0] for body_id in cable_bodies)
-        for robot_shape_id in franka_grasp_shape_ids.all_shape_ids:
+        for robot_shape_id in franka_grasp_shape_ids.hand_shape_ids:
             for task_shape_id in official_task_shapes:
                 builder.add_shape_collision_filter_pair(robot_shape_id, task_shape_id)
+        for finger_shape_id in franka_grasp_shape_ids.finger_shape_ids:
+            for task_shape_id in (socket_shape, latch_shape):
+                builder.add_shape_collision_filter_pair(finger_shape_id, task_shape_id)
 
         # The proxy is an Isaac Lab grasp aid, not part of Newton's connector,
         # and must not introduce a second plug/support contact patch.
-        builder.add_shape_collision_filter_pair(grasp_proxy_shape, support_plane_shape)
+        if support_plane_shape is not None:
+            builder.add_shape_collision_filter_pair(grasp_proxy_shape, support_plane_shape)
 
         # The grasp proxy is deliberately finger-only. Its overlap with the
         # official connector/cable geometry must not alter insertion physics.
@@ -932,6 +1287,7 @@ class Rj45NewtonAssemblyBuilder:
         ids = Rj45WorldBodyIds(
             world_id=env_id,
             support_plane_shape_id=support_plane_shape,
+            socket_body_id=socket_body,
             socket_shape_id=socket_shape,
             plug_body_id=plug_body,
             plug_shape_id=plug_shape,
@@ -943,6 +1299,10 @@ class Rj45NewtonAssemblyBuilder:
             cable_body_ids=tuple(cable_bodies),
             cable_joint_ids=tuple(cable_joints),
         )
+        if len(ids.task_body_ids) != self.layout.body_count:
+            raise RuntimeError(
+                f"RJ45 persisted layout expected {self.layout.body_count} bodies, got {len(ids.task_body_ids)}."
+            )
         default_body_q = tuple(_as_transform_tuple(builder.body_q[body_id]) for body_id in ids.task_body_ids)
         goal_target_w = _as_vec3_tuple(wp.transform_point(world_tf, geometry.plug_position))
         return _WorldBuildRecord(
@@ -980,10 +1340,14 @@ class Rj45NewtonAssemblyBuilder:
         if model.body_label is None:
             raise RuntimeError("Finalized Newton model does not expose body labels.")
         for record in records:
+            connector_labels = (
+                (f"{record.root_label}/Socket", f"{record.root_label}/Plug", f"{record.root_label}/Latch")
+                if self.topology_cfg.resettable_socket
+                else (f"{record.root_label}/Plug", f"{record.root_label}/Latch")
+            )
             expected_labels = (
-                f"{record.root_label}/Plug",
-                f"{record.root_label}/Latch",
-                *(f"{record.root_label}/Cable/Segment_{index:02d}" for index in range(CABLE_SEGMENT_COUNT)),
+                *connector_labels,
+                *(f"{record.root_label}/Cable/Segment_{index:02d}" for index in range(self.layout.cable_segment_count)),
             )
             for body_id, expected_label in zip(record.ids.task_body_ids, expected_labels, strict=True):
                 if body_id >= model.body_count or str(model.body_label[body_id]) != expected_label:
@@ -994,7 +1358,14 @@ class Rj45NewtonAssemblyBuilder:
                     )
         if self._geometry is None:
             raise RuntimeError("RJ45 geometry was unexpectedly released before model binding.")
-        self._runtime = Rj45NewtonAssembly(model, records, self._geometry, self.drive_cfg)
+        self._runtime = Rj45NewtonAssembly(
+            model,
+            records,
+            self._geometry,
+            self.drive_cfg,
+            self.topology_cfg,
+            self.layout,
+        )
         return self._runtime
 
 
@@ -1013,10 +1384,14 @@ class Rj45NewtonAssembly:
         records: tuple[_WorldBuildRecord, ...],
         geometry: _Rj45Geometry,
         drive_cfg: Rj45InsertionDriveCfg,
+        topology_cfg: Rj45AssemblyTopologyCfg,
+        layout: Rj45TaskLayout,
     ) -> None:
         self.model = model
         self.num_worlds = len(records)
         self.drive_cfg = drive_cfg
+        self.topology_cfg = topology_cfg
+        self.layout = layout
         device = model.device
         world_ids = [record.ids.world_id for record in records]
         cable_body_ids = [record.ids.cable_body_ids for record in records]
@@ -1026,8 +1401,18 @@ class Rj45NewtonAssembly:
         self.socket_shape_ids = wp.array(
             [record.ids.socket_shape_id for record in records], dtype=wp.int32, device=device
         )
+        self.socket_body_ids = wp.array(
+            [record.ids.socket_body_id if record.ids.socket_body_id is not None else -1 for record in records],
+            dtype=wp.int32,
+            device=device,
+        )
         self.support_plane_shape_ids = wp.array(
-            [record.ids.support_plane_shape_id for record in records], dtype=wp.int32, device=device
+            [
+                record.ids.support_plane_shape_id if record.ids.support_plane_shape_id is not None else -1
+                for record in records
+            ],
+            dtype=wp.int32,
+            device=device,
         )
         self.plug_body_ids = wp.array([record.ids.plug_body_id for record in records], dtype=wp.int32, device=device)
         self.plug_shape_ids = wp.array([record.ids.plug_shape_id for record in records], dtype=wp.int32, device=device)
@@ -1039,6 +1424,11 @@ class Rj45NewtonAssembly:
             [record.ids.latch_shape_id for record in records], dtype=wp.int32, device=device
         )
         self.cable_body_ids = wp.array(cable_body_ids, dtype=wp.int32, device=device)
+        self.cable_preserved_input_body_ids = wp.array(
+            [body_id for body_ids in cable_body_ids for body_id in body_ids[:-1]],
+            dtype=wp.int32,
+            device=device,
+        )
         self.cable_anchor_body_ids = wp.array(
             [ids[:CABLE_KINEMATIC_COUNT] for ids in cable_body_ids], dtype=wp.int32, device=device
         )
@@ -1050,6 +1440,13 @@ class Rj45NewtonAssembly:
         )
         self.drive_target_w = wp.clone(self.default_goal_target_w)
         self.drive_enabled = wp.zeros(self.num_worlds, dtype=wp.bool, device=device)
+        self.default_orientation_target_w = wp.array(
+            [record.default_body_q[layout.plug_body_index][3:7] for record in records],
+            dtype=wp.quat,
+            device=device,
+        )
+        self.orientation_target_w = wp.clone(self.default_orientation_target_w)
+        self.orientation_hold_enabled = wp.zeros(self.num_worlds, dtype=wp.bool, device=device)
         self._all_env_mask = wp.ones(self.num_worlds, dtype=wp.bool, device=device)
         self._anchor_offsets = wp.array(geometry.anchor_offsets, dtype=wp.vec3, device=device)
         self._anchor_rotations = wp.array(geometry.anchor_rotations, dtype=wp.quat, device=device)
@@ -1076,14 +1473,20 @@ class Rj45NewtonAssembly:
                 state.body_qd,
                 state.body_f,
                 self.model.body_mass,
+                self.model.body_inertia,
                 self.model.gravity,
                 self.world_ids,
                 self.plug_body_ids,
                 self.latch_body_ids,
                 self.drive_enabled,
                 self.drive_target_w,
+                self.orientation_hold_enabled,
+                self.orientation_target_w,
+                self.topology_cfg.plug_passive_angular_damping_rate,
                 self.drive_cfg.stiffness,
                 self.drive_cfg.damping,
+                self.drive_cfg.orientation_stiffness,
+                self.drive_cfg.orientation_damping,
             ],
             device=self.model.device,
         )
@@ -1137,10 +1540,13 @@ class Rj45NewtonAssembly:
             per-world constraint/contact history.
         """
         mask = self._resolve_env_mask(env_mask)
+        self.set_drive_enabled(False, mask)
+        self.restore_goal_drive_targets(mask)
+        self.restore_orientation_hold_targets(mask)
         for state in self._iter_states(states):
             wp.launch(
                 reset_task_bodies,
-                dim=(self.num_worlds, TASK_BODY_COUNT),
+                dim=(self.num_worlds, self.layout.body_count),
                 inputs=[mask, self.task_body_ids, self.default_body_q, state.body_q, state.body_qd],
                 device=self.model.device,
             )
@@ -1157,13 +1563,13 @@ class Rj45NewtonAssembly:
         Args:
             states: One state or all double-buffered Newton states to update.
             body_q: Body poses [m and unitless xyzw], shape
-                ``[num_worlds, TASK_BODY_COUNT]``.
+                ``[num_worlds, layout.body_count]``.
             body_qd: COM velocities [m/s, rad/s], shape
-                ``[num_worlds, TASK_BODY_COUNT]``.
+                ``[num_worlds, layout.body_count]``.
             env_mask: Selected environments, shape ``[num_worlds]``. Defaults
                 to all worlds.
         """
-        expected_shape = (self.num_worlds, TASK_BODY_COUNT)
+        expected_shape = (self.num_worlds, self.layout.body_count)
         if body_q.shape != expected_shape or body_qd.shape != expected_shape:
             raise ValueError(
                 f"RJ45 state arrays must have shape {expected_shape}, got body_q={body_q.shape}, "
@@ -1192,6 +1598,31 @@ class Rj45NewtonAssembly:
             inputs=[mask, bool(enabled), self.drive_enabled],
             device=self.model.device,
         )
+        if not enabled:
+            self.set_orientation_hold_enabled(False, mask)
+
+    def set_orientation_hold_enabled(
+        self,
+        enabled: bool,
+        env_mask: wp.array[wp.bool] | None = None,
+    ) -> None:
+        """Enable the construction-only plug orientation hold.
+
+        The force kernel also requires :attr:`drive_enabled`; enabling this
+        flag alone never applies torque. Disabling the translational drive
+        automatically clears this flag.
+
+        Args:
+            enabled: Whether selected worlds request orientation holding.
+            env_mask: Selected environments. Defaults to all worlds.
+        """
+        mask = self._resolve_env_mask(env_mask)
+        wp.launch(
+            set_drive_enabled_masked,
+            dim=self.num_worlds,
+            inputs=[mask, bool(enabled), self.orientation_hold_enabled],
+            device=self.model.device,
+        )
 
     def restore_goal_drive_targets(self, env_mask: wp.array[wp.bool] | None = None) -> None:
         """Restore the USD-authored nominal plug targets in selected worlds."""
@@ -1200,6 +1631,16 @@ class Rj45NewtonAssembly:
             restore_goal_targets_masked,
             dim=self.num_worlds,
             inputs=[mask, self.default_goal_target_w, self.drive_target_w],
+            device=self.model.device,
+        )
+
+    def restore_orientation_hold_targets(self, env_mask: wp.array[wp.bool] | None = None) -> None:
+        """Restore authored world-frame plug orientation targets."""
+        mask = self._resolve_env_mask(env_mask)
+        wp.launch(
+            restore_orientation_targets_masked,
+            dim=self.num_worlds,
+            inputs=[mask, self.default_orientation_target_w, self.orientation_target_w],
             device=self.model.device,
         )
 
@@ -1216,6 +1657,22 @@ class Rj45NewtonAssembly:
             write_drive_targets_masked,
             dim=self.num_worlds,
             inputs=[mask, targets_w, self.drive_target_w],
+            device=self.model.device,
+        )
+
+    def write_orientation_hold_targets(
+        self,
+        targets_w: wp.array[wp.quat],
+        env_mask: wp.array[wp.bool] | None = None,
+    ) -> None:
+        """Set normalized world-frame orientation targets for selected plugs."""
+        if targets_w.shape != (self.num_worlds,):
+            raise ValueError(f"RJ45 orientation targets must have shape {(self.num_worlds,)}, got {targets_w.shape}.")
+        mask = self._resolve_env_mask(env_mask)
+        wp.launch(
+            write_orientation_targets_masked,
+            dim=self.num_worlds,
+            inputs=[mask, targets_w, self.orientation_target_w],
             device=self.model.device,
         )
 

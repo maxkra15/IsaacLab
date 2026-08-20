@@ -6,8 +6,15 @@
 """Franka impedance configuration shared with the reset-driven stack workflow."""
 
 from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets import ArticulationCfg
 
 from isaaclab_assets.robots.franka import FRANKA_PANDA_MENAGERIE_CFG
+
+from .asset_provenance import (
+    FRANKA_RJ45_ASSET_CLOSURE_TREE_SHA256,
+    FRANKA_RJ45_FRANKA_LOGICAL_URI,
+    FrankaRJ45AssetClosure,
+)
 
 _ARM_EFFORT_LIMITS = {"panda_joint[1-4]": 87.0, "panda_joint[5-7]": 12.0}
 _ARM_VELOCITY_LIMITS = {"panda_joint[1-4]": 2.175, "panda_joint[5-7]": 2.61}
@@ -28,6 +35,8 @@ _ARM_ARMATURE = {
     "panda_joint[3-4]": 0.4625,
     "panda_joint[5-7]": 0.2055,
 }
+PICK_INSERT_ARM_TARGET_TRACKING_LIMITS = (0.145, 0.145, 0.145, 0.145, 0.048, 0.080, 0.240)
+"""Pick-task target-error limits [rad], derived from effort limit / stiffness per joint."""
 
 FRANKA_RJ45_CFG = FRANKA_PANDA_MENAGERIE_CFG.copy()
 FRANKA_RJ45_CFG.spawn.rigid_props.disable_gravity = False
@@ -49,6 +58,19 @@ FRANKA_RJ45_CFG.actuators = {
         armature=0.1,
     ),
 }
+
+
+def configure_franka_rj45_external_asset(
+    robot_cfg: ArticulationCfg,
+    verified_closure: FrankaRJ45AssetClosure | None = None,
+) -> None:
+    """Use the logical Franka identity for diagnostics or a verified local entrypoint for production."""
+    if verified_closure is None:
+        robot_cfg.spawn.usd_path = FRANKA_RJ45_FRANKA_LOGICAL_URI
+        return
+    if verified_closure.tree_sha256 != FRANKA_RJ45_ASSET_CLOSURE_TREE_SHA256:
+        raise ValueError("Cannot bind a Franka asset from the wrong external-asset closure.")
+    robot_cfg.spawn.usd_path = str(verified_closure.franka_usd_path)
 
 
 def franka_reset_control_contract() -> dict[str, object]:
@@ -74,4 +96,28 @@ def franka_reset_control_contract() -> dict[str, object]:
     }
 
 
-__all__ = ["FRANKA_RJ45_CFG", "franka_reset_control_contract"]
+def franka_pick_insert_control_contract() -> dict[str, object]:
+    """Return the pick-only persistent-target and native-gravity control contract."""
+    return {
+        "contract_version": 1,
+        "source_workflow": "maximiliank/franka-newton-stack",
+        "target_semantics": "persistent-absolute-integrated-once-per-policy-step",
+        "policy_delta_filter": "ema",
+        "zero_action_semantics": "clear-ema-tail-and-hold-absolute-target-bitwise",
+        "reset_target_semantics": "restore-stored-absolute-actuator-target",
+        "target_tracking_error_limits_rad": PICK_INSERT_ARM_TARGET_TRACKING_LIMITS,
+        "target_tracking_failure": "terminate-on-nonfinite-or-envelope-violation",
+        "native_gravity_compensation": "mjwarp-joint-actuatorgravcomp",
+        "native_gravity_compensation_scope": "pick-insert-franka-only",
+        "action_inverse_dynamics_gravity_compensation": False,
+        "global_inverse_dynamics_gravity_compensation": False,
+    }
+
+
+__all__ = [
+    "FRANKA_RJ45_CFG",
+    "PICK_INSERT_ARM_TARGET_TRACKING_LIMITS",
+    "configure_franka_rj45_external_asset",
+    "franka_pick_insert_control_contract",
+    "franka_reset_control_contract",
+]
