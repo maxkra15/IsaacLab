@@ -65,6 +65,16 @@ restitution, torsional/rolling friction `0.002/0.0001`, contact stiffness
 `1.0e4` N/m, and contact damping `200.0` N s/m. This slab replaces the original
 task-local support plane for the pick-and-insert variant.
 
+Kit presentation references NVIDIA's AS4610 48-port 1U network switch and aligns
+one of its copper RJ45 ports behind the active socket. The switch and active-port
+accent are authored after Newton model finalization and follow the randomized
+active socket pose. The referenced switch contains no rigid bodies, joints, or
+collision schemas and adds no Newton shapes; only the original socket remains
+physical and defines the policy goal. Headless training and Newton physics
+construction do not author this presentation subtree. The visual asset resolves
+from ``{NVIDIA_NUCLEUS_DIR}/Assets/DigitalTwin/Assets/Datacenter/``
+``Network_Switches/NVIDIA/AS4600/AS4610_01.usd``.
+
 ### Pinned external scene assets
 
 The Franka and Seattle table remain NVIDIA-authored external assets and are not

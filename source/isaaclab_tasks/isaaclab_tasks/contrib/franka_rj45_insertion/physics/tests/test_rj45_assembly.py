@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import warp as wp
 
-from pxr import Gf, Usd, UsdGeom
+from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 from isaaclab_tasks.contrib.franka_rj45_insertion.physics.rj45_assembly import (
     CABLE_EXTENSION_SEGMENT_COUNT,
@@ -27,6 +27,7 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.physics.rj45_assembly import (
     RJ45_DEFAULT_TOPOLOGY,
     RJ45_PICK_INSERT_PLUG_PASSIVE_ANGULAR_DAMPING_RATE,
     RJ45_PICK_INSERT_TOPOLOGY,
+    RJ45_PRESENTATION_SWITCH_USD_PATH,
     RJ45_VBD_CONTACT_BUFFER_SIZE,
     RJ45_VBD_ITERATIONS,
     SUPPORT_PLANE_CONTACT_KD,
@@ -269,6 +270,7 @@ def test_builder_topology_and_runtime_layout() -> None:
     assert cable_visual.GetWidthsAttr().Get() == pytest.approx([2.0 * CABLE_RADIUS])
     assert "PhysicsCurvesDeformableSimAPI" in cable_visual.GetPrim().GetPrimTypeInfo().GetAppliedAPISchemas()
     assert not stage.GetPrimAtPath("/World/envs/env_0/Rj45Assembly/Plug/GraspProxy").IsValid()
+    assert not stage.GetPrimAtPath("/World/envs/env_0/Rj45Assembly/Socket/Presentation").IsValid()
     authored_layer = stage.GetRootLayer().ExportToString()
     assembly.author_render_prims(stage)
     assert stage.GetRootLayer().ExportToString() == authored_layer
@@ -336,6 +338,9 @@ def test_pick_insert_builder_has_resettable_socket_free_rotation_and_extended_ta
         assert tuple(extension_step) == pytest.approx(tuple(authored_terminal_step), abs=1.0e-8)
 
     model = builder.finalize(device="cuda:0")
+    model_counts = (model.body_count, model.shape_count, model.joint_count, model.articulation_count)
+    builder_labels = (tuple(builder.body_label), tuple(builder.shape_label), tuple(builder.joint_label))
+    collision_filters = tuple(builder.shape_collision_filter_pairs)
     runtime = assembly.bind(model)
     assert runtime.layout == layout
     assert runtime.topology_cfg == RJ45_PICK_INSERT_TOPOLOGY
@@ -357,6 +362,56 @@ def test_pick_insert_builder_has_resettable_socket_free_rotation_and_extended_ta
     for segment_id, body_id in enumerate(ids.cable_body_ids):
         (shape_id,) = builder.body_shapes[body_id]
         assert builder.shape_label[shape_id] == f"{cable_visual_path}_edge_capsule_{segment_id}"
+
+    socket_path = "/World/envs/env_0/Rj45Assembly/Socket"
+    presentation_path = f"{socket_path}/Presentation"
+    presentation = stage.GetPrimAtPath(presentation_path)
+    assert presentation.IsA(UsdGeom.Xform)
+    for prim in Usd.PrimRange(presentation):
+        assert not prim.HasAPI(UsdPhysics.RigidBodyAPI)
+        assert not prim.HasAPI(UsdPhysics.CollisionAPI)
+        assert not prim.HasAPI(UsdPhysics.MassAPI)
+        assert not prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+        assert not prim.IsA(UsdPhysics.Joint)
+        if prim.IsA(UsdGeom.Xformable):
+            assert not UsdGeom.Xformable(prim).GetResetXformStack()
+
+    active_socket_visual = stage.GetPrimAtPath(f"{socket_path}/geometry/mesh")
+    assert active_socket_visual.IsA(UsdGeom.Mesh)
+    assert builder.body_label[ids.socket_body_id] == socket_path
+    assert builder.shape_label[ids.socket_shape_id] == f"{socket_path}/Collision"
+    assert (model.body_count, model.shape_count, model.joint_count, model.articulation_count) == model_counts
+    assert (tuple(builder.body_label), tuple(builder.shape_label), tuple(builder.joint_label)) == builder_labels
+    assert tuple(builder.shape_collision_filter_pairs) == collision_filters
+    assert not any("Presentation" in str(label) for label in (*builder.body_label, *builder.shape_label))
+
+    network_switch = stage.GetPrimAtPath(f"{presentation_path}/NetworkSwitch")
+    assert network_switch.IsA(UsdGeom.Xform)
+    assert not network_switch.IsInstanceable()
+    references = network_switch.GetMetadata("references").prependedItems
+    assert len(references) == 1
+    assert references[0].assetPath == RJ45_PRESENTATION_SWITCH_USD_PATH
+    assert references[0].primPath == "/AS4610"
+    (switch_matrix_op,) = UsdGeom.Xformable(network_switch).GetOrderedXformOps()
+    switch_matrix = switch_matrix_op.Get()
+    assert tuple(switch_matrix.Transform(Gf.Vec3d(-0.3902528441, 21.82628255, 2.4888706))) == pytest.approx(
+        (0.0, 0.0, 0.0), abs=1.0e-8
+    )
+    assert tuple(switch_matrix.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))) == pytest.approx((0.0, -0.01, 0.0), abs=1.0e-8)
+    authored_layer = stage.GetRootLayer().ExportToString()
+    assembly.author_render_prims(stage)
+    assert stage.GetRootLayer().ExportToString() == authored_layer
+
+    xform_cache = UsdGeom.XformCache()
+    switch_world_before = xform_cache.GetLocalToWorldTransform(network_switch).ExtractTranslation()
+    socket_xform = UsdGeom.Xformable(stage.GetPrimAtPath(socket_path))
+    (socket_matrix_op,) = socket_xform.GetOrderedXformOps()
+    socket_matrix = socket_matrix_op.Get()
+    socket_matrix.SetTranslateOnly(socket_matrix.ExtractTranslation() + Gf.Vec3d(0.1, -0.2, 0.3))
+    socket_matrix_op.Set(socket_matrix)
+    xform_cache.Clear()
+    switch_world_after = xform_cache.GetLocalToWorldTransform(network_switch).ExtractTranslation()
+    assert tuple(switch_world_after - switch_world_before) == pytest.approx((0.1, -0.2, 0.3))
 
     body_q_values = runtime.default_body_q.numpy()
     body_q_values[0, layout.socket_body_index, 0] += 0.03

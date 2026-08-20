@@ -12,6 +12,7 @@ import torch
 import warp as wp
 from isaaclab_newton.sim.schemas import MujocoJointCfg
 
+from isaaclab.managers import ObservationTermCfg
 from isaaclab.utils import math as math_utils
 
 from isaaclab_contrib.coupling import NewtonCouplerManager
@@ -27,6 +28,9 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.asset_provenance import (
     AssetClosureError,
     FrankaRJ45AssetClosure,
     franka_rj45_asset_contract,
+)
+from isaaclab_tasks.contrib.franka_rj45_insertion.config.franka.agents.pick_insert_rsl_rl_ppo_cfg import (
+    FrankaRJ45PickInsertPPORunnerCfg,
 )
 from isaaclab_tasks.contrib.franka_rj45_insertion.franka_robot_cfg import (
     PICK_INSERT_ARM_TARGET_TRACKING_LIMITS,
@@ -649,6 +653,81 @@ def test_pick_insert_contract_round_trips_through_safe_torch_load(tmp_path):
     assert control["target_semantics"] == "persistent-absolute-integrated-once-per-policy-step"
     assert tuple(control["target_tracking_error_limits_rad"]) == PICK_INSERT_ARM_TARGET_TRACKING_LIMITS
     assert control["native_gravity_compensation"] == "mjwarp-joint-actuatorgravcomp"
+
+
+def test_pick_insert_policy_interface_remains_checkpoint_compatible():
+    """Pin the term order and dimensions consumed by the fine-tuned policy."""
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    policy_widths = {
+        "arm_q": 7,
+        "arm_qd": 7,
+        "arm_target_error": 7,
+        "tcp_pose": 7,
+        "tcp_velocity": 6,
+        "plug_pose": 7,
+        "socket_pose": 7,
+        "goal_plug_pose": 7,
+        "tcp_grasp_error": 6,
+        "plug_goal_error": 7,
+        "plug_velocity": 6,
+        "cable_shape": 21,
+        "cable_velocity": 21,
+        "finger_position": 2,
+        "finger_velocity": 2,
+        "gripper_target": 1,
+        "gripper_deflection": 2,
+        "grasp_proxy_contact": 1,
+        "grasp_stage": 2,
+        "time_remaining": 1,
+        "last_action": 8,
+    }
+    privileged_widths = {"reset_phase": 1, "reset_difficulty": 1, "success_dwell": 1}
+
+    policy_terms = tuple(
+        name for name, value in vars(cfg.observations.policy).items() if isinstance(value, ObservationTermCfg)
+    )
+    privileged_terms = tuple(
+        name for name, value in vars(cfg.observations.privileged).items() if isinstance(value, ObservationTermCfg)
+    )
+    assert policy_terms == tuple(policy_widths)
+    assert privileged_terms == tuple(privileged_widths)
+    assert sum(policy_widths.values()) == 135
+    assert sum(policy_widths.values()) + sum(privileged_widths.values()) == 138
+    assert tuple(vars(cfg.actions)) == ("arm_action", "gripper_action")
+    assert tuple(cfg.actions.arm_action.joint_names) == tuple(f"panda_joint{index}" for index in range(1, 8))
+
+    reward_names = ("progress", "grasp_acquired", "success", "failure", "action_magnitude", "action_rate")
+    assert tuple(vars(cfg.rewards)) == reward_names
+    assert tuple(getattr(cfg.rewards, name).weight for name in reward_names) == pytest.approx(
+        (1.0, 0.5, 10.0, -2.0, -5.0e-5, -1.0e-4)
+    )
+    assert tuple(vars(cfg.terminations)) == (
+        "stage_context",
+        "nonfinite",
+        "task_out_of_bounds",
+        "arm_target_tracking",
+        "lost_grasp",
+        "success",
+        "learning_progress_context",
+        "time_out",
+    )
+
+    runner_cfg = FrankaRJ45PickInsertPPORunnerCfg()
+    assert runner_cfg.obs_groups == {"actor": ["policy"], "critic": ["policy", "privileged"]}
+    assert runner_cfg.actor.hidden_dims == [512, 256, 128]
+    assert runner_cfg.critic.hidden_dims == [512, 256, 128]
+    assert runner_cfg.actor.obs_normalization is True
+    assert runner_cfg.critic.obs_normalization is True
+    assert runner_cfg.actor.distribution_cfg.init_std == pytest.approx(0.45)
+    contract = pick_insert_reset_dataset_task_contract(cfg)
+    assert set(contract["static_scene"]) == {
+        "ground_initial_state",
+        "ground_spawn",
+        "table_contact_initial_state",
+        "table_contact_spawn",
+        "table_initial_state",
+        "table_spawn",
+    }
 
 
 def test_pick_insert_contract_is_identical_after_verified_local_asset_binding(tmp_path):

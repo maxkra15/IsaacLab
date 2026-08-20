@@ -31,6 +31,8 @@ from newton.solvers import SolverVBD
 
 from pxr import Gf, Usd, UsdGeom, Vt
 
+from isaaclab.utils.assets import NVIDIA_NUCLEUS_DIR
+
 from ._kernels import (
     align_cable_orientations,
     apply_connector_forces,
@@ -319,6 +321,15 @@ _CONNECTOR_VISUAL_SPECS = (
     ("Latch", "/World/Latch", (0.42, 0.48, 0.43)),
 )
 _CABLE_VISUAL_COLOR = (0.08, 0.20, 0.62)
+RJ45_PRESENTATION_SWITCH_USD_PATH = (
+    f"{NVIDIA_NUCLEUS_DIR}/Assets/DigitalTwin/Assets/Datacenter/Network_Switches/NVIDIA/AS4600/AS4610_01.usd"
+)
+"""NVIDIA AS4610 48-port switch used only for Kit presentation."""
+
+_PRESENTATION_SWITCH_SOURCE_PRIM_PATH = "/AS4610"
+_PRESENTATION_SWITCH_SCALE = 0.01
+_PRESENTATION_SWITCH_ACTIVE_PORT_CENTER = (-0.3902528441, 21.82628255, 2.4888706)
+_PRESENTATION_ACTIVE_PORT_COLOR = (0.025, 0.42, 0.78)
 
 
 @dataclass(frozen=True)
@@ -829,6 +840,98 @@ def _author_reference_mesh(
     mesh.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*color)]))
 
 
+def _local_transform_matrix(
+    translation: tuple[float, float, float],
+    scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> Gf.Matrix4d:
+    """Build one row-major USD transform from local translation and scale."""
+    return Gf.Matrix4d(
+        scale[0],
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        scale[1],
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        scale[2],
+        0.0,
+        translation[0],
+        translation[1],
+        translation[2],
+        1.0,
+    )
+
+
+def _author_visual_cuboid(
+    stage: Usd.Stage,
+    prim_path: str,
+    center: tuple[float, float, float],
+    size: tuple[float, float, float],
+    color: tuple[float, float, float],
+) -> None:
+    """Author a render-only cuboid with no physics schemas."""
+    cube = UsdGeom.Cube.Define(stage, prim_path)
+    cube.CreateSizeAttr(1.0)
+    UsdGeom.Xformable(cube).MakeMatrixXform().Set(_local_transform_matrix(center, size))
+    cube.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*color)]))
+
+
+def _presentation_switch_transform() -> Gf.Matrix4d:
+    """Align one AS4610 port with the active socket in the socket frame."""
+    scale = _PRESENTATION_SWITCH_SCALE
+    port_x, port_y, port_z = _PRESENTATION_SWITCH_ACTIVE_PORT_CENTER
+    return Gf.Matrix4d(
+        0.0,
+        -scale,
+        0.0,
+        0.0,
+        scale,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        scale,
+        0.0,
+        -scale * port_y,
+        scale * port_x,
+        -scale * port_z,
+        1.0,
+    )
+
+
+def _author_pick_insert_network_switch(stage: Usd.Stage, socket_path: str) -> None:
+    """Author a visual-only AS4610 switch that follows the active socket."""
+    presentation_path = f"{socket_path}/Presentation"
+    UsdGeom.Xform.Define(stage, presentation_path)
+    switch = UsdGeom.Xform.Define(stage, f"{presentation_path}/NetworkSwitch")
+    switch.MakeMatrixXform().Set(_presentation_switch_transform())
+    switch_prim = switch.GetPrim()
+    switch_prim.SetInstanceable(False)
+    references = switch_prim.GetReferences()
+    references.ClearReferences()
+    references.AddReference(RJ45_PRESENTATION_SWITCH_USD_PATH, _PRESENTATION_SWITCH_SOURCE_PRIM_PATH)
+
+    accent_path = f"{presentation_path}/ActivePortAccent"
+    UsdGeom.Xform.Define(stage, accent_path)
+    for name, center, size in (
+        ("Left", (-0.0101, -0.0133, 0.0), (0.0015, 0.0012, 0.0175)),
+        ("Right", (0.0101, -0.0133, 0.0), (0.0015, 0.0012, 0.0175)),
+        ("Bottom", (0.0, -0.0133, -0.0081), (0.0217, 0.0012, 0.0015)),
+        ("Top", (0.0, -0.0133, 0.0081), (0.0217, 0.0012, 0.0015)),
+    ):
+        _author_visual_cuboid(
+            stage,
+            f"{accent_path}/{name}",
+            center,
+            size,
+            _PRESENTATION_ACTIVE_PORT_COLOR,
+        )
+
+
 def _world_transform(position: Sequence[float], quaternion: Sequence[float]) -> wp.transform:
     """Construct and validate one hook-provided environment transform."""
     if len(position) != 3 or len(quaternion) != 4:
@@ -1051,6 +1154,9 @@ class Rj45NewtonAssemblyBuilder:
             if "PhysicsCurvesDeformableSimAPI" not in curve_prim.GetPrimTypeInfo().GetAppliedAPISchemas():
                 if not curve_prim.AddAppliedSchema("PhysicsCurvesDeformableSimAPI"):
                     raise RuntimeError(f"Failed to tag RJ45 cable render curve {curve_prim.GetPath()}.")
+
+            if self.topology_cfg == RJ45_PICK_INSERT_TOPOLOGY:
+                _author_pick_insert_network_switch(stage, f"{record.root_label}/Socket")
 
     def _add_world(
         self,
