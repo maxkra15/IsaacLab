@@ -44,6 +44,7 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.physics import (
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env import (
     FrankaRJ45PickInsertEnv,
     _bilateral_grasp_proxy_contact_mask,
+    _sample_procedural_scene_poses,
 )
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     PICK_INSERT_CLOSED_FINGER_POSITION,
@@ -54,12 +55,20 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS,
     PICK_INSERT_SUCCESS_MAX_PLUG_SPEED,
     FrankaRJ45PickInsertEnvCfg,
+    PickInsertCurriculumCfg,
+    pick_insert_play_reset_seed_contract,
     pick_insert_reset_dataset_task_contract,
     pick_insert_topology_cfg,
 )
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_reset_dataset_io import (
     PICK_INSERT_GOAL_MAX_PLUG_RELATIVE_LATCH_ANGLE_RAD,
     PICK_INSERT_GOAL_MAX_TASK_BODY_DRIFT_M,
+)
+from isaaclab_tasks.contrib.franka_rj45_insertion.play_seed import (
+    load_play_reset_seed,
+    rigidly_transform_task_pose,
+    rigidly_transform_task_state,
+    transform_play_reset_seed,
 )
 from isaaclab_tasks.contrib.franka_rj45_insertion.reset_dataset_io import reset_dataset_digest
 from isaaclab_tasks.contrib.franka_rj45_insertion.rj45_env import FrankaRJ45InsertionEnv
@@ -510,6 +519,253 @@ def test_pick_insert_config_is_distinct_long_horizon_six_stage_task():
     ]
 
 
+def test_pick_insert_play_mode_uses_procedural_full_pick_without_changing_task_contract():
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    training_contract = pick_insert_reset_dataset_task_contract(cfg)
+    assert cfg.reset_source == "dataset"
+    assert isinstance(cfg.curriculum, PickInsertCurriculumCfg)
+    assert cfg.events.reset_scene.func is mdp.reset_rj45_scene
+
+    cfg.play_mode()
+    cfg.validate_config()
+
+    assert cfg.scene.num_envs == 1
+    assert cfg.reset_source == "procedural"
+    assert cfg.curriculum is None
+    assert pick_insert_reset_dataset_task_contract(cfg) == training_contract
+
+
+def test_detailed_network_switch_presentation_is_only_requested_for_kit():
+    env = object.__new__(FrankaRJ45PickInsertEnv)
+    env._is_closed = True
+    env.sim = SimpleNamespace(resolve_visualizer_types=lambda: ["newton_gl"])
+    assert not env._include_rj45_network_switch_presentation()
+    env.sim = SimpleNamespace(resolve_visualizer_types=lambda: ["kit"])
+    assert env._include_rj45_network_switch_presentation()
+
+
+def test_procedural_scene_sampling_is_seeded_bounded_and_diverse():
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    identity = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
+    zero = torch.zeros((1, 3))
+
+    torch.manual_seed(137)
+    first = _sample_procedural_scene_poses(
+        cfg,
+        512,
+        device="cpu",
+        dtype=torch.float32,
+        socket_local_position=zero,
+        socket_local_orientation=identity,
+    )
+    torch.manual_seed(137)
+    repeated = _sample_procedural_scene_poses(
+        cfg,
+        512,
+        device="cpu",
+        dtype=torch.float32,
+        socket_local_position=zero,
+        socket_local_orientation=identity,
+    )
+    torch.manual_seed(138)
+    different = _sample_procedural_scene_poses(
+        cfg,
+        512,
+        device="cpu",
+        dtype=torch.float32,
+        socket_local_position=zero,
+        socket_local_orientation=identity,
+    )
+
+    socket_pose, pickup_pose = first
+    assert torch.equal(socket_pose, repeated[0])
+    assert torch.equal(pickup_pose, repeated[1])
+    assert not torch.equal(socket_pose, different[0])
+    assert not torch.equal(pickup_pose, different[1])
+    socket_lower = torch.tensor(cfg.socket_position_lower)
+    socket_upper = torch.tensor(cfg.socket_position_upper)
+    pickup_lower = torch.tensor(cfg.pickup_position_lower)
+    pickup_upper = torch.tensor(cfg.pickup_position_upper)
+    assert bool(((socket_pose[:, :3] >= socket_lower) & (socket_pose[:, :3] <= socket_upper)).all())
+    assert bool(((pickup_pose[:, :3] >= pickup_lower) & (pickup_pose[:, :3] <= pickup_upper)).all())
+    assert bool(
+        (
+            torch.linalg.vector_norm(pickup_pose[:, :2] - socket_pose[:, :2], dim=-1)
+            >= cfg.minimum_pickup_socket_distance
+        ).all()
+    )
+    assert bool((socket_pose[:, :2].amax(dim=0) - socket_pose[:, :2].amin(dim=0) > 0.10).all())
+    assert bool((pickup_pose[:, :2].amax(dim=0) - pickup_pose[:, :2].amin(dim=0) > 0.14).all())
+    assert torch.allclose(torch.linalg.vector_norm(socket_pose[:, 3:7], dim=-1), torch.ones(512), atol=1.0e-6)
+    assert torch.allclose(torch.linalg.vector_norm(pickup_pose[:, 3:7], dim=-1), torch.ones(512), atol=1.0e-6)
+
+
+def test_procedural_task_transform_preserves_whole_loose_assembly():
+    task_pose = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                [0.1, -0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
+                [-0.4, 0.5, 0.2, 0.0, 0.0, 0.0, 1.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    source = task_pose[:, 1].clone()
+    yaw = torch.tensor([0.7])
+    destination = torch.cat(
+        (
+            torch.tensor([[0.55, -0.12, 0.02]]),
+            math_utils.quat_from_euler_xyz(torch.zeros(1), torch.zeros(1), yaw),
+        ),
+        dim=-1,
+    )
+
+    transformed = rigidly_transform_task_pose(task_pose, source, destination)
+
+    assert torch.allclose(transformed[:, 1], destination, atol=1.0e-6)
+    assert torch.allclose(
+        torch.cdist(task_pose[..., :3], task_pose[..., :3]),
+        torch.cdist(transformed[..., :3], transformed[..., :3]),
+        atol=1.0e-6,
+    )
+    assert torch.allclose(
+        torch.linalg.vector_norm(transformed[..., 3:7], dim=-1),
+        torch.ones((1, 3)),
+        atol=1.0e-6,
+    )
+
+
+def test_packaged_play_reset_seed_matches_live_physics_and_transforms_velocity():
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    layout = make_rj45_task_layout(pick_insert_topology_cfg(cfg))
+    contract = pick_insert_play_reset_seed_contract(cfg)
+    seed = load_play_reset_seed(
+        expected_task_body_order=layout.body_names,
+        expected_physics_contract=contract,
+    )
+
+    assert set(seed) == {
+        "task_body_pose",
+        "task_body_previous_pose",
+        "task_body_coupling_previous_pose",
+        "task_body_velocity",
+        "goal_task_body_pose",
+    }
+    assert seed["task_body_pose"].shape == (layout.body_count, 7)
+    pickup_height = float(seed["task_body_pose"][layout.plug_body_index, 2])
+    assert cfg.pickup_position_lower[2] <= pickup_height <= cfg.pickup_position_upper[2]
+    _, fixed_height_pickup = _sample_procedural_scene_poses(
+        cfg,
+        64,
+        device="cpu",
+        dtype=torch.float32,
+        socket_local_position=torch.zeros((1, 3)),
+        socket_local_orientation=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+        pickup_height=pickup_height,
+    )
+    assert torch.equal(fixed_height_pickup[:, 2], torch.full((64,), pickup_height))
+    with pytest.raises(ValueError, match="inside the declared sampling bounds"):
+        _sample_procedural_scene_poses(
+            cfg,
+            1,
+            device="cpu",
+            dtype=torch.float32,
+            socket_local_position=torch.zeros((1, 3)),
+            socket_local_orientation=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            pickup_height=cfg.pickup_position_upper[2] + 0.001,
+        )
+
+    pose = seed["task_body_pose"].unsqueeze(0)
+    velocity = seed["task_body_velocity"].unsqueeze(0)
+    source = pose[:, layout.plug_body_index]
+    destination = source.clone()
+    destination[:, :2] += torch.tensor([[0.1, -0.2]])
+    yaw = torch.tensor([0.5])
+    destination[:, 3:7] = math_utils.quat_mul(
+        math_utils.quat_from_euler_xyz(torch.zeros(1), torch.zeros(1), yaw),
+        source[:, 3:7],
+    )
+    transformed_pose, transformed_velocity = rigidly_transform_task_state(
+        pose,
+        velocity,
+        source,
+        destination,
+    )
+
+    assert torch.allclose(transformed_pose[:, layout.plug_body_index], destination, atol=1.0e-6)
+    assert torch.allclose(
+        torch.linalg.vector_norm(transformed_velocity[..., :3], dim=-1),
+        torch.linalg.vector_norm(velocity[..., :3], dim=-1),
+        atol=1.0e-7,
+    )
+    assert torch.allclose(
+        torch.linalg.vector_norm(transformed_velocity[..., 3:6], dim=-1),
+        torch.linalg.vector_norm(velocity[..., 3:6], dim=-1),
+        atol=1.0e-7,
+    )
+
+
+def test_packaged_play_reset_seed_rejects_incompatible_live_physics():
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    layout = make_rj45_task_layout(pick_insert_topology_cfg(cfg))
+    contract = pick_insert_play_reset_seed_contract(cfg)
+    incompatible = dict(contract)
+    incompatible["contract_version"] = 2
+
+    with pytest.raises(ValueError, match="physics contract"):
+        load_play_reset_seed(
+            expected_task_body_order=layout.body_names,
+            expected_physics_contract=incompatible,
+        )
+
+
+def test_packaged_play_reset_seed_two_stage_transform_preserves_history_and_socket():
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    layout = make_rj45_task_layout(pick_insert_topology_cfg(cfg))
+    seed = load_play_reset_seed(
+        expected_task_body_order=layout.body_names,
+        expected_physics_contract=pick_insert_play_reset_seed_contract(cfg),
+    )
+    socket_pose = seed["task_body_pose"][layout.socket_body_index].repeat(2, 1)
+    socket_pose[:, :2] += torch.tensor([[0.04, -0.02], [-0.05, 0.06]])
+    pickup_pose = seed["task_body_pose"][layout.plug_body_index].repeat(2, 1)
+    pickup_pose[:, :2] += torch.tensor([[0.08, 0.03], [-0.06, -0.04]])
+    pickup_yaw = torch.tensor([0.35, -0.55])
+    pickup_pose[:, 3:7] = math_utils.quat_from_euler_xyz(
+        torch.zeros(2),
+        torch.zeros(2),
+        pickup_yaw,
+    )
+
+    transformed = transform_play_reset_seed(
+        seed,
+        socket_body_index=layout.socket_body_index,
+        plug_body_index=layout.plug_body_index,
+        socket_pose=socket_pose,
+        pickup_pose=pickup_pose,
+    )
+
+    assert torch.allclose(transformed["task_body_pose"][:, layout.socket_body_index], socket_pose, atol=1.0e-6)
+    assert torch.allclose(transformed["goal_task_body_pose"][:, layout.socket_body_index], socket_pose, atol=1.0e-6)
+    assert torch.allclose(transformed["task_body_pose"][:, layout.plug_body_index], pickup_pose, atol=1.0e-6)
+    for history_name in ("task_body_previous_pose", "task_body_coupling_previous_pose"):
+        seed_delta = torch.linalg.vector_norm(
+            seed[history_name][..., :3] - seed["task_body_pose"][..., :3],
+            dim=-1,
+        )
+        transformed_delta = torch.linalg.vector_norm(
+            transformed[history_name][..., :3] - transformed["task_body_pose"][..., :3],
+            dim=-1,
+        )
+        assert torch.allclose(transformed_delta, seed_delta.expand_as(transformed_delta), atol=1.0e-7)
+    seed_speed = torch.linalg.vector_norm(seed["task_body_velocity"].reshape(layout.body_count, 2, 3), dim=-1)
+    transformed_speed = torch.linalg.vector_norm(
+        transformed["task_body_velocity"].reshape(2, layout.body_count, 2, 3), dim=-1
+    )
+    assert torch.allclose(transformed_speed, seed_speed.expand_as(transformed_speed), atol=1.0e-7)
+
+
 def test_pick_insert_runtime_builder_forwards_proxy_friction_without_mutating_legacy_defaults():
     pick_cfg = FrankaRJ45PickInsertEnvCfg()
     legacy_cfg = FrankaRJ45InsertionEnvCfg()
@@ -556,6 +812,23 @@ def test_pick_insert_config_rejects_timeout_bootstrapping():
     cfg.is_finite_horizon = False
 
     with pytest.raises(ValueError, match="finite task horizon"):
+        cfg.validate_config()
+
+
+def test_pick_insert_config_rejects_incoherent_reset_source_and_curriculum():
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.reset_source = "procedural"
+    with pytest.raises(ValueError, match="must not construct"):
+        cfg.validate_config()
+
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.curriculum = None
+    with pytest.raises(ValueError, match="require.*curriculum"):
+        cfg.validate_config()
+
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.reset_source = "unknown"
+    with pytest.raises(ValueError, match="reset_source"):
         cfg.validate_config()
 
 

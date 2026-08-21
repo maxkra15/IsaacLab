@@ -36,6 +36,9 @@ play configuration of the insertion-only environment. Its task state contains
 48 bodies in the fixed order socket, plug, latch, then 45 cable segments. The
 cable keeps Newton's original 35 segments and adds a ten-segment tail so a
 randomized pickup can be transported without shortening the source geometry.
+Its physical centerline length is fixed at 0.43987943027 m; neither training nor
+play scales or changes the cable topology, so its length-randomization range is
+exactly [0.43987943027, 0.43987943027] m.
 The socket is resettable, plug rotation is free, and insertion and success are
 measured in each randomized socket goal frame.
 The actor observes seven approximately arclength-uniform cable centers and
@@ -74,6 +77,10 @@ physical and defines the policy goal. Headless training and Newton physics
 construction do not author this presentation subtree. The visual asset resolves
 from ``{NVIDIA_NUCLEUS_DIR}/Assets/DigitalTwin/Assets/Datacenter/``
 ``Network_Switches/NVIDIA/AS4600/AS4610_01.usd``.
+Newton GL does not traverse the USD stage, so standalone play uses a lightweight
+marker proxy with the same outer bounds, 47 neighboring port openings, and an
+accent around the one active port. These markers are also render-only and never
+enter the Newton model or task contract.
 
 ### Pinned external scene assets
 
@@ -196,14 +203,24 @@ uv run isaaclab train --rl_library rsl_rl \
   --num_envs 256 --device cuda:0 --max_iterations 8000 --visualizer none
 ```
 
-Adjust `--num_envs` for the available GPU memory. Playback needs the same reset
-artifact and stable validation gate as training:
+Adjust `--num_envs` for the available GPU memory. Training keeps the six-phase
+reset bank and curriculum, and continues to fail closed unless its artifacts
+match the current runtime contract. Standard interactive playback instead
+uses one packaged, physics-contract-bound loose-cable equilibrium and samples a
+fresh continuous full-pick pose on every reset. Socket and pickup XY, their yaw,
+and the open-arm home noise are sampled from the task bounds; pickup height is
+held at the seed's 0.01067824010 m plug height so a planar transform preserves
+the settled cable/table contact manifold and both VBD history buffers. Playback
+therefore does not read or sample the training reset bank or validation report:
 
 ```bash
 uv run isaaclab play --rl_library rsl_rl \
   --task IsaacContrib-Franka-RJ45-Pick-Insert \
   --checkpoint latest --num_envs 1 --device cuda:0
 ```
+
+Pass `--train_env_cfg` only when deliberately replaying the training reset bank
+and its curriculum-compatible configuration.
 
 ## Insertion-only reset artifact
 

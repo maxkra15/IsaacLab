@@ -31,6 +31,7 @@ from .pick_insert_reset_dataset_io import (
     reset_dataset_validate_runtime,
     reset_validation_report_validate_runtime,
 )
+from .play_seed import load_play_reset_seed, transform_play_reset_seed
 from .rj45_env import (
     FrankaRJ45InsertionEnv,
     _resolve_reset_dataset_path,
@@ -41,6 +42,79 @@ from .table_scene_cfg import configure_seattle_table_external_asset
 from .task_success import rj45_insertion_success
 
 logger = logging.getLogger(__name__)
+
+_PROCEDURAL_FULL_PICK_PHASE = 5
+_PROCEDURAL_MAX_TABLE_PENETRATION_M = 5.0e-4
+_PROCEDURAL_MIN_NONADJACENT_CABLE_GAP_M = -5.0e-4
+_PROCEDURAL_MIN_CABLE_SOCKET_CENTER_DISTANCE_M = 0.02
+_PROCEDURAL_JOINT_LIMIT_MARGIN_RAD = 0.02
+
+
+def _sample_procedural_scene_poses(
+    cfg,
+    count: int,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    socket_local_position: torch.Tensor,
+    socket_local_orientation: torch.Tensor,
+    pickup_height: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample continuous socket and loose-plug poses from the declared task bounds."""
+    socket_lower = torch.as_tensor(cfg.socket_position_lower, device=device, dtype=dtype)
+    socket_upper = torch.as_tensor(cfg.socket_position_upper, device=device, dtype=dtype)
+    pickup_lower = torch.as_tensor(cfg.pickup_position_lower, device=device, dtype=dtype)
+    pickup_upper = torch.as_tensor(cfg.pickup_position_upper, device=device, dtype=dtype)
+    if pickup_height is not None:
+        if not float(pickup_lower[2]) <= pickup_height <= float(pickup_upper[2]):
+            raise ValueError("Procedural RJ45 pickup height must remain inside the declared sampling bounds.")
+        pickup_lower = pickup_lower.clone()
+        pickup_upper = pickup_upper.clone()
+        pickup_lower[2] = pickup_height
+        pickup_upper[2] = pickup_height
+    assembly_position = socket_lower + torch.rand((count, 3), device=device, dtype=dtype) * (
+        socket_upper - socket_lower
+    )
+    socket_yaw = float(cfg.socket_yaw_range[0]) + torch.rand((count,), device=device, dtype=dtype) * (
+        float(cfg.socket_yaw_range[1]) - float(cfg.socket_yaw_range[0])
+    )
+    socket_yaw_quat = math_utils.quat_from_euler_xyz(
+        torch.zeros_like(socket_yaw),
+        torch.zeros_like(socket_yaw),
+        socket_yaw,
+    )
+    socket_local_position = socket_local_position.expand(count, -1)
+    socket_local_orientation = socket_local_orientation.expand(count, -1)
+    socket_position = assembly_position + math_utils.quat_apply(socket_yaw_quat, socket_local_position)
+    socket_orientation = math_utils.quat_mul(socket_yaw_quat, socket_local_orientation)
+
+    pickup_position = pickup_lower + torch.rand((count, 3), device=device, dtype=dtype) * (pickup_upper - pickup_lower)
+    for _ in range(int(cfg.procedural_reset_max_sampling_attempts)):
+        too_close = torch.linalg.vector_norm(pickup_position[:, :2] - socket_position[:, :2], dim=-1) < float(
+            cfg.minimum_pickup_socket_distance
+        )
+        if not bool(too_close.any()):
+            break
+        resampled = pickup_lower + torch.rand((count, 3), device=device, dtype=dtype) * (pickup_upper - pickup_lower)
+        pickup_position = torch.where(too_close[:, None], resampled, pickup_position)
+    too_close = torch.linalg.vector_norm(pickup_position[:, :2] - socket_position[:, :2], dim=-1) < float(
+        cfg.minimum_pickup_socket_distance
+    )
+    if bool(too_close.any()):
+        raise RuntimeError("Procedural RJ45 reset could not satisfy the pickup/socket separation bound.")
+
+    pickup_yaw = float(cfg.pickup_yaw_range[0]) + torch.rand((count,), device=device, dtype=dtype) * (
+        float(cfg.pickup_yaw_range[1]) - float(cfg.pickup_yaw_range[0])
+    )
+    pickup_orientation = math_utils.quat_from_euler_xyz(
+        torch.zeros_like(pickup_yaw),
+        torch.zeros_like(pickup_yaw),
+        pickup_yaw,
+    )
+    return (
+        torch.cat((socket_position, socket_orientation), dim=-1),
+        torch.cat((pickup_position, pickup_orientation), dim=-1),
+    )
 
 
 def _bilateral_grasp_proxy_contact_mask(
@@ -96,11 +170,35 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
         # Match ManagerBasedEnv's partial-initialization guard before doing the
         # task-specific preflight, so a verification failure is cleanly inert.
         self._is_closed = True
+        self._network_switch_presentation = None
         closure = configured_franka_rj45_asset_closure(required=True)
         configure_franka_rj45_external_asset(cfg.scene.robot, closure)
         configure_seattle_table_external_asset(cfg.scene.table, closure)
         self._external_asset_closure = closure
         super().__init__(cfg, render_mode, **kwargs)
+        sim = getattr(self, "sim", None)
+        if cfg.reset_source == "procedural":
+            from .network_switch_presentation import (
+                NewtonGlNetworkSwitchPresentation,
+                should_enable_newton_gl_network_switch,
+            )
+
+            if should_enable_newton_gl_network_switch(sim, reset_source=cfg.reset_source):
+                try:
+                    self._network_switch_presentation = NewtonGlNetworkSwitchPresentation(sim, self.socket_pose_e)
+                except Exception:
+                    self.close()
+                    raise
+
+    def close(self) -> None:
+        """Release viewer-only presentation state before closing the simulation."""
+        presentation = getattr(self, "_network_switch_presentation", None)
+        try:
+            if presentation is not None:
+                presentation.close()
+        finally:
+            self._network_switch_presentation = None
+            super().close()
 
     def _create_rj45_builder(self, cfg):
         from .physics import Rj45NewtonAssemblyBuilder
@@ -133,6 +231,10 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
             )
         )
 
+    def _include_rj45_network_switch_presentation(self) -> bool:
+        """Author the detailed switch only when a Kit visualizer was requested."""
+        return "kit" in self.sim.resolve_visualizer_types()
+
     def _prepare_rj45_substep(self, state) -> None:
         """Apply forces and synchronize anchors before the coupled solve.
 
@@ -162,6 +264,237 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
             dtype=torch.float32,
         ).repeat(self.num_envs, 1)
         self._bind_grasp_proxy_contacts()
+
+    def _initialize_reset_source(self) -> None:
+        """Load validated training rows or initialize play-only procedural state."""
+        if self.cfg.reset_source == "dataset":
+            super()._initialize_reset_source()
+        elif self.cfg.reset_source == "procedural":
+            self._initialize_procedural_reset_source()
+        else:
+            raise ValueError(f"Unsupported RJ45 pick-insert reset source: {self.cfg.reset_source!r}.")
+
+    def _initialize_procedural_reset_source(self) -> None:
+        """Create dataset-shaped staging tensors from one packaged physical seed."""
+        from .pick_insert_env_cfg import pick_insert_play_reset_seed_contract
+
+        runtime = self._ensure_rj45_runtime()
+        default_task_pose = wp.to_torch(runtime.default_body_q).to(device=self.device).clone()
+        default_task_pose[..., :3] -= self.env_origins[:, None, :]
+        seed = load_play_reset_seed(
+            expected_task_body_order=self._task_layout.body_names,
+            expected_physics_contract=pick_insert_play_reset_seed_contract(self.cfg),
+        )
+        self._procedural_seed_state = {name: value.to(device=self.device) for name, value in seed.items()}
+        seed_task_pose = self._procedural_seed_state["task_body_pose"]
+        seed_goal_pose = self._procedural_seed_state["goal_task_body_pose"]
+        assert self._socket_task_body_index is not None
+        self._procedural_pickup_height = float(seed_task_pose[self._plug_task_body_index, 2])
+
+        task_position = torch.as_tensor(
+            self.cfg.task_translation,
+            device=self.device,
+            dtype=default_task_pose.dtype,
+        ).unsqueeze(0)
+        task_orientation = torch.as_tensor(
+            self.cfg.task_rotation_xyzw,
+            device=self.device,
+            dtype=default_task_pose.dtype,
+        ).unsqueeze(0)
+        default_socket = default_task_pose[:, self._socket_task_body_index]
+        self._procedural_socket_local_position = math_utils.quat_apply_inverse(
+            task_orientation,
+            default_socket[:1, :3] - task_position,
+        )
+        self._procedural_socket_local_orientation = math_utils.quat_mul(
+            math_utils.quat_conjugate(task_orientation),
+            default_socket[:1, 3:7],
+        )
+
+        task_pose = seed_task_pose.unsqueeze(0).repeat(self.num_envs, 1, 1)
+        task_previous_pose = (
+            self._procedural_seed_state["task_body_previous_pose"].unsqueeze(0).repeat(self.num_envs, 1, 1)
+        )
+        task_coupling_previous_pose = (
+            self._procedural_seed_state["task_body_coupling_previous_pose"].unsqueeze(0).repeat(self.num_envs, 1, 1)
+        )
+        task_velocity = self._procedural_seed_state["task_body_velocity"].unsqueeze(0).repeat(self.num_envs, 1, 1)
+        goal_pose = seed_goal_pose.unsqueeze(0).repeat(self.num_envs, 1, 1)
+
+        arm_q = self._robot.data.default_joint_pos.torch[:, self._arm_joint_ids].clone()
+        finger_q = torch.full(
+            (self.num_envs, self._finger_joint_ids.numel()),
+            float(self.cfg.actions.gripper_action.default_position),
+            device=self.device,
+            dtype=arm_q.dtype,
+        )
+        self._reset_dataset_states = {
+            "arm_joint_position": arm_q.clone(),
+            "arm_joint_target": arm_q.clone(),
+            "arm_joint_velocity": torch.zeros_like(arm_q),
+            "finger_joint_position": finger_q.clone(),
+            "finger_joint_velocity": torch.zeros_like(finger_q),
+            "finger_joint_target": finger_q.clone(),
+            "task_body_pose": task_pose,
+            "task_body_previous_pose": task_previous_pose,
+            "task_body_coupling_previous_pose": task_coupling_previous_pose,
+            "task_body_velocity": task_velocity,
+            "goal_task_body_pose": goal_pose,
+            "goal_arm_joint_target": arm_q.clone(),
+            "phase": torch.full(
+                (self.num_envs,),
+                _PROCEDURAL_FULL_PICK_PHASE,
+                device=self.device,
+                dtype=torch.int64,
+            ),
+            "starts_grasped": torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+            "difficulty": torch.ones(self.num_envs, device=self.device, dtype=torch.float32),
+            "initial_goal_error": torch.linalg.vector_norm(
+                task_pose[:, self._plug_task_body_index, :3] - goal_pose[:, self._plug_task_body_index, :3],
+                dim=-1,
+            ),
+            "initial_tcp_grasp_distance": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
+            "progress_threshold": torch.full((self.num_envs,), 0.02, device=self.device, dtype=torch.float32),
+        }
+        if set(self._reset_dataset_states) != set(RESET_DATASET_STATE_NAMES):
+            raise RuntimeError("Procedural RJ45 reset state does not match the runtime reset-state schema.")
+        self.goal_task_body_pose = goal_pose.clone()
+        logger.info(
+            "Initialized continuous fixed-height full-pick resets for %d RJ45 play environments.",
+            self.num_envs,
+        )
+
+    def _procedural_task_state_valid(
+        self,
+        task_pose: torch.Tensor,
+        goal_pose: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply bounded analytic checks before a procedural state reaches physics."""
+        from .physics.rj45_assembly import CABLE_RADIUS
+
+        position = task_pose[..., :3]
+        workspace_lower = self._task_body_workspace_lower.to(dtype=position.dtype)
+        workspace_upper = self._task_body_workspace_upper.to(dtype=position.dtype)
+        workspace_valid = ((position >= workspace_lower) & (position <= workspace_upper)).all(dim=(1, 2))
+
+        cable_position = position[:, self._task_layout.cable_body_slice]
+        contact_surface = self.cfg.scene.table_contact_surface
+        table_top = float(contact_surface.init_state.pos[2]) + 0.5 * float(contact_surface.spawn.size[2])
+        table_valid = (
+            cable_position[..., 2].amin(dim=-1) - CABLE_RADIUS - table_top >= -_PROCEDURAL_MAX_TABLE_PENETRATION_M
+        )
+        cable_distance = torch.cdist(cable_position, cable_position)
+        cable_count = cable_position.shape[1]
+        nonadjacent = torch.triu(
+            torch.ones((cable_count, cable_count), device=self.device, dtype=torch.bool),
+            diagonal=2,
+        )
+        self_collision_valid = cable_distance[:, nonadjacent].amin(dim=-1) >= (
+            2.0 * CABLE_RADIUS + _PROCEDURAL_MIN_NONADJACENT_CABLE_GAP_M
+        )
+        socket_position = position[:, self._socket_task_body_index, None]
+        socket_valid = torch.linalg.vector_norm(cable_position - socket_position, dim=-1).amin(dim=-1) >= (
+            _PROCEDURAL_MIN_CABLE_SOCKET_CENTER_DISTANCE_M
+        )
+
+        task_quat_norm = torch.linalg.vector_norm(task_pose[..., 3:7], dim=-1)
+        goal_quat_norm = torch.linalg.vector_norm(goal_pose[..., 3:7], dim=-1)
+        finite = torch.isfinite(task_pose).all(dim=(1, 2)) & torch.isfinite(goal_pose).all(dim=(1, 2))
+        normalized = torch.all(torch.abs(task_quat_norm - 1.0) <= 1.0e-5, dim=-1)
+        normalized &= torch.all(torch.abs(goal_quat_norm - 1.0) <= 1.0e-5, dim=-1)
+        return finite & normalized & workspace_valid & table_valid & self_collision_valid & socket_valid
+
+    def _sample_procedural_full_pick_rows(self, env_ids: torch.Tensor) -> None:
+        """Fill per-environment staging rows with fresh continuous full-pick samples."""
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
+        count = env_ids.numel()
+        task_pose = self._procedural_seed_state["task_body_pose"].unsqueeze(0).repeat(count, 1, 1)
+        task_previous_pose = self._procedural_seed_state["task_body_previous_pose"].unsqueeze(0).repeat(count, 1, 1)
+        task_coupling_previous_pose = (
+            self._procedural_seed_state["task_body_coupling_previous_pose"].unsqueeze(0).repeat(count, 1, 1)
+        )
+        task_velocity = self._procedural_seed_state["task_body_velocity"].unsqueeze(0).repeat(count, 1, 1)
+        goal_pose = self._procedural_seed_state["goal_task_body_pose"].unsqueeze(0).repeat(count, 1, 1)
+        pending = torch.arange(count, device=self.device, dtype=torch.long)
+        for _ in range(int(self.cfg.procedural_reset_max_sampling_attempts)):
+            if pending.numel() == 0:
+                break
+            socket_pose, pickup_pose = _sample_procedural_scene_poses(
+                self.cfg,
+                pending.numel(),
+                device=self.device,
+                dtype=task_pose.dtype,
+                socket_local_position=self._procedural_socket_local_position,
+                socket_local_orientation=self._procedural_socket_local_orientation,
+                pickup_height=self._procedural_pickup_height,
+            )
+            candidate = transform_play_reset_seed(
+                self._procedural_seed_state,
+                socket_body_index=self._socket_task_body_index,
+                plug_body_index=self._plug_task_body_index,
+                socket_pose=socket_pose,
+                pickup_pose=pickup_pose,
+            )
+            candidate_task = candidate["task_body_pose"]
+            candidate_previous = candidate["task_body_previous_pose"]
+            candidate_coupling_previous = candidate["task_body_coupling_previous_pose"]
+            candidate_velocity = candidate["task_body_velocity"]
+            candidate_goal = candidate["goal_task_body_pose"]
+            valid = self._procedural_task_state_valid(candidate_task, candidate_goal)
+            accepted = pending[valid]
+            task_pose[accepted] = candidate_task[valid]
+            task_previous_pose[accepted] = candidate_previous[valid]
+            task_coupling_previous_pose[accepted] = candidate_coupling_previous[valid]
+            task_velocity[accepted] = candidate_velocity[valid]
+            goal_pose[accepted] = candidate_goal[valid]
+            pending = pending[~valid]
+        if pending.numel():
+            raise RuntimeError(
+                "Procedural RJ45 reset exhausted its bounded sampling attempts for "
+                f"{pending.numel()} of {count} environments."
+            )
+
+        arm_home = self._robot.data.default_joint_pos.torch[env_ids][:, self._arm_joint_ids]
+        arm_limits = self._robot.data.soft_joint_pos_limits.torch[env_ids][:, self._arm_joint_ids]
+        noise = float(self.cfg.arm_reset_joint_noise)
+        arm_lower = torch.maximum(arm_home - noise, arm_limits[..., 0] + _PROCEDURAL_JOINT_LIMIT_MARGIN_RAD)
+        arm_upper = torch.minimum(arm_home + noise, arm_limits[..., 1] - _PROCEDURAL_JOINT_LIMIT_MARGIN_RAD)
+        if bool(torch.any(arm_lower > arm_upper)):
+            raise RuntimeError("Procedural RJ45 arm-reset range does not fit inside the soft joint limits.")
+        arm_q = arm_lower + torch.rand_like(arm_lower) * (arm_upper - arm_lower)
+        finger_q = torch.full(
+            (count, self._finger_joint_ids.numel()),
+            float(self.cfg.actions.gripper_action.default_position),
+            device=self.device,
+            dtype=arm_q.dtype,
+        )
+        goal_error = torch.linalg.vector_norm(
+            task_pose[:, self._plug_task_body_index, :3] - goal_pose[:, self._plug_task_body_index, :3],
+            dim=-1,
+        )
+        values = {
+            "arm_joint_position": arm_q,
+            "arm_joint_target": arm_q,
+            "arm_joint_velocity": torch.zeros_like(arm_q),
+            "finger_joint_position": finger_q,
+            "finger_joint_velocity": torch.zeros_like(finger_q),
+            "finger_joint_target": finger_q,
+            "task_body_pose": task_pose,
+            "task_body_previous_pose": task_previous_pose,
+            "task_body_coupling_previous_pose": task_coupling_previous_pose,
+            "task_body_velocity": task_velocity,
+            "goal_task_body_pose": goal_pose,
+            "goal_arm_joint_target": arm_q,
+            "phase": torch.full((count,), _PROCEDURAL_FULL_PICK_PHASE, device=self.device, dtype=torch.int64),
+            "starts_grasped": torch.zeros(count, device=self.device, dtype=torch.bool),
+            "difficulty": torch.ones(count, device=self.device, dtype=torch.float32),
+            "initial_goal_error": goal_error,
+            "initial_tcp_grasp_distance": torch.zeros(count, device=self.device, dtype=torch.float32),
+            "progress_threshold": torch.full((count,), 0.02, device=self.device, dtype=torch.float32),
+        }
+        for name in RESET_DATASET_STATE_NAMES:
+            self._reset_dataset_states[name][env_ids] = values[name]
+        self.reset_dataset_row_id[env_ids] = env_ids
 
     def _pose_history_selection(self, env_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ordered parent-body and world IDs for selected task worlds."""
@@ -542,13 +875,27 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
         return evidence
 
     def reset_rj45_scene(self, env_ids: torch.Tensor) -> None:
-        """Restore public state and stage the latest serialized VBD history."""
+        """Restore public state and stage the latest exact VBD history."""
         env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
         # A prior policy step may have applied a ticket before same-step
         # autoreset reaches this event.  Verify it before staging the next row.
         self.finalize_pending_task_pose_history_restores(require_complete=True)
+        procedural = self.cfg.reset_source == "procedural"
+        if procedural:
+            self._sample_procedural_full_pick_rows(env_ids)
         super().reset_rj45_scene(env_ids)
         rows = self.reset_dataset_row_id[env_ids]
+        if procedural:
+            initial_tcp_distance = torch.linalg.vector_norm(
+                self.tcp_pose_e()[env_ids, :3] - self.plug_grasp_position_e()[env_ids],
+                dim=-1,
+            )
+            self._reset_dataset_states["initial_goal_error"][rows] = self.scalar_goal_error()[env_ids]
+            self._reset_dataset_states["initial_tcp_grasp_distance"][rows] = initial_tcp_distance
+            self._reset_dataset_states["progress_threshold"][rows] = (0.15 * initial_tcp_distance).clamp(
+                2.0e-4,
+                0.02,
+            )
         self._stage_task_pose_history_restore(env_ids, rows)
 
     def step(self, action: torch.Tensor):

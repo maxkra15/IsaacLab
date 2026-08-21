@@ -145,7 +145,14 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
         """Allocate task runtime arrays after model finalization and before capture."""
         self._rj45_runtime = self._rj45_builder.bind(NewtonManager.get_model())
         if not NewtonManager._clone_physics_only:
-            self._rj45_builder.author_render_prims(sim_utils.get_current_stage())
+            self._rj45_builder.author_render_prims(
+                sim_utils.get_current_stage(),
+                include_network_switch_presentation=self._include_rj45_network_switch_presentation(),
+            )
+
+    def _include_rj45_network_switch_presentation(self) -> bool:
+        """Return whether this task should author optional Kit presentation decor."""
+        return False
 
     def _prepare_rj45_substep(self, state) -> None:
         """Faithfully align the previous solve, apply forces, and sync four anchors."""
@@ -164,7 +171,7 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
 
     def _setup_after_physics(self) -> None:
         self._bind_physics_state()
-        self._load_reset_dataset(self.cfg.reset_dataset_path)
+        self._initialize_reset_source()
         self.reset_dataset_row_id = torch.full((self.num_envs,), -1, device=self.device, dtype=torch.long)
         self.episode_succeeded = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         # Same-step autoreset clears stateful termination terms before callers
@@ -178,6 +185,10 @@ class FrankaRJ45InsertionEnv(ManagerBasedRLEnv):
             1, math.ceil(float(self.cfg.success_dwell_time_s) / max(float(self.step_dt), 1.0e-6))
         )
         self._success_dwell_count = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+
+    def _initialize_reset_source(self) -> None:
+        """Initialize the task-specific source used by reset events."""
+        self._load_reset_dataset(self.cfg.reset_dataset_path)
 
     def _bind_physics_state(self) -> None:
         """Bind robot and task body indices without requiring a reset artifact.

@@ -1090,7 +1090,12 @@ class Rj45NewtonAssemblyBuilder:
             nonfinger_collision_shape_ids,
         )
 
-    def author_render_prims(self, stage: Usd.Stage) -> None:
+    def author_render_prims(
+        self,
+        stage: Usd.Stage,
+        *,
+        include_network_switch_presentation: bool = True,
+    ) -> None:
         """Author render-only connector meshes and a synchronized cable curve.
 
         This method must run after Newton model finalization and before Fabric
@@ -1155,7 +1160,7 @@ class Rj45NewtonAssemblyBuilder:
                 if not curve_prim.AddAppliedSchema("PhysicsCurvesDeformableSimAPI"):
                     raise RuntimeError(f"Failed to tag RJ45 cable render curve {curve_prim.GetPath()}.")
 
-            if self.topology_cfg == RJ45_PICK_INSERT_TOPOLOGY:
+            if include_network_switch_presentation and self.topology_cfg == RJ45_PICK_INSERT_TOPOLOGY:
                 _author_pick_insert_network_switch(stage, f"{record.root_label}/Socket")
 
     def _add_world(

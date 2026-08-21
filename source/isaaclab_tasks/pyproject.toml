@@ -39,4 +39,5 @@ include = ["isaaclab_tasks", "isaaclab_tasks.*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.pyi"]
+"isaaclab_tasks.contrib.franka_rj45_insertion" = ["data/*.pt"]
 "isaaclab_tasks.contrib.franka_rj45_insertion.physics" = ["assets/*.md", "assets/*.usd"]

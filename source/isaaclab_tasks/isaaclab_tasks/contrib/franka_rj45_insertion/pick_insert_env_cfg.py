@@ -8,12 +8,12 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 from isaaclab_newton.sim.schemas import MujocoJointCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
-from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -222,11 +222,6 @@ class PickInsertTerminationsCfg:
 
 
 @configclass
-class PickInsertEventsCfg:
-    reset_scene = EventTerm(func=mdp.reset_rj45_scene, mode="reset")
-
-
-@configclass
 class PickInsertCurriculumCfg(CurriculumCfg):
     reset_dataset = CurrTerm(func=mdp.RJ45PickInsertResetDatasetCurriculum)
 
@@ -240,7 +235,6 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
     actions: PickInsertActionsCfg = PickInsertActionsCfg()
     rewards: PickInsertRewardsCfg = PickInsertRewardsCfg()
     terminations: PickInsertTerminationsCfg = PickInsertTerminationsCfg()
-    events: PickInsertEventsCfg = PickInsertEventsCfg()
     curriculum: PickInsertCurriculumCfg = PickInsertCurriculumCfg()
 
     task_translation: tuple[float, float, float] = PICK_INSERT_TASK_TRANSLATION
@@ -259,6 +253,10 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
 
     reset_dataset_path: str = "datasets/franka_rj45_pick_insert/reset_dataset.pt"
     reset_validation_report_path: str = "logs/rsl_rl/franka_rj45_pick_insert/validation/reset_validation.json"
+    reset_source: Literal["dataset", "procedural"] = "dataset"
+    """Reset source. Interactive play switches to fresh procedural full-pick starts."""
+    procedural_reset_max_sampling_attempts: int = 32
+    """Maximum bounded rejection-sampling attempts per procedural reset."""
     reset_dataset_rows_per_phase: int = 96
     reset_dataset_diversity_round_decimals: int = 4
     reset_dataset_min_unique_full_pick_rows: int = 90
@@ -317,6 +315,13 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
             origin_env_index=0,
         )
 
+    def play_mode(self) -> None:
+        """Use one freshly randomized full-pick start for interactive inference."""
+        super().play_mode()
+        self.scene.num_envs = 1
+        self.reset_source = "procedural"
+        self.curriculum = None
+
     def validate_config(self) -> None:
         if tuple(self.rj45_entry_body_patterns) != PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS:
             raise ValueError(
@@ -324,6 +329,7 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
             )
         if self.is_finite_horizon is not True:
             raise ValueError("Franka RJ45 pick-insert requires a finite task horizon without timeout bootstrapping.")
+        _validate_pick_insert_reset_source(self)
         super().validate_config()
         from .physics import RJ45_PICK_INSERT_TOPOLOGY, make_rj45_task_layout
 
@@ -424,6 +430,18 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
             or not self.scene.table.spawn.make_uninstanceable
         ):
             raise ValueError("The Seattle table must be recursively editable so authored collision can be disabled.")
+
+
+def _validate_pick_insert_reset_source(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
+    """Validate the mutually exclusive training and play reset paths."""
+    if cfg.reset_source not in ("dataset", "procedural"):
+        raise ValueError("reset_source must be either 'dataset' or 'procedural'.")
+    if cfg.reset_source == "dataset" and cfg.curriculum is None:
+        raise ValueError("Dataset resets require the reset-dataset curriculum to assign rows.")
+    if cfg.reset_source == "procedural" and cfg.curriculum is not None:
+        raise ValueError("Procedural resets must not construct the reset-dataset curriculum.")
+    if type(cfg.procedural_reset_max_sampling_attempts) is not int or cfg.procedural_reset_max_sampling_attempts < 1:
+        raise ValueError("procedural_reset_max_sampling_attempts must be a positive plain integer.")
 
 
 def _validate_pick_insert_grasp_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
@@ -569,6 +587,27 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
     return contract
 
 
+def pick_insert_play_reset_seed_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> dict[str, object]:
+    """Return the physics subset that a packaged play-reset seed must match."""
+    contract = pick_insert_reset_dataset_task_contract(cfg)
+    static_scene = contract["static_scene"]
+    return {
+        "contract_version": 1,
+        "task_variant": contract["task_variant"],
+        "task_translation": contract["task_translation"],
+        "task_rotation_xyzw": contract["task_rotation_xyzw"],
+        "task_body_count": contract["task_body_count"],
+        "task_body_order": contract["task_body_order"],
+        "runtime_physics_versions": contract["runtime_physics_versions"],
+        "reset_state_representation": contract["reset_state_representation"],
+        "rj45_physics": contract["rj45_physics"],
+        "simulation": contract["simulation"],
+        "coupler": contract["coupler"],
+        "table_contact_initial_state": static_scene["table_contact_initial_state"],
+        "table_contact_spawn": static_scene["table_contact_spawn"],
+    }
+
+
 def pick_insert_topology_cfg(cfg: FrankaRJ45PickInsertEnvCfg):
     """Create the immutable physics topology lazily to keep config discovery light."""
     from .physics import RJ45_PICK_INSERT_PLUG_PASSIVE_ANGULAR_DAMPING_RATE, Rj45AssemblyTopologyCfg
@@ -596,6 +635,7 @@ __all__ = [
     "PICK_INSERT_TASK_ROTATION_XYZW",
     "PICK_INSERT_TASK_TRANSLATION",
     "PickInsertSceneCfg",
+    "pick_insert_play_reset_seed_contract",
     "pick_insert_reset_dataset_task_contract",
     "pick_insert_topology_cfg",
 ]

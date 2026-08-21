@@ -126,7 +126,7 @@ def test_physics_ready_authors_kit_visuals_after_model_finalization(monkeypatch)
     events = []
     runtime = object()
     builder = SimpleNamespace(
-        author_render_prims=lambda stage: events.append(("author", stage)),
+        author_render_prims=lambda stage, **kwargs: events.append(("author", stage, kwargs)),
         bind=lambda model: events.append(("bind", model)) or runtime,
     )
     env = object.__new__(rj45_env.FrankaRJ45InsertionEnv)
@@ -139,7 +139,10 @@ def test_physics_ready_authors_kit_visuals_after_model_finalization(monkeypatch)
 
     env._bind_rj45_physics_ready()
 
-    assert events == [("bind", "finalized-model"), ("author", "live-stage")]
+    assert events == [
+        ("bind", "finalized-model"),
+        ("author", "live-stage", {"include_network_switch_presentation": False}),
+    ]
     assert env._rj45_runtime is runtime
 
 
@@ -147,7 +150,7 @@ def test_physics_ready_skips_usd_authoring_without_kit(monkeypatch):
     events = []
     runtime = object()
     builder = SimpleNamespace(
-        author_render_prims=lambda stage: events.append(("author", stage)),
+        author_render_prims=lambda stage, **kwargs: events.append(("author", stage, kwargs)),
         bind=lambda model: events.append(("bind", model)) or runtime,
     )
     env = object.__new__(rj45_env.FrankaRJ45InsertionEnv)
