@@ -22,6 +22,7 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     PICK_INSERT_GRASP_PROXY_FRICTION,
     PICK_INSERT_SUCCESS_MAX_PLUG_SPEED,
     FrankaRJ45PickInsertEnvCfg,
+    pick_insert_reset_dataset_task_contract,
 )
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_reset_dataset_io import (
     PICK_INSERT_GOAL_MAX_ARM_JOINT_SPEED_RAD_S,
@@ -222,6 +223,146 @@ def test_validation_cfg_uses_canonical_goal_thresholds():
     assert cfg.maximum_goal_authored_plug_angle_rad == PICK_INSERT_GOAL_MAX_AUTHORED_PLUG_ANGLE_RAD
     assert cfg.maximum_goal_plug_relative_latch_angle_rad == PICK_INSERT_GOAL_MAX_PLUG_RELATIVE_LATCH_ANGLE_RAD
     assert (cfg.ik_sampler, cfg.ik_seed_count, cfg.ik_iterations, cfg.ik_noise_std) == ("none", 1, 160, 0.0)
+
+
+def test_phase_4_pregrasp_orientation_sampler_contract_has_exact_ranges():
+    cfg = generator.GeneratorCfg()
+    contract = generator._phase_4_pregrasp_orientation_sampling_contract(cfg)
+    runtime_contract = pick_insert_reset_dataset_task_contract(FrankaRJ45PickInsertEnvCfg())
+
+    assert contract == runtime_contract["pick_insert"]["phase_4_pregrasp_orientation_sampling"]
+    assert contract["sampler_version"] == 1
+    assert contract["phase"] == 4
+    assert contract["phase_name"] == "pregrasp"
+    assert contract["starts_grasped"] is False
+    assert contract["clearance_height_m"] == pytest.approx(0.045)
+    assert contract["frame"] == "canonical-grasp-tool-local"
+    assert contract["top_down_tilt_distribution"] == "uniform-solid-angle-cone"
+    assert contract["top_down_tilt_range_rad"] == pytest.approx((0.0, math.radians(25.0)))
+    assert contract["closing_axis_twist_distribution"] == "uniform"
+    assert contract["closing_axis_twist_range_rad"] == pytest.approx((-math.radians(60.0), math.radians(60.0)))
+    assert contract["starts_grasped_phases_use_canonical_orientation"] == (0, 1, 2, 3)
+    assert contract["full_pick_phase_5_orientation_sampling"] == "unchanged-away-pose"
+    assert "phase_4_pregrasp_orientation_sampling" not in generator._canonical_goal_generation_contract(cfg)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("phase_4_pregrasp_maximum_top_down_tilt_error_rad", 0.0, "top-down tilt"),
+        ("phase_4_pregrasp_maximum_top_down_tilt_error_rad", math.radians(25.01), "top-down tilt"),
+        ("phase_4_pregrasp_maximum_closing_axis_twist_error_rad", 0.0, "closing-axis twist"),
+        ("phase_4_pregrasp_maximum_closing_axis_twist_error_rad", math.radians(60.01), "closing-axis twist"),
+    ),
+)
+def test_phase_4_pregrasp_orientation_sampler_rejects_out_of_contract_ranges(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        generator.GeneratorCfg(**{field: value})
+
+
+def test_phase_4_pregrasp_orientation_sampler_is_deterministic_bounded_and_area_uniform():
+    sample_count = 8192
+    first_rng = torch.Generator().manual_seed(4815)
+    second_rng = torch.Generator().manual_seed(4815)
+
+    first = generator.sample_phase_4_pregrasp_orientation_errors(
+        sample_count,
+        device="cpu",
+        rng=first_rng,
+    )
+    second = generator.sample_phase_4_pregrasp_orientation_errors(
+        sample_count,
+        device="cpu",
+        rng=second_rng,
+    )
+
+    torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(first, dim=-1),
+        torch.ones(sample_count),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    canonical_tool_z = torch.tensor((0.0, 0.0, 1.0)).expand(sample_count, -1)
+    sampled_tool_z = generator.math_utils.quat_apply(first, canonical_tool_z)
+    tilt_cosine = sampled_tool_z[:, 2].clamp(-1.0, 1.0)
+    tilt_error = torch.acos(tilt_cosine)
+    # For error = tilt * twist with a tilt axis in tool XY, 2*atan2(z, w)
+    # recovers the signed tool-Z closing-axis twist independently of tilt.
+    twist_error = 2.0 * torch.atan2(first[:, 2], first[:, 3])
+
+    assert float(tilt_error.min()) >= 0.0
+    assert float(tilt_error.max()) <= math.radians(25.0) + 1.0e-6
+    assert float(twist_error.min()) >= -math.radians(60.0) - 1.0e-6
+    assert float(twist_error.max()) <= math.radians(60.0) + 1.0e-6
+    assert float(tilt_error.max()) > math.radians(24.0)
+    assert float(twist_error.min()) < -math.radians(58.0)
+    assert float(twist_error.max()) > math.radians(58.0)
+    expected_mean_cosine = 0.5 * (1.0 + math.cos(math.radians(25.0)))
+    assert float(tilt_cosine.mean()) == pytest.approx(expected_mean_cosine, abs=1.0e-3)
+
+
+def test_phase_4_pregrasp_orientation_sampler_maps_rows_independently_of_batch_partition():
+    whole_rng = torch.Generator().manual_seed(2026)
+    chunked_rng = torch.Generator().manual_seed(2026)
+
+    whole = generator.sample_phase_4_pregrasp_orientation_errors(96, device="cpu", rng=whole_rng)
+    chunked = torch.cat(
+        tuple(generator.sample_phase_4_pregrasp_orientation_errors(24, device="cpu", rng=chunked_rng) for _ in range(4))
+    )
+
+    torch.testing.assert_close(chunked, whole, rtol=0.0, atol=0.0)
+    assert torch.equal(chunked_rng.get_state(), whole_rng.get_state())
+
+
+def test_only_phase_4_consumes_the_pregrasp_orientation_rng_stream():
+    owner = object.__new__(generator.PickInsertResetDatasetGenerator)
+    owner.env = SimpleNamespace(num_envs=8)
+    owner.cfg = generator.GeneratorCfg(batch_size=8)
+    owner.device = torch.device("cpu")
+    owner.random = torch.Generator().manual_seed(91)
+    initial_state = owner.random.get_state().clone()
+
+    assert all(owner._sample_phase_tcp_orientation_error(phase) is None for phase in (0, 1, 2, 3, 5))
+    assert torch.equal(owner.random.get_state(), initial_state)
+    sampled = owner._sample_phase_tcp_orientation_error(4)
+
+    assert sampled is not None
+    assert sampled.shape == (8, 4)
+    assert not torch.equal(owner.random.get_state(), initial_state)
+
+
+def test_desired_tcp_pose_applies_pregrasp_error_after_the_canonical_grasp():
+    owner = object.__new__(generator.PickInsertResetDatasetGenerator)
+    owner.env = SimpleNamespace(cfg=SimpleNamespace(plug_grasp_offset=(0.0, 0.0, 0.0)))
+    owner.device = torch.device("cpu")
+    owner.local_grasp_orientation = torch.tensor(((math.sqrt(0.5), math.sqrt(0.5), 0.0, 0.0),))
+    plug_pose = torch.tensor(((0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0),))
+    orientation_error = generator.math_utils.quat_from_angle_axis(
+        torch.tensor((math.radians(30.0),)),
+        torch.tensor(((0.0, 0.0, 1.0),)),
+    )
+
+    position, orientation = owner._desired_tcp_pose(
+        plug_pose,
+        orientation_error_xyzw=orientation_error,
+    )
+    expected = generator.math_utils.quat_mul(owner.local_grasp_orientation, orientation_error)
+
+    torch.testing.assert_close(position, plug_pose[:, :3])
+    torch.testing.assert_close(orientation, expected)
+
+
+def test_starts_grasped_pickup_construction_rejects_pregrasp_orientation_errors():
+    owner = object.__new__(generator.PickInsertResetDatasetGenerator)
+
+    with pytest.raises(ValueError, match="Starts-grasped.*canonical grasp orientation"):
+        owner._construct_pickup(
+            torch.zeros((1, 7)),
+            torch.zeros((1, 7)),
+            acquire=True,
+            pregrasp_orientation_error_xyzw=torch.tensor(((0.0, 0.0, 0.0, 1.0),)),
+        )
 
 
 def test_generator_contract_selects_the_shared_pick_insert_recovery_policy():
@@ -2220,7 +2361,11 @@ def test_construction_robot_staging_freezes_failed_lane_and_preserves_open_targe
             return self.clearance_pose.clone()
 
     class FakeIK:
-        def solve(self, *_args, **_kwargs):
+        def __init__(self):
+            self.orientations: list[torch.Tensor] = []
+
+        def solve(self, _position, orientation, *_args, **_kwargs):
+            self.orientations.append(orientation.clone())
             return SimpleNamespace(
                 arm_q=torch.tensor(((0.3,) * 7, (0.2,) * 7)),
                 valid=torch.tensor((True, True)),
@@ -2258,13 +2403,21 @@ def test_construction_robot_staging_freezes_failed_lane_and_preserves_open_targe
     pickup_pose = torch.zeros((2, 7))
     pickup_pose[:, 2] = 0.1
     pickup_pose[:, 3] = 1.0
-    expected_position, expected_orientation = owner._desired_tcp_pose(pickup_pose)
+    orientation_error = generator.math_utils.quat_from_angle_axis(
+        torch.tensor((math.radians(20.0),) * 2),
+        torch.tensor(((0.0, 0.0, 1.0),) * 2),
+    )
+    expected_position, expected_orientation = owner._desired_tcp_pose(
+        pickup_pose,
+        orientation_error_xyzw=orientation_error,
+    )
     expected_position[:, 2] += owner.cfg.grasp_open_clearance_m
     env.clearance_pose = torch.cat((expected_position, expected_orientation), dim=-1)
 
     staged_target, valid, evidence = owner._stage_robot_for_pickup(
         pickup_pose,
         active_mask=torch.ones(2, dtype=torch.bool),
+        orientation_error_xyzw=orientation_error,
     )
 
     assert valid.tolist() == [False, True]
@@ -2284,6 +2437,7 @@ def test_construction_robot_staging_freezes_failed_lane_and_preserves_open_targe
     assert owner._ik_solve_call_count == 1
     assert evidence["ik_solve_call_count"] == 1
     assert evidence["control_step_count"] == 1
+    torch.testing.assert_close(owner.ik.orientations[0], expected_orientation)
     assert all(torch.equal(finger, owner.open_finger_q) for _, finger in env.target_writes)
 
 
@@ -3045,6 +3199,9 @@ def test_certificate_generation_restores_row_rng_and_embeds_state_not_path(monke
     } == generator._pickup_construction_sequence_contract()
     assert payload["metadata"]["initial_state_policy"]["scripted_recovery"] == (
         PICK_INSERT_RECOVERY_CARTESIAN_C2_POLICY
+    )
+    assert payload["metadata"]["initial_state_policy"]["phase_4_pregrasp_orientation_sampling"] == (
+        generator._phase_4_pregrasp_orientation_sampling_contract(owner.cfg)
     )
     assert "certificate_input" not in repr(payload["metadata"])
 
@@ -4210,6 +4367,51 @@ def test_generation_checkpoint_interrupted_resume_exactly_matches_fresh_576_row_
     )
 
 
+def test_fast_phase_4_ik_uses_the_bounded_pregrasp_orientation_sample():
+    owner = object.__new__(generator.PickInsertResetDatasetGenerator)
+    owner.env = SimpleNamespace(
+        num_envs=4,
+        cfg=SimpleNamespace(plug_grasp_offset=(0.0, 0.0, 0.0)),
+    )
+    owner.cfg = generator.GeneratorCfg(batch_size=4)
+    owner.device = torch.device("cpu")
+    owner.random = torch.Generator().manual_seed(37)
+    owner.plug_index = 0
+    owner.local_grasp_orientation = torch.tensor(((math.sqrt(0.5), math.sqrt(0.5), 0.0, 0.0),) * 4)
+    owner.closed_finger_target = torch.zeros((4, 2))
+    owner.open_finger_q = torch.full((4, 2), 0.04)
+    owner.home_arm_q = torch.zeros((4, 7))
+    observed: dict[str, torch.Tensor] = {}
+
+    def solve(position, orientation, finger_target, *, arm_seed):
+        observed.update(
+            position=position.clone(),
+            orientation=orientation.clone(),
+            finger_target=finger_target.clone(),
+            arm_seed=arm_seed.clone(),
+        )
+        return SimpleNamespace(arm_q=arm_seed.clone(), valid=torch.ones(4, dtype=torch.bool))
+
+    owner._solve_ik = solve
+    task_q = torch.zeros((4, 1, 7))
+    task_q[..., 6] = 1.0
+    expected_rng = torch.Generator().manual_seed(37)
+    expected_error = generator.sample_phase_4_pregrasp_orientation_errors(
+        4,
+        device="cpu",
+        rng=expected_rng,
+    )
+    expected_orientation = generator.math_utils.quat_mul(owner.local_grasp_orientation, expected_error)
+
+    _, finger_target = owner._fast_row_ik(4, task_q, torch.ones((4, 7)))
+
+    torch.testing.assert_close(observed["position"][:, 2], torch.full((4,), 0.045))
+    torch.testing.assert_close(observed["orientation"], expected_orientation)
+    assert torch.equal(finger_target, owner.open_finger_q)
+    assert torch.equal(observed["finger_target"], owner.open_finger_q)
+    assert torch.equal(observed["arm_seed"], owner.home_arm_q)
+
+
 def test_fast_ik_generator_mode_is_explicit_and_legacy_remains_default():
     assert generator.GeneratorCfg().generation_mode == generator._GENERATION_MODE_PHYSICAL_ORACLE
     assert (
@@ -4298,8 +4500,7 @@ def test_fast_generation_embeds_distinct_policy_and_metrics(monkeypatch):
     owner.attempt_counts = [0] * 6
     owner.rejection_counts = {phase: {} for phase in range(6)}
     owner.accepted_oracle_metrics = {
-        phase: [{"checks": dict(generator.FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY["checks"])}]
-        for phase in range(6)
+        phase: [{"checks": dict(generator.FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY["checks"])}] for phase in range(6)
     }
     owner.validate_goal_certificate = lambda value: value
     calls: list[int] = []

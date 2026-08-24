@@ -78,10 +78,21 @@ class PickInsertStageContext(ManagerTermBase):
 
     def __call__(self, env: FrankaRJ45PickInsertEnv) -> torch.Tensor:
         gripper = env.action_manager.get_term("gripper_action")
-        tcp_distance = torch.linalg.vector_norm(env.tcp_pose_e()[:, :3] - env.plug_grasp_position_e(), dim=-1)
-        self.proxy_contact.copy_(env.bilateral_grasp_proxy_contact_mask())
-        bilateral_contact = gripper.bilateral_contact & self.proxy_contact
-        self.current_grasp.copy_(bilateral_contact & (tcp_distance <= float(env.cfg.max_tcp_grasp_distance)))
+        tcp_pose = env.tcp_pose_e()
+        tcp_distance = torch.linalg.vector_norm(tcp_pose[:, :3] - env.plug_grasp_position_e(), dim=-1)
+        acquisition_tolerance = float(env.cfg.grasp_acquisition_axis_tolerance_rad)
+        retention_tolerance = float(env.cfg.grasp_retention_axis_tolerance_rad)
+        alignment_tolerance = acquisition_tolerance + self.ever_grasped.to(tcp_distance.dtype) * (
+            retention_tolerance - acquisition_tolerance
+        )
+        contact_aligned = env.grasp_contact_alignment_mask(
+            alignment_tolerance,
+            tcp_orientation_xyzw=tcp_pose[:, 3:7],
+            proxy_contact_mask_out=self.proxy_contact,
+        )
+        self.current_grasp.copy_(
+            gripper.bilateral_contact & contact_aligned & (tcp_distance <= float(env.cfg.max_tcp_grasp_distance))
+        )
         acquired = self.current_grasp & (tcp_distance <= float(env.cfg.grasp_acquisition_distance_m))
         self.new_grasp.copy_(acquired & ~self.ever_grasped)
         self.ever_grasped |= acquired

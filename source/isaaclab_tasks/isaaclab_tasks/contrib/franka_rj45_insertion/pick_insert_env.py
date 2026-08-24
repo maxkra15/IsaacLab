@@ -117,25 +117,33 @@ def _sample_procedural_scene_poses(
     )
 
 
-def _bilateral_grasp_proxy_contact_mask(
+def _grasp_proxy_face_assignment_masks(
     contact_count: torch.Tensor,
     contact_slots: torch.Tensor,
     shape0: torch.Tensor,
     shape1: torch.Tensor,
+    point0: torch.Tensor,
+    point1: torch.Tensor,
     shape_world: torch.Tensor,
     left_finger_shape: torch.Tensor,
     right_finger_shape: torch.Tensor,
     grasp_proxy_shape: torch.Tensor,
+    *,
+    proxy_center: torch.Tensor,
+    proxy_half_extents: torch.Tensor,
+    proxy_face_tolerance_m: float,
     num_envs: int,
-) -> torch.Tensor:
-    """Return worlds with simultaneous left- and right-finger grasp-proxy contacts."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return canonical and finger-swapped exclusive opposing proxy-face masks."""
     capacity = contact_slots.numel()
     result = torch.zeros(num_envs, device=contact_slots.device, dtype=torch.bool)
     if capacity == 0 or shape_world.numel() == 0:
-        return result
+        return result, result.clone()
 
     shape0 = shape0[:capacity].long()
     shape1 = shape1[:capacity].long()
+    point0 = point0[:capacity]
+    point1 = point1[:capacity]
     shape_count = shape_world.numel()
     valid_shape = (shape0 >= 0) & (shape0 < shape_count) & (shape1 >= 0) & (shape1 < shape_count)
     safe_shape0 = shape0.clamp(0, shape_count - 1)
@@ -149,18 +157,138 @@ def _bilateral_grasp_proxy_contact_mask(
     active_count = contact_count.reshape(-1)[0].long().clamp(0, capacity)
     active = contact_slots < active_count
     valid_contact = active & valid_shape & valid_world
-    left_contact = (left_finger_shape[safe_shape0] & grasp_proxy_shape[safe_shape1]) | (
-        left_finger_shape[safe_shape1] & grasp_proxy_shape[safe_shape0]
+    proxy_is_shape0 = grasp_proxy_shape[safe_shape0]
+    proxy_is_shape1 = grasp_proxy_shape[safe_shape1]
+    left_contact = (left_finger_shape[safe_shape0] & proxy_is_shape1) | (
+        left_finger_shape[safe_shape1] & proxy_is_shape0
     )
-    right_contact = (right_finger_shape[safe_shape0] & grasp_proxy_shape[safe_shape1]) | (
-        right_finger_shape[safe_shape1] & grasp_proxy_shape[safe_shape0]
+    right_contact = (right_finger_shape[safe_shape0] & proxy_is_shape1) | (
+        right_finger_shape[safe_shape1] & proxy_is_shape0
     )
-    left_count = torch.zeros(num_envs, device=contact_slots.device, dtype=torch.long)
-    right_count = torch.zeros_like(left_count)
-    left_count.scatter_add_(0, safe_world, (valid_contact & left_contact).long())
-    right_count.scatter_add_(0, safe_world, (valid_contact & right_contact).long())
+
+    # Newton reports each point in its shape body's frame. The proxy shape has
+    # an identity rotation under the plug body, so subtracting its center gives
+    # the coordinates needed to distinguish the two intended finger faces.
+    proxy_point = torch.where(proxy_is_shape0[:, None], point0, point1)
+    proxy_local_point = proxy_point - proxy_center
+    on_x_surface = (proxy_local_point[:, 0].abs() - proxy_half_extents[0]).abs() <= proxy_face_tolerance_m
+    valid_x_face = valid_contact & torch.isfinite(proxy_local_point).all(dim=-1) & on_x_surface
+    positive_x = valid_x_face & (proxy_local_point[:, 0] > 0.0)
+    negative_x = valid_x_face & (proxy_local_point[:, 0] < 0.0)
+
+    # Accumulate the four finger/face classes with one scatter over the fixed
+    # contact capacity rather than launching one scatter per class.
+    finger_contact = left_contact | right_contact
+    negative_face = negative_x & ~positive_x
+    contact_class = 2 * right_contact.long() + negative_face.long()
+    flat_contact_count = torch.zeros(4 * num_envs, device=contact_slots.device, dtype=torch.long)
+    flat_contact_count.scatter_add_(
+        0,
+        4 * safe_world + contact_class,
+        (finger_contact & (positive_x | negative_x)).long(),
+    )
+    face_contact = flat_contact_count.view(num_envs, 4) > 0
+    left_positive, left_negative, right_positive, right_negative = face_contact.unbind(dim=-1)
+    canonical_faces = left_positive & ~left_negative & right_negative & ~right_positive
+    swapped_faces = left_negative & ~left_positive & right_positive & ~right_negative
     no_overflow = contact_count.reshape(-1)[0] <= capacity
-    return (left_count > 0) & (right_count > 0) & no_overflow
+    return canonical_faces & no_overflow, swapped_faces & no_overflow
+
+
+def _bilateral_grasp_proxy_contact_mask(
+    contact_count: torch.Tensor,
+    contact_slots: torch.Tensor,
+    shape0: torch.Tensor,
+    shape1: torch.Tensor,
+    point0: torch.Tensor,
+    point1: torch.Tensor,
+    shape_world: torch.Tensor,
+    left_finger_shape: torch.Tensor,
+    right_finger_shape: torch.Tensor,
+    grasp_proxy_shape: torch.Tensor,
+    *,
+    proxy_center: torch.Tensor,
+    proxy_half_extents: torch.Tensor,
+    proxy_face_tolerance_m: float,
+    num_envs: int,
+) -> torch.Tensor:
+    """Return worlds whose fingers contact exclusive opposing proxy X faces."""
+    canonical_faces, swapped_faces = _grasp_proxy_face_assignment_masks(
+        contact_count,
+        contact_slots,
+        shape0,
+        shape1,
+        point0,
+        point1,
+        shape_world,
+        left_finger_shape,
+        right_finger_shape,
+        grasp_proxy_shape,
+        proxy_center=proxy_center,
+        proxy_half_extents=proxy_half_extents,
+        proxy_face_tolerance_m=proxy_face_tolerance_m,
+        num_envs=num_envs,
+    )
+    return canonical_faces | swapped_faces
+
+
+def _grasp_axis_alignment_components(
+    current_orientation_xyzw: torch.Tensor,
+    target_orientation_xyzw: torch.Tensor,
+    max_axis_angle_rad: float | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return signed tool/closing-axis alignment, threshold, and finite mask [rad]."""
+    current_norm = torch.linalg.vector_norm(current_orientation_xyzw, dim=-1)
+    target_norm = torch.linalg.vector_norm(target_orientation_xyzw, dim=-1)
+    relative = math_utils.normalize(
+        math_utils.quat_mul(math_utils.quat_conjugate(target_orientation_xyzw), current_orientation_xyzw)
+    )
+    x, y, z, _ = relative.unbind(dim=-1)
+    # These are the Z/Z and Y/Y diagonal terms of the relative rotation.
+    tool_axis_alignment = 1.0 - 2.0 * (x.square() + y.square())
+    closing_axis_alignment = 1.0 - 2.0 * (x.square() + z.square())
+    minimum_alignment = torch.cos(torch.as_tensor(max_axis_angle_rad, device=relative.device, dtype=relative.dtype))
+    finite = (
+        torch.isfinite(current_orientation_xyzw).all(dim=-1)
+        & torch.isfinite(target_orientation_xyzw).all(dim=-1)
+        & torch.isfinite(minimum_alignment)
+        & (current_norm > 1.0e-6)
+        & (target_norm > 1.0e-6)
+    )
+    return tool_axis_alignment, closing_axis_alignment, minimum_alignment, finite
+
+
+def _symmetry_aware_grasp_alignment_mask(
+    current_orientation_xyzw: torch.Tensor,
+    target_orientation_xyzw: torch.Tensor,
+    max_axis_angle_rad: float | torch.Tensor,
+) -> torch.Tensor:
+    """Test signed tool-Z and unsigned finger-closing-Y alignment [rad]."""
+    tool_axis_alignment, closing_axis_alignment, minimum_alignment, finite = _grasp_axis_alignment_components(
+        current_orientation_xyzw,
+        target_orientation_xyzw,
+        max_axis_angle_rad,
+    )
+    return finite & (tool_axis_alignment >= minimum_alignment) & (closing_axis_alignment.abs() >= minimum_alignment)
+
+
+def _coupled_grasp_contact_alignment_mask(
+    canonical_face_contact: torch.Tensor,
+    swapped_face_contact: torch.Tensor,
+    current_orientation_xyzw: torch.Tensor,
+    target_orientation_xyzw: torch.Tensor,
+    max_axis_angle_rad: float | torch.Tensor,
+) -> torch.Tensor:
+    """Couple signed closing-axis alignment to the matching proxy-face assignment [rad]."""
+    tool_axis_alignment, closing_axis_alignment, minimum_alignment, finite = _grasp_axis_alignment_components(
+        current_orientation_xyzw,
+        target_orientation_xyzw,
+        max_axis_angle_rad,
+    )
+    face_axis_match = (canonical_face_contact & (closing_axis_alignment >= minimum_alignment)) | (
+        swapped_face_contact & (closing_axis_alignment <= -minimum_alignment)
+    )
+    return finite & (tool_axis_alignment >= minimum_alignment) & face_axis_match
 
 
 class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
@@ -691,6 +819,8 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
         self._pending_task_pose_history_restores = still_pending
 
     def _bind_grasp_proxy_contacts(self) -> None:
+        from .physics import GRASP_PROXY_CENTER, GRASP_PROXY_HALF_EXTENTS
+
         contacts, destination_view, _ = NewtonCouplerManager.get_proxy_contact_data(
             RIGID_ENTRY,
             RJ45_ENTRY,
@@ -724,6 +854,8 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
         self._grasp_contact_count = wp.to_torch(contacts.rigid_contact_count)
         self._grasp_contact_shape0 = wp.to_torch(contacts.rigid_contact_shape0)
         self._grasp_contact_shape1 = wp.to_torch(contacts.rigid_contact_shape1)
+        self._grasp_contact_point0 = wp.to_torch(contacts.rigid_contact_point0)
+        self._grasp_contact_point1 = wp.to_torch(contacts.rigid_contact_point1)
         self._grasp_contact_slots = torch.arange(
             int(contacts.rigid_contact_max),
             device=self.device,
@@ -739,20 +871,34 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
         self._grasp_proxy_contact_shape = torch.as_tensor(
             label_masks["grasp proxy"], device=self.device, dtype=torch.bool
         )
+        self._grasp_proxy_center = torch.as_tensor(GRASP_PROXY_CENTER, device=self.device, dtype=torch.float32)
+        self._grasp_proxy_half_extents = torch.as_tensor(
+            GRASP_PROXY_HALF_EXTENTS, device=self.device, dtype=torch.float32
+        )
 
-    def bilateral_grasp_proxy_contact_mask(self) -> torch.Tensor:
-        """Return environments where both fingers contact the plug grasp proxy."""
-        return _bilateral_grasp_proxy_contact_mask(
+    def _grasp_proxy_face_assignment_masks(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return canonical and finger-swapped proxy-face contact assignments."""
+        return _grasp_proxy_face_assignment_masks(
             self._grasp_contact_count,
             self._grasp_contact_slots,
             self._grasp_contact_shape0,
             self._grasp_contact_shape1,
+            self._grasp_contact_point0,
+            self._grasp_contact_point1,
             self._grasp_contact_shape_world,
             self._left_finger_contact_shape,
             self._right_finger_contact_shape,
             self._grasp_proxy_contact_shape,
-            self.num_envs,
+            proxy_center=self._grasp_proxy_center,
+            proxy_half_extents=self._grasp_proxy_half_extents,
+            proxy_face_tolerance_m=float(self.cfg.grasp_proxy_face_tolerance_m),
+            num_envs=self.num_envs,
         )
+
+    def bilateral_grasp_proxy_contact_mask(self) -> torch.Tensor:
+        """Return environments where the fingers contact opposing proxy X faces."""
+        canonical_faces, swapped_faces = self._grasp_proxy_face_assignment_masks()
+        return canonical_faces | swapped_faces
 
     def _load_reset_dataset(self, configured_path: str) -> None:
         path = _resolve_reset_dataset_path(configured_path)
@@ -984,6 +1130,47 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
         position = self.plug_grasp_position_e()
         orientation = math_utils.quat_unique(math_utils.quat_mul(plug[:, 3:7], self._plug_grasp_orientation))
         return torch.cat((position, orientation), dim=-1)
+
+    def _grasp_target_orientation_xyzw(self) -> torch.Tensor:
+        body_q, _ = self._newton_state_tensors()
+        plug_orientation_xyzw = body_q[self._task_body_ids[:, self._plug_task_body_index], 3:7]
+        return math_utils.quat_unique(math_utils.quat_mul(plug_orientation_xyzw, self._plug_grasp_orientation))
+
+    def grasp_axis_alignment_mask(
+        self,
+        max_axis_angle_rad: float | torch.Tensor,
+        *,
+        tcp_orientation_xyzw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return symmetry-aware tool and finger alignment within the given tolerance [rad]."""
+        if tcp_orientation_xyzw is None:
+            tcp_orientation_xyzw = self.tcp_pose_e()[:, 3:7]
+        return _symmetry_aware_grasp_alignment_mask(
+            tcp_orientation_xyzw,
+            self._grasp_target_orientation_xyzw(),
+            max_axis_angle_rad,
+        )
+
+    def grasp_contact_alignment_mask(
+        self,
+        max_axis_angle_rad: float | torch.Tensor,
+        *,
+        tcp_orientation_xyzw: torch.Tensor | None = None,
+        proxy_contact_mask_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return face-assignment-coupled grasp contact and axis alignment [rad]."""
+        if tcp_orientation_xyzw is None:
+            tcp_orientation_xyzw = self.tcp_pose_e()[:, 3:7]
+        canonical_faces, swapped_faces = self._grasp_proxy_face_assignment_masks()
+        if proxy_contact_mask_out is not None:
+            proxy_contact_mask_out.copy_(canonical_faces | swapped_faces)
+        return _coupled_grasp_contact_alignment_mask(
+            canonical_faces,
+            swapped_faces,
+            tcp_orientation_xyzw,
+            self._grasp_target_orientation_xyzw(),
+            max_axis_angle_rad,
+        )
 
     def tcp_velocity_e(self) -> torch.Tensor:
         """TCP spatial velocity; the rigid offset correction is negligible for policy input."""

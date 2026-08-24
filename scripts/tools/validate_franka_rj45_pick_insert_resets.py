@@ -33,6 +33,7 @@ from _franka_rj45_reset_tools import (
     RJ45PickInsertResetToolEnv,
     _active_waypoint_count,
     _PerLaneTargetHold,
+    _runtime_bilateral_grasp_proxy_contact_mask,
     advance_exact_success_dwell,
     advance_reset_absolute_target_hold,
     collision_metrics,
@@ -1022,6 +1023,7 @@ def _settle_physical_grasp(
     all_finite = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
     all_collision_free = all_finite.clone()
     all_bilateral = all_finite.clone()
+    all_grasp_valid = all_finite.clone()
     all_drives_disabled = all_finite.clone()
     maximum_cable_speed = torch.zeros(env.num_envs, device=env.device)
     maximum_plug_linear_speed = torch.zeros_like(maximum_cable_speed)
@@ -1038,7 +1040,12 @@ def _settle_physical_grasp(
         cable_speed = torch.linalg.vector_norm(task_qd[:, cable_slice, :3], dim=-1).amax(dim=-1)
         plug_linear_speed = torch.linalg.vector_norm(task_qd[:, plug_index, :3], dim=-1)
         plug_angular_speed = torch.linalg.vector_norm(task_qd[:, plug_index, 3:6], dim=-1)
-        bilateral = (collision.left_grasp_contact_count > 0) & (collision.right_grasp_contact_count > 0)
+        bilateral = _runtime_bilateral_grasp_proxy_contact_mask(
+            env,
+            collision.left_grasp_contact_count,
+            collision.right_grasp_contact_count,
+        )
+        grasp = grasp_metrics(env, closed_target, retaining_grasp=False)
         finite = task_state_is_finite_and_normalized(task_q, task_qd)
         drives_disabled = torch.full_like(all_finite, _drive_disabled(env))
         if not bool(drives_disabled.all()):
@@ -1046,6 +1053,7 @@ def _settle_physical_grasp(
         all_finite.logical_and_(finite)
         all_collision_free.logical_and_(collision.valid)
         all_bilateral.logical_and_(bilateral)
+        all_grasp_valid.logical_and_(grasp.valid)
         all_drives_disabled.logical_and_(drives_disabled)
         maximum_cable_speed.copy_(torch.maximum(maximum_cable_speed, cable_speed))
         maximum_plug_linear_speed.copy_(torch.maximum(maximum_plug_linear_speed, plug_linear_speed))
@@ -1055,6 +1063,7 @@ def _settle_physical_grasp(
             lane_hold.deactivate(~finite, reason="validator-post-contact-non-finite")
             lane_hold.deactivate(~collision.valid, reason="validator-post-contact-collision")
             lane_hold.deactivate(~bilateral, reason="validator-post-contact-lost-bilateral-contact")
+            lane_hold.deactivate(~grasp.valid, reason="validator-post-contact-invalid-grasp")
         for pair in collision.invalid_contact_pairs:
             if pair not in invalid_pairs and len(invalid_pairs) < 64:
                 invalid_pairs.append(pair)
@@ -1076,6 +1085,7 @@ def _settle_physical_grasp(
         all_finite
         & all_collision_free
         & all_bilateral
+        & all_grasp_valid
         & all_drives_disabled
         & (not any_overflow)
         & (final_cable_speed <= cfg.maximum_row_cable_speed_m_s)
@@ -1610,7 +1620,7 @@ def _goal_replay(
         & (stored_plug_relative_latch_angle <= cfg.maximum_goal_plug_relative_latch_angle_rad)
         & (final_plug_relative_latch_angle <= cfg.maximum_goal_plug_relative_latch_angle_rad)
     )
-    grasp = grasp_metrics(env, repeated["finger_joint_target"])
+    grasp = grasp_metrics(env, repeated["finger_joint_target"], retaining_grasp=True)
     collision = collision_metrics(env)
     if collision.contact_overflow:
         raise RuntimeError("Global contact-buffer overflow at the canonical goal replay boundary.")
@@ -2247,7 +2257,7 @@ def validate_payload(  # noqa: C901
             oracle_prerequisites = real_lane_mask & reset_stable
 
             if _PHASE_STARTS_GRASPED[phase]:
-                grasp = grasp_metrics(env, state["finger_joint_target"])
+                grasp = grasp_metrics(env, state["finger_joint_target"], retaining_grasp=True)
                 acquired = (
                     oracle_prerequisites
                     & grasp.valid

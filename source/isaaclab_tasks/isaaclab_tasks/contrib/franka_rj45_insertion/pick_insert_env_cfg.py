@@ -60,6 +60,16 @@ PICK_INSERT_OPEN_FINGER_POSITION = 0.04
 """Per-finger Franka joint position for a physically open pick-insert gripper [m]."""
 PICK_INSERT_GRASP_PROXY_FRICTION = 4.5
 """Raw Coulomb friction of the pick-only plug grasp proxy."""
+PICK_INSERT_GRASP_PROXY_FACE_TOLERANCE_M = 5.0e-4
+"""Tolerance for classifying a contact on a grasp-proxy face [m]."""
+PICK_INSERT_PHASE_4_PREGRASP_HEIGHT_M = 0.045
+"""Vertical clearance of phase-4 open-pregrasp reset rows [m]."""
+PICK_INSERT_PHASE_4_PREGRASP_ORIENTATION_SAMPLER_VERSION = 1
+"""Version of the phase-4 tool-local orientation sampler contract."""
+PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_TOP_DOWN_TILT_ERROR_RAD = math.radians(25.0)
+"""Maximum phase-4 top-down tool-axis error [rad]."""
+PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_CLOSING_AXIS_TWIST_ERROR_RAD = math.radians(60.0)
+"""Maximum symmetric phase-4 finger-closing-axis twist error [rad]."""
 PICK_INSERT_EFFECTIVE_GRASP_FRICTION = 3.0
 """Effective finger/proxy friction under Newton's geometric-mean combine rule."""
 PICK_INSERT_SUCCESS_MAX_PLUG_SPEED = 0.10
@@ -248,6 +258,8 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
     plug_grasp_orientation_xyzw: tuple[float, float, float, float] = PICK_INSERT_GRASP_QUAT_PLUG_XYZW
     grasp_proxy_friction: float = PICK_INSERT_GRASP_PROXY_FRICTION
     """Raw Coulomb friction assigned only to the pick-insert grasp proxy."""
+    grasp_proxy_face_tolerance_m: float = PICK_INSERT_GRASP_PROXY_FACE_TOLERANCE_M
+    """Tolerance for opposing local-X grasp-proxy surface contacts [m]."""
     success_max_plug_speed: float = PICK_INSERT_SUCCESS_MAX_PLUG_SPEED
     """Maximum success velocity norm with [m/s] linear and [rad/s] angular components."""
 
@@ -283,6 +295,10 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
     arm_reset_joint_noise: float = 0.12
 
     grasp_acquisition_distance_m: float = 0.02
+    grasp_acquisition_axis_tolerance_rad: float = math.radians(15.0)
+    """Maximum tool and finger-axis error for grasp acquisition [rad]."""
+    grasp_retention_axis_tolerance_rad: float = math.radians(25.0)
+    """Maximum tool and finger-axis error after grasp acquisition [rad]."""
     grasp_loss_grace_steps: int = 3
     transport_stage_distance_m: float = 0.08
     preinsert_stage_distance_m: float = 0.035
@@ -377,6 +393,7 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
             "minimum_pickup_socket_distance",
             "arm_reset_joint_noise",
             "grasp_acquisition_distance_m",
+            "grasp_proxy_face_tolerance_m",
             "transport_stage_distance_m",
             "preinsert_stage_distance_m",
             "reach_reward_scale_m",
@@ -388,6 +405,18 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
+        acquisition_tolerance = float(self.grasp_acquisition_axis_tolerance_rad)
+        retention_tolerance = float(self.grasp_retention_axis_tolerance_rad)
+        if not (
+            math.isfinite(acquisition_tolerance)
+            and math.isfinite(retention_tolerance)
+            and 0.0 < acquisition_tolerance < retention_tolerance < math.pi / 2.0
+        ):
+            raise ValueError("grasp axis tolerances must be finite and satisfy 0 < acquisition < retention < pi/2.")
+        from .physics import GRASP_PROXY_HALF_EXTENTS
+
+        if float(self.grasp_proxy_face_tolerance_m) >= min(GRASP_PROXY_HALF_EXTENTS):
+            raise ValueError("grasp_proxy_face_tolerance_m must be smaller than every proxy half extent.")
         if isinstance(self.grasp_loss_grace_steps, bool) or int(self.grasp_loss_grace_steps) < 1:
             raise ValueError("grasp_loss_grace_steps must be a positive integer.")
         if not 0.0 < float(self.reach_orientation_reward_weight) < 1.0:
@@ -487,7 +516,7 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
     base_contract_version = int(contract["contract_version"])
     topology = pick_insert_topology_cfg(cfg)
     layout = make_rj45_task_layout(topology)
-    contract["contract_version"] = 6
+    contract["contract_version"] = 7
     contract["base_contract_version"] = base_contract_version
     contract["task_variant"] = "franka-rj45-pick-insert"
     # Runtime binds verified absolute paths immediately before scene startup.
@@ -539,8 +568,24 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
     )
     from .task_success import RJ45_GOAL_LOCAL_SUCCESS_PREDICATE_VERSION
 
+    contract["validation_geometry"]["grasp"] = {
+        "contract_version": 2,
+        "acquisition_axis_tolerance_rad": float(cfg.grasp_acquisition_axis_tolerance_rad),
+        "retention_axis_tolerance_rad": float(cfg.grasp_retention_axis_tolerance_rad),
+        "tool_axis": (0.0, 0.0, 1.0),
+        "tool_axis_comparison": "signed",
+        "finger_closing_axis": (0.0, 1.0, 0.0),
+        "finger_closing_axis_comparison": "signed-coupled-to-proxy-face-assignment",
+        "proxy_contact_faces": "exclusive-opposing-local-x-surface",
+        "canonical_proxy_face_assignment": "left:+local-x,right:-local-x",
+        "canonical_closing_axis_comparison": "relative-rotation-yy>=cos(tolerance)",
+        "swapped_proxy_face_assignment": "left:-local-x,right:+local-x",
+        "swapped_closing_axis_comparison": "relative-rotation-yy<=-cos(tolerance)",
+        "proxy_face_tolerance_m": float(cfg.grasp_proxy_face_tolerance_m),
+    }
+
     contract["pick_insert"] = {
-        "semantics_version": 6,
+        "semantics_version": 7,
         "goal_local_success_predicate_version": RJ45_GOAL_LOCAL_SUCCESS_PREDICATE_VERSION,
         "phase_names": PICK_INSERT_PHASE_NAMES,
         "plug_grasp_orientation_xyzw": tuple(cfg.plug_grasp_orientation_xyzw),
@@ -568,6 +613,7 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
             "minimum_tcp_grasp_distance_span_m": float(cfg.reset_dataset_min_full_pick_tcp_distance_span),
         },
         "full_pick_start_fraction": float(cfg.full_pick_start_fraction),
+        "phase_4_pregrasp_orientation_sampling": pick_insert_phase_4_pregrasp_orientation_sampling_contract(),
         "grasp_acquisition_distance_m": float(cfg.grasp_acquisition_distance_m),
         "grasp_loss_grace_steps": int(cfg.grasp_loss_grace_steps),
         "transport_stage_distance_m": float(cfg.transport_stage_distance_m),
@@ -585,6 +631,33 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
         "terminations": _config_contract(cfg.terminations),
     }
     return contract
+
+
+def pick_insert_phase_4_pregrasp_orientation_sampling_contract() -> dict[str, object]:
+    """Return the immutable phase-4 open-pregrasp reset sampler contract."""
+    maximum_tilt = PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_TOP_DOWN_TILT_ERROR_RAD
+    maximum_twist = PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_CLOSING_AXIS_TWIST_ERROR_RAD
+    return {
+        "sampler_version": PICK_INSERT_PHASE_4_PREGRASP_ORIENTATION_SAMPLER_VERSION,
+        "phase": 4,
+        "phase_name": PICK_INSERT_PHASE_NAMES[4],
+        "starts_grasped": False,
+        "clearance_height_m": PICK_INSERT_PHASE_4_PREGRASP_HEIGHT_M,
+        "frame": "canonical-grasp-tool-local",
+        "composition": "canonical-tcp * top-down-tilt * closing-axis-twist",
+        "top_down_tilt_distribution": "uniform-solid-angle-cone",
+        "top_down_tilt_range_rad": (0.0, maximum_tilt),
+        "tilt_azimuth_distribution": "uniform",
+        "tilt_azimuth_range_rad": (-math.pi, math.pi),
+        "closing_axis_twist_distribution": "uniform",
+        "closing_axis_twist_range_rad": (-maximum_twist, maximum_twist),
+        "sampled_once_per_candidate": True,
+        "rng_owner": "PickInsertResetDatasetGenerator.random",
+        "additional_ik_solves_per_candidate": 0,
+        "additional_simulation_steps_per_candidate": 0,
+        "starts_grasped_phases_use_canonical_orientation": (0, 1, 2, 3),
+        "full_pick_phase_5_orientation_sampling": "unchanged-away-pose",
+    }
 
 
 def pick_insert_play_reset_seed_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> dict[str, object]:

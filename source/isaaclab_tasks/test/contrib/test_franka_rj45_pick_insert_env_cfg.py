@@ -5,6 +5,7 @@
 
 """Configuration and pure task-logic tests for Franka RJ45 pick-and-insert."""
 
+import math
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -44,7 +45,9 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.physics import (
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env import (
     FrankaRJ45PickInsertEnv,
     _bilateral_grasp_proxy_contact_mask,
+    _coupled_grasp_contact_alignment_mask,
     _sample_procedural_scene_poses,
+    _symmetry_aware_grasp_alignment_mask,
 )
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     PICK_INSERT_CLOSED_FINGER_POSITION,
@@ -868,6 +871,90 @@ def test_pick_insert_grasp_is_table_clearance_tilted_with_fingers_across_plug_wi
     assert torch.allclose(rotated[0], torch.tensor([1.0, 0.0, 0.0]), atol=1.0e-6)
     assert torch.allclose(rotated[1], torch.tensor([0.0, 0.0, -1.0]), atol=1.0e-6)
 
+    # The bundled Franka URDF assigns the left/right finger joints +Y/-Y in
+    # tool coordinates.  The authored grasp therefore places them on the
+    # proxy's +X/-X sides respectively.
+    finger_directions_tool = torch.tensor([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]])
+    finger_directions_plug = math_utils.quat_apply(orientation, finger_directions_tool)
+    assert torch.allclose(
+        finger_directions_plug,
+        torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+        atol=1.0e-6,
+    )
+
+
+def test_pick_insert_grasp_alignment_is_top_down_and_half_turn_symmetric():
+    zero = torch.zeros(5)
+    current = math_utils.quat_from_euler_xyz(
+        torch.tensor([0.0, 0.0, 0.0, math.radians(20.0), math.pi]),
+        zero,
+        torch.tensor([0.0, math.pi, math.pi / 2.0, 0.0, 0.0]),
+    )
+    target = math_utils.quat_from_euler_xyz(zero, zero, zero)
+
+    acquisition = _symmetry_aware_grasp_alignment_mask(current, target, math.radians(15.0))
+    retention = _symmetry_aware_grasp_alignment_mask(current, target, math.radians(25.0))
+
+    assert acquisition.tolist() == [True, True, False, False, False]
+    assert retention.tolist() == [True, True, False, True, False]
+
+
+def test_pick_insert_grasp_couples_proxy_face_assignment_to_signed_closing_axis():
+    target = math_utils.quat_from_euler_xyz(torch.zeros(4), torch.zeros(4), torch.zeros(4))
+    current = math_utils.quat_from_euler_xyz(
+        torch.zeros(4),
+        torch.zeros(4),
+        torch.tensor([0.0, math.pi, 0.0, math.pi]),
+    )
+    canonical_faces = torch.tensor([True, True, False, False])
+    swapped_faces = ~canonical_faces
+
+    coupled = _coupled_grasp_contact_alignment_mask(
+        canonical_faces,
+        swapped_faces,
+        current,
+        target,
+        math.radians(15.0),
+    )
+    independent_product = (canonical_faces | swapped_faces) & _symmetry_aware_grasp_alignment_mask(
+        current,
+        target,
+        math.radians(15.0),
+    )
+
+    # Positive Ryy matches canonical faces; negative Ryy matches swapped faces.
+    # The middle two entries exercise and reject both mismatched Cartesian branches.
+    assert independent_product.tolist() == [True, True, True, True]
+    assert coupled.tolist() == [True, False, False, True]
+
+
+@pytest.mark.parametrize(
+    ("acquisition", "retention"),
+    (
+        (0.0, math.radians(25.0)),
+        (math.radians(15.0), math.radians(15.0)),
+        (math.radians(25.0), math.radians(15.0)),
+        (float("nan"), math.radians(25.0)),
+        (math.radians(15.0), math.pi / 2.0),
+    ),
+)
+def test_pick_insert_config_rejects_invalid_grasp_axis_tolerances(acquisition: float, retention: float):
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.grasp_acquisition_axis_tolerance_rad = acquisition
+    cfg.grasp_retention_axis_tolerance_rad = retention
+
+    with pytest.raises(ValueError, match="grasp axis tolerances"):
+        cfg.validate_config()
+
+
+@pytest.mark.parametrize("tolerance", (0.0, -1.0, float("nan"), 0.00475))
+def test_pick_insert_config_rejects_invalid_grasp_proxy_face_tolerance(tolerance: float):
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.grasp_proxy_face_tolerance_m = tolerance
+
+    with pytest.raises(ValueError, match="grasp_proxy_face_tolerance_m"):
+        cfg.validate_config()
+
 
 def test_pick_insert_contract_round_trips_through_safe_torch_load(tmp_path):
     contract = pick_insert_reset_dataset_task_contract(FrankaRJ45PickInsertEnvCfg())
@@ -881,15 +968,38 @@ def test_pick_insert_contract_round_trips_through_safe_torch_load(tmp_path):
     assert loaded["rj45_physics"]["socket_body_mode"] == "zero-mass-resettable"
     assert loaded["rj45_physics"]["task_support_plane_enabled"] is False
     assert tuple(loaded["coupler"]["rj45_entry"]["bodies"]) == PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS
-    assert loaded["contract_version"] == 6
+    assert loaded["contract_version"] == 7
     assert loaded["base_contract_version"] == 3
     assert loaded["external_assets"] == franka_rj45_asset_contract()
     assert loaded["robot"]["asset"] == FRANKA_RJ45_FRANKA_LOGICAL_URI
     assert loaded["robot"]["spawn"]["usd_path"] == FRANKA_RJ45_FRANKA_LOGICAL_URI
     assert loaded["static_scene"]["table_spawn"]["usd_path"] == FRANKA_RJ45_SEATTLE_TABLE_LOGICAL_URI
-    assert loaded["pick_insert"]["semantics_version"] == 6
+    assert loaded["pick_insert"]["semantics_version"] == 7
     assert loaded["pick_insert"]["goal_local_success_predicate_version"] == 1
+    phase_4_sampling = loaded["pick_insert"]["phase_4_pregrasp_orientation_sampling"]
+    assert phase_4_sampling["sampler_version"] == 1
+    assert phase_4_sampling["clearance_height_m"] == 0.045
+    assert phase_4_sampling["top_down_tilt_range_rad"] == (0.0, math.radians(25.0))
+    assert phase_4_sampling["closing_axis_twist_range_rad"] == (
+        -math.radians(60.0),
+        math.radians(60.0),
+    )
     assert loaded["validation_geometry"]["success_predicate_version"] == 1
+    assert loaded["validation_geometry"]["grasp"] == {
+        "contract_version": 2,
+        "acquisition_axis_tolerance_rad": math.radians(15.0),
+        "retention_axis_tolerance_rad": math.radians(25.0),
+        "tool_axis": (0.0, 0.0, 1.0),
+        "tool_axis_comparison": "signed",
+        "finger_closing_axis": (0.0, 1.0, 0.0),
+        "finger_closing_axis_comparison": "signed-coupled-to-proxy-face-assignment",
+        "proxy_contact_faces": "exclusive-opposing-local-x-surface",
+        "canonical_proxy_face_assignment": "left:+local-x,right:-local-x",
+        "canonical_closing_axis_comparison": "relative-rotation-yy>=cos(tolerance)",
+        "swapped_proxy_face_assignment": "left:-local-x,right:+local-x",
+        "swapped_closing_axis_comparison": "relative-rotation-yy<=-cos(tolerance)",
+        "proxy_face_tolerance_m": 5.0e-4,
+    }
     assert loaded["rj45_physics"]["contract_version"] == 6
     assert loaded["rj45_physics"]["franka_finger_raw_friction"] == GRASP_FRICTION == 2.0
     assert loaded["rj45_physics"]["grasp_proxy_raw_friction"] == PICK_INSERT_GRASP_PROXY_FRICTION
@@ -1112,6 +1222,15 @@ def test_pick_insert_contract_changes_with_learning_semantics():
     cfg = FrankaRJ45PickInsertEnvCfg()
     cfg.success_max_plug_speed = 0.019
     mutated.append(cfg)
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.grasp_acquisition_axis_tolerance_rad = math.radians(14.0)
+    mutated.append(cfg)
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.grasp_retention_axis_tolerance_rad = math.radians(24.0)
+    mutated.append(cfg)
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.grasp_proxy_face_tolerance_m = 4.0e-4
+    mutated.append(cfg)
 
     assert all(reset_dataset_digest(pick_insert_reset_dataset_task_contract(cfg)) != baseline for cfg in mutated)
 
@@ -1133,17 +1252,24 @@ def test_bilateral_grasp_proxy_contacts_are_vectorized_per_world():
     proxy = torch.tensor([False, False, True, False, False, True])
     shape0 = torch.tensor([0, 2, 3, 4, 99])
     shape1 = torch.tensor([2, 1, 5, 0, -1])
+    point0 = torch.tensor([[0.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    point1 = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
 
     result = _bilateral_grasp_proxy_contact_mask(
         torch.tensor([5]),
         torch.arange(5),
         shape0,
         shape1,
+        point0,
+        point1,
         shape_world,
         left,
         right,
         proxy,
-        2,
+        proxy_center=torch.zeros(3),
+        proxy_half_extents=torch.ones(3),
+        proxy_face_tolerance_m=0.01,
+        num_envs=2,
     )
 
     assert result.tolist() == [True, False]
@@ -1156,22 +1282,93 @@ def test_bilateral_grasp_proxy_contacts_reject_zero_count_and_overflow():
     proxy = torch.tensor([False, False, True])
     shape0 = torch.tensor([0, 1])
     shape1 = torch.tensor([2, 2])
+    point0 = torch.zeros((2, 3))
+    point1 = torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
     slots = torch.arange(2)
 
     zero = _bilateral_grasp_proxy_contact_mask(
-        torch.tensor([0]), slots, shape0, shape1, shape_world, left, right, proxy, 1
+        torch.tensor([0]),
+        slots,
+        shape0,
+        shape1,
+        point0,
+        point1,
+        shape_world,
+        left,
+        right,
+        proxy,
+        proxy_center=torch.zeros(3),
+        proxy_half_extents=torch.ones(3),
+        proxy_face_tolerance_m=0.01,
+        num_envs=1,
     )
     overflow = _bilateral_grasp_proxy_contact_mask(
-        torch.tensor([3]), slots, shape0, shape1, shape_world, left, right, proxy, 1
+        torch.tensor([3]),
+        slots,
+        shape0,
+        shape1,
+        point0,
+        point1,
+        shape_world,
+        left,
+        right,
+        proxy,
+        proxy_center=torch.zeros(3),
+        proxy_half_extents=torch.ones(3),
+        proxy_face_tolerance_m=0.01,
+        num_envs=1,
     )
 
     assert zero.tolist() == [False]
     assert overflow.tolist() == [False]
 
 
+def test_bilateral_grasp_proxy_contacts_allow_finger_swap_but_reject_other_faces():
+    shape_world = torch.tensor([0, 0, 0, 1, 1, 1])
+    left = torch.tensor([True, False, False, True, False, False])
+    right = torch.tensor([False, True, False, False, True, False])
+    proxy = torch.tensor([False, False, True, False, False, True])
+    shape0 = torch.tensor([0, 1, 3, 4])
+    shape1 = torch.tensor([2, 2, 5, 5])
+    point0 = torch.zeros((4, 3))
+    point1 = torch.tensor(
+        [
+            # X/Z edge witnesses are still contacts on the intended X faces.
+            [-1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+    )
+
+    result = _bilateral_grasp_proxy_contact_mask(
+        torch.tensor([4]),
+        torch.arange(4),
+        shape0,
+        shape1,
+        point0,
+        point1,
+        shape_world,
+        left,
+        right,
+        proxy,
+        proxy_center=torch.zeros(3),
+        proxy_half_extents=torch.ones(3),
+        proxy_face_tolerance_m=0.01,
+        num_envs=2,
+    )
+
+    assert result.tolist() == [True, False]
+
+
 def test_stage_tracker_requires_proxy_contact_for_grasp_and_loss():
     gripper = type("Gripper", (), {"bilateral_contact": torch.tensor([True, True])})()
     proxy_contact = torch.tensor([False, True])
+
+    def grasp_contact_alignment(_self, _tolerance, *, proxy_contact_mask_out, **_kwargs):
+        proxy_contact_mask_out.copy_(proxy_contact)
+        return proxy_contact
+
     env = type(
         "FakeEnv",
         (),
@@ -1181,6 +1378,8 @@ def test_stage_tracker_requires_proxy_contact_for_grasp_and_loss():
                 (),
                 {
                     "grasp_acquisition_distance_m": 0.03,
+                    "grasp_acquisition_axis_tolerance_rad": math.radians(15.0),
+                    "grasp_retention_axis_tolerance_rad": math.radians(25.0),
                     "max_tcp_grasp_distance": 0.08,
                     "transport_stage_distance_m": 0.08,
                     "preinsert_stage_distance_m": 0.035,
@@ -1189,7 +1388,7 @@ def test_stage_tracker_requires_proxy_contact_for_grasp_and_loss():
             "action_manager": type("Actions", (), {"get_term": lambda self, _name: gripper})(),
             "tcp_pose_e": lambda self: torch.zeros((2, 7)),
             "plug_grasp_position_e": lambda self: torch.zeros((2, 3)),
-            "bilateral_grasp_proxy_contact_mask": lambda self: proxy_contact,
+            "grasp_contact_alignment_mask": grasp_contact_alignment,
             "plug_goal_translation_error_local": lambda self: torch.ones((2, 3)),
             "insertion_success_mask": lambda self: torch.tensor([False, False]),
         },
@@ -1219,6 +1418,53 @@ def test_stage_tracker_requires_proxy_contact_for_grasp_and_loss():
     assert tracker.loss_count.tolist() == [0, 1]
 
 
+def test_stage_tracker_uses_wider_axis_tolerance_only_after_acquisition():
+    gripper = type("Gripper", (), {"bilateral_contact": torch.tensor([True, True])})()
+
+    def grasp_contact_alignment(_self, tolerance, *, proxy_contact_mask_out, **_kwargs):
+        proxy_contact_mask_out.fill_(True)
+        return tolerance >= math.radians(20.0)
+
+    env = type(
+        "FakeEnv",
+        (),
+        {
+            "cfg": type(
+                "Cfg",
+                (),
+                {
+                    "grasp_acquisition_distance_m": 0.03,
+                    "grasp_acquisition_axis_tolerance_rad": math.radians(15.0),
+                    "grasp_retention_axis_tolerance_rad": math.radians(25.0),
+                    "max_tcp_grasp_distance": 0.08,
+                    "transport_stage_distance_m": 0.08,
+                    "preinsert_stage_distance_m": 0.035,
+                },
+            )(),
+            "action_manager": type("Actions", (), {"get_term": lambda self, _name: gripper})(),
+            "tcp_pose_e": lambda self: torch.zeros((2, 7)),
+            "plug_grasp_position_e": lambda self: torch.zeros((2, 3)),
+            "grasp_contact_alignment_mask": grasp_contact_alignment,
+            "plug_goal_translation_error_local": lambda self: torch.ones((2, 3)),
+            "insertion_success_mask": lambda self: torch.tensor([False, False]),
+        },
+    )()
+    tracker = object.__new__(mdp.PickInsertStageContext)
+    tracker.ever_grasped = torch.tensor([False, True])
+    tracker.new_grasp = torch.zeros(2, dtype=torch.bool)
+    tracker.proxy_contact = torch.zeros(2, dtype=torch.bool)
+    tracker.current_grasp = torch.zeros(2, dtype=torch.bool)
+    tracker.maximum_stage = torch.tensor([0, 1])
+    tracker.loss_count = torch.zeros(2, dtype=torch.long)
+    tracker._no_termination = torch.zeros(2, dtype=torch.bool)
+
+    tracker(env)
+
+    assert tracker.current_grasp.tolist() == [False, True]
+    assert tracker.ever_grasped.tolist() == [False, True]
+    assert tracker.loss_count.tolist() == [0, 0]
+
+
 def test_stage_tracker_does_not_declare_open_far_reset_lost():
     tracker = object.__new__(mdp.PickInsertStageContext)
     tracker.ever_grasped = torch.tensor([False, True])
@@ -1238,6 +1484,11 @@ def test_stage_tracker_does_not_declare_open_far_reset_lost():
 
 def test_stage_tracker_does_not_credit_insertion_without_a_physical_grasp():
     gripper = type("Gripper", (), {"bilateral_contact": torch.tensor([False])})()
+
+    def grasp_contact_alignment(_self, _tolerance, *, proxy_contact_mask_out, **_kwargs):
+        proxy_contact_mask_out.fill_(False)
+        return torch.zeros(1, dtype=torch.bool)
+
     env = type(
         "FakeEnv",
         (),
@@ -1247,6 +1498,8 @@ def test_stage_tracker_does_not_credit_insertion_without_a_physical_grasp():
                 (),
                 {
                     "grasp_acquisition_distance_m": 0.03,
+                    "grasp_acquisition_axis_tolerance_rad": math.radians(15.0),
+                    "grasp_retention_axis_tolerance_rad": math.radians(25.0),
                     "max_tcp_grasp_distance": 0.08,
                     "transport_stage_distance_m": 0.08,
                     "preinsert_stage_distance_m": 0.035,
@@ -1255,7 +1508,7 @@ def test_stage_tracker_does_not_credit_insertion_without_a_physical_grasp():
             "action_manager": type("Actions", (), {"get_term": lambda self, _name: gripper})(),
             "tcp_pose_e": lambda self: torch.zeros((1, 7)),
             "plug_grasp_position_e": lambda self: torch.zeros((1, 3)),
-            "bilateral_grasp_proxy_contact_mask": lambda self: torch.tensor([False]),
+            "grasp_contact_alignment_mask": grasp_contact_alignment,
             "plug_goal_translation_error_local": lambda self: torch.zeros((1, 3)),
             "insertion_success_mask": lambda self: torch.tensor([True]),
         },

@@ -895,21 +895,87 @@ class GraspMetrics:
     bilateral_deflection: torch.Tensor
 
 
+def _runtime_grasp_contact_alignment_mask(
+    env: _ResetToolEnv,
+    tcp_orientation_xyzw: torch.Tensor,
+    *,
+    retaining_grasp: bool,
+) -> torch.Tensor:
+    """Evaluate the live task's coupled contact/alignment predicate when available."""
+    predicate = getattr(env, "grasp_contact_alignment_mask", None)
+    legacy_predicate = getattr(env, "grasp_axis_alignment_mask", None)
+    if not callable(predicate) and not callable(legacy_predicate):
+        return torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+    tolerance_name = (
+        "grasp_retention_axis_tolerance_rad" if retaining_grasp else "grasp_acquisition_axis_tolerance_rad"
+    )
+    try:
+        tolerance = float(getattr(env.cfg, tolerance_name))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Reset-tool environment is missing a valid {tolerance_name!r}.") from exc
+    if callable(predicate):
+        aligned = predicate(tolerance, tcp_orientation_xyzw=tcp_orientation_xyzw)
+        predicate_name = "grasp contact/alignment"
+    else:
+        aligned = legacy_predicate(tolerance, tcp_orientation_xyzw=tcp_orientation_xyzw)
+        predicate_name = "legacy grasp-axis"
+    if not isinstance(aligned, torch.Tensor) or aligned.dtype != torch.bool or tuple(aligned.shape) != (env.num_envs,):
+        raise RuntimeError(
+            f"The live {predicate_name} predicate must return a boolean tensor with shape "
+            f"({env.num_envs},), got {type(aligned).__name__} {getattr(aligned, 'shape', None)}."
+        )
+    return aligned.to(device=env.device)
+
+
+def _runtime_bilateral_grasp_proxy_contact_mask(
+    env: _ResetToolEnv,
+    left_grasp_contact_count: torch.Tensor,
+    right_grasp_contact_count: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate the live task's intended bilateral-contact predicate when available.
+
+    The fallback preserves legacy insertion-tool behavior.  Pick-insert tools
+    delegate to the task method so contact-point semantics stay authoritative
+    in one runtime implementation.
+    """
+    predicate = getattr(env, "bilateral_grasp_proxy_contact_mask", None)
+    if not callable(predicate):
+        return (left_grasp_contact_count > 0) & (right_grasp_contact_count > 0)
+    bilateral = predicate()
+    if (
+        not isinstance(bilateral, torch.Tensor)
+        or bilateral.dtype != torch.bool
+        or tuple(bilateral.shape) != (env.num_envs,)
+    ):
+        raise RuntimeError(
+            "The live grasp-contact predicate must return a boolean tensor with shape "
+            f"({env.num_envs},), got {type(bilateral).__name__} {getattr(bilateral, 'shape', None)}."
+        )
+    return bilateral.to(device=env.device)
+
+
 def grasp_metrics(
     env: _ResetToolEnv,
     finger_target: torch.Tensor,
     *,
     max_distance: float | None = None,
     min_deflection: float = 2.5e-4,
+    retaining_grasp: bool = False,
 ) -> GraspMetrics:
     _, _, finger_q, _ = env.read_robot_state()
-    tcp_distance = torch.linalg.vector_norm(env.tcp_pose_e()[:, :3] - env.plug_grasp_position_e(), dim=-1)
+    tcp_pose = env.tcp_pose_e()
+    tcp_distance = torch.linalg.vector_norm(tcp_pose[:, :3] - env.plug_grasp_position_e(), dim=-1)
     deflection = finger_q - finger_target
     bilateral = (deflection >= min_deflection).all(dim=-1)
     closed = (finger_target <= 0.006).all(dim=-1) & (finger_q <= 0.012).all(dim=-1)
+    contact_aligned = _runtime_grasp_contact_alignment_mask(
+        env,
+        tcp_pose[:, 3:7],
+        retaining_grasp=retaining_grasp,
+    )
     distance_limit = float(env.cfg.max_tcp_grasp_distance if max_distance is None else max_distance)
     return GraspMetrics(
-        valid=(tcp_distance <= distance_limit) & bilateral & closed,
+        valid=(tcp_distance <= distance_limit) & bilateral & closed & contact_aligned,
         tcp_distance=tcp_distance,
         bilateral_deflection=deflection.amin(dim=-1),
     )
@@ -1307,8 +1373,11 @@ def collision_metrics(
     )
     left_grasp_count = outer.left_grasp_contact_count + proxy.left_grasp_contact_count
     right_grasp_count = outer.right_grasp_contact_count + proxy.right_grasp_contact_count
-    bilateral_grasp = (left_grasp_count > 0) & (right_grasp_count > 0)
-    grasp_valid = bilateral_grasp if require_bilateral_grasp else torch.ones_like(bilateral_grasp)
+    grasp_valid = (
+        _runtime_bilateral_grasp_proxy_contact_mask(env, left_grasp_count, right_grasp_count)
+        if require_bilateral_grasp
+        else torch.ones_like(left_grasp_count, dtype=torch.bool)
+    )
     return CollisionMetrics(
         valid=outer.valid & proxy.valid & grasp_valid,
         invalid_contact_count=outer.invalid_contact_count + proxy.invalid_contact_count,
@@ -1323,6 +1392,8 @@ def collision_metrics(
 def _physical_validity_sample(
     env: _ResetToolEnv,
     finger_target: torch.Tensor,
+    *,
+    retaining_grasp: bool = True,
 ) -> tuple[CollisionMetrics, GraspMetrics, torch.Tensor]:
     """Sample collisions and require real bilateral proxy contact independently.
 
@@ -1331,8 +1402,12 @@ def _physical_validity_sample(
     contact from being reported as an unexplained collision failure.
     """
     collision = collision_metrics(env, require_bilateral_grasp=False)
-    grasp = grasp_metrics(env, finger_target)
-    bilateral_proxy_contact = (collision.left_grasp_contact_count > 0) & (collision.right_grasp_contact_count > 0)
+    grasp = grasp_metrics(env, finger_target, retaining_grasp=retaining_grasp)
+    bilateral_proxy_contact = _runtime_bilateral_grasp_proxy_contact_mask(
+        env,
+        collision.left_grasp_contact_count,
+        collision.right_grasp_contact_count,
+    )
     return collision, grasp, bilateral_proxy_contact
 
 
@@ -1839,7 +1914,8 @@ def _sample_reset_replay_post_step(
     drives_disabled = _runtime_drives_disabled(env)
     if not bool(drives_disabled.all()):
         raise RuntimeError("A construction drive became enabled during reset replay.")
-    grasp = grasp_metrics(env, finger_target)
+    retaining_grasp = bool(evidence["starts_grasped"])
+    grasp = grasp_metrics(env, finger_target, retaining_grasp=retaining_grasp)
     left_contacts = collision.left_grasp_contact_count
     right_contacts = collision.right_grasp_contact_count
     expected_shape = (env.num_envs,)
@@ -1853,7 +1929,7 @@ def _sample_reset_replay_post_step(
         if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_shape:
             raise RuntimeError(f"Reset replay {name} must have shape {expected_shape}.")
 
-    proxy_bilateral = (left_contacts > 0) & (right_contacts > 0)
+    proxy_bilateral = _runtime_bilateral_grasp_proxy_contact_mask(env, left_contacts, right_contacts)
     zero_proxy_contacts = (left_contacts == 0) & (right_contacts == 0)
     expected_contact_state = grasp.valid & proxy_bilateral if evidence["starts_grasped"] else zero_proxy_contacts
     state_finite = _per_world_finite(
@@ -4009,7 +4085,7 @@ def _scripted_recovery_cartesian_c2(  # noqa: C901
         latch_body_index=latch_body_index,
     )
     plug_speed = torch.linalg.vector_norm(task_qd[:, plug_body_index, :3], dim=-1)
-    grasp = grasp_metrics(env, finger_target)
+    grasp = grasp_metrics(env, finger_target, retaining_grasp=True)
     collision = collision_metrics(env)
     if collision.contact_overflow:
         raise RuntimeError("Global contact-buffer overflow at the scripted-recovery result boundary.")
@@ -4336,7 +4412,7 @@ def _scripted_recovery_legacy(
     )
     # Newton spatial velocities store world linear xyz first, angular xyz last.
     plug_speed = torch.linalg.vector_norm(task_qd[:, plug_body_index, :3], dim=-1)
-    grasp = grasp_metrics(env, finger_target)
+    grasp = grasp_metrics(env, finger_target, retaining_grasp=True)
     collision = collision_metrics(env)
     if collision.contact_overflow:
         raise RuntimeError("Global contact-buffer overflow at the scripted-recovery result boundary.")

@@ -5,6 +5,7 @@
 
 """Pure compatibility tests for the Franka RJ45 reset-tool helpers."""
 
+import math
 import os
 import stat
 from types import SimpleNamespace
@@ -1334,12 +1335,14 @@ def test_reset_bias_hold_samples_mechanics_after_every_step_and_accumulates_cont
     ]
     grasps = [torch.tensor((True, True)), torch.tensor((True, False)), torch.tensor((True, True))]
     requested_bilateral: list[bool] = []
+    requested_retaining: list[bool] = []
 
     def fake_collision_metrics(fake_env, *, require_bilateral_grasp):
         requested_bilateral.append(require_bilateral_grasp)
         return collisions[fake_env.index - 1]
 
-    def fake_grasp_metrics(fake_env, _finger_target):
+    def fake_grasp_metrics(fake_env, _finger_target, *, retaining_grasp):
+        requested_retaining.append(retaining_grasp)
         return reset_tools.GraspMetrics(
             valid=grasps[fake_env.index - 1],
             tcp_distance=torch.zeros(fake_env.num_envs),
@@ -1371,6 +1374,7 @@ def test_reset_bias_hold_samples_mechanics_after_every_step_and_accumulates_cont
 
     assert (first_steps, second_steps) == (1, 2)
     assert requested_bilateral == [False, False, False]
+    assert requested_retaining == [True, True, True]
     assert evidence["post_step_samples"] == 3
     assert torch.allclose(evidence["stored_maximum_arm_joint_speed_rad_s"], torch.tensor((0.1, 0.2)))
     assert torch.allclose(evidence["stored_maximum_finger_joint_speed_m_s"], torch.tensor((0.01, 0.02)))
@@ -1482,7 +1486,7 @@ def test_reset_bias_hold_requires_zero_proxy_contacts_for_open_rows(monkeypatch)
     monkeypatch.setattr(
         reset_tools,
         "grasp_metrics",
-        lambda fake_env, _finger_target: reset_tools.GraspMetrics(
+        lambda fake_env, _finger_target, **_kwargs: reset_tools.GraspMetrics(
             valid=torch.zeros(fake_env.num_envs, dtype=torch.bool),
             tcp_distance=torch.ones(fake_env.num_envs),
             bilateral_deflection=torch.zeros(fake_env.num_envs),
@@ -1533,7 +1537,7 @@ def test_reset_bias_hold_rejects_discontinuous_evidence_reuse(monkeypatch) -> No
     monkeypatch.setattr(
         reset_tools,
         "grasp_metrics",
-        lambda fake_env, _finger_target: reset_tools.GraspMetrics(
+        lambda fake_env, _finger_target, **_kwargs: reset_tools.GraspMetrics(
             valid=torch.zeros(fake_env.num_envs, dtype=torch.bool),
             tcp_distance=torch.ones(fake_env.num_envs),
             bilateral_deflection=torch.zeros(fake_env.num_envs),
@@ -1602,8 +1606,87 @@ def test_ik_seed_scores_follow_explicit_continuation_reference() -> None:
     assert near_second.argmin(dim=-1).tolist() == [1]
 
 
-def test_physical_validity_separates_collision_and_proxy_contact(monkeypatch) -> None:
-    """Do not disguise a missing finger contact as an invalid collision."""
+def test_grasp_metrics_use_live_acquisition_and_retention_axis_tolerances() -> None:
+    """Preserve the live axis-only predicate as a legacy tool fallback."""
+
+    class FakeEnv:
+        num_envs = 2
+        device = "cpu"
+        cfg = SimpleNamespace(
+            max_tcp_grasp_distance=0.02,
+            grasp_acquisition_axis_tolerance_rad=math.radians(15.0),
+            grasp_retention_axis_tolerance_rad=math.radians(25.0),
+        )
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[float, torch.Tensor]] = []
+
+        def read_robot_state(self):
+            return torch.zeros((2, 7)), torch.zeros((2, 7)), torch.full((2, 2), 0.005), torch.zeros((2, 2))
+
+        def tcp_pose_e(self):
+            return _identity_pose(2, 1)[:, 0]
+
+        def plug_grasp_position_e(self):
+            return torch.zeros((2, 3))
+
+        def grasp_axis_alignment_mask(self, tolerance, *, tcp_orientation_xyzw):
+            self.calls.append((float(tolerance), tcp_orientation_xyzw.clone()))
+            return torch.full((2,), float(tolerance) >= math.radians(20.0), dtype=torch.bool)
+
+    env = FakeEnv()
+    finger_target = torch.full((2, 2), 0.004)
+
+    acquiring = reset_tools.grasp_metrics(env, finger_target)
+    retaining = reset_tools.grasp_metrics(env, finger_target, retaining_grasp=True)
+
+    assert acquiring.valid.tolist() == [False, False]
+    assert retaining.valid.tolist() == [True, True]
+    assert [call[0] for call in env.calls] == pytest.approx((math.radians(15.0), math.radians(25.0)))
+    assert all(torch.equal(call[1], _identity_pose(2, 1)[:, 0, 3:7]) for call in env.calls)
+
+
+def test_grasp_metrics_prefer_live_coupled_contact_alignment_predicate() -> None:
+    """Certify pick-insert grasps through its authoritative combined predicate."""
+
+    class FakeEnv:
+        num_envs = 2
+        device = "cpu"
+        cfg = SimpleNamespace(
+            max_tcp_grasp_distance=0.02,
+            grasp_acquisition_axis_tolerance_rad=math.radians(15.0),
+            grasp_retention_axis_tolerance_rad=math.radians(25.0),
+        )
+
+        def __init__(self) -> None:
+            self.calls: list[float] = []
+
+        def read_robot_state(self):
+            return torch.zeros((2, 7)), torch.zeros((2, 7)), torch.full((2, 2), 0.005), torch.zeros((2, 2))
+
+        def tcp_pose_e(self):
+            return _identity_pose(2, 1)[:, 0]
+
+        def plug_grasp_position_e(self):
+            return torch.zeros((2, 3))
+
+        def grasp_contact_alignment_mask(self, tolerance, *, tcp_orientation_xyzw):
+            assert torch.equal(tcp_orientation_xyzw, _identity_pose(2, 1)[:, 0, 3:7])
+            self.calls.append(float(tolerance))
+            return torch.tensor([False, True])
+
+        def grasp_axis_alignment_mask(self, _tolerance, *, tcp_orientation_xyzw):
+            raise AssertionError(f"Legacy predicate unexpectedly called with {tcp_orientation_xyzw!r}.")
+
+    env = FakeEnv()
+    metrics = reset_tools.grasp_metrics(env, torch.full((2, 2), 0.004))
+
+    assert metrics.valid.tolist() == [False, True]
+    assert env.calls == pytest.approx([math.radians(15.0)])
+
+
+def test_physical_validity_separates_collision_and_live_proxy_contact(monkeypatch) -> None:
+    """Keep collision validity separate and delegate intended contact semantics to runtime."""
     collision = reset_tools.CollisionMetrics(
         valid=torch.tensor((True, False)),
         invalid_contact_count=torch.tensor((0, 1)),
@@ -1625,18 +1708,30 @@ def test_physical_validity_separates_collision_and_proxy_contact(monkeypatch) ->
         return collision
 
     monkeypatch.setattr(reset_tools, "collision_metrics", fake_collision_metrics)
-    monkeypatch.setattr(reset_tools, "grasp_metrics", lambda _env, _finger_target: grasp)
+    requested_retaining: list[bool] = []
+
+    def fake_grasp_metrics(_env, _finger_target, *, retaining_grasp):
+        requested_retaining.append(retaining_grasp)
+        return grasp
+
+    monkeypatch.setattr(reset_tools, "grasp_metrics", fake_grasp_metrics)
+    env = SimpleNamespace(
+        num_envs=2,
+        device="cpu",
+        bilateral_grasp_proxy_contact_mask=lambda: torch.tensor((False, True)),
+    )
 
     sampled_collision, sampled_grasp, bilateral_proxy = reset_tools._physical_validity_sample(
-        SimpleNamespace(),
+        env,
         torch.zeros((2, 2)),
     )
 
     assert requested_bilateral == [False]
+    assert requested_retaining == [True]
     assert sampled_collision is collision
     assert sampled_grasp is grasp
     assert sampled_collision.valid.tolist() == [True, False]
-    assert bilateral_proxy.tolist() == [True, False]
+    assert bilateral_proxy.tolist() == [False, True]
 
 
 def test_reset_tool_environments_use_sibling_mixin_inheritance() -> None:

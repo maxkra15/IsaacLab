@@ -14,6 +14,11 @@ explicit fast-IK mode instead constructs coherent rows directly and applies
 only static IK, finite-state, joint-limit, workspace, collision, and phase
 semantic gates.
 
+Open phase-4 pregrasp rows retain the 45 mm clearance while sampling a
+plug-relative closing-axis twist uniformly over +/-60 degrees and a top-down
+tilt uniformly by solid angle over a 0-25 degree cone.  Starts-grasped phases
+remain at the canonical grasp orientation, and phase 5 keeps its away pose.
+
 Production runs first certify the canonical goal with one or four worlds, then
 load that self-contained certificate for the fixed-width batch-24 row stream.
 """
@@ -46,6 +51,7 @@ from _franka_rj45_reset_tools import (
     RJ45PickInsertResetToolEnv,
     _active_waypoint_count,
     _PerLaneTargetHold,
+    _runtime_bilateral_grasp_proxy_contact_mask,
     advance_exact_success_dwell,
     advance_reset_absolute_target_hold,
     batched_quat_slerp,
@@ -86,8 +92,12 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     PICK_INSERT_EFFECTIVE_GRASP_FRICTION,
     PICK_INSERT_GRASP_PROXY_FRICTION,
     PICK_INSERT_OPEN_FINGER_POSITION,
+    PICK_INSERT_PHASE_4_PREGRASP_HEIGHT_M,
+    PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_CLOSING_AXIS_TWIST_ERROR_RAD,
+    PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_TOP_DOWN_TILT_ERROR_RAD,
     PICK_INSERT_PHASE_NAMES,
     FrankaRJ45PickInsertEnvCfg,
+    pick_insert_phase_4_pregrasp_orientation_sampling_contract,
     pick_insert_reset_dataset_task_contract,
 )
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_reset_dataset_io import (
@@ -415,6 +425,24 @@ def _grasped_transport_schedule_contract(cfg: GeneratorCfg) -> dict[str, Any]:
             "final_reset_row_orientation-and-physical-gates_unchanged": True,
         },
     }
+
+
+def _phase_4_pregrasp_orientation_sampling_contract(cfg: GeneratorCfg) -> dict[str, Any]:
+    """Describe the bounded open-pregrasp orientation curriculum."""
+    contract = pick_insert_phase_4_pregrasp_orientation_sampling_contract()
+    configured = (
+        cfg.phase_4_pregrasp_height_m,
+        cfg.phase_4_pregrasp_maximum_top_down_tilt_error_rad,
+        cfg.phase_4_pregrasp_maximum_closing_axis_twist_error_rad,
+    )
+    expected = (
+        contract["clearance_height_m"],
+        contract["top_down_tilt_range_rad"][1],
+        contract["closing_axis_twist_range_rad"][1],
+    )
+    if configured != expected:
+        raise ValueError("Phase-4 pregrasp sampling must exactly match the runtime task contract.")
+    return contract
 
 
 def _canonical_goal_generation_contract(cfg: GeneratorCfg) -> dict[str, Any]:
@@ -2040,7 +2068,13 @@ class GeneratorCfg:
     phase_1_axial_offset_m: float = 0.030
     phase_2_lift_m: float = 0.10
     phase_3_lift_m: float = 0.025
-    phase_4_pregrasp_height_m: float = 0.045
+    phase_4_pregrasp_height_m: float = PICK_INSERT_PHASE_4_PREGRASP_HEIGHT_M
+    phase_4_pregrasp_maximum_top_down_tilt_error_rad: float = (
+        PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_TOP_DOWN_TILT_ERROR_RAD
+    )
+    phase_4_pregrasp_maximum_closing_axis_twist_error_rad: float = (
+        PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_CLOSING_AXIS_TWIST_ERROR_RAD
+    )
     maximum_socket_drift_m: float = PICK_INSERT_RESET_MAX_SOCKET_EXCURSION_M
     maximum_row_plug_drift_m: float = PICK_INSERT_RESET_MAX_PLUG_EXCURSION_M
     maximum_row_body_drift_m: float = PICK_INSERT_RESET_MAX_BODY_EXCURSION_M
@@ -2140,6 +2174,18 @@ class GeneratorCfg:
             raise ValueError("maximum_pickup_position_error_m must lie in (0, 0.025].")
         if not 0.0 < self.maximum_pickup_orientation_error_rad <= 0.08726646259971647:
             raise ValueError("maximum_pickup_orientation_error_rad must be at most five degrees.")
+        if self.phase_4_pregrasp_height_m != PICK_INSERT_PHASE_4_PREGRASP_HEIGHT_M:
+            raise ValueError("Phase-4 pregrasp height must remain at the exact 45 mm task-contract clearance.")
+        if (
+            self.phase_4_pregrasp_maximum_top_down_tilt_error_rad
+            != PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_TOP_DOWN_TILT_ERROR_RAD
+        ):
+            raise ValueError("Phase-4 top-down tilt sampling must use the exact 0-25 degree task-contract cone.")
+        if (
+            self.phase_4_pregrasp_maximum_closing_axis_twist_error_rad
+            != PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_CLOSING_AXIS_TWIST_ERROR_RAD
+        ):
+            raise ValueError("Phase-4 closing-axis twist sampling must use the exact +/-60 degree task-contract range.")
         if not 0.0 < self.maximum_pickup_plug_linear_speed_m_s <= self.maximum_row_cable_speed_m_s:
             raise ValueError("Pickup plug linear speed must be no larger than the row cable-speed limit.")
         if not 0.0 < self.maximum_pickup_plug_angular_speed_rad_s <= 0.05:
@@ -2258,6 +2304,60 @@ class GeneratorCfg:
 def phase_counts(cfg: GeneratorCfg) -> tuple[int, ...]:
     """Return the exact six-phase row counts."""
     return tuple(cfg.rows_per_phase for _ in PICK_INSERT_RESET_PHASE_IDS)
+
+
+def sample_phase_4_pregrasp_orientation_errors(
+    sample_count: int,
+    *,
+    device: torch.device | str,
+    rng: torch.Generator,
+    dtype: torch.dtype = torch.float32,
+    maximum_top_down_tilt_error_rad: float = PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_TOP_DOWN_TILT_ERROR_RAD,
+    maximum_closing_axis_twist_error_rad: float = (PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_CLOSING_AXIS_TWIST_ERROR_RAD),
+) -> torch.Tensor:
+    """Sample deterministic canonical-grasp-local phase-4 orientation errors.
+
+    Tilt directions are uniform by solid angle in a cone about the canonical
+    tool Z axis.  Closing-axis twist is uniform about that tool Z axis, and
+    tilt is composed after twist so the sampled cone angle remains exact.
+
+    Args:
+        sample_count: Number of orientation errors to sample.
+        device: Torch device that owns both the returned tensor and ``rng``.
+        rng: Dedicated deterministic reset-row random-number generator.
+        dtype: Floating-point dtype of the returned quaternions.
+        maximum_top_down_tilt_error_rad: Maximum top-down cone angle [rad].
+        maximum_closing_axis_twist_error_rad: Symmetric closing-axis twist limit [rad].
+
+    Returns:
+        Unit quaternions in XYZW convention, shape ``(sample_count, 4)``.
+    """
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 1:
+        raise ValueError("sample_count must be a positive integer.")
+    if not (0.0 < maximum_top_down_tilt_error_rad <= PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_TOP_DOWN_TILT_ERROR_RAD):
+        raise ValueError("maximum_top_down_tilt_error_rad must lie in (0, 25 degrees].")
+    if not (
+        0.0 < maximum_closing_axis_twist_error_rad <= PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_CLOSING_AXIS_TWIST_ERROR_RAD
+    ):
+        raise ValueError("maximum_closing_axis_twist_error_rad must lie in (0, 60 degrees].")
+
+    uniform = torch.rand((sample_count, 3), device=device, dtype=dtype, generator=rng)
+    minimum_cosine = math.cos(maximum_top_down_tilt_error_rad)
+    tilt_cosine = 1.0 - uniform[:, 0] * (1.0 - minimum_cosine)
+    tilt_angle = torch.acos(tilt_cosine.clamp(-1.0, 1.0))
+    tilt_azimuth = (2.0 * uniform[:, 1] - 1.0) * math.pi
+    tilt_axis = torch.stack(
+        (torch.cos(tilt_azimuth), torch.sin(tilt_azimuth), torch.zeros_like(tilt_azimuth)),
+        dim=-1,
+    )
+    tilt = math_utils.quat_from_angle_axis(tilt_angle, tilt_axis)
+
+    twist_angle = (2.0 * uniform[:, 2] - 1.0) * maximum_closing_axis_twist_error_rad
+    twist_axis = torch.zeros((sample_count, 3), device=device, dtype=dtype)
+    twist_axis[:, 2] = 1.0
+    twist = math_utils.quat_from_angle_axis(twist_angle, twist_axis)
+    error = math_utils.quat_mul(tilt, twist)
+    return error / torch.linalg.vector_norm(error, dim=-1, keepdim=True).clamp_min(1.0e-9)
 
 
 def _smoothstep(progress: float) -> float:
@@ -3534,8 +3634,12 @@ class PickInsertResetDatasetGenerator:
                     collision = collision_metrics(self.env, require_bilateral_grasp=False)
                     if collision.contact_overflow:
                         raise RuntimeError("Global contact-buffer overflow during reset-history diagnostic replay.")
-                    grasp = grasp_metrics(self.env, candidate["finger_joint_target"])
-                    bilateral = (collision.left_grasp_contact_count > 0) & (collision.right_grasp_contact_count > 0)
+                    grasp = grasp_metrics(self.env, candidate["finger_joint_target"], retaining_grasp=True)
+                    bilateral = _runtime_bilateral_grasp_proxy_contact_mask(
+                        self.env,
+                        collision.left_grasp_contact_count,
+                        collision.right_grasp_contact_count,
+                    )
                     all_collision_free.logical_and_(collision.valid)
                     all_bilateral.logical_and_(grasp.valid & bilateral)
                     all_drives_disabled.logical_and_(~self._drive_enabled() & ~self._orientation_hold_enabled())
@@ -3790,11 +3894,42 @@ class PickInsertResetDatasetGenerator:
         print(f"[PICK-INSERT RESET A/B/C/D/E COMPLETE] {result}", flush=True)
         return result
 
-    def _desired_tcp_pose(self, plug_pose: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sample_phase_tcp_orientation_error(self, phase: int) -> torch.Tensor | None:
+        """Sample the one phase-specific TCP orientation error, if any."""
+        if phase != 4:
+            return None
+        return sample_phase_4_pregrasp_orientation_errors(
+            self.env.num_envs,
+            device=self.device,
+            rng=self.random,
+            maximum_top_down_tilt_error_rad=(self.cfg.phase_4_pregrasp_maximum_top_down_tilt_error_rad),
+            maximum_closing_axis_twist_error_rad=(self.cfg.phase_4_pregrasp_maximum_closing_axis_twist_error_rad),
+        )
+
+    def _desired_tcp_pose(
+        self,
+        plug_pose: torch.Tensor,
+        *,
+        orientation_error_xyzw: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         grasp_offset = torch.as_tensor(self.env.cfg.plug_grasp_offset, device=self.device, dtype=torch.float32)
         grasp_offset = grasp_offset.expand(len(plug_pose), -1)
         position = plug_pose[:, :3] + math_utils.quat_apply(plug_pose[:, 3:7], grasp_offset)
         orientation = math_utils.quat_mul(plug_pose[:, 3:7], self.local_grasp_orientation[: len(plug_pose)])
+        if orientation_error_xyzw is not None:
+            orientation_error_xyzw = torch.as_tensor(
+                orientation_error_xyzw,
+                device=self.device,
+                dtype=orientation.dtype,
+            )
+            if orientation_error_xyzw.shape != orientation.shape:
+                raise ValueError("orientation_error_xyzw must match the batched plug quaternion shape.")
+            orientation_error_xyzw = orientation_error_xyzw / torch.linalg.vector_norm(
+                orientation_error_xyzw,
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1.0e-9)
+            orientation = math_utils.quat_mul(orientation, orientation_error_xyzw)
         return position, orientation
 
     def _move_tcp(
@@ -4105,6 +4240,7 @@ class PickInsertResetDatasetGenerator:
         all_finite = torch.ones(self.env.num_envs, device=self.device, dtype=torch.bool)
         all_collision_free = all_finite.clone()
         all_bilateral = all_finite.clone()
+        all_grasp_valid = all_finite.clone()
         all_drives_disabled = all_finite.clone()
         all_construction_drives_enabled = all_finite.clone()
         all_drive_states_expected = all_finite.clone()
@@ -4123,9 +4259,12 @@ class PickInsertResetDatasetGenerator:
             cable_speed = torch.linalg.vector_norm(sample_qd[:, self.cable_slice, :3], dim=-1).amax(dim=-1)
             plug_linear_speed = torch.linalg.vector_norm(sample_qd[:, self.plug_index, :3], dim=-1)
             plug_angular_speed = torch.linalg.vector_norm(sample_qd[:, self.plug_index, 3:6], dim=-1)
-            bilateral = (sample_collision.left_grasp_contact_count > 0) & (
-                sample_collision.right_grasp_contact_count > 0
+            bilateral = _runtime_bilateral_grasp_proxy_contact_mask(
+                self.env,
+                sample_collision.left_grasp_contact_count,
+                sample_collision.right_grasp_contact_count,
             )
+            grasp = grasp_metrics(self.env, self.closed_finger_target, retaining_grasp=False)
             translation_drive_enabled = self._drive_enabled()
             orientation_hold_enabled = self._orientation_hold_enabled()
             drives_disabled = ~translation_drive_enabled & ~orientation_hold_enabled
@@ -4139,6 +4278,7 @@ class PickInsertResetDatasetGenerator:
             all_finite.logical_and_(finite)
             all_collision_free.logical_and_(sample_collision.valid)
             all_bilateral.logical_and_(bilateral)
+            all_grasp_valid.logical_and_(grasp.valid)
             all_drives_disabled.logical_and_(drives_disabled)
             all_construction_drives_enabled.logical_and_(construction_drives_enabled)
             all_drive_states_expected.logical_and_(drive_state_expected)
@@ -4150,6 +4290,7 @@ class PickInsertResetDatasetGenerator:
                 lane_hold.deactivate(~finite, reason="post-contact-non-finite")
                 lane_hold.deactivate(~sample_collision.valid, reason="post-contact-collision")
                 lane_hold.deactivate(~bilateral, reason="post-contact-lost-bilateral-contact")
+                lane_hold.deactivate(~grasp.valid, reason="post-contact-invalid-grasp")
             for pair in sample_collision.invalid_contact_pairs:
                 if pair not in invalid_pairs and len(invalid_pairs) < 64:
                     invalid_pairs.append(pair)
@@ -4177,6 +4318,7 @@ class PickInsertResetDatasetGenerator:
             all_finite
             & all_collision_free
             & all_bilateral
+            & all_grasp_valid
             & all_drive_states_expected
             & (not any_overflow)
             & (final_cable_speed <= self.cfg.maximum_row_cable_speed_m_s)
@@ -5615,7 +5757,7 @@ class PickInsertResetDatasetGenerator:
             plug_body_index=self.plug_index,
             latch_body_index=self.latch_index,
         )
-        grasp = grasp_metrics(self.env, candidate["finger_joint_target"])
+        grasp = grasp_metrics(self.env, candidate["finger_joint_target"], retaining_grasp=True)
         collision = collision_metrics(self.env)
         stored_arm_speed = torch.abs(candidate["arm_joint_velocity"]).amax(dim=-1)
         final_arm_speed = torch.abs(final_arm_qd).amax(dim=-1)
@@ -5827,7 +5969,7 @@ class PickInsertResetDatasetGenerator:
         final_finger_speed = torch.abs(final_finger_qd).amax(dim=-1)
         stored_target_error = torch.abs(stored_arm_target - stored_arm_q)
         final_target_error = torch.abs(stored_arm_target - final_arm_q)
-        final_grasp = grasp_metrics(self.env, candidate["finger_joint_target"])
+        final_grasp = grasp_metrics(self.env, candidate["finger_joint_target"], retaining_grasp=True)
         final_collision = collision_metrics(self.env)
         history_applied = self._vbd_pose_history_applied_mask(history_evidence)
         hard_valid = (
@@ -5983,7 +6125,7 @@ class PickInsertResetDatasetGenerator:
         collision = collision_metrics(self.env, require_bilateral_grasp=False)
         if collision.contact_overflow:
             raise RuntimeError(f"Global contact-buffer overflow during {context}.")
-        grasp = grasp_metrics(self.env, self.closed_finger_target)
+        grasp = grasp_metrics(self.env, self.closed_finger_target, retaining_grasp=True)
         exact = exact_success_from_state(
             self.env,
             task_q,
@@ -6012,7 +6154,11 @@ class PickInsertResetDatasetGenerator:
             plug_body_index=self.plug_index,
             latch_body_index=self.latch_index,
         )
-        proxy_bilateral = (collision.left_grasp_contact_count > 0) & (collision.right_grasp_contact_count > 0)
+        proxy_bilateral = _runtime_bilateral_grasp_proxy_contact_mask(
+            self.env,
+            collision.left_grasp_contact_count,
+            collision.right_grasp_contact_count,
+        )
         finite = (
             task_state_is_finite_and_normalized(task_q, task_qd)
             & torch.isfinite(arm_q).all(dim=-1)
@@ -6743,7 +6889,7 @@ class PickInsertResetDatasetGenerator:
             collision = collision_metrics(self.env, require_bilateral_grasp=False)
             if collision.contact_overflow:
                 raise RuntimeError("Global contact-buffer overflow during canonical grasp relaxation.")
-            grasp = grasp_metrics(self.env, self.closed_finger_target)
+            grasp = grasp_metrics(self.env, self.closed_finger_target, retaining_grasp=True)
             exact = exact_success_from_state(
                 self.env,
                 task_q,
@@ -6809,7 +6955,11 @@ class PickInsertResetDatasetGenerator:
             )
             target_drift = torch.abs(resolved_target - immutable_relaxation_target).amax(dim=-1)
             tracking_error = torch.abs(resolved_target - arm_q).amax(dim=-1)
-            proxy_bilateral = (collision.left_grasp_contact_count > 0) & (collision.right_grasp_contact_count > 0)
+            proxy_bilateral = _runtime_bilateral_grasp_proxy_contact_mask(
+                self.env,
+                collision.left_grasp_contact_count,
+                collision.right_grasp_contact_count,
+            )
             finite = (
                 task_state_is_finite_and_normalized(task_q, task_qd)
                 & torch.isfinite(arm_q).all(dim=-1)
@@ -7488,7 +7638,7 @@ class PickInsertResetDatasetGenerator:
         release_to_settled_arm_drift = torch.abs(settled_arm_q - release_arm_q).amax(dim=-1)
         stability_start_q, stability_start_qd = self.env.read_task_state()
         stability_start_arm_q = settled_arm_q.clone()
-        stability_start_grasp = grasp_metrics(self.env, self.closed_finger_target)
+        stability_start_grasp = grasp_metrics(self.env, self.closed_finger_target, retaining_grasp=True)
         stability_start_collision = collision_metrics(self.env)
         canonical_target_e = authored_seat_target_w - self.env.env_origins
         trailing_goal_q = stability_start_q.clone()
@@ -7535,7 +7685,7 @@ class PickInsertResetDatasetGenerator:
             plug_body_index=self.plug_index,
             latch_body_index=self.latch_index,
         )
-        passive_grasp = grasp_metrics(self.env, self.closed_finger_target)
+        passive_grasp = grasp_metrics(self.env, self.closed_finger_target, retaining_grasp=True)
         passive_collision = collision_metrics(self.env)
         passive_arm_q, passive_arm_qd, _, passive_finger_qd = self.env.read_robot_state()
         passive_arm_drift = torch.abs(passive_arm_q - stability_start_arm_q).amax(dim=-1)
@@ -7675,7 +7825,7 @@ class PickInsertResetDatasetGenerator:
             final_qd[:, self.cable_slice, :3],
             dim=-1,
         ).max(dim=-1)
-        goal_grasp = grasp_metrics(self.env, self.closed_finger_target)
+        goal_grasp = grasp_metrics(self.env, self.closed_finger_target, retaining_grasp=True)
         final_collision = collision_metrics(self.env)
         final_seat_error = torch.linalg.vector_norm(
             final_q[:, self.plug_index, :3] - canonical_target_e,
@@ -7953,6 +8103,7 @@ class PickInsertResetDatasetGenerator:
         pickup_pose: torch.Tensor,
         *,
         active_mask: torch.Tensor,
+        orientation_error_xyzw: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Kinematically stage the open gripper above the future loose-plug pose."""
         active_mask = torch.as_tensor(active_mask, device=self.device, dtype=torch.bool)
@@ -7967,7 +8118,10 @@ class PickInsertResetDatasetGenerator:
         entry_bias_finite = torch.isfinite(entry_equilibrium_bias).all(dim=-1)
         entry_bias_within_tracking_limits = (torch.abs(entry_equilibrium_bias) <= tracking_error_limits).all(dim=-1)
         entry_bias_valid = entry_bias_finite & entry_bias_within_tracking_limits
-        clearance_position, clearance_orientation = self._desired_tcp_pose(pickup_pose)
+        clearance_position, clearance_orientation = self._desired_tcp_pose(
+            pickup_pose,
+            orientation_error_xyzw=orientation_error_xyzw,
+        )
         clearance_position = clearance_position.clone()
         clearance_position[:, 2] += self.cfg.grasp_open_clearance_m
         ik_count_before = self._ik_solve_call_count
@@ -8145,8 +8299,11 @@ class PickInsertResetDatasetGenerator:
         acquire: bool,
         active_mask: torch.Tensor | None = None,
         diagnostic_evidence: dict[str, Any] | None = None,
+        pregrasp_orientation_error_xyzw: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Physically place the loose cable, then optionally acquire it drive-free."""
+        if acquire and pregrasp_orientation_error_xyzw is not None:
+            raise ValueError("Starts-grasped pickup construction must retain the canonical grasp orientation.")
         if active_mask is None:
             active_mask = torch.ones(self.env.num_envs, device=self.device, dtype=torch.bool)
         else:
@@ -8155,6 +8312,7 @@ class PickInsertResetDatasetGenerator:
         staged_arm_target, staging_valid, staging_evidence = self._stage_robot_for_pickup(
             pickup_pose,
             active_mask=active_mask,
+            orientation_error_xyzw=pregrasp_orientation_error_xyzw,
         )
         staged_finger_target = self.open_finger_q
         parked_q, parked_qd = self.env.read_task_state()
@@ -8387,7 +8545,10 @@ class PickInsertResetDatasetGenerator:
             pickup_pose[:, 3:7],
         )
         live_reference_plug = settled_q[:, self.plug_index].clone()
-        live_clearance_position, live_clearance_orientation = self._desired_tcp_pose(live_reference_plug)
+        live_clearance_position, live_clearance_orientation = self._desired_tcp_pose(
+            live_reference_plug,
+            orientation_error_xyzw=pregrasp_orientation_error_xyzw,
+        )
         live_clearance_position = live_clearance_position.clone()
         live_clearance_position[:, 2] += self.cfg.grasp_open_clearance_m
         staged_tcp = self.env.tcp_pose_e()
@@ -8886,13 +9047,17 @@ class PickInsertResetDatasetGenerator:
             collision = collision_metrics(self.env, require_bilateral_grasp=False)
             if collision.contact_overflow:
                 raise RuntimeError("Global contact-buffer overflow during grasped transport.")
-            grasp = grasp_metrics(self.env, self.closed_finger_target)
+            grasp = grasp_metrics(self.env, self.closed_finger_target, retaining_grasp=True)
             cable_speed = torch.linalg.vector_norm(task_qd[:, self.cable_slice, :3], dim=-1).amax(dim=-1)
             plug_linear_speed = torch.linalg.vector_norm(task_qd[:, self.plug_index, :3], dim=-1)
             plug_angular_speed = torch.linalg.vector_norm(task_qd[:, self.plug_index, 3:6], dim=-1)
             arm_speed = torch.abs(arm_qd).amax(dim=-1)
             finger_speed = torch.abs(finger_qd).amax(dim=-1)
-            bilateral = (collision.left_grasp_contact_count > 0) & (collision.right_grasp_contact_count > 0)
+            bilateral = _runtime_bilateral_grasp_proxy_contact_mask(
+                self.env,
+                collision.left_grasp_contact_count,
+                collision.right_grasp_contact_count,
+            )
             finite = (
                 task_state_is_finite_and_normalized(task_q, task_qd)
                 & torch.isfinite(arm_q).all(dim=-1)
@@ -9330,7 +9495,7 @@ class PickInsertResetDatasetGenerator:
                     current_plug_position = next_plug_position
         finally:
             self.env.advance = original_advance
-        grasp = grasp_metrics(self.env, self.closed_finger_target)
+        grasp = grasp_metrics(self.env, self.closed_finger_target, retaining_grasp=True)
         collision = collision_metrics(self.env)
         if collision.contact_overflow:
             raise RuntimeError("Global contact-buffer overflow at the grasped-transport result boundary.")
@@ -10016,7 +10181,14 @@ class PickInsertResetDatasetGenerator:
             active_mask=active_mask,
         )
         if starts_grasped:
-            acquired = entry_valid & grasp_metrics(self.env, state["finger_joint_target"]).valid
+            acquired = (
+                entry_valid
+                & grasp_metrics(
+                    self.env,
+                    state["finger_joint_target"],
+                    retaining_grasp=True,
+                ).valid
+            )
             recovery_start_finger_target = state["finger_joint_target"]
         else:
             arm_target, acquired, recovery_start_finger_target = self._acquire_grasp(
@@ -10106,9 +10278,7 @@ class PickInsertResetDatasetGenerator:
         plug_target = goal_plug.clone()
         if phase in (0, 1, 2):
             local_offset = torch.zeros((self.env.num_envs, 3), device=self.device)
-            local_offset[:, 1] = -(
-                self.cfg.phase_0_axial_offset_m if phase == 0 else self.cfg.phase_1_axial_offset_m
-            )
+            local_offset[:, 1] = -(self.cfg.phase_0_axial_offset_m if phase == 0 else self.cfg.phase_1_axial_offset_m)
             if phase == 2:
                 local_offset[:, 1] = -0.08
             plug_target[:, :3] += math_utils.quat_apply(goal_plug[:, 3:7], local_offset)
@@ -10147,7 +10317,10 @@ class PickInsertResetDatasetGenerator:
     ) -> tuple[Any, torch.Tensor]:
         """Solve the one static TCP target associated with a fast reset row."""
         plug_pose = task_q[:, self.plug_index]
-        target_position, target_orientation = self._desired_tcp_pose(plug_pose)
+        target_position, target_orientation = self._desired_tcp_pose(
+            plug_pose,
+            orientation_error_xyzw=self._sample_phase_tcp_orientation_error(phase),
+        )
         if phase == 4:
             target_position = target_position.clone()
             target_position[:, 2] += self.cfg.phase_4_pregrasp_height_m
@@ -10215,10 +10388,7 @@ class PickInsertResetDatasetGenerator:
         ).amin(dim=-1)
         collision_policy = FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY["collision_filter"]
         collision_filtered = (
-            (
-                minimum_cable_support_clearance
-                >= -float(collision_policy["maximum_table_penetration_m"])
-            )
+            (minimum_cable_support_clearance >= -float(collision_policy["maximum_table_penetration_m"]))
             & (
                 minimum_nonadjacent_cable_separation
                 >= 2.0 * CABLE_RADIUS + float(collision_policy["minimum_nonadjacent_cable_surface_gap_m"])
@@ -10310,9 +10480,7 @@ class PickInsertResetDatasetGenerator:
             arm_target = row_ik.arm_q
             finger_position = finger_target
             if starts_grasped:
-                finger_position = canonical_goal["finger_joint_position"].to(self.device).repeat(
-                    self.env.num_envs, 1
-                )
+                finger_position = canonical_goal["finger_joint_position"].to(self.device).repeat(self.env.num_envs, 1)
             checks, metrics = self._fast_static_checks(
                 phase,
                 task_q,
@@ -10349,12 +10517,7 @@ class PickInsertResetDatasetGenerator:
                 "initial_goal_error": metrics["initial_goal_error"].clone(),
                 "initial_tcp_grasp_distance": metrics["initial_tcp_grasp_distance"].clone(),
                 "progress_threshold": (
-                    0.15
-                    * (
-                        metrics["initial_goal_error"]
-                        if starts_grasped
-                        else metrics["initial_tcp_grasp_distance"]
-                    )
+                    0.15 * (metrics["initial_goal_error"] if starts_grasped else metrics["initial_tcp_grasp_distance"])
                 ).clamp(2.0e-4, 0.02),
             }
             remaining = self.cfg.rows_per_phase - accepted_count
@@ -10367,12 +10530,8 @@ class PickInsertResetDatasetGenerator:
                     self.accepted_oracle_metrics[phase].append(
                         {
                             "checks": {name: bool(value[index]) for name, value in checks.items()},
-                            "goal_ik_position_residual_m": float(
-                                self._last_goal_ik_result.position_residual[index]
-                            ),
-                            "goal_ik_rotation_residual_rad": float(
-                                self._last_goal_ik_result.rotation_residual[index]
-                            ),
+                            "goal_ik_position_residual_m": float(self._last_goal_ik_result.position_residual[index]),
+                            "goal_ik_rotation_residual_rad": float(self._last_goal_ik_result.rotation_residual[index]),
                             "row_ik_position_residual_m": float(row_ik.position_residual[index]),
                             "row_ik_rotation_residual_rad": float(row_ik.rotation_residual[index]),
                             **{name: float(value[index]) for name, value in metrics.items()},
@@ -10419,11 +10578,13 @@ class PickInsertResetDatasetGenerator:
                 break
             socket_pose, pickup_pose = self._sample_scene()
             goal_q, _goal_qd, goal_arm_target, goal_ik_valid = self._row_goal(canonical_goal, socket_pose)
+            pregrasp_orientation_error = self._sample_phase_tcp_orientation_error(phase)
             pickup_arm_target, pickup_finger_target, pickup_valid = self._construct_pickup(
                 socket_pose,
                 pickup_pose,
                 acquire=starts_grasped,
                 active_mask=goal_ik_valid,
+                pregrasp_orientation_error_xyzw=pregrasp_orientation_error,
             )
             arm_target, finger_target, realization_valid = self._realize_phase(
                 phase,
@@ -10659,9 +10820,7 @@ class PickInsertResetDatasetGenerator:
             row_rng_state = certificate["row_rng_state"].detach().cpu().clone().contiguous()
             certificate_embedding = _canonical_goal_certificate_embedding(certificate)
         generate_phase = (
-            self._generate_phase_fast
-            if self.cfg.generation_mode == _GENERATION_MODE_FAST_IK
-            else self._generate_phase
+            self._generate_phase_fast if self.cfg.generation_mode == _GENERATION_MODE_FAST_IK else self._generate_phase
         )
         if generation_checkpoint is None:
             try:
@@ -10717,6 +10876,9 @@ class PickInsertResetDatasetGenerator:
                 "scripted_recovery": PICK_INSERT_RECOVERY_CARTESIAN_C2_POLICY,
                 **_pickup_construction_sequence_contract(),
             }
+        initial_state_policy["phase_4_pregrasp_orientation_sampling"] = _phase_4_pregrasp_orientation_sampling_contract(
+            self.cfg
+        )
         payload: dict[str, Any] = {
             "format": FRANKA_RJ45_PICK_INSERT_RESET_DATASET_FORMAT,
             "schema_version": FRANKA_RJ45_PICK_INSERT_RESET_DATASET_SCHEMA_VERSION,
@@ -10782,6 +10944,9 @@ def _generation_checkpoint_metadata(
                 "phase_ids": tuple(PICK_INSERT_RESET_PHASE_IDS),
                 "phase_names": tuple(PICK_INSERT_PHASE_NAMES),
                 "phase_starts_grasped": _PHASE_STARTS_GRASPED,
+                "phase_4_pregrasp_orientation_sampling": (
+                    _phase_4_pregrasp_orientation_sampling_contract(generator.cfg)
+                ),
                 "state_names": tuple(RESET_DATASET_STATE_NAMES),
                 "goal_state_names": tuple(RESET_DATASET_GOAL_STATE_NAMES),
                 "final_row_order": "one-torch-randperm-after-rows-complete",
