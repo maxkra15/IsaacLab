@@ -443,6 +443,64 @@ def test_vector_collision_reduction_matches_randomized_scalar_reference(device_n
         assert observed_pairs == reference["invalid_contact_pairs"]
 
 
+def test_collide_only_metrics_refreshes_outer_and_proxy_without_stepping(monkeypatch) -> None:
+    """Static reset admission must reuse the production contact classifier."""
+    events: list[tuple[Any, ...]] = []
+    state = object()
+    contacts = object()
+    expected = object()
+
+    class Pipeline:
+        def collide(self, received_state, received_contacts):
+            events.append(("outer", received_state, received_contacts))
+
+    monkeypatch.setattr(reset_tools.NewtonManager, "forward", lambda: events.append(("forward",)))
+    monkeypatch.setattr(reset_tools.NewtonManager, "get_state_0", lambda: state)
+    monkeypatch.setattr(reset_tools.NewtonManager, "get_contacts", lambda: contacts)
+    monkeypatch.setattr(reset_tools.NewtonManager, "_collision_pipeline", Pipeline())
+    monkeypatch.setattr(
+        reset_tools.NewtonCouplerManager,
+        "refresh_proxy_collision_contacts",
+        lambda source, destination: events.append(("proxy", source, destination)),
+    )
+
+    def classify(env, penetration_tolerance, *, require_bilateral_grasp):
+        events.append(("classify", env, penetration_tolerance, require_bilateral_grasp))
+        return expected
+
+    monkeypatch.setattr(reset_tools, "collision_metrics", classify)
+    env = object()
+
+    result = reset_tools.collide_only_metrics(
+        env,
+        penetration_tolerance=1.0e-4,
+        require_bilateral_grasp=False,
+    )
+
+    assert result is expected
+    assert events == [
+        ("forward",),
+        ("outer", state, contacts),
+        ("proxy", reset_tools.RIGID_ENTRY, reset_tools.RJ45_ENTRY),
+        ("classify", env, 1.0e-4, False),
+    ]
+
+
+@pytest.mark.parametrize("missing", ("state", "contacts", "pipeline"))
+def test_collide_only_metrics_requires_complete_collision_runtime(monkeypatch, missing: str) -> None:
+    monkeypatch.setattr(reset_tools.NewtonManager, "forward", lambda: None)
+    monkeypatch.setattr(reset_tools.NewtonManager, "get_state_0", lambda: None if missing == "state" else object())
+    monkeypatch.setattr(reset_tools.NewtonManager, "get_contacts", lambda: None if missing == "contacts" else object())
+    monkeypatch.setattr(
+        reset_tools.NewtonManager,
+        "_collision_pipeline",
+        None if missing == "pipeline" else SimpleNamespace(collide=lambda *_args: None),
+    )
+
+    with pytest.raises(RuntimeError, match="initialized outer collision pipeline"):
+        reset_tools.collide_only_metrics(object())
+
+
 def test_warp_to_torch_contact_ordering_uses_stream_event_without_device_sync(monkeypatch) -> None:
     producer = SimpleNamespace(cuda_stream=11)
     torch_stream = SimpleNamespace(cuda_stream=22)

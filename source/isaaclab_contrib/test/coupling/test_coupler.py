@@ -120,6 +120,71 @@ def test_proxy_contact_data_rejects_wrong_solver_and_entry(monkeypatch):
         NewtonCouplerManager.get_proxy_contact_data("missing", "soft")
 
 
+def test_proxy_collision_refresh_syncs_input_and_preserves_cadence(monkeypatch):
+    """A collide-only refresh must not consume the solver's step cadence."""
+    parent_state = object()
+    destination_state = object()
+    destination_view = object()
+    contacts = object()
+    events: list[tuple[object, ...]] = []
+
+    class Pipeline:
+        def collide(self, state, received_contacts):
+            events.append(("collide", state, received_contacts))
+
+    config = SimpleNamespace(
+        dst_name="soft",
+        pipeline=Pipeline(),
+        contacts=contacts,
+        collide_counter=7,
+    )
+
+    class FakeSolverCoupledProxy:
+        _proxy_collision_configs = {("rigid", "soft"): config}
+
+        def entry_names(self):
+            return ("rigid", "soft")
+
+        def sync_entry_states(self, state, *, dt):
+            events.append(("sync", state, dt))
+
+        def entry_state(self, name, phase="current"):
+            assert (name, phase) == ("soft", "input")
+            return destination_state
+
+        def view(self, name):
+            assert name == "soft"
+            return destination_view
+
+    solver = FakeSolverCoupledProxy()
+    monkeypatch.setattr(coupler, "SolverCoupledProxy", FakeSolverCoupledProxy)
+    monkeypatch.setattr(coupler.NewtonManager, "_solver", solver)
+    monkeypatch.setattr(coupler.NewtonManager, "_state_0", parent_state)
+
+    result = NewtonCouplerManager.refresh_proxy_collision_contacts("rigid", "soft")
+
+    assert result == (contacts, destination_view, destination_state)
+    assert events == [("sync", parent_state, 0.0), ("collide", destination_state, contacts)]
+    assert config.collide_counter == 7
+
+
+def test_proxy_collision_refresh_rejects_missing_pipeline(monkeypatch):
+    """A proxy that intentionally consumes outer contacts has nothing to refresh."""
+
+    class FakeSolverCoupledProxy:
+        _proxy_collision_configs = {}
+
+        def entry_names(self):
+            return ("rigid", "soft")
+
+    monkeypatch.setattr(coupler, "SolverCoupledProxy", FakeSolverCoupledProxy)
+    monkeypatch.setattr(coupler.NewtonManager, "_solver", FakeSolverCoupledProxy())
+    monkeypatch.setattr(coupler.NewtonManager, "_state_0", object())
+
+    with pytest.raises(KeyError, match="no dedicated collision pipeline"):
+        NewtonCouplerManager.refresh_proxy_collision_contacts("rigid", "soft")
+
+
 def test_vbd_pose_history_requires_active_coupler_and_named_vbd_entry(monkeypatch):
     """The public history API must reject unsupported solvers before reading arrays."""
     monkeypatch.setattr(coupler.NewtonManager, "_solver", object())

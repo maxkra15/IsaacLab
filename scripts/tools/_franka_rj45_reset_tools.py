@@ -906,9 +906,7 @@ def _runtime_grasp_contact_alignment_mask(
     legacy_predicate = getattr(env, "grasp_axis_alignment_mask", None)
     if not callable(predicate) and not callable(legacy_predicate):
         return torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
-    tolerance_name = (
-        "grasp_retention_axis_tolerance_rad" if retaining_grasp else "grasp_acquisition_axis_tolerance_rad"
-    )
+    tolerance_name = "grasp_retention_axis_tolerance_rad" if retaining_grasp else "grasp_acquisition_axis_tolerance_rad"
     try:
         tolerance = float(getattr(env.cfg, tolerance_name))
     except (AttributeError, TypeError, ValueError) as exc:
@@ -1386,6 +1384,35 @@ def collision_metrics(
         right_grasp_contact_count=right_grasp_count,
         contact_overflow=outer.contact_overflow or proxy.contact_overflow,
         invalid_contact_pairs=outer.invalid_contact_pairs + proxy.invalid_contact_pairs,
+    )
+
+
+def collide_only_metrics(
+    env: _ResetToolEnv,
+    penetration_tolerance: float = 5.0e-4,
+    *,
+    require_bilateral_grasp: bool = True,
+) -> CollisionMetrics:
+    """Refresh and classify exact contacts without integrating physics.
+
+    Callers must author the complete candidate robot and task state first.
+    This helper updates articulation forward kinematics, queries the outer and
+    proxy-local Newton collision pipelines, and then delegates to the same
+    contact classifier used by physical reset validation. It intentionally
+    does not advance either solver or consume the proxy collision cadence.
+    """
+    NewtonManager.forward()
+    state = NewtonManager.get_state_0()
+    contacts = NewtonManager.get_contacts()
+    pipeline = NewtonManager._collision_pipeline
+    if state is None or contacts is None or pipeline is None:
+        raise RuntimeError("Collide-only reset screening requires an initialized outer collision pipeline.")
+    pipeline.collide(state, contacts)
+    NewtonCouplerManager.refresh_proxy_collision_contacts(RIGID_ENTRY, RJ45_ENTRY)
+    return collision_metrics(
+        env,
+        penetration_tolerance=penetration_tolerance,
+        require_bilateral_grasp=require_bilateral_grasp,
     )
 
 

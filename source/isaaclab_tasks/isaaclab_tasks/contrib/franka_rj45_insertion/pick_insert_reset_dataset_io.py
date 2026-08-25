@@ -23,9 +23,7 @@ FRANKA_RJ45_PICK_INSERT_RESET_DATASET_FORMAT = "isaaclab-franka-rj45-pick-insert
 FRANKA_RJ45_PICK_INSERT_RESET_DATASET_SCHEMA_VERSION = 3
 FRANKA_RJ45_PICK_INSERT_RESET_VALIDATION_FORMAT = "isaaclab-franka-rj45-pick-insert-reset-validation"
 FRANKA_RJ45_PICK_INSERT_RESET_VALIDATION_SCHEMA_VERSION = 5
-FRANKA_RJ45_PICK_INSERT_FAST_RESET_VALIDATION_FORMAT = (
-    "isaaclab-franka-rj45-pick-insert-fast-reset-validation"
-)
+FRANKA_RJ45_PICK_INSERT_FAST_RESET_VALIDATION_FORMAT = "isaaclab-franka-rj45-pick-insert-fast-reset-validation"
 FRANKA_RJ45_PICK_INSERT_FAST_RESET_VALIDATION_SCHEMA_VERSION = 1
 PICK_INSERT_RECOVERY_CARTESIAN_C2_POLICY = {
     "contract_version": 3,
@@ -124,7 +122,7 @@ FRANKA_RJ45_PICK_INSERT_RESET_VALIDATION_POLICY = {
 }
 """Immutable independent-validator solver policy embedded in schema-5 reports."""
 FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY = {
-    "contract_version": 1,
+    "contract_version": 2,
     "generation_mode": "fast-ik",
     "checks": {
         "finite": True,
@@ -136,10 +134,26 @@ FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY = {
     },
     "joint_limit_margin_rad": 0.02,
     "collision_filter": {
-        "method": "analytic-initial-state",
+        "method": "analytic-plus-newton-collide-only",
         "maximum_table_penetration_m": 5.0e-4,
         "minimum_nonadjacent_cable_surface_gap_m": -5.0e-4,
         "minimum_cable_socket_center_distance_m": 0.02,
+        "newton_query": {
+            "outer_pipeline": True,
+            "proxy_pipeline": True,
+            "penetration_tolerance_m": 5.0e-4,
+            "starts_grasped_requires_bilateral_proxy_contact": True,
+            "open_gripper_requires_zero_proxy_contact": True,
+            "advances_solver": False,
+            "consumes_proxy_collision_cadence": False,
+            "accepted_row_evidence_fields": (
+                "collide_only_invalid_contact_count",
+                "collide_only_grasp_contact_count",
+                "collide_only_left_grasp_contact_count",
+                "collide_only_right_grasp_contact_count",
+                "collide_only_contact_overflow",
+            ),
+        },
     },
     "simulation_steps": 0,
     "dynamics_replay": False,
@@ -185,6 +199,7 @@ _VALIDATION_SOURCE_FILES = (
 )
 _FAST_VALIDATION_SOURCE_FILES = (
     *_VALIDATION_SOURCE_FILES,
+    "scripts/tools/generate_franka_rj45_pick_insert_reset_dataset.py",
     "scripts/tools/validate_franka_rj45_pick_insert_fast_resets.py",
 )
 
@@ -509,6 +524,21 @@ RESET_DATASET_GOAL_STATE_NAMES = (
     "task_body_coupling_previous_pose",
     "task_body_velocity",
 )
+
+PICK_INSERT_FAST_RESET_ROW_BINDING_CONTRACT = {
+    "contract_version": 1,
+    "row_id_field": "final_row_id",
+    "state_digest_field": "state_sha256",
+    "state_digest_algorithm": "reset_dataset_digest",
+    "state_names": RESET_DATASET_STATE_NAMES,
+}
+"""Binding between fast-reset evidence records and final artifact rows."""
+PICK_INSERT_FAST_RESET_PHASE_0_BAND_ACCEPTANCE_CONTRACT = {
+    "contract_version": 1,
+    "maximum_absolute_fraction_error": 0.05,
+    "small_bank_discretization_allowance_rows": 1,
+}
+"""Admission tolerance for accepted phase-0 reverse-curriculum bands."""
 
 _PAYLOAD_NAMES = {"format", "schema_version", "metadata", "states", "goal_state", "content_sha256"}
 _ROW_CHECK_NAMES = (
@@ -866,6 +896,60 @@ def reset_dataset_validate_phase_row_counts(
             f"expected {expected}, got {counts}."
         )
     return counts
+
+
+def pick_insert_reset_dataset_row_digest(states: Mapping[str, torch.Tensor], row_id: int) -> str:
+    """Digest every stored state tensor for one final artifact row.
+
+    Args:
+        states: Complete reset-dataset state tensor mapping.
+        row_id: Final artifact row index.
+
+    Returns:
+        Lowercase hexadecimal SHA-256 digest for the row.
+
+    Raises:
+        ValueError: If the mapping or row index is invalid.
+    """
+    if not isinstance(states, Mapping) or set(states) != set(RESET_DATASET_STATE_NAMES):
+        raise ValueError("states must contain exactly the pick-insert reset-dataset state tensors.")
+    if not _is_plain_int(row_id) or row_id < 0:
+        raise ValueError("row_id must be a non-negative plain integer.")
+    row_count: int | None = None
+    row: dict[str, torch.Tensor] = {}
+    for name in RESET_DATASET_STATE_NAMES:
+        tensor = states[name]
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim < 1:
+            raise ValueError(f"states.{name} must be a tensor with a leading row dimension.")
+        if row_count is None:
+            row_count = int(tensor.shape[0])
+            if row_id >= row_count:
+                raise ValueError("row_id lies outside the reset-dataset state tensors.")
+        elif int(tensor.shape[0]) != row_count:
+            raise ValueError("All state tensors must have the same leading row count.")
+        row[name] = tensor[row_id]
+    return reset_dataset_digest(row)
+
+
+def pick_insert_fast_reset_phase_0_band_fraction_tolerance(row_count: int) -> float:
+    """Return the deterministic phase-0 band-fraction tolerance for one bank size.
+
+    Args:
+        row_count: Number of accepted phase-0 rows.
+
+    Returns:
+        Maximum allowed absolute deviation from a configured band weight.
+
+    Raises:
+        ValueError: If ``row_count`` is not a positive plain integer.
+    """
+    if not _is_plain_int(row_count) or row_count < 1:
+        raise ValueError("row_count must be a positive plain integer.")
+    contract = PICK_INSERT_FAST_RESET_PHASE_0_BAND_ACCEPTANCE_CONTRACT
+    return max(
+        float(contract["maximum_absolute_fraction_error"]),
+        int(contract["small_bank_discretization_allowance_rows"]) / row_count,
+    )
 
 
 def reset_dataset_validate_full_pick_diversity(
@@ -1453,8 +1537,8 @@ def fast_reset_validation_report_validate_runtime(
     policy_filter = policy.get("collision_filter")
     if not isinstance(policy_filter, Mapping):
         raise ValueError("Fast reset validation policy must define collision_filter.")
-    expected_minimum_nonadjacent_separation = (
-        2.0 * float(cable_radius) + float(policy_filter["minimum_nonadjacent_cable_surface_gap_m"])
+    expected_minimum_nonadjacent_separation = 2.0 * float(cable_radius) + float(
+        policy_filter["minimum_nonadjacent_cable_surface_gap_m"]
     )
     row_ids: list[int] = []
     row_phases: list[int] = []
@@ -1487,8 +1571,7 @@ def fast_reset_validation_report_validate_runtime(
             metric_values_valid
             and metrics["minimum_joint_limit_margin_rad"] >= policy["joint_limit_margin_rad"]
             and metrics["minimum_workspace_margin_m"] >= 0.0
-            and metrics["minimum_cable_support_clearance_m"]
-            >= -policy_filter["maximum_table_penetration_m"]
+            and metrics["minimum_cable_support_clearance_m"] >= -policy_filter["maximum_table_penetration_m"]
             and metrics["minimum_nonadjacent_cable_separation_m"] >= expected_minimum_nonadjacent_separation
             and metrics["minimum_cable_socket_center_distance_m"]
             >= policy_filter["minimum_cable_socket_center_distance_m"]
@@ -2652,6 +2735,8 @@ __all__ = [
     "FRANKA_RJ45_PICK_INSERT_RESET_VALIDATION_POLICY",
     "FRANKA_RJ45_PICK_INSERT_RESET_VALIDATION_SCHEMA_VERSION",
     "PICK_INSERT_RECOVERY_CARTESIAN_C2_POLICY",
+    "PICK_INSERT_FAST_RESET_PHASE_0_BAND_ACCEPTANCE_CONTRACT",
+    "PICK_INSERT_FAST_RESET_ROW_BINDING_CONTRACT",
     "PICK_INSERT_RESET_PHASE_IDS",
     "PICK_INSERT_RESET_REPLAY_DURATION_S",
     "PICK_INSERT_RESET_REPLAY_POST_STEP_SAMPLES",
@@ -2672,6 +2757,8 @@ __all__ = [
     "RESET_DATASET_STATE_NAMES",
     "franka_rj45_validation_source_sha256",
     "fast_reset_validation_report_validate_runtime",
+    "pick_insert_fast_reset_phase_0_band_fraction_tolerance",
+    "pick_insert_reset_dataset_row_digest",
     "reset_dataset_content_digest",
     "reset_dataset_digest",
     "reset_dataset_validate_full_pick_diversity",

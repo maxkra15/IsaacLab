@@ -19,8 +19,10 @@ plug-relative closing-axis twist uniformly over +/-60 degrees and a top-down
 tilt uniformly by solid angle over a 0-25 degree cone.  Starts-grasped phases
 remain at the canonical grasp orientation, and phase 5 keeps its away pose.
 
-Production runs first certify the canonical goal with one or four worlds, then
-load that self-contained certificate for the fixed-width batch-24 row stream.
+Production runs first certify the canonical goal with one or four worlds.  The
+legacy physical row stream remains fixed at 96 rows per phase and batch 24.
+The reference fast bank uses 3,334 rows per phase (20,004 total), batch 256,
+and a phase-0 reverse curriculum sampled just outside geometric success.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +58,7 @@ from _franka_rj45_reset_tools import (
     advance_exact_success_dwell,
     advance_reset_absolute_target_hold,
     batched_quat_slerp,
+    collide_only_metrics,
     collision_metrics,
     configured_arm_home,
     exact_success_from_state,
@@ -92,11 +96,15 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     PICK_INSERT_EFFECTIVE_GRASP_FRICTION,
     PICK_INSERT_GRASP_PROXY_FRICTION,
     PICK_INSERT_OPEN_FINGER_POSITION,
+    PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M,
+    PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES,
+    PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS,
     PICK_INSERT_PHASE_4_PREGRASP_HEIGHT_M,
     PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_CLOSING_AXIS_TWIST_ERROR_RAD,
     PICK_INSERT_PHASE_4_PREGRASP_MAXIMUM_TOP_DOWN_TILT_ERROR_RAD,
     PICK_INSERT_PHASE_NAMES,
     FrankaRJ45PickInsertEnvCfg,
+    pick_insert_phase_0_reverse_curriculum_sampling_contract,
     pick_insert_phase_4_pregrasp_orientation_sampling_contract,
     pick_insert_reset_dataset_task_contract,
 )
@@ -104,6 +112,8 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_reset_dataset_io i
     FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY,
     FRANKA_RJ45_PICK_INSERT_RESET_DATASET_FORMAT,
     FRANKA_RJ45_PICK_INSERT_RESET_DATASET_SCHEMA_VERSION,
+    PICK_INSERT_FAST_RESET_PHASE_0_BAND_ACCEPTANCE_CONTRACT,
+    PICK_INSERT_FAST_RESET_ROW_BINDING_CONTRACT,
     PICK_INSERT_GOAL_MAX_ARM_JOINT_SPEED_RAD_S,
     PICK_INSERT_GOAL_MAX_AUTHORED_PLUG_ANGLE_RAD,
     PICK_INSERT_GOAL_MAX_AUTHORED_SEAT_ERROR_M,
@@ -123,6 +133,8 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_reset_dataset_io i
     PICK_INSERT_RESET_REPLAY_POST_STEP_SAMPLES,
     RESET_DATASET_GOAL_STATE_NAMES,
     RESET_DATASET_STATE_NAMES,
+    pick_insert_fast_reset_phase_0_band_fraction_tolerance,
+    pick_insert_reset_dataset_row_digest,
     reset_dataset_content_digest,
     reset_dataset_validate_runtime,
 )
@@ -136,6 +148,9 @@ _DEFAULT_STABLE_VALIDATION_REPORT_PATH = (
 )
 _CANONICAL_ROWS_PER_PHASE = 96
 _CANONICAL_BATCH_SIZE = 24
+_REFERENCE_FAST_ROWS_PER_PHASE = 3_334
+_REFERENCE_FAST_BATCH_SIZE = 256
+_REFERENCE_FAST_TOTAL_ROWS = _REFERENCE_FAST_ROWS_PER_PHASE * len(PICK_INSERT_RESET_PHASE_IDS)
 _GENERATION_MODE_PHYSICAL_ORACLE = "physical-oracle"
 _GENERATION_MODE_FAST_IK = "fast-ik"
 _GENERATION_MODES = (_GENERATION_MODE_PHYSICAL_ORACLE, _GENERATION_MODE_FAST_IK)
@@ -445,6 +460,100 @@ def _phase_4_pregrasp_orientation_sampling_contract(cfg: GeneratorCfg) -> dict[s
     return contract
 
 
+def _fast_reset_bank_profile_contract(cfg: GeneratorCfg) -> dict[str, Any]:
+    """Describe the balanced fast reset-bank shape and reference profile."""
+    counts = phase_counts(cfg)
+    reference_profile = (
+        not cfg.quick
+        and cfg.rows_per_phase == _REFERENCE_FAST_ROWS_PER_PHASE
+        and cfg.batch_size == _REFERENCE_FAST_BATCH_SIZE
+    )
+    return {
+        "contract_version": 1,
+        "profile": "balanced-20004-v1" if reference_profile else "custom-balanced-fast-ik",
+        "reference_profile": reference_profile,
+        "rows_per_phase": cfg.rows_per_phase,
+        "phase_counts": counts,
+        "total_rows": _REFERENCE_FAST_TOTAL_ROWS if reference_profile else sum(counts),
+        "batch_size": cfg.batch_size,
+        "maximum_batches_per_phase": cfg.max_batches_per_phase,
+        "simulation_steps_per_row": 0,
+    }
+
+
+def _phase_0_reverse_curriculum_evidence(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize accepted phase-0 sampler evidence without storing trajectories."""
+    band_counts = {name: 0 for name in PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES}
+    shortfalls: list[float] = []
+    runtime_success_count = 0
+    for record in records:
+        band_name = record.get("phase_0_reverse_curriculum_band")
+        if band_name not in band_counts:
+            raise RuntimeError("Accepted phase-0 row has no valid reverse-curriculum band evidence.")
+        band_counts[str(band_name)] += 1
+        shortfalls.append(float(record["phase_0_axial_shortfall_m"]))
+        runtime_success_count += int(bool(record["initial_runtime_geometric_success"]))
+    if not shortfalls:
+        raise RuntimeError("Fast reset generation produced no phase-0 reverse-curriculum evidence.")
+    row_count = len(records)
+    band_fractions = {name: count / row_count for name, count in band_counts.items()}
+    maximum_fraction_error = max(
+        abs(band_fractions[name] - weight)
+        for name, weight in zip(
+            PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES,
+            PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS,
+            strict=True,
+        )
+    )
+    allowed_fraction_error = pick_insert_fast_reset_phase_0_band_fraction_tolerance(row_count)
+    if maximum_fraction_error > allowed_fraction_error:
+        raise RuntimeError(
+            "Accepted phase-0 reverse-curriculum band fractions exceed the deterministic tolerance: "
+            f"fractions={band_fractions}, maximum_error={maximum_fraction_error}, "
+            f"allowed={allowed_fraction_error}."
+        )
+    return {
+        "accepted_row_count": row_count,
+        "accepted_band_counts": band_counts,
+        "accepted_band_fractions": band_fractions,
+        "maximum_absolute_band_fraction_error": maximum_fraction_error,
+        "allowed_absolute_band_fraction_error": allowed_fraction_error,
+        "band_proportions_within_tolerance": True,
+        "minimum_axial_shortfall_m": min(shortfalls),
+        "maximum_axial_shortfall_m": max(shortfalls),
+        "initial_runtime_geometric_success_count": runtime_success_count,
+        "all_rows_preseat_and_outside_geometric_success": runtime_success_count == 0,
+        "simulation_steps": 0,
+    }
+
+
+def _bind_fast_accepted_metrics_to_final_rows(
+    accepted_metrics: Mapping[int, Sequence[Mapping[str, Any]]],
+    final_states: Mapping[str, torch.Tensor],
+    permutation: torch.Tensor,
+) -> dict[str, list[dict[str, Any]]]:
+    """Bind every fast admission record to its final permuted artifact row."""
+    source_records: list[tuple[int, Mapping[str, Any]]] = []
+    for phase in PICK_INSERT_RESET_PHASE_IDS:
+        source_records.extend((phase, record) for record in accepted_metrics[phase])
+    source_indices = permutation.detach().cpu().tolist()
+    if len(source_records) != len(source_indices) or sorted(source_indices) != list(range(len(source_records))):
+        raise RuntimeError("Fast accepted-row evidence does not match the final artifact permutation.")
+
+    bound = {str(phase): [] for phase in PICK_INSERT_RESET_PHASE_IDS}
+    for final_row_id, source_row_id in enumerate(source_indices):
+        phase, source_record = source_records[source_row_id]
+        if int(final_states["phase"][final_row_id]) != phase:
+            raise RuntimeError("Fast accepted-row evidence phase does not match its final artifact row.")
+        if "final_row_id" in source_record or "state_sha256" in source_record:
+            raise RuntimeError("Unbound fast accepted-row evidence contains reserved row-binding fields.")
+        record = dict(source_record)
+        record["final_row_id"] = final_row_id
+        record["state_sha256"] = pick_insert_reset_dataset_row_digest(final_states, final_row_id)
+        bound[str(phase)].append(record)
+    return bound
+
+
 def _canonical_goal_generation_contract(cfg: GeneratorCfg) -> dict[str, Any]:
     """Return the canonical row-generation contract independent of certifier width."""
     generator_cfg = asdict(cfg)
@@ -518,6 +627,21 @@ def _canonical_goal_generation_contract(cfg: GeneratorCfg) -> dict[str, Any]:
         "grasped_transport_schedule": _grasped_transport_schedule_contract(cfg),
         "scripted_recovery": PICK_INSERT_RECOVERY_CARTESIAN_C2_POLICY,
     }
+
+
+def _canonical_goal_task_contract_projection(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove reset-bank cardinality fields that cannot affect the certified goal."""
+    projected = deepcopy(dict(contract))
+    pick_insert = projected.get("pick_insert")
+    if not isinstance(pick_insert, dict):
+        raise ValueError("Canonical-goal task contract has no pick_insert mapping.")
+    pick_insert.pop("reset_dataset_rows_per_phase", None)
+    diversity = pick_insert.get("full_pick_diversity")
+    if not isinstance(diversity, dict):
+        raise ValueError("Canonical-goal task contract has no full-pick diversity mapping.")
+    for name in ("minimum_unique_socket_rows", "minimum_unique_plug_rows", "minimum_unique_arm_rows"):
+        diversity.pop(name, None)
+    return projected
 
 
 def _validity_and_recovery_failure_checks(
@@ -993,11 +1117,17 @@ def _validate_generation_checkpoint(  # noqa: C901
     artifact_contract = metadata.get("artifact_contract")
     if not isinstance(artifact_contract, Mapping):
         raise ValueError("Generation checkpoint artifact_contract must be a mapping.")
+    rows_per_phase = artifact_contract.get("rows_per_phase")
+    batch_size = artifact_contract.get("batch_size")
+    if type(rows_per_phase) is not int or rows_per_phase < 1:
+        raise ValueError("Generation checkpoint rows_per_phase must be positive.")
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("Generation checkpoint batch_size must be positive.")
     expected_artifact_core = {
         "format": FRANKA_RJ45_PICK_INSERT_RESET_DATASET_FORMAT,
         "schema_version": FRANKA_RJ45_PICK_INSERT_RESET_DATASET_SCHEMA_VERSION,
-        "rows_per_phase": _CANONICAL_ROWS_PER_PHASE,
-        "batch_size": _CANONICAL_BATCH_SIZE,
+        "rows_per_phase": rows_per_phase,
+        "batch_size": batch_size,
         "phase_ids": list(PICK_INSERT_RESET_PHASE_IDS),
         "phase_names": list(PICK_INSERT_PHASE_NAMES),
     }
@@ -1139,16 +1269,12 @@ def _validate_generation_checkpoint(  # noqa: C901
             or phase not in PICK_INSERT_RESET_PHASE_IDS
             or type(phase_batch_index) is not int
             or not isinstance(row_ids, list)
-            or len(row_ids) > _CANONICAL_BATCH_SIZE
+            or len(row_ids) > batch_size
             or any(type(row_id) is not int for row_id in row_ids)
         ):
             raise ValueError(f"Generation checkpoint completed batch {ordinal} is malformed.")
         next_phase = next(
-            (
-                candidate
-                for candidate in PICK_INSERT_RESET_PHASE_IDS
-                if accepted_counts[candidate] < _CANONICAL_ROWS_PER_PHASE
-            ),
+            (candidate for candidate in PICK_INSERT_RESET_PHASE_IDS if accepted_counts[candidate] < rows_per_phase),
             None,
         )
         expected_row_ids = (
@@ -1156,9 +1282,8 @@ def _validate_generation_checkpoint(  # noqa: C901
             if next_phase is None
             else list(
                 range(
-                    next_phase * _CANONICAL_ROWS_PER_PHASE + accepted_counts[next_phase],
-                    next_phase * _CANONICAL_ROWS_PER_PHASE
-                    + min(_CANONICAL_ROWS_PER_PHASE, accepted_counts[next_phase] + len(row_ids)),
+                    next_phase * rows_per_phase + accepted_counts[next_phase],
+                    next_phase * rows_per_phase + min(rows_per_phase, accepted_counts[next_phase] + len(row_ids)),
                 )
             )
         )
@@ -1184,13 +1309,13 @@ def _validate_generation_checkpoint(  # noqa: C901
     expected_chunk_ordinals = [record["ordinal"] for record in completed_batches if record["row_ids"]]
     if [chunk["ordinal"] for chunk in decoded_chunks] != expected_chunk_ordinals:
         raise ValueError("Generation checkpoint accepted chunks are not in committed batch order.")
-    expected_attempt_counts = [count * _CANONICAL_BATCH_SIZE for count in phase_batch_counts]
+    expected_attempt_counts = [count * batch_size for count in phase_batch_counts]
     if attempt_counts != expected_attempt_counts:
         raise ValueError("Generation checkpoint attempt counts do not match completed whole batches.")
     if any(len(metrics[str(phase)]) != accepted_counts[phase] for phase in PICK_INSERT_RESET_PHASE_IDS):
         raise ValueError("Generation checkpoint oracle metrics do not match accepted rows.")
-    total_rows = _CANONICAL_ROWS_PER_PHASE * len(PICK_INSERT_RESET_PHASE_IDS)
-    all_rows_complete = accepted_counts == [_CANONICAL_ROWS_PER_PHASE] * len(PICK_INSERT_RESET_PHASE_IDS)
+    total_rows = rows_per_phase * len(PICK_INSERT_RESET_PHASE_IDS)
+    all_rows_complete = accepted_counts == [rows_per_phase] * len(PICK_INSERT_RESET_PHASE_IDS)
     final_artifact = progress.get("final_artifact")
     if status == "goal-ready":
         if completed_batches or logical_ik_count or any(attempt_counts):
@@ -1419,7 +1544,7 @@ def _validate_generation_checkpoint_invocation(args: argparse.Namespace) -> tupl
     return resolved, resuming
 
 
-def _validate_parsed_artifact_policy(args: argparse.Namespace) -> bool:
+def _validate_parsed_artifact_policy(args: argparse.Namespace) -> bool:  # noqa: C901
     """Validate artifact modes and return whether reset-dataset saving is disabled."""
     generation_mode = getattr(args, "generation_mode", _GENERATION_MODE_PHYSICAL_ORACLE)
     if generation_mode not in _GENERATION_MODES:
@@ -1526,10 +1651,30 @@ def _validate_parsed_artifact_policy(args: argparse.Namespace) -> bool:
             return True
         if diagnostic_only:
             raise ValueError("Canonical-goal certificate input cannot be combined with a diagnostic mode.")
+        if generation_mode == _GENERATION_MODE_FAST_IK:
+            output = Path(args.output).expanduser().resolve()
+            canonical_output = DEFAULT_DATASET_PATH.expanduser().resolve()
+            reference_fast_shape = (
+                not args.quick
+                and args.rows_per_phase == _REFERENCE_FAST_ROWS_PER_PHASE
+                and args.batch_size == _REFERENCE_FAST_BATCH_SIZE
+            )
+            if output == canonical_output and not reference_fast_shape:
+                raise ValueError(
+                    "Canonical fast-IK reset-bank output requires exactly "
+                    f"{_REFERENCE_FAST_ROWS_PER_PHASE} rows per phase and batch size "
+                    f"{_REFERENCE_FAST_BATCH_SIZE}; custom fast banks require an explicit noncanonical --output."
+                )
+            return False
         if args.quick or args.rows_per_phase != _CANONICAL_ROWS_PER_PHASE or args.batch_size != _CANONICAL_BATCH_SIZE:
             raise ValueError(
                 "Canonical-goal certificate input requires exact non-quick production generation with "
                 f"{_CANONICAL_ROWS_PER_PHASE} rows per phase and batch size {_CANONICAL_BATCH_SIZE}."
+            )
+        if Path(args.output).expanduser().resolve() == DEFAULT_DATASET_PATH.expanduser().resolve():
+            raise ValueError(
+                "Legacy 96-row physical-oracle generation cannot overwrite the canonical 20,004-row reset bank; "
+                "use an explicit noncanonical --output path."
             )
         return False
     if diagnostic_only:
@@ -2306,6 +2451,69 @@ def phase_counts(cfg: GeneratorCfg) -> tuple[int, ...]:
     return tuple(cfg.rows_per_phase for _ in PICK_INSERT_RESET_PHASE_IDS)
 
 
+def sample_phase_0_reverse_curriculum_axial_shortfalls(
+    sample_count: int,
+    *,
+    device: torch.device | str,
+    rng: torch.Generator,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample phase-0 pre-seat shortfalls and their curriculum-band indices.
+
+    One uniform variate per row selects both the weighted band and the uniform
+    position inside that band.  This keeps the row stream deterministic across
+    batch partitions while consuming exactly one random tensor per batch.
+
+    Args:
+        sample_count: Number of axial shortfalls to sample.
+        device: Torch device that owns both returned tensors and ``rng``.
+        rng: Dedicated deterministic reset-row random-number generator.
+        dtype: Floating-point dtype of the returned shortfalls [m].
+
+    Returns:
+        Axial shortfalls [m], shape ``(sample_count,)``, and integer band
+        indices, shape ``(sample_count,)``.
+    """
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 0:
+        raise ValueError("sample_count must be a non-negative integer.")
+    if not dtype.is_floating_point:
+        raise ValueError("Phase-0 axial shortfalls require a floating-point dtype.")
+    ranges = torch.as_tensor(
+        PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M,
+        device=device,
+        dtype=dtype,
+    )
+    weights = torch.as_tensor(
+        PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS,
+        device=device,
+        dtype=dtype,
+    )
+    if ranges.shape != (len(PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES), 2):
+        raise RuntimeError("Phase-0 reverse-curriculum ranges do not match their band names.")
+    if weights.shape != (len(PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES),):
+        raise RuntimeError("Phase-0 reverse-curriculum weights do not match their band names.")
+
+    draws = torch.rand((sample_count,), device=device, generator=rng, dtype=dtype)
+    cumulative = torch.cumsum(weights, dim=0)
+    band_indices = torch.bucketize(draws, cumulative[:-1], right=True)
+    probability_lower = torch.cat((torch.zeros_like(cumulative[:1]), cumulative[:-1]))
+    within_band = (draws - probability_lower[band_indices]) / weights[band_indices]
+    selected_ranges = ranges[band_indices]
+    shortfalls = selected_ranges[:, 0] + within_band * (selected_ranges[:, 1] - selected_ranges[:, 0])
+    return shortfalls, band_indices
+
+
+def phase_0_reverse_curriculum_band_indices(axial_shortfall_m: torch.Tensor) -> torch.Tensor:
+    """Classify pre-seat axial shortfalls [m], returning ``-1`` outside all bands."""
+    band_indices = torch.full_like(axial_shortfall_m, -1, dtype=torch.int64)
+    last_band = len(PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M) - 1
+    for band_index, (lower, upper) in enumerate(PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M):
+        upper_valid = axial_shortfall_m <= upper if band_index == last_band else axial_shortfall_m < upper
+        in_band = (axial_shortfall_m >= lower) & upper_valid
+        band_indices = torch.where(in_band, band_index, band_indices)
+    return band_indices
+
+
 def sample_phase_4_pregrasp_orientation_errors(
     sample_count: int,
     *,
@@ -2704,7 +2912,7 @@ class PickInsertResetDatasetGenerator:
         self.rejection_counts: dict[int, dict[str, int]] = {
             phase: defaultdict(int) for phase in PICK_INSERT_RESET_PHASE_IDS
         }
-        self.accepted_oracle_metrics: dict[int, list[dict[str, float | bool]]] = {
+        self.accepted_oracle_metrics: dict[int, list[dict[str, Any]]] = {
             phase: [] for phase in PICK_INSERT_RESET_PHASE_IDS
         }
 
@@ -2765,13 +2973,25 @@ class PickInsertResetDatasetGenerator:
             metadata = certificate.get("metadata") if isinstance(certificate, Mapping) else None
             source_sha256 = metadata.get("source_sha256") if isinstance(metadata, Mapping) else None
             generation_contract = metadata.get("generation_contract") if isinstance(metadata, Mapping) else None
-            if not isinstance(source_sha256, Mapping) or not isinstance(generation_contract, Mapping):
-                raise ValueError("Fast-IK generation requires a source- and generation-bound goal certificate.")
+            certificate_task_contract = metadata.get("task_contract") if isinstance(metadata, Mapping) else None
+            if (
+                not isinstance(source_sha256, Mapping)
+                or not isinstance(generation_contract, Mapping)
+                or not isinstance(certificate_task_contract, Mapping)
+            ):
+                raise ValueError("Fast-IK generation requires a source-, task-, and generation-bound goal certificate.")
+            live_goal_contract = _canonical_goal_task_contract_projection(validation["expected_task_contract"])
+            certificate_goal_contract = _canonical_goal_task_contract_projection(certificate_task_contract)
+            if reset_dataset_digest(live_goal_contract) != reset_dataset_digest(certificate_goal_contract):
+                raise ValueError("Fast-IK goal certificate task contract differs beyond reset-bank cardinality fields.")
             # Fast-IK does not reinterpret or regenerate the canonical goal.
             # Its own report binds the current row generator source, while the
             # embedded certificate retains the source that produced the goal.
+            # Row count and diversity minima are artifact properties, so they
+            # do not invalidate a physically identical certified goal.
             validation["expected_source_sha256"] = source_sha256
             validation["expected_generation_contract"] = generation_contract
+            validation["expected_task_contract"] = certificate_task_contract
         return _validate_canonical_goal_certificate(certificate, **validation)
 
     def _solve_ik(self, *args: Any, **kwargs: Any) -> Any:
@@ -10278,7 +10498,16 @@ class PickInsertResetDatasetGenerator:
         plug_target = goal_plug.clone()
         if phase in (0, 1, 2):
             local_offset = torch.zeros((self.env.num_envs, 3), device=self.device)
-            local_offset[:, 1] = -(self.cfg.phase_0_axial_offset_m if phase == 0 else self.cfg.phase_1_axial_offset_m)
+            if phase == 0:
+                axial_shortfall, _band_indices = sample_phase_0_reverse_curriculum_axial_shortfalls(
+                    self.env.num_envs,
+                    device=self.device,
+                    rng=self.random,
+                    dtype=goal_q.dtype,
+                )
+                local_offset[:, 1] = -axial_shortfall
+            else:
+                local_offset[:, 1] = -self.cfg.phase_1_axial_offset_m
             if phase == 2:
                 local_offset[:, 1] = -0.08
             plug_target[:, :3] += math_utils.quat_apply(goal_plug[:, 3:7], local_offset)
@@ -10412,8 +10641,29 @@ class PickInsertResetDatasetGenerator:
             plug_body_index=self.plug_index,
             latch_body_index=self.latch_index,
         )
+        goal_plug = goal_q[:, self.plug_index]
+        plug_translation_error_local = math_utils.quat_apply_inverse(
+            goal_plug[:, 3:7],
+            task_q[:, self.plug_index, :3] - goal_plug[:, :3],
+        )
+        signed_axial_error = plug_translation_error_local[:, 1]
+        phase_0_axial_shortfall = -signed_axial_error
+        phase_0_band_index = phase_0_reverse_curriculum_band_indices(phase_0_axial_shortfall)
+        initial_runtime_success = exact_success_from_state(
+            self.env,
+            task_q,
+            task_qd,
+            goal_q,
+            plug_body_index=self.plug_index,
+            latch_body_index=self.latch_index,
+        ).mask
         if phase == 0:
-            phase_semantics = goal_error <= 0.020
+            phase_semantics = (
+                (signed_axial_error < 0.0)
+                & (phase_0_band_index >= 0)
+                & (goal_error <= 0.020)
+                & ~initial_runtime_success
+            )
         elif phase == 1:
             phase_semantics = (goal_error >= 0.015) & (goal_error <= 0.090)
         elif phase == 2:
@@ -10450,7 +10700,130 @@ class PickInsertResetDatasetGenerator:
             "minimum_cable_support_clearance_m": minimum_cable_support_clearance,
             "minimum_nonadjacent_cable_separation_m": minimum_nonadjacent_cable_separation,
             "minimum_cable_socket_center_distance_m": minimum_cable_socket_center_distance,
+            "phase_0_signed_axial_error_m": signed_axial_error,
+            "phase_0_axial_shortfall_m": phase_0_axial_shortfall,
+            "phase_0_reverse_curriculum_band_index": phase_0_band_index,
+            "initial_runtime_geometric_success": initial_runtime_success,
         }
+
+    def _fast_collide_only_checks(
+        self,
+        *,
+        task_q: torch.Tensor,
+        task_qd: torch.Tensor,
+        arm_target: torch.Tensor,
+        finger_position: torch.Tensor,
+        finger_target: torch.Tensor,
+        starts_grasped: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Author one candidate batch and run exact zero-step Newton collision checks."""
+        self.env.write_task_state(task_q, task_qd)
+        self.env.write_robot_state(
+            arm_target,
+            finger_position,
+            arm_target=arm_target,
+            finger_target=finger_target,
+        )
+        collision = collide_only_metrics(
+            self.env,
+            penetration_tolerance=float(
+                FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY["collision_filter"]["newton_query"]["penetration_tolerance_m"]
+            ),
+            require_bilateral_grasp=starts_grasped,
+        )
+        if collision.contact_overflow:
+            raise RuntimeError("Global contact-buffer overflow during fast collide-only reset admission.")
+        if starts_grasped:
+            valid = (
+                collision.valid
+                & grasp_metrics(
+                    self.env,
+                    finger_target,
+                    retaining_grasp=True,
+                ).valid
+            )
+        else:
+            valid = collision.valid & (collision.grasp_contact_count == 0)
+        return valid, {
+            "collide_only_invalid_contact_count": collision.invalid_contact_count,
+            "collide_only_grasp_contact_count": collision.grasp_contact_count,
+            "collide_only_left_grasp_contact_count": collision.left_grasp_contact_count,
+            "collide_only_right_grasp_contact_count": collision.right_grasp_contact_count,
+            "collide_only_contact_overflow": torch.full(
+                (self.env.num_envs,),
+                collision.contact_overflow,
+                device=self.device,
+                dtype=torch.bool,
+            ),
+        }
+
+    def _fast_collision_authoring_state(
+        self,
+        *,
+        task_q: torch.Tensor,
+        task_qd: torch.Tensor,
+        goal_q: torch.Tensor,
+        arm_target: torch.Tensor,
+        ik_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Replace rejected lanes with finite states before invoking collision kernels."""
+        authorable = (
+            ik_valid & task_state_is_finite_and_normalized(task_q, task_qd) & torch.isfinite(arm_target).all(dim=-1)
+        )
+        collision_task_q = torch.where(authorable[:, None, None], task_q, goal_q)
+        collision_task_qd = torch.where(authorable[:, None, None], task_qd, torch.zeros_like(task_qd))
+        collision_arm_target = torch.where(authorable[:, None], arm_target, self.home_arm_q)
+        return collision_task_q, collision_task_qd, collision_arm_target
+
+    def _append_fast_accepted_metrics(
+        self,
+        *,
+        phase: int,
+        chosen: torch.Tensor,
+        checks: Mapping[str, torch.Tensor],
+        metrics: Mapping[str, torch.Tensor],
+        row_ik: Any,
+    ) -> None:
+        """Batch-copy accepted evidence to CPU before creating plain metadata records."""
+        check_rows = {name: value[chosen].detach().cpu() for name, value in checks.items()}
+        metric_rows = {name: value[chosen].detach().cpu() for name, value in metrics.items()}
+        goal_position_residual = self._last_goal_ik_result.position_residual[chosen].detach().cpu()
+        goal_rotation_residual = self._last_goal_ik_result.rotation_residual[chosen].detach().cpu()
+        row_position_residual = row_ik.position_residual[chosen].detach().cpu()
+        row_rotation_residual = row_ik.rotation_residual[chosen].detach().cpu()
+        for row_index in range(chosen.numel()):
+            record: dict[str, Any] = {
+                "checks": {name: bool(value[row_index]) for name, value in check_rows.items()},
+                "goal_ik_position_residual_m": float(goal_position_residual[row_index]),
+                "goal_ik_rotation_residual_rad": float(goal_rotation_residual[row_index]),
+                "row_ik_position_residual_m": float(row_position_residual[row_index]),
+                "row_ik_rotation_residual_rad": float(row_rotation_residual[row_index]),
+                **{name: float(value[row_index]) for name, value in metric_rows.items()},
+            }
+            record.update(
+                {
+                    "collide_only_invalid_contact_count": int(
+                        metric_rows["collide_only_invalid_contact_count"][row_index]
+                    ),
+                    "collide_only_grasp_contact_count": int(metric_rows["collide_only_grasp_contact_count"][row_index]),
+                    "collide_only_left_grasp_contact_count": int(
+                        metric_rows["collide_only_left_grasp_contact_count"][row_index]
+                    ),
+                    "collide_only_right_grasp_contact_count": int(
+                        metric_rows["collide_only_right_grasp_contact_count"][row_index]
+                    ),
+                    "collide_only_contact_overflow": bool(metric_rows["collide_only_contact_overflow"][row_index]),
+                }
+            )
+            if phase == 0:
+                band_index = int(metric_rows["phase_0_reverse_curriculum_band_index"][row_index])
+                record["phase_0_reverse_curriculum_band"] = PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES[
+                    band_index
+                ]
+                record["initial_runtime_geometric_success"] = bool(
+                    metric_rows["initial_runtime_geometric_success"][row_index]
+                )
+            self.accepted_oracle_metrics[phase].append(record)
 
     @torch.inference_mode()
     def _generate_phase_fast(
@@ -10481,6 +10854,22 @@ class PickInsertResetDatasetGenerator:
             finger_position = finger_target
             if starts_grasped:
                 finger_position = canonical_goal["finger_joint_position"].to(self.device).repeat(self.env.num_envs, 1)
+            ik_valid = goal_ik_valid & row_ik.valid
+            collision_task_q, collision_task_qd, collision_arm_target = self._fast_collision_authoring_state(
+                task_q=task_q,
+                task_qd=task_qd,
+                goal_q=goal_q,
+                arm_target=arm_target,
+                ik_valid=ik_valid,
+            )
+            collide_only_valid, collide_only_evidence = self._fast_collide_only_checks(
+                task_q=collision_task_q,
+                task_qd=collision_task_qd,
+                arm_target=collision_arm_target,
+                finger_position=finger_position,
+                finger_target=finger_target,
+                starts_grasped=starts_grasped,
+            )
             checks, metrics = self._fast_static_checks(
                 phase,
                 task_q,
@@ -10489,8 +10878,10 @@ class PickInsertResetDatasetGenerator:
                 arm_target,
                 finger_position,
                 row_ik.tcp_position,
-                goal_ik_valid & row_ik.valid,
+                ik_valid,
             )
+            checks["collision_filtered"] &= collide_only_valid
+            metrics.update(collide_only_evidence)
             valid = torch.stack(tuple(checks.values())).all(dim=0)
             self._record_rejections(phase, checks, valid)
             self.attempt_counts[phase] += self.env.num_envs
@@ -10526,17 +10917,13 @@ class PickInsertResetDatasetGenerator:
             if chosen.numel():
                 accepted_chunk = {name: value[chosen].detach().clone() for name, value in snapshot.items()}
                 accepted.append(accepted_chunk)
-                for index in chosen.tolist():
-                    self.accepted_oracle_metrics[phase].append(
-                        {
-                            "checks": {name: bool(value[index]) for name, value in checks.items()},
-                            "goal_ik_position_residual_m": float(self._last_goal_ik_result.position_residual[index]),
-                            "goal_ik_rotation_residual_rad": float(self._last_goal_ik_result.rotation_residual[index]),
-                            "row_ik_position_residual_m": float(row_ik.position_residual[index]),
-                            "row_ik_rotation_residual_rad": float(row_ik.rotation_residual[index]),
-                            **{name: float(value[index]) for name, value in metrics.items()},
-                        }
-                    )
+                self._append_fast_accepted_metrics(
+                    phase=phase,
+                    chosen=chosen,
+                    checks=checks,
+                    metrics=metrics,
+                    row_ik=row_ik,
+                )
                 accepted_count += int(chosen.numel())
             check_counts = ", ".join(f"{name}={int(value.sum())}" for name, value in checks.items())
             print(
@@ -10801,11 +11188,12 @@ class PickInsertResetDatasetGenerator:
             if not torch.equal(self.random.get_state().detach().cpu(), row_rng_state):
                 raise RuntimeError("Canonical-goal derivation consumed the dedicated reset-row RNG stream.")
         else:
-            if (
+            legacy_shape_required = self.cfg.generation_mode == _GENERATION_MODE_PHYSICAL_ORACLE and (
                 self.cfg.quick
                 or self.cfg.rows_per_phase != _CANONICAL_ROWS_PER_PHASE
                 or self.env.num_envs != _CANONICAL_BATCH_SIZE
-            ):
+            )
+            if legacy_shape_required:
                 raise RuntimeError("Canonical-goal certificate input is restricted to canonical batch-24 generation.")
             if self._ik_solve_call_count != 0:
                 raise RuntimeError(
@@ -10854,6 +11242,11 @@ class PickInsertResetDatasetGenerator:
         contract = pick_insert_reset_dataset_task_contract(self.env.cfg)
         if self.cfg.generation_mode == _GENERATION_MODE_FAST_IK:
             accepted_metrics_name = "accepted_fast_reset_metrics"
+            accepted_metrics = _bind_fast_accepted_metrics_to_final_rows(
+                self.accepted_oracle_metrics,
+                cpu_states,
+                permutation,
+            )
             initial_state_policy = {
                 "generation_mode": _GENERATION_MODE_FAST_IK,
                 "construction": "direct-rigid-task-transform-plus-batched-ik",
@@ -10861,9 +11254,19 @@ class PickInsertResetDatasetGenerator:
                 "independent_cable_body_noise": False,
                 "construction_drive_disabled_in_every_snapshot": True,
                 "fast_reset_policy": FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY,
+                "reset_bank_profile": _fast_reset_bank_profile_contract(self.cfg),
+                "accepted_row_binding": PICK_INSERT_FAST_RESET_ROW_BINDING_CONTRACT,
+                "phase_0_accepted_band_proportions": PICK_INSERT_FAST_RESET_PHASE_0_BAND_ACCEPTANCE_CONTRACT,
+                "phase_0_reverse_curriculum_sampling": (pick_insert_phase_0_reverse_curriculum_sampling_contract()),
+                "phase_0_reverse_curriculum_evidence": _phase_0_reverse_curriculum_evidence(
+                    self.accepted_oracle_metrics[0]
+                ),
             }
         else:
             accepted_metrics_name = "accepted_oracle_metrics"
+            accepted_metrics = {
+                str(phase): self.accepted_oracle_metrics[phase] for phase in PICK_INSERT_RESET_PHASE_IDS
+            }
             initial_state_policy = {
                 "generation_mode": _GENERATION_MODE_PHYSICAL_ORACLE,
                 "whole_cable_generated_by_coupled_motion": True,
@@ -10896,9 +11299,7 @@ class PickInsertResetDatasetGenerator:
                     str(phase): dict(sorted(self.rejection_counts[phase].items()))
                     for phase in PICK_INSERT_RESET_PHASE_IDS
                 },
-                accepted_metrics_name: {
-                    str(phase): self.accepted_oracle_metrics[phase] for phase in PICK_INSERT_RESET_PHASE_IDS
-                },
+                accepted_metrics_name: accepted_metrics,
                 "canonical_goal_evidence": goal_evidence,
                 "canonical_goal_certificate": certificate_embedding,
                 "goal_policy": {
@@ -10938,8 +11339,8 @@ def _generation_checkpoint_metadata(
             "artifact_contract": {
                 "format": FRANKA_RJ45_PICK_INSERT_RESET_DATASET_FORMAT,
                 "schema_version": FRANKA_RJ45_PICK_INSERT_RESET_DATASET_SCHEMA_VERSION,
-                "rows_per_phase": _CANONICAL_ROWS_PER_PHASE,
-                "batch_size": _CANONICAL_BATCH_SIZE,
+                "rows_per_phase": generator.cfg.rows_per_phase,
+                "batch_size": generator.cfg.batch_size,
                 "max_batches_per_phase": generator.cfg.max_batches_per_phase,
                 "phase_ids": tuple(PICK_INSERT_RESET_PHASE_IDS),
                 "phase_names": tuple(PICK_INSERT_PHASE_NAMES),
@@ -11148,7 +11549,8 @@ class _GenerationCheckpoint:
             len(record["row_ids"]) for record in progress["completed_batches"] if record["phase"] == phase
         )
         accepted_count = 0 if accepted_chunk is None else int(accepted_chunk["phase"].shape[0])
-        row_id_start = phase * _CANONICAL_ROWS_PER_PHASE + prior_phase_rows
+        rows_per_phase = int(self.expected_metadata["artifact_contract"]["rows_per_phase"])
+        row_id_start = phase * rows_per_phase + prior_phase_rows
         row_ids = list(range(row_id_start, row_id_start + accepted_count))
         progress["completed_batches"].append(
             {
@@ -11179,7 +11581,8 @@ class _GenerationCheckpoint:
         """Commit the all-rows boundary before drawing the final permutation."""
         if self.status in {"artifact-ready", "stable-published"}:
             return
-        expected_rows = _CANONICAL_ROWS_PER_PHASE * len(PICK_INSERT_RESET_PHASE_IDS)
+        rows_per_phase = int(self.expected_metadata["artifact_contract"]["rows_per_phase"])
+        expected_rows = rows_per_phase * len(PICK_INSERT_RESET_PHASE_IDS)
         accepted_rows = sum(len(chunk["row_ids"]) for chunk in self.accepted_chunks)
         if accepted_rows != expected_rows:
             raise RuntimeError(f"Cannot mark {accepted_rows}/{expected_rows} checkpoint rows complete.")
@@ -11448,6 +11851,18 @@ def _finalize_certificate_backed_recovery_diagnostic(
     )
 
 
+def _configure_generation_reset_dataset_shape(env_cfg: FrankaRJ45PickInsertEnvCfg, rows_per_phase: int) -> None:
+    """Bind generated row cardinality and its diversity gate into the task contract."""
+    env_cfg.reset_dataset_rows_per_phase = rows_per_phase
+    if rows_per_phase == _CANONICAL_ROWS_PER_PHASE:
+        minimum_unique = 90
+    elif rows_per_phase == _REFERENCE_FAST_ROWS_PER_PHASE:
+        minimum_unique = 3_000
+    else:
+        minimum_unique = max(1, min(rows_per_phase, math.ceil(0.90 * rows_per_phase)))
+    env_cfg.reset_dataset_min_unique_full_pick_rows = minimum_unique
+
+
 def _execute_parsed_invocation(
     args: argparse.Namespace,
     *,
@@ -11473,6 +11888,7 @@ def _execute_parsed_invocation(
         finger_closed_target=PICK_INSERT_CLOSED_FINGER_POSITION,
     )
     env_cfg = FrankaRJ45PickInsertEnvCfg()
+    _configure_generation_reset_dataset_shape(env_cfg, generator_cfg.rows_per_phase)
     if args.diagnostic_forward_grasp_offset:
         env_cfg.plug_grasp_offset = (0.0, -0.020, 0.010)
     env_cfg.scene.num_envs = generator_cfg.batch_size
@@ -11588,15 +12004,31 @@ def _execute_parsed_invocation(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=DEFAULT_DATASET_PATH)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_DATASET_PATH,
+        help=(
+            "Artifact path. The default training-bank path is reserved for the 20,004-row reference fast profile; "
+            "legacy physical-oracle generation requires an explicit noncanonical path."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
         "--generation-mode",
         choices=_GENERATION_MODES,
         default=_GENERATION_MODE_PHYSICAL_ORACLE,
-        help="Use the legacy physical oracle or the bounded zero-step fast-IK screen.",
+        help=(
+            "Use the legacy physical oracle or the bounded zero-step fast-IK screen. The reference fast bank uses "
+            "--rows-per-phase 3334 --batch-size 256."
+        ),
     )
-    parser.add_argument("--rows-per-phase", type=int, default=_CANONICAL_ROWS_PER_PHASE)
+    parser.add_argument(
+        "--rows-per-phase",
+        type=int,
+        default=_CANONICAL_ROWS_PER_PHASE,
+        help="Rows in each of six balanced phases; use 3334 for the 20,004-row reference fast bank.",
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -11615,8 +12047,8 @@ def main() -> None:
         "--canonical-goal-certificate-input",
         type=Path,
         help=(
-            "Safely load a production canonical-goal certificate for exact batch-24 dataset generation or the "
-            "phase-0 transport and phase-1/2/4/5 recovery diagnostics."
+            "Safely load a production canonical-goal certificate for legacy batch-24 physical generation, "
+            "scalable fast-IK generation, or the phase-0 transport and phase-1/2/4/5 recovery diagnostics."
         ),
     )
     checkpoint_group = parser.add_mutually_exclusive_group()

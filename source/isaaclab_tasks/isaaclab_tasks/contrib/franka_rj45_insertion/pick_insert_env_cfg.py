@@ -90,6 +90,16 @@ PICK_INSERT_PHASE_NAMES = (
     "pregrasp",
     "full_pick",
 )
+PICK_INSERT_RESET_PHASE_FRACTIONS = (0.30, 0.15, 0.08, 0.06, 0.06, 0.35)
+"""Long-run reset assignment fractions for phases zero through five."""
+PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_SAMPLER_VERSION = 1
+PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES = ("immediate", "quick", "boundary")
+PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M = (
+    (0.0010, 0.0016),
+    (0.0016, 0.0035),
+    (0.0035, 0.0120),
+)
+PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS = (0.35, 0.35, 0.30)
 _FRANKA_STACK_ARM_HOME = {
     "panda_joint1": 0.0444,
     "panda_joint2": -0.1894,
@@ -269,9 +279,9 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
     """Reset source. Interactive play switches to fresh procedural full-pick starts."""
     procedural_reset_max_sampling_attempts: int = 32
     """Maximum bounded rejection-sampling attempts per procedural reset."""
-    reset_dataset_rows_per_phase: int = 96
+    reset_dataset_rows_per_phase: int = 3334
     reset_dataset_diversity_round_decimals: int = 4
-    reset_dataset_min_unique_full_pick_rows: int = 90
+    reset_dataset_min_unique_full_pick_rows: int = 3000
     reset_dataset_min_socket_span_fraction: float = 0.60
     reset_dataset_min_pickup_span_fraction: float = 0.60
     reset_dataset_min_arm_joint_span_fraction: float = 0.50
@@ -284,6 +294,8 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
         uniform_fraction=0.35,
     )
     full_pick_start_fraction: float = 0.35
+    reset_dataset_phase_fractions: tuple[float, ...] = PICK_INSERT_RESET_PHASE_FRACTIONS
+    """Long-run reset assignment fractions ordered like :data:`PICK_INSERT_PHASE_NAMES`."""
 
     socket_position_lower: tuple[float, float, float] = (0.52, 0.08, 0.0)
     socket_position_upper: tuple[float, float, float] = (0.66, 0.22, 0.0)
@@ -449,8 +461,7 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
             or self.reset_dataset_min_full_pick_tcp_distance_span <= 0.0
         ):
             raise ValueError("reset_dataset_min_full_pick_tcp_distance_span must be finite and positive.")
-        if not 0.0 < float(self.full_pick_start_fraction) < 1.0:
-            raise ValueError("full_pick_start_fraction must lie strictly inside (0, 1).")
+        _validate_pick_insert_reset_phase_fractions(self)
         quat_norm = math.sqrt(sum(float(value) ** 2 for value in self.plug_grasp_orientation_xyzw))
         if not math.isclose(quat_norm, 1.0, rel_tol=0.0, abs_tol=1.0e-6):
             raise ValueError("plug_grasp_orientation_xyzw must be normalized.")
@@ -471,6 +482,27 @@ def _validate_pick_insert_reset_source(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
         raise ValueError("Procedural resets must not construct the reset-dataset curriculum.")
     if type(cfg.procedural_reset_max_sampling_attempts) is not int or cfg.procedural_reset_max_sampling_attempts < 1:
         raise ValueError("procedural_reset_max_sampling_attempts must be a positive plain integer.")
+
+
+def _validate_pick_insert_reset_phase_fractions(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
+    """Validate phase weights and their legacy full-pick alias."""
+    if not 0.0 < float(cfg.full_pick_start_fraction) < 1.0:
+        raise ValueError("full_pick_start_fraction must lie strictly inside (0, 1).")
+    try:
+        phase_fractions = tuple(float(value) for value in cfg.reset_dataset_phase_fractions)
+    except (TypeError, ValueError) as error:
+        raise ValueError("reset_dataset_phase_fractions must contain six finite numeric fractions.") from error
+    if len(phase_fractions) != len(PICK_INSERT_PHASE_NAMES):
+        raise ValueError("reset_dataset_phase_fractions must contain exactly six fractions.")
+    if any(
+        isinstance(value, bool) or not math.isfinite(fraction) or fraction < 0.0
+        for value, fraction in zip(cfg.reset_dataset_phase_fractions, phase_fractions, strict=True)
+    ):
+        raise ValueError("reset_dataset_phase_fractions must contain finite nonnegative fractions.")
+    if not math.isclose(math.fsum(phase_fractions), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError("reset_dataset_phase_fractions must sum exactly to 1.0.")
+    if phase_fractions[5] != float(cfg.full_pick_start_fraction):
+        raise ValueError("reset_dataset_phase_fractions phase-5 fraction must equal full_pick_start_fraction.")
 
 
 def _validate_pick_insert_grasp_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
@@ -516,7 +548,7 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
     base_contract_version = int(contract["contract_version"])
     topology = pick_insert_topology_cfg(cfg)
     layout = make_rj45_task_layout(topology)
-    contract["contract_version"] = 7
+    contract["contract_version"] = 8
     contract["base_contract_version"] = base_contract_version
     contract["task_variant"] = "franka-rj45-pick-insert"
     # Runtime binds verified absolute paths immediately before scene startup.
@@ -585,7 +617,7 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
     }
 
     contract["pick_insert"] = {
-        "semantics_version": 7,
+        "semantics_version": 8,
         "goal_local_success_predicate_version": RJ45_GOAL_LOCAL_SUCCESS_PREDICATE_VERSION,
         "phase_names": PICK_INSERT_PHASE_NAMES,
         "plug_grasp_orientation_xyzw": tuple(cfg.plug_grasp_orientation_xyzw),
@@ -602,6 +634,7 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
         "minimum_pickup_socket_distance": float(cfg.minimum_pickup_socket_distance),
         "arm_reset_joint_noise": float(cfg.arm_reset_joint_noise),
         "reset_dataset_rows_per_phase": int(cfg.reset_dataset_rows_per_phase),
+        "reset_dataset_phase_fractions": tuple(float(value) for value in cfg.reset_dataset_phase_fractions),
         "full_pick_diversity": {
             "round_decimals": int(cfg.reset_dataset_diversity_round_decimals),
             "minimum_unique_socket_rows": int(cfg.reset_dataset_min_unique_full_pick_rows),
@@ -613,6 +646,7 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
             "minimum_tcp_grasp_distance_span_m": float(cfg.reset_dataset_min_full_pick_tcp_distance_span),
         },
         "full_pick_start_fraction": float(cfg.full_pick_start_fraction),
+        "phase_0_reverse_curriculum_sampling": pick_insert_phase_0_reverse_curriculum_sampling_contract(),
         "phase_4_pregrasp_orientation_sampling": pick_insert_phase_4_pregrasp_orientation_sampling_contract(),
         "grasp_acquisition_distance_m": float(cfg.grasp_acquisition_distance_m),
         "grasp_loss_grace_steps": int(cfg.grasp_loss_grace_steps),
@@ -631,6 +665,22 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
         "terminations": _config_contract(cfg.terminations),
     }
     return contract
+
+
+def pick_insert_phase_0_reverse_curriculum_sampling_contract() -> dict[str, object]:
+    """Return the immutable near-insertion reverse-curriculum sampler contract."""
+    return {
+        "sampler_version": PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_SAMPLER_VERSION,
+        "phase": 0,
+        "phase_name": PICK_INSERT_PHASE_NAMES[0],
+        "frame": "goal-plug-local",
+        "axial_offset_semantics": "positive-pre-seat-distance-along-negative-local-y",
+        "band_names": PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES,
+        "axial_offset_ranges_m": PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M,
+        "band_weights": PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS,
+        "geometric_success_at_reset": False,
+        "rng_owner": "PickInsertResetDatasetGenerator.random",
+    }
 
 
 def pick_insert_phase_4_pregrasp_orientation_sampling_contract() -> dict[str, object]:
@@ -702,12 +752,18 @@ __all__ = [
     "PICK_INSERT_GRASP_PROXY_FRICTION",
     "PICK_INSERT_GRASP_QUAT_PLUG_XYZW",
     "PICK_INSERT_OPEN_FINGER_POSITION",
+    "PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M",
+    "PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES",
+    "PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_SAMPLER_VERSION",
+    "PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS",
     "PICK_INSERT_PHASE_NAMES",
+    "PICK_INSERT_RESET_PHASE_FRACTIONS",
     "PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS",
     "PICK_INSERT_SUCCESS_MAX_PLUG_SPEED",
     "PICK_INSERT_TASK_ROTATION_XYZW",
     "PICK_INSERT_TASK_TRANSLATION",
     "PickInsertSceneCfg",
+    "pick_insert_phase_0_reverse_curriculum_sampling_contract",
     "pick_insert_play_reset_seed_contract",
     "pick_insert_reset_dataset_task_contract",
     "pick_insert_topology_cfg",

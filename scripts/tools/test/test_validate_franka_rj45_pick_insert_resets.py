@@ -40,6 +40,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SCRIPT_DIR))
 try:
     validator = importlib.import_module("validate_franka_rj45_pick_insert_resets")
+    fast_validator = importlib.import_module("validate_franka_rj45_pick_insert_fast_resets")
     generator = importlib.import_module("generate_franka_rj45_pick_insert_reset_dataset")
     ValidationCfg = validator.ValidationCfg
 finally:
@@ -225,6 +226,42 @@ def test_validation_cfg_uses_canonical_goal_thresholds():
     assert (cfg.ik_sampler, cfg.ik_seed_count, cfg.ik_iterations, cfg.ik_noise_std) == ("none", 1, 160, 0.0)
 
 
+@pytest.mark.parametrize(
+    ("rows_per_phase", "minimum_unique"),
+    ((96, 90), (3_334, 3_000), (137, 124), (1, 1)),
+)
+def test_generation_environment_task_contract_matches_requested_reset_bank_shape(rows_per_phase, minimum_unique):
+    env_cfg = FrankaRJ45PickInsertEnvCfg()
+
+    generator._configure_generation_reset_dataset_shape(env_cfg, rows_per_phase)
+    env_cfg.validate_config()
+    contract = pick_insert_reset_dataset_task_contract(env_cfg)
+
+    assert contract["pick_insert"]["reset_dataset_rows_per_phase"] == rows_per_phase
+    diversity = contract["pick_insert"]["full_pick_diversity"]
+    assert (
+        diversity["minimum_unique_socket_rows"],
+        diversity["minimum_unique_plug_rows"],
+        diversity["minimum_unique_arm_rows"],
+    ) == (minimum_unique,) * 3
+
+
+def test_canonical_goal_task_projection_ignores_only_reset_bank_cardinality():
+    legacy_cfg = FrankaRJ45PickInsertEnvCfg()
+    generator._configure_generation_reset_dataset_shape(legacy_cfg, 96)
+    reference_cfg = FrankaRJ45PickInsertEnvCfg()
+    generator._configure_generation_reset_dataset_shape(reference_cfg, 3_334)
+    legacy = generator._canonical_goal_task_contract_projection(pick_insert_reset_dataset_task_contract(legacy_cfg))
+    reference = generator._canonical_goal_task_contract_projection(
+        pick_insert_reset_dataset_task_contract(reference_cfg)
+    )
+
+    assert generator.reset_dataset_digest(legacy) == generator.reset_dataset_digest(reference)
+    changed = deepcopy(reference)
+    changed["pick_insert"]["reach_reward_scale_m"] *= 2.0
+    assert generator.reset_dataset_digest(legacy) != generator.reset_dataset_digest(changed)
+
+
 def test_phase_4_pregrasp_orientation_sampler_contract_has_exact_ranges():
     cfg = generator.GeneratorCfg()
     contract = generator._phase_4_pregrasp_orientation_sampling_contract(cfg)
@@ -244,6 +281,86 @@ def test_phase_4_pregrasp_orientation_sampler_contract_has_exact_ranges():
     assert contract["starts_grasped_phases_use_canonical_orientation"] == (0, 1, 2, 3)
     assert contract["full_pick_phase_5_orientation_sampling"] == "unchanged-away-pose"
     assert "phase_4_pregrasp_orientation_sampling" not in generator._canonical_goal_generation_contract(cfg)
+
+
+def test_phase_0_reverse_curriculum_sampler_contract_and_reference_profile_are_exact():
+    contract = generator.pick_insert_phase_0_reverse_curriculum_sampling_contract()
+    cfg = generator.GeneratorCfg(generation_mode="fast-ik", rows_per_phase=3_334, batch_size=256)
+    profile = generator._fast_reset_bank_profile_contract(cfg)
+
+    assert contract["sampler_version"] == 1
+    assert contract["frame"] == "goal-plug-local"
+    assert contract["axial_offset_ranges_m"] == (
+        (0.0010, 0.0016),
+        (0.0016, 0.0035),
+        (0.0035, 0.0120),
+    )
+    assert contract["band_weights"] == (0.35, 0.35, 0.30)
+    assert contract["geometric_success_at_reset"] is False
+    assert profile == {
+        "contract_version": 1,
+        "profile": "balanced-20004-v1",
+        "reference_profile": True,
+        "rows_per_phase": 3_334,
+        "phase_counts": (3_334,) * 6,
+        "total_rows": 20_004,
+        "batch_size": 256,
+        "maximum_batches_per_phase": 96,
+        "simulation_steps_per_row": 0,
+    }
+    assert cfg.max_batches_per_phase >= math.ceil(cfg.rows_per_phase / cfg.batch_size)
+
+
+def test_phase_0_reverse_curriculum_sampler_is_deterministic_bounded_and_band_weighted():
+    sample_count = 20_004
+    first_rng = torch.Generator().manual_seed(2026)
+    second_rng = torch.Generator().manual_seed(2026)
+
+    first_shortfalls, first_bands = generator.sample_phase_0_reverse_curriculum_axial_shortfalls(
+        sample_count,
+        device="cpu",
+        rng=first_rng,
+    )
+    second_shortfalls, second_bands = generator.sample_phase_0_reverse_curriculum_axial_shortfalls(
+        sample_count,
+        device="cpu",
+        rng=second_rng,
+    )
+
+    torch.testing.assert_close(first_shortfalls, second_shortfalls, rtol=0.0, atol=0.0)
+    assert torch.equal(first_bands, second_bands)
+    assert float(first_shortfalls.min()) >= 0.0010
+    assert float(first_shortfalls.max()) <= 0.0120
+    assert float(first_shortfalls.min()) > FrankaRJ45PickInsertEnvCfg().success_axial_tolerance
+    counts = torch.bincount(first_bands, minlength=3).float() / sample_count
+    torch.testing.assert_close(counts, torch.tensor((0.35, 0.35, 0.30)), rtol=0.0, atol=0.01)
+    for band_index, (lower, upper) in enumerate(generator.PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M):
+        values = first_shortfalls[first_bands == band_index]
+        assert len(values) > 0
+        assert float(values.min()) >= lower
+        assert float(values.max()) <= upper
+
+
+def test_phase_0_reverse_curriculum_sampler_is_batch_partition_invariant_and_consumes_one_uniform_per_row():
+    whole_rng = torch.Generator().manual_seed(4815)
+    chunked_rng = torch.Generator().manual_seed(4815)
+    reference_rng = torch.Generator().manual_seed(4815)
+
+    whole_shortfalls, whole_bands = generator.sample_phase_0_reverse_curriculum_axial_shortfalls(
+        256,
+        device="cpu",
+        rng=whole_rng,
+    )
+    chunks = [
+        generator.sample_phase_0_reverse_curriculum_axial_shortfalls(64, device="cpu", rng=chunked_rng)
+        for _ in range(4)
+    ]
+    torch.rand((256,), generator=reference_rng)
+
+    torch.testing.assert_close(torch.cat([chunk[0] for chunk in chunks]), whole_shortfalls, rtol=0.0, atol=0.0)
+    assert torch.equal(torch.cat([chunk[1] for chunk in chunks]), whole_bands)
+    assert torch.equal(chunked_rng.get_state(), whole_rng.get_state())
+    assert torch.equal(whole_rng.get_state(), reference_rng.get_state())
 
 
 @pytest.mark.parametrize(
@@ -710,6 +827,7 @@ def test_validator_resume_accepts_only_an_exact_whole_batch_prefix():
 def _parsed_generator_args(
     output: Path,
     *,
+    generation_mode: str = "physical-oracle",
     rows_per_phase: int = 96,
     batch_size: int = 24,
     quick: bool = False,
@@ -725,6 +843,7 @@ def _parsed_generator_args(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         output=output,
+        generation_mode=generation_mode,
         rows_per_phase=rows_per_phase,
         batch_size=batch_size,
         quick=quick,
@@ -747,13 +866,18 @@ def _parsed_generator_args(
     )
 
 
-def test_canonical_output_policy_requires_certificate_input_for_exact_production_shape(tmp_path):
+def test_legacy_physical_generation_requires_explicit_noncanonical_output(tmp_path):
     args = _parsed_generator_args(generator.DEFAULT_DATASET_PATH)
 
     with pytest.raises(ValueError, match="requires --canonical-goal-certificate-input"):
         generator._validate_parsed_artifact_policy(args)
 
     args.canonical_goal_certificate_input = tmp_path / "goal-certificate.pt"
+
+    with pytest.raises(ValueError, match="cannot overwrite the canonical 20,004-row reset bank"):
+        generator._validate_parsed_artifact_policy(args)
+
+    args.output = tmp_path / "legacy-physical-reset-bank.pt"
 
     assert generator._validate_parsed_artifact_policy(args) is False
 
@@ -1040,7 +1164,7 @@ def test_canonical_goal_certifier_policy_rejects_other_batch_widths(tmp_path, ba
         {"batch_size": 4},
     ),
 )
-def test_canonical_goal_certificate_input_requires_exact_batch24_generation(tmp_path, overrides):
+def test_physical_canonical_goal_certificate_input_requires_exact_batch24_generation(tmp_path, overrides):
     args = _parsed_generator_args(
         generator.DEFAULT_DATASET_PATH,
         canonical_goal_certificate_input=tmp_path / "goal-certificate.pt",
@@ -1051,12 +1175,49 @@ def test_canonical_goal_certificate_input_requires_exact_batch24_generation(tmp_
         generator._validate_parsed_artifact_policy(args)
 
 
+def test_reference_fast_bank_policy_allows_canonical_20004_row_output(tmp_path):
+    args = _parsed_generator_args(
+        generator.DEFAULT_DATASET_PATH,
+        generation_mode="fast-ik",
+        rows_per_phase=3_334,
+        batch_size=256,
+        canonical_goal_certificate_input=tmp_path / "goal-certificate.pt",
+    )
+
+    assert generator._validate_parsed_artifact_policy(args) is False
+
+
+def test_fast_bank_policy_allows_custom_noncanonical_shape(tmp_path):
+    args = _parsed_generator_args(
+        tmp_path / "custom-fast-reset-bank.pt",
+        generation_mode="fast-ik",
+        rows_per_phase=137,
+        batch_size=32,
+        canonical_goal_certificate_input=tmp_path / "goal-certificate.pt",
+    )
+
+    assert generator._validate_parsed_artifact_policy(args) is False
+
+
+def test_fast_bank_policy_reserves_canonical_output_for_reference_shape(tmp_path):
+    args = _parsed_generator_args(
+        generator.DEFAULT_DATASET_PATH,
+        generation_mode="fast-ik",
+        rows_per_phase=3_333,
+        batch_size=256,
+        canonical_goal_certificate_input=tmp_path / "goal-certificate.pt",
+    )
+
+    with pytest.raises(ValueError, match="Canonical fast-IK.*3334 rows per phase"):
+        generator._validate_parsed_artifact_policy(args)
+
+
 def test_generation_checkpoint_policy_is_exact_certificate_input_only(tmp_path):
     certificate = tmp_path / "goal.pt"
     certificate.touch()
     checkpoint = tmp_path / "rows.json"
     args = _parsed_generator_args(
-        generator.DEFAULT_DATASET_PATH,
+        tmp_path / "legacy-physical-reset-bank.pt",
         canonical_goal_certificate_input=certificate,
         checkpoint=checkpoint,
     )
@@ -1291,6 +1452,41 @@ def test_generation_checkpoint_stop_resume_restores_rng_rows_counters_and_logica
     }
     assert len(resumed.phase_chunks(0, device=torch.device("cpu"))) == 1
     assert float(torch.rand((), generator=resumed_owner.random)) == expected_next
+
+
+def test_generation_checkpoint_uses_custom_fast_bank_row_stride_and_batch_width(tmp_path):
+    certificate, contracts = _canonical_goal_certificate()
+    owner = _checkpoint_owner(contracts, certificate)
+    owner.cfg = generator.GeneratorCfg(generation_mode="fast-ik", rows_per_phase=5, batch_size=3)
+    checkpoint = generator._GenerationCheckpoint.open(
+        owner,
+        certificate,
+        path=tmp_path / "custom-fast-bank.json",
+        resuming=False,
+    )
+
+    owner.attempt_counts[0] = 3
+    owner.accepted_oracle_metrics[0] = [{"accepted": True}] * 3
+    checkpoint.commit_batch(owner, 0, 0, _checkpoint_row_chunk(0, row_count=3))
+    owner.attempt_counts[0] = 6
+    owner.accepted_oracle_metrics[0] = [{"accepted": True}] * 5
+    checkpoint.commit_batch(owner, 0, 1, _checkpoint_row_chunk(0, row_count=2))
+    owner.attempt_counts[1] = 3
+    owner.accepted_oracle_metrics[1] = [{"accepted": True}]
+    checkpoint.commit_batch(owner, 1, 0, _checkpoint_row_chunk(1))
+
+    assert checkpoint.document["metadata"]["artifact_contract"]["rows_per_phase"] == 5
+    assert checkpoint.document["metadata"]["artifact_contract"]["batch_size"] == 3
+    assert [record["row_ids"] for record in checkpoint.document["progress"]["completed_batches"]] == [
+        [0, 1, 2],
+        [3, 4],
+        [5],
+    ]
+    reloaded = generator._load_generation_checkpoint(
+        checkpoint.path,
+        expected_metadata=checkpoint.expected_metadata,
+    )
+    assert [chunk["row_ids"] for chunk in reloaded.accepted_chunks] == [[0, 1, 2], [3, 4], [5]]
 
 
 def test_generation_checkpoint_rejects_digest_corruption_and_recomputed_unknown_fields(tmp_path):
@@ -3289,7 +3485,7 @@ def test_validation_cfg_rejects_changed_production_close_target():
         ValidationCfg(finger_closed_target=0.001)
 
 
-def _canonical_phase_rows(rows_per_phase: int = 96) -> torch.Tensor:
+def _canonical_phase_rows(rows_per_phase: int = 3_334) -> torch.Tensor:
     return torch.repeat_interleave(
         torch.arange(6, dtype=torch.int64),
         rows_per_phase,
@@ -3314,7 +3510,7 @@ def test_full_validation_phase_count_gate_accepts_only_the_canonical_bank():
         expected_rows_per_phase=env_cfg.reset_dataset_rows_per_phase,
     )
 
-    assert counts == (96, 96, 96, 96, 96, 96)
+    assert counts == (3_334,) * 6
 
 
 @pytest.mark.parametrize("phase", range(6))
@@ -4367,6 +4563,49 @@ def test_generation_checkpoint_interrupted_resume_exactly_matches_fresh_576_row_
     )
 
 
+def test_fast_phase_0_task_state_is_preseat_banded_and_never_geometrically_successful():
+    num_envs = 2_048
+    env_cfg = FrankaRJ45PickInsertEnvCfg()
+    owner = object.__new__(generator.PickInsertResetDatasetGenerator)
+    owner.env = SimpleNamespace(
+        num_envs=num_envs,
+        cfg=env_cfg,
+        rj45_runtime=SimpleNamespace(layout=SimpleNamespace(body_count=3, plug_body_index=0, latch_body_index=1)),
+        advance=lambda *_args, **_kwargs: pytest.fail("physics advanced"),
+    )
+    owner.cfg = generator.GeneratorCfg(generation_mode="fast-ik", batch_size=num_envs)
+    owner.device = torch.device("cpu")
+    owner.random = torch.Generator().manual_seed(91)
+    owner.layout = SimpleNamespace(body_count=3)
+    owner.plug_index = 0
+    owner.latch_index = 1
+    owner.socket_index = 2
+    goal_q = torch.zeros((num_envs, 3, 7))
+    goal_q[..., 6] = 1.0
+
+    task_q, task_qd = owner._fast_task_state(0, torch.zeros((num_envs, 7)), goal_q)
+    local_error = generator.math_utils.quat_apply_inverse(
+        goal_q[:, owner.plug_index, 3:7],
+        task_q[:, owner.plug_index, :3] - goal_q[:, owner.plug_index, :3],
+    )
+    shortfall = -local_error[:, 1]
+    band_indices = generator.phase_0_reverse_curriculum_band_indices(shortfall)
+    success = generator.exact_success_from_state(
+        owner.env,
+        task_q,
+        task_qd,
+        goal_q,
+        plug_body_index=owner.plug_index,
+        latch_body_index=owner.latch_index,
+    ).mask
+
+    assert bool((local_error[:, 1] < 0.0).all())
+    assert bool((band_indices >= 0).all())
+    assert set(band_indices.tolist()) == {0, 1, 2}
+    assert not bool(success.any())
+    assert not bool((task_qd != 0.0).any())
+
+
 def test_fast_phase_4_ik_uses_the_bounded_pregrasp_orientation_sample():
     owner = object.__new__(generator.PickInsertResetDatasetGenerator)
     owner.env = SimpleNamespace(
@@ -4422,10 +4661,105 @@ def test_fast_ik_generator_mode_is_explicit_and_legacy_remains_default():
         generator.GeneratorCfg(generation_mode="implicit-shortcut")
 
 
-def test_fast_phase_generation_never_enters_dynamics_replay_or_recovery():
+def test_fast_collision_authoring_replaces_invalid_lanes_without_admitting_them():
     owner = object.__new__(generator.PickInsertResetDatasetGenerator)
-    owner.env = SimpleNamespace(num_envs=2, advance=lambda *_args, **_kwargs: pytest.fail("physics advanced"))
+    owner.home_arm_q = torch.full((2, 7), 0.25)
+    goal_q = torch.zeros((2, 3, 7))
+    goal_q[..., 6] = 1.0
+    goal_q[:, :, 0] = 0.5
+    task_q = goal_q.clone()
+    task_q[0, :, 0] = 0.1
+    task_q[1, 0, 0] = torch.nan
+    task_qd = torch.ones((2, 3, 6))
+    arm_target = torch.zeros((2, 7))
+    arm_target[1, 0] = torch.nan
+
+    collision_q, collision_qd, collision_arm = owner._fast_collision_authoring_state(
+        task_q=task_q,
+        task_qd=task_qd,
+        goal_q=goal_q,
+        arm_target=arm_target,
+        ik_valid=torch.tensor((True, False)),
+    )
+
+    torch.testing.assert_close(collision_q[0], task_q[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(collision_qd[0], task_qd[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(collision_arm[0], arm_target[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(collision_q[1], goal_q[1], rtol=0.0, atol=0.0)
+    assert not bool((collision_qd[1] != 0.0).any())
+    torch.testing.assert_close(collision_arm[1], owner.home_arm_q[1], rtol=0.0, atol=0.0)
+    assert bool(torch.isfinite(collision_q).all())
+    assert bool(torch.isfinite(collision_arm).all())
+
+
+@pytest.mark.parametrize(
+    ("starts_grasped", "grasp_contact_count", "grasp_aligned", "expected"),
+    (
+        (True, 2, True, True),
+        (True, 2, False, False),
+        (False, 0, False, True),
+        (False, 1, False, False),
+    ),
+)
+def test_fast_collide_only_checks_enforce_grasped_and_open_contact_semantics(
+    monkeypatch,
+    starts_grasped,
+    grasp_contact_count,
+    grasp_aligned,
+    expected,
+):
+    owner = object.__new__(generator.PickInsertResetDatasetGenerator)
+    calls: list[str] = []
     owner.device = torch.device("cpu")
+    owner.env = SimpleNamespace(
+        num_envs=1,
+        write_task_state=lambda *_args, **_kwargs: calls.append("task"),
+        write_robot_state=lambda *_args, **_kwargs: calls.append("robot"),
+    )
+    monkeypatch.setattr(
+        generator,
+        "collide_only_metrics",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            valid=torch.ones(1, dtype=torch.bool),
+            invalid_contact_count=torch.zeros(1, dtype=torch.long),
+            grasp_contact_count=torch.full((1,), grasp_contact_count, dtype=torch.long),
+            left_grasp_contact_count=torch.full((1,), int(grasp_contact_count > 0), dtype=torch.long),
+            right_grasp_contact_count=torch.full((1,), int(grasp_contact_count > 1), dtype=torch.long),
+            contact_overflow=False,
+        ),
+    )
+    monkeypatch.setattr(
+        generator,
+        "grasp_metrics",
+        lambda *_args, **_kwargs: SimpleNamespace(valid=torch.tensor((grasp_aligned,))),
+    )
+
+    valid, evidence = owner._fast_collide_only_checks(
+        task_q=torch.zeros((1, 3, 7)),
+        task_qd=torch.zeros((1, 3, 6)),
+        arm_target=torch.zeros((1, 7)),
+        finger_position=torch.zeros((1, 2)),
+        finger_target=torch.zeros((1, 2)),
+        starts_grasped=starts_grasped,
+    )
+
+    assert calls == ["task", "robot"]
+    assert bool(valid[0]) is expected
+    assert int(evidence["collide_only_grasp_contact_count"][0]) == grasp_contact_count
+    assert bool(evidence["collide_only_contact_overflow"][0]) is False
+
+
+def test_fast_phase_generation_never_enters_dynamics_replay_or_recovery(monkeypatch):
+    owner = object.__new__(generator.PickInsertResetDatasetGenerator)
+    authored: list[str] = []
+    owner.env = SimpleNamespace(
+        num_envs=2,
+        advance=lambda *_args, **_kwargs: pytest.fail("physics advanced"),
+        write_task_state=lambda *_args, **_kwargs: authored.append("task"),
+        write_robot_state=lambda *_args, **_kwargs: authored.append("robot"),
+    )
+    owner.device = torch.device("cpu")
+    owner.home_arm_q = torch.zeros((2, 7))
     owner.cfg = SimpleNamespace(rows_per_phase=2, max_batches_per_phase=1)
     owner.attempt_counts = [0] * 6
     owner.rejection_counts = {phase: {} for phase in range(6)}
@@ -4465,6 +4799,10 @@ def test_fast_phase_generation_never_enters_dynamics_replay_or_recovery():
             "minimum_cable_support_clearance_m": torch.zeros(2),
             "minimum_nonadjacent_cable_separation_m": torch.full((2,), 0.01),
             "minimum_cable_socket_center_distance_m": torch.full((2,), 0.1),
+            "phase_0_signed_axial_error_m": torch.full((2,), -0.0012),
+            "phase_0_axial_shortfall_m": torch.full((2,), 0.0012),
+            "phase_0_reverse_curriculum_band_index": torch.zeros(2, dtype=torch.int64),
+            "initial_runtime_geometric_success": torch.zeros(2, dtype=torch.bool),
         },
     )
     owner._record_rejections = lambda phase, _checks, valid: owner.rejection_counts[phase].update(
@@ -4472,6 +4810,23 @@ def test_fast_phase_generation_never_enters_dynamics_replay_or_recovery():
     )
     owner._cold_replay = lambda *_args, **_kwargs: pytest.fail("cold replay entered")
     owner._oracle = lambda *_args, **_kwargs: pytest.fail("recovery oracle entered")
+    monkeypatch.setattr(
+        generator,
+        "collide_only_metrics",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            valid=torch.ones(2, dtype=torch.bool),
+            invalid_contact_count=torch.zeros(2, dtype=torch.long),
+            grasp_contact_count=torch.full((2,), 2, dtype=torch.long),
+            left_grasp_contact_count=torch.ones(2, dtype=torch.long),
+            right_grasp_contact_count=torch.ones(2, dtype=torch.long),
+            contact_overflow=False,
+        ),
+    )
+    monkeypatch.setattr(
+        generator,
+        "grasp_metrics",
+        lambda *_args, **_kwargs: SimpleNamespace(valid=torch.ones(2, dtype=torch.bool)),
+    )
 
     rows = owner._generate_phase_fast(
         0,
@@ -4479,11 +4834,17 @@ def test_fast_phase_generation_never_enters_dynamics_replay_or_recovery():
     )
 
     assert rows["phase"].tolist() == [0, 0]
+    assert authored == ["task", "robot"]
     assert owner.attempt_counts[0] == 2
     assert len(owner.accepted_oracle_metrics[0]) == 2
     assert owner.accepted_oracle_metrics[0][0]["checks"] == {
         name: True for name in generator.FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY["checks"]
     }
+    assert owner.accepted_oracle_metrics[0][0]["collide_only_invalid_contact_count"] == 0
+    assert owner.accepted_oracle_metrics[0][0]["collide_only_grasp_contact_count"] == 2
+    assert owner.accepted_oracle_metrics[0][0]["collide_only_left_grasp_contact_count"] == 1
+    assert owner.accepted_oracle_metrics[0][0]["collide_only_right_grasp_contact_count"] == 1
+    assert owner.accepted_oracle_metrics[0][0]["collide_only_contact_overflow"] is False
 
 
 def test_fast_generation_embeds_distinct_policy_and_metrics(monkeypatch):
@@ -4500,7 +4861,21 @@ def test_fast_generation_embeds_distinct_policy_and_metrics(monkeypatch):
     owner.attempt_counts = [0] * 6
     owner.rejection_counts = {phase: {} for phase in range(6)}
     owner.accepted_oracle_metrics = {
-        phase: [{"checks": dict(generator.FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY["checks"])}] for phase in range(6)
+        phase: [
+            {
+                "checks": dict(generator.FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY["checks"]),
+                **(
+                    {
+                        "phase_0_reverse_curriculum_band": "immediate",
+                        "phase_0_axial_shortfall_m": 0.0012,
+                        "initial_runtime_geometric_success": False,
+                    }
+                    if phase == 0
+                    else {}
+                ),
+            }
+        ]
+        for phase in range(6)
     }
     owner.validate_goal_certificate = lambda value: value
     calls: list[int] = []
@@ -4530,3 +4905,287 @@ def test_fast_generation_embeds_distinct_policy_and_metrics(monkeypatch):
     assert "accepted_fast_reset_metrics" in payload["metadata"]
     assert "accepted_oracle_metrics" not in payload["metadata"]
     assert payload["metadata"]["initial_state_policy"]["fast_reset_policy"]["simulation_steps"] == 0
+    assert payload["metadata"]["initial_state_policy"]["phase_0_reverse_curriculum_sampling"] == (
+        generator.pick_insert_phase_0_reverse_curriculum_sampling_contract()
+    )
+    assert payload["metadata"]["initial_state_policy"]["phase_0_reverse_curriculum_evidence"] == {
+        "accepted_row_count": 1,
+        "accepted_band_counts": {"immediate": 1, "quick": 0, "boundary": 0},
+        "accepted_band_fractions": {"immediate": 1.0, "quick": 0.0, "boundary": 0.0},
+        "maximum_absolute_band_fraction_error": 0.65,
+        "allowed_absolute_band_fraction_error": 1.0,
+        "band_proportions_within_tolerance": True,
+        "minimum_axial_shortfall_m": 0.0012,
+        "maximum_axial_shortfall_m": 0.0012,
+        "initial_runtime_geometric_success_count": 0,
+        "all_rows_preseat_and_outside_geometric_success": True,
+        "simulation_steps": 0,
+    }
+    bound_records = payload["metadata"]["accepted_fast_reset_metrics"]
+    final_row_ids = sorted(record["final_row_id"] for records in bound_records.values() for record in records)
+    assert final_row_ids == list(range(6))
+    for records in bound_records.values():
+        for record in records:
+            assert record["state_sha256"] == generator.pick_insert_reset_dataset_row_digest(
+                payload["states"], record["final_row_id"]
+            )
+
+
+def _fast_validator_metadata_fixture(*, rows_per_phase: int = 7, batch_size: int = 4):
+    phases = torch.arange(6, dtype=torch.int64).repeat_interleave(rows_per_phase)
+    states = {
+        name: torch.arange(len(phases), dtype=torch.float32)
+        for name in fast_validator.PICK_INSERT_FAST_RESET_ROW_BINDING_CONTRACT["state_names"]
+    }
+    states["phase"] = phases
+    sampler = fast_validator.pick_insert_phase_0_reverse_curriculum_sampling_contract()
+    band_names = tuple(sampler["band_names"])
+    band_ranges = tuple(sampler["axial_offset_ranges_m"])
+    accepted: dict[str, list[dict[str, object]]] = {}
+    phase_0_shortfalls: list[float] = []
+    phase_0_band_counts = {name: 0 for name in band_names}
+    for phase in range(6):
+        records: list[dict[str, object]] = []
+        for row_index in range(rows_per_phase):
+            starts_grasped = phase <= 3
+            record: dict[str, object] = {
+                "final_row_id": phase * rows_per_phase + row_index,
+                "checks": deepcopy(fast_validator.FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY["checks"]),
+                "collide_only_invalid_contact_count": 0,
+                "collide_only_grasp_contact_count": 2 if starts_grasped else 0,
+                "collide_only_left_grasp_contact_count": 1 if starts_grasped else 0,
+                "collide_only_right_grasp_contact_count": 1 if starts_grasped else 0,
+                "collide_only_contact_overflow": False,
+            }
+            record["state_sha256"] = fast_validator.pick_insert_reset_dataset_row_digest(
+                states, int(record["final_row_id"])
+            )
+            if phase == 0:
+                band_index = row_index % len(band_names)
+                band_name = band_names[band_index]
+                lower, upper = band_ranges[band_index]
+                shortfall = 0.5 * (lower + upper)
+                record.update(
+                    {
+                        "phase_0_reverse_curriculum_band": band_name,
+                        "phase_0_axial_shortfall_m": shortfall,
+                        "initial_runtime_geometric_success": False,
+                    }
+                )
+                phase_0_shortfalls.append(shortfall)
+                phase_0_band_counts[band_name] += 1
+            records.append(record)
+        accepted[str(phase)] = records
+    reference_profile = rows_per_phase == 3_334 and batch_size == 256
+    metadata = {
+        "phase_counts": [rows_per_phase] * 6,
+        "accepted_fast_reset_metrics": accepted,
+        "initial_state_policy": {
+            "generation_mode": "fast-ik",
+            "fast_reset_policy": deepcopy(fast_validator.FRANKA_RJ45_PICK_INSERT_FAST_RESET_POLICY),
+            "accepted_row_binding": deepcopy(fast_validator.PICK_INSERT_FAST_RESET_ROW_BINDING_CONTRACT),
+            "phase_0_accepted_band_proportions": deepcopy(
+                fast_validator.PICK_INSERT_FAST_RESET_PHASE_0_BAND_ACCEPTANCE_CONTRACT
+            ),
+            "reset_bank_profile": {
+                "contract_version": 1,
+                "profile": "balanced-20004-v1" if reference_profile else "custom-balanced-fast-ik",
+                "reference_profile": reference_profile,
+                "rows_per_phase": rows_per_phase,
+                "phase_counts": [rows_per_phase] * 6,
+                "total_rows": rows_per_phase * 6,
+                "batch_size": batch_size,
+                "maximum_batches_per_phase": 96 if reference_profile else math.ceil(rows_per_phase / batch_size),
+                "simulation_steps_per_row": 0,
+            },
+            "phase_0_reverse_curriculum_sampling": deepcopy(sampler),
+            "phase_0_reverse_curriculum_evidence": {
+                "accepted_row_count": rows_per_phase,
+                "accepted_band_counts": phase_0_band_counts,
+                "accepted_band_fractions": {
+                    name: count / rows_per_phase for name, count in phase_0_band_counts.items()
+                },
+                "maximum_absolute_band_fraction_error": max(
+                    abs(phase_0_band_counts[name] / rows_per_phase - weight)
+                    for name, weight in zip(band_names, sampler["band_weights"], strict=True)
+                ),
+                "allowed_absolute_band_fraction_error": (
+                    fast_validator.pick_insert_fast_reset_phase_0_band_fraction_tolerance(rows_per_phase)
+                ),
+                "band_proportions_within_tolerance": True,
+                "minimum_axial_shortfall_m": min(phase_0_shortfalls),
+                "maximum_axial_shortfall_m": max(phase_0_shortfalls),
+                "initial_runtime_geometric_success_count": 0,
+                "all_rows_preseat_and_outside_geometric_success": True,
+                "simulation_steps": 0,
+            },
+        },
+    }
+    return metadata, states
+
+
+def test_fast_validator_derives_nonlegacy_balanced_shape_from_artifact_contract():
+    env_cfg = FrankaRJ45PickInsertEnvCfg()
+    env_cfg.reset_dataset_rows_per_phase = 7
+    env_cfg.reset_dataset_min_unique_full_pick_rows = 6
+    payload = {
+        "metadata": {"task_contract": pick_insert_reset_dataset_task_contract(env_cfg)},
+        "states": {"phase": torch.arange(6, dtype=torch.int64).repeat_interleave(7)},
+    }
+
+    resolved = fast_validator._artifact_bound_env_cfg(payload)
+
+    assert resolved.reset_dataset_rows_per_phase == 7
+    assert resolved.reset_dataset_min_unique_full_pick_rows == 6
+    assert pick_insert_reset_dataset_task_contract(resolved) == payload["metadata"]["task_contract"]
+
+
+def test_fast_validator_rejects_artifact_cardinality_that_disagrees_with_state_rows():
+    env_cfg = FrankaRJ45PickInsertEnvCfg()
+    env_cfg.reset_dataset_rows_per_phase = 7
+    env_cfg.reset_dataset_min_unique_full_pick_rows = 6
+    payload = {
+        "metadata": {"task_contract": pick_insert_reset_dataset_task_contract(env_cfg)},
+        "states": {"phase": torch.arange(6, dtype=torch.int64).repeat_interleave(6)},
+    }
+
+    with pytest.raises(ValueError, match="phase counts do not match"):
+        fast_validator._artifact_bound_env_cfg(payload)
+
+
+def test_fast_validator_accepts_complete_policy_v2_collide_only_evidence_at_custom_scale():
+    metadata, states = _fast_validator_metadata_fixture(rows_per_phase=7, batch_size=4)
+
+    evidence, evidence_sha256 = fast_validator._fast_metadata_evidence(metadata, states)
+
+    assert len(evidence) == len(states["phase"]) == 42
+    assert evidence[0] is not evidence[len(states["phase"]) - 1]
+    assert all(evidence[0].values())
+    assert evidence_sha256 == fast_validator.reset_dataset_digest(metadata["accepted_fast_reset_metrics"])
+
+
+def test_fast_validator_accepts_the_balanced_20004_row_reference_profile():
+    metadata, states = _fast_validator_metadata_fixture(rows_per_phase=3_334, batch_size=256)
+
+    evidence, _ = fast_validator._fast_metadata_evidence(metadata, states)
+
+    assert len(evidence) == 20_004
+    assert metadata["initial_state_policy"]["reset_bank_profile"]["reference_profile"] is True
+    assert metadata["initial_state_policy"]["reset_bank_profile"]["profile"] == "balanced-20004-v1"
+
+
+def test_fast_validator_canonical_promotion_requires_reference_profile_and_live_contract():
+    reference_metadata, reference_states = _fast_validator_metadata_fixture(rows_per_phase=3_334, batch_size=256)
+    reference_metadata["task_contract"] = pick_insert_reset_dataset_task_contract(FrankaRJ45PickInsertEnvCfg())
+
+    fast_validator._require_reference_promotion({"metadata": reference_metadata, "states": reference_states})
+
+    custom_metadata, custom_states = _fast_validator_metadata_fixture(rows_per_phase=7, batch_size=4)
+    custom_cfg = FrankaRJ45PickInsertEnvCfg()
+    custom_cfg.reset_dataset_rows_per_phase = 7
+    custom_cfg.reset_dataset_min_unique_full_pick_rows = 7
+    custom_metadata["task_contract"] = pick_insert_reset_dataset_task_contract(custom_cfg)
+    with pytest.raises(ValueError, match="exact 20,004-row reference fast profile"):
+        fast_validator._require_reference_promotion({"metadata": custom_metadata, "states": custom_states})
+
+    reference_metadata["initial_state_policy"]["generation_mode"] = "physical-oracle"
+    with pytest.raises(ValueError, match="exact reference profile and default live task contract"):
+        fast_validator._require_reference_promotion({"metadata": reference_metadata, "states": reference_states})
+
+
+@pytest.mark.parametrize("mutation", ("duplicate-row-id", "stale-state-digest", "wrong-record-digest"))
+def test_fast_validator_rejects_unbound_final_row_evidence(mutation):
+    metadata, states = _fast_validator_metadata_fixture()
+    record = metadata["accepted_fast_reset_metrics"]["0"][0]
+    if mutation == "duplicate-row-id":
+        record["final_row_id"] = metadata["accepted_fast_reset_metrics"]["0"][1]["final_row_id"]
+    elif mutation == "stale-state-digest":
+        states["difficulty"][record["final_row_id"]] += 1.0
+    else:
+        record["state_sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="not bound to its exact final artifact row"):
+        fast_validator._fast_metadata_evidence(metadata, states)
+
+
+@pytest.mark.parametrize(
+    ("phase", "field", "value", "message"),
+    (
+        (0, "collide_only_right_grasp_contact_count", 0, "lacks bilateral"),
+        (4, "collide_only_grasp_contact_count", 1, "open-gripper row has Newton proxy contacts"),
+        (5, "collide_only_invalid_contact_count", 0.0, "non-negative plain integers"),
+        (2, "collide_only_contact_overflow", True, "invalid or overflowing"),
+    ),
+)
+def test_fast_validator_rejects_inconsistent_collide_only_evidence(phase, field, value, message):
+    metadata, states = _fast_validator_metadata_fixture()
+    metadata["accepted_fast_reset_metrics"][str(phase)][0][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        fast_validator._fast_metadata_evidence(metadata, states)
+
+
+def test_fast_validator_rejects_terminal_or_out_of_band_phase_0_metadata():
+    metadata, states = _fast_validator_metadata_fixture()
+    metadata["accepted_fast_reset_metrics"]["0"][0]["initial_runtime_geometric_success"] = True
+
+    with pytest.raises(ValueError, match="already a geometric success"):
+        fast_validator._fast_metadata_evidence(metadata, states)
+
+    metadata, states = _fast_validator_metadata_fixture()
+    metadata["accepted_fast_reset_metrics"]["0"][0]["phase_0_axial_shortfall_m"] = 0.02
+    with pytest.raises(ValueError, match="outside its recorded band"):
+        fast_validator._fast_metadata_evidence(metadata, states)
+
+
+def test_fast_validator_rejects_grossly_skewed_accepted_phase_0_bands_with_matching_summary():
+    metadata, states = _fast_validator_metadata_fixture(rows_per_phase=100, batch_size=20)
+    records = metadata["accepted_fast_reset_metrics"]["0"]
+    for record in records:
+        record["phase_0_reverse_curriculum_band"] = "immediate"
+        record["phase_0_axial_shortfall_m"] = 0.0012
+    evidence = metadata["initial_state_policy"]["phase_0_reverse_curriculum_evidence"]
+    evidence.update(
+        {
+            "accepted_band_counts": {"immediate": 100, "quick": 0, "boundary": 0},
+            "accepted_band_fractions": {"immediate": 1.0, "quick": 0.0, "boundary": 0.0},
+            "maximum_absolute_band_fraction_error": 0.65,
+            "allowed_absolute_band_fraction_error": 0.05,
+            "minimum_axial_shortfall_m": 0.0012,
+            "maximum_axial_shortfall_m": 0.0012,
+        }
+    )
+
+    with pytest.raises(ValueError, match="band proportions exceed"):
+        fast_validator._fast_metadata_evidence(metadata, states)
+
+
+def test_fast_validator_rejects_an_impossible_reset_bank_profile_capacity():
+    metadata, states = _fast_validator_metadata_fixture(rows_per_phase=7, batch_size=2)
+    metadata["initial_state_policy"]["reset_bank_profile"]["maximum_batches_per_phase"] = 3
+
+    with pytest.raises(ValueError, match="reset_bank_profile is inconsistent"):
+        fast_validator._fast_metadata_evidence(metadata, states)
+
+
+def test_fast_validator_phase_0_geometry_accepts_only_banded_nonterminal_preseat_rows():
+    env_cfg = FrankaRJ45PickInsertEnvCfg()
+    task_contract = pick_insert_reset_dataset_task_contract(env_cfg)
+    layout = task_contract["rj45_physics"]["task_layout"]
+    plug_index = int(layout["plug_body_index"])
+    body_count = int(task_contract["task_body_count"])
+    shortfalls = torch.tensor((0.0010, 0.0016, 0.0035, 0.0120, 0.0007, 0.0121, -0.0012))
+    task_pose = torch.zeros((len(shortfalls), body_count, 7))
+    goal_pose = torch.zeros_like(task_pose)
+    task_pose[..., 6] = 1.0
+    goal_pose[..., 6] = 1.0
+    task_pose[:, plug_index, 1] = -shortfalls
+    states = {
+        "task_body_pose": task_pose,
+        "task_body_velocity": torch.zeros((len(shortfalls), body_count, 6)),
+        "goal_task_body_pose": goal_pose,
+    }
+
+    valid = fast_validator._phase_0_reverse_curriculum_semantics(states, task_contract, env_cfg)
+
+    assert valid.tolist() == [True, True, True, True, False, False, False]

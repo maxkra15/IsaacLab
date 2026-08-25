@@ -172,6 +172,8 @@ def test_public_validation_source_helper_hashes_the_complete_canonical_closure(t
     for relative_name in (
         "scripts/tools/validate_franka_rj45_pick_insert_resets.py",
         "scripts/tools/_franka_rj45_reset_tools.py",
+        "scripts/tools/generate_franka_rj45_pick_insert_reset_dataset.py",
+        "scripts/tools/validate_franka_rj45_pick_insert_fast_resets.py",
         "uv.lock",
     ):
         source = tmp_path / relative_name
@@ -182,11 +184,17 @@ def test_public_validation_source_helper_hashes_the_complete_canonical_closure(t
     changed = tmp_path / roots[-1] / "module.py"
     changed.write_text("VALUE = 'changed'\n", encoding="utf-8")
     second = franka_rj45_validation_source_sha256(tmp_path)
+    fast = franka_rj45_validation_source_sha256(tmp_path, include_fast_validator=True)
 
     assert len(first) == len(roots) + 3
     assert set(first) == set(second)
     assert all(len(digest) == 64 for digest in first.values())
     assert first[changed.relative_to(tmp_path).as_posix()] != second[changed.relative_to(tmp_path).as_posix()]
+    assert set(fast) == {
+        *first,
+        "scripts/tools/generate_franka_rj45_pick_insert_reset_dataset.py",
+        "scripts/tools/validate_franka_rj45_pick_insert_fast_resets.py",
+    }
 
 
 def test_public_validation_source_helper_fails_closed_on_partial_checkout(tmp_path):

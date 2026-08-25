@@ -469,6 +469,55 @@ class NewtonCouplerManager(NewtonVBDManager):
         )
 
     @classmethod
+    def refresh_proxy_collision_contacts(
+        cls,
+        source: str,
+        destination: str,
+    ) -> tuple[Contacts, ModelView, State]:
+        """Refresh one proxy contact buffer without advancing either solver.
+
+        This is the collision-query counterpart to :meth:`get_proxy_contact_data`.
+        It distributes the current parent state to the coupled entry views and
+        invokes the configured destination collision pipeline directly.  The
+        proxy collision cadence is deliberately left unchanged, which makes
+        this suitable for offline reset admission and other read-only overlap
+        checks between simulation steps.
+
+        Args:
+            source: Name of the proxy source entry.
+            destination: Name of the proxy destination entry.
+
+        Returns:
+            The freshly populated proxy-local contacts, destination model view,
+            and matching destination input state.
+
+        Raises:
+            RuntimeError: If the active solver or collision state is unavailable.
+            KeyError: If the proxy direction has no dedicated collision pipeline.
+        """
+        solver = NewtonManager._solver
+        if not isinstance(solver, SolverCoupledProxy):
+            raise RuntimeError("Proxy collision refresh requires an active SolverCoupledProxy.")
+        entry_names = solver.entry_names()
+        for role, name in (("source", source), ("destination", destination)):
+            if name not in entry_names:
+                raise KeyError(f"Unknown proxy {role} entry {name!r}; available entries are {entry_names}.")
+
+        parent_state = NewtonManager._state_0
+        if parent_state is None:
+            raise RuntimeError("Proxy collision refresh requires the current Newton parent state.")
+        config = solver._proxy_collision_configs.get((source, destination))
+        if config is None:
+            raise KeyError(f"Proxy direction {(source, destination)!r} has no dedicated collision pipeline.")
+        if config.pipeline is None or config.contacts is None:
+            raise RuntimeError(f"Proxy collision pipeline {(source, destination)!r} is not initialized.")
+
+        solver.sync_entry_states(parent_state, dt=0.0)
+        destination_state = solver.entry_state(config.dst_name, phase="input")
+        config.pipeline.collide(destination_state, config.contacts)
+        return config.contacts, solver.view(config.dst_name), destination_state
+
+    @classmethod
     def register_vbd_preserved_input_pose_projection(
         cls,
         *,

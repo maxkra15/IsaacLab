@@ -54,11 +54,16 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     PICK_INSERT_EFFECTIVE_GRASP_FRICTION,
     PICK_INSERT_GRASP_PROXY_FRICTION,
     PICK_INSERT_OPEN_FINGER_POSITION,
+    PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M,
+    PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES,
+    PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS,
     PICK_INSERT_PHASE_NAMES,
+    PICK_INSERT_RESET_PHASE_FRACTIONS,
     PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS,
     PICK_INSERT_SUCCESS_MAX_PLUG_SPEED,
     FrankaRJ45PickInsertEnvCfg,
     PickInsertCurriculumCfg,
+    pick_insert_phase_0_reverse_curriculum_sampling_contract,
     pick_insert_play_reset_seed_contract,
     pick_insert_reset_dataset_task_contract,
     pick_insert_topology_cfg,
@@ -487,7 +492,18 @@ def test_pick_insert_config_is_distinct_long_horizon_six_stage_task():
     assert cfg.actions.gripper_action.close_position == PICK_INSERT_CLOSED_FINGER_POSITION == 0.0
     assert cfg.grasp_proxy_friction == PICK_INSERT_GRASP_PROXY_FRICTION == 4.5
     assert cfg.success_max_plug_speed == PICK_INSERT_SUCCESS_MAX_PLUG_SPEED == 0.10
-    assert cfg.reset_dataset_rows_per_phase == 96
+    assert cfg.reset_dataset_rows_per_phase == 3334
+    assert cfg.reset_dataset_rows_per_phase * len(PICK_INSERT_PHASE_NAMES) == 20_004
+    assert cfg.reset_dataset_min_unique_full_pick_rows == 3000
+    assert cfg.reset_dataset_phase_fractions == PICK_INSERT_RESET_PHASE_FRACTIONS
+    assert cfg.reset_dataset_phase_fractions == (0.30, 0.15, 0.08, 0.06, 0.06, 0.35)
+    assert PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M == (
+        (0.0010, 0.0016),
+        (0.0016, 0.0035),
+        (0.0035, 0.0120),
+    )
+    assert PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS == (0.35, 0.35, 0.30)
+    assert math.fsum(PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS) == 1.0
     assert cfg.plug_grasp_offset == (0.0, -0.025, 0.010)
     assert tuple(cfg.scene.robot.init_state.joint_pos[f"panda_joint{index}"] for index in range(1, 8)) == (
         0.0444,
@@ -861,6 +877,28 @@ def test_pick_insert_config_rejects_invalid_rows_per_phase(value: object):
         cfg.validate_config()
 
 
+@pytest.mark.parametrize(
+    ("fractions", "match"),
+    (
+        ((1.0,), "exactly six"),
+        ((0.30, 0.15, 0.08, 0.06, 0.06, float("nan")), "finite nonnegative"),
+        ((-0.01, 0.16, 0.08, 0.06, 0.06, 0.65), "finite nonnegative"),
+        ((0.29, 0.15, 0.08, 0.06, 0.06, 0.35), "sum exactly"),
+        ((True, 0.15, 0.08, 0.06, 0.06, -0.35), "finite nonnegative"),
+        ((0.31, 0.15, 0.08, 0.06, 0.06, 0.34), "phase-5 fraction"),
+    ),
+)
+def test_pick_insert_config_rejects_invalid_phase_assignment_fractions(
+    fractions: tuple[float, ...],
+    match: str,
+):
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.reset_dataset_phase_fractions = fractions
+
+    with pytest.raises(ValueError, match=match):
+        cfg.validate_config()
+
+
 def test_pick_insert_grasp_is_table_clearance_tilted_with_fingers_across_plug_width():
     cfg = FrankaRJ45PickInsertEnvCfg()
     orientation = torch.tensor(cfg.plug_grasp_orientation_xyzw).repeat(2, 1)
@@ -968,14 +1006,23 @@ def test_pick_insert_contract_round_trips_through_safe_torch_load(tmp_path):
     assert loaded["rj45_physics"]["socket_body_mode"] == "zero-mass-resettable"
     assert loaded["rj45_physics"]["task_support_plane_enabled"] is False
     assert tuple(loaded["coupler"]["rj45_entry"]["bodies"]) == PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS
-    assert loaded["contract_version"] == 7
+    assert loaded["contract_version"] == 8
     assert loaded["base_contract_version"] == 3
     assert loaded["external_assets"] == franka_rj45_asset_contract()
     assert loaded["robot"]["asset"] == FRANKA_RJ45_FRANKA_LOGICAL_URI
     assert loaded["robot"]["spawn"]["usd_path"] == FRANKA_RJ45_FRANKA_LOGICAL_URI
     assert loaded["static_scene"]["table_spawn"]["usd_path"] == FRANKA_RJ45_SEATTLE_TABLE_LOGICAL_URI
-    assert loaded["pick_insert"]["semantics_version"] == 7
+    assert loaded["pick_insert"]["semantics_version"] == 8
     assert loaded["pick_insert"]["goal_local_success_predicate_version"] == 1
+    phase_0_sampling = loaded["pick_insert"]["phase_0_reverse_curriculum_sampling"]
+    assert phase_0_sampling == pick_insert_phase_0_reverse_curriculum_sampling_contract()
+    assert phase_0_sampling["sampler_version"] == 1
+    assert phase_0_sampling["frame"] == "goal-plug-local"
+    assert phase_0_sampling["band_names"] == PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_BAND_NAMES
+    assert phase_0_sampling["axial_offset_ranges_m"] == PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_AXIAL_RANGES_M
+    assert phase_0_sampling["band_weights"] == PICK_INSERT_PHASE_0_REVERSE_CURRICULUM_WEIGHTS
+    assert phase_0_sampling["geometric_success_at_reset"] is False
+    assert phase_0_sampling["rng_owner"] == "PickInsertResetDatasetGenerator.random"
     phase_4_sampling = loaded["pick_insert"]["phase_4_pregrasp_orientation_sampling"]
     assert phase_4_sampling["sampler_version"] == 1
     assert phase_4_sampling["clearance_height_m"] == 0.045
@@ -1030,7 +1077,8 @@ def test_pick_insert_contract_round_trips_through_safe_torch_load(tmp_path):
     assert loaded["actions"]["gripper"]["default_position"] == PICK_INSERT_OPEN_FINGER_POSITION
     assert loaded["actions"]["gripper"]["close_position"] == PICK_INSERT_CLOSED_FINGER_POSITION
     assert loaded["validation_geometry"]["success_max_plug_speed"] == PICK_INSERT_SUCCESS_MAX_PLUG_SPEED
-    assert loaded["pick_insert"]["reset_dataset_rows_per_phase"] == 96
+    assert loaded["pick_insert"]["reset_dataset_rows_per_phase"] == 3334
+    assert loaded["pick_insert"]["reset_dataset_phase_fractions"] == PICK_INSERT_RESET_PHASE_FRACTIONS
     assert loaded["pick_insert"]["is_finite_horizon"] is True
     control = loaded["robot"]["reset_control_convention"]
     assert control["target_semantics"] == "persistent-absolute-integrated-once-per-policy-step"
@@ -1230,6 +1278,9 @@ def test_pick_insert_contract_changes_with_learning_semantics():
     mutated.append(cfg)
     cfg = FrankaRJ45PickInsertEnvCfg()
     cfg.grasp_proxy_face_tolerance_m = 4.0e-4
+    mutated.append(cfg)
+    cfg = FrankaRJ45PickInsertEnvCfg()
+    cfg.reset_dataset_phase_fractions = (0.29, 0.16, 0.08, 0.06, 0.06, 0.35)
     mutated.append(cfg)
 
     assert all(reset_dataset_digest(pick_insert_reset_dataset_task_contract(cfg)) != baseline for cfg in mutated)
@@ -1761,24 +1812,107 @@ def test_pick_insert_cable_velocity_observation_uses_socket_frame_and_is_bounded
     )
 
 
-def test_pick_insert_curriculum_reserves_exact_full_pick_share():
+def _phase_partitioned_pick_insert_curriculum(
+    pool_sizes: tuple[int, ...] = (2, 7, 1, 9, 3, 4),
+) -> tuple[mdp.RJ45PickInsertResetDatasetCurriculum, torch.Tensor]:
+    """Build the pure sampling portion without constructing a simulation manager."""
     curriculum = object.__new__(mdp.RJ45PickInsertResetDatasetCurriculum)
-    curriculum._deployment_rows = torch.arange(50, 60)
-    curriculum._continuation_rows = torch.arange(50)
-    curriculum._deployment_fraction = 0.35
-    curriculum._deployment_credit = 0.0
-    curriculum._continuation_uniform_credit = 0.0
-    curriculum._deployment_order = curriculum._deployment_rows.clone()
-    curriculum._continuation_order = curriculum._continuation_rows.clone()
-    curriculum._deployment_cursor = 0
-    curriculum._continuation_cursor = 0
+    phase_by_row = torch.repeat_interleave(torch.arange(6), torch.tensor(pool_sizes))
+    curriculum._row_count = int(phase_by_row.numel())
+    curriculum._phase_fractions = PICK_INSERT_RESET_PHASE_FRACTIONS
+    curriculum._phase_rows = tuple(torch.where(phase_by_row == phase_id)[0] for phase_id in range(6))
+    curriculum._phase_credits = [0.0] * 6
+    curriculum._phase_uniform_credits = [0.0] * 6
+    curriculum._phase_orders = [pool.clone() for pool in curriculum._phase_rows]
+    curriculum._phase_cursors = [0] * 6
+    curriculum._assigned_phase_counts = [0] * 6
+    curriculum._assigned_phase_uniform_counts = [0] * 6
+    curriculum._assigned_phase_adaptive_counts = [0] * 6
     curriculum._sampler = _ResetDatasetSampler(
-        60,
+        curriculum._row_count,
         "cpu",
         ResetDatasetSamplerCfg(uniform_fraction=0.35),
     )
+    curriculum._metrics_cache = {}
+    curriculum._assignments_since_metrics = 0
+    return curriculum, phase_by_row
 
-    rows = curriculum._sample_training_rows(100)
 
-    assert int((rows >= 50).sum()) == 35
-    assert bool(((rows >= 0) & (rows < 60)).all())
+@pytest.mark.parametrize(
+    ("sampling_mode", "curriculum_freeze", "expected_uniform_fraction"),
+    (
+        ("adaptive", False, 0.35),
+        ("uniform", False, 1.0),
+        ("adaptive", True, 1.0),
+    ),
+)
+def test_pick_insert_curriculum_honors_phase_fractions_in_every_sampling_mode(
+    sampling_mode: str,
+    curriculum_freeze: bool,
+    expected_uniform_fraction: float,
+):
+    curriculum, phase_by_row = _phase_partitioned_pick_insert_curriculum()
+    count = 10_000
+    env = SimpleNamespace(
+        num_envs=count,
+        device=torch.device("cpu"),
+        cfg=SimpleNamespace(
+            curriculum_freeze=curriculum_freeze,
+            reset_dataset_sampling_mode=sampling_mode,
+        ),
+        episode_length_buf=torch.zeros(count, dtype=torch.long),
+        reset_dataset_row_id=torch.full((count,), -1, dtype=torch.long),
+    )
+
+    metrics = curriculum(env, slice(None))
+    realized_phases = phase_by_row[env.reset_dataset_row_id]
+
+    assert torch.bincount(realized_phases, minlength=6).tolist() == [3000, 1500, 800, 600, 600, 3500]
+    assert metrics["sampler/uniform_replay_fraction"] == pytest.approx(expected_uniform_fraction)
+    assert metrics["sampler/adaptive_sampling_fraction"] == pytest.approx(1.0 - expected_uniform_fraction)
+    for phase_id, fraction in enumerate(PICK_INSERT_RESET_PHASE_FRACTIONS):
+        assert metrics[f"sampler/configured_phase_{phase_id}_assignment_fraction"] == fraction
+        assert metrics[f"sampler/realized_phase_{phase_id}_assignment_fraction"] == pytest.approx(fraction)
+        assert metrics[f"sampler/phase_{phase_id}_uniform_replay_fraction"] == pytest.approx(expected_uniform_fraction)
+        assert metrics[f"sampler/phase_{phase_id}_adaptive_sampling_fraction"] == pytest.approx(
+            1.0 - expected_uniform_fraction
+        )
+
+
+def test_pick_insert_uniform_phase_replay_cycles_each_pool_independently():
+    curriculum, phase_by_row = _phase_partitioned_pick_insert_curriculum()
+
+    rows = curriculum._sample_uniform_rows(10_000)
+
+    realized_phases = phase_by_row[rows]
+    for phase_id, pool in enumerate(curriculum._phase_rows):
+        per_row_counts = torch.bincount(rows[realized_phases == phase_id] - int(pool[0]), minlength=pool.numel())
+        assert int(per_row_counts.max() - per_row_counts.min()) <= 1
+
+
+def test_pick_insert_phase_allocation_carries_fractional_credit_across_async_batches():
+    curriculum, _ = _phase_partitioned_pick_insert_curriculum()
+    totals = [0] * 6
+    chunk_sizes = (1, 2, 1, 3, 7, 13, 29) * 100
+    chunk_sizes += (10_000 - sum(chunk_sizes),)
+
+    for count in chunk_sizes:
+        phase_counts = curriculum._phase_assignment_counts(count)
+        assert min(phase_counts) >= 0
+        assert sum(phase_counts) == count
+        totals = [total + assigned for total, assigned in zip(totals, phase_counts, strict=True)]
+
+    assert totals == [3000, 1500, 800, 600, 600, 3500]
+
+
+def test_pick_insert_adaptive_phase_replay_reports_actual_assignment_mix():
+    curriculum, phase_by_row = _phase_partitioned_pick_insert_curriculum()
+
+    rows = curriculum._sample_training_rows(10_000)
+    metrics = curriculum._sampling_metrics(adaptive_enabled=True)
+
+    assert bool(((rows >= 0) & (rows < curriculum._row_count)).all())
+    assert torch.bincount(phase_by_row[rows], minlength=6).tolist() == [3000, 1500, 800, 600, 600, 3500]
+    assert metrics["sampler/configured_uniform_replay_fraction"] == 0.35
+    assert metrics["sampler/uniform_replay_fraction"] == pytest.approx(0.35)
+    assert metrics["sampler/adaptive_sampling_fraction"] == pytest.approx(0.65)
