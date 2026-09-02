@@ -100,6 +100,7 @@ from isaaclab_newton.cloner.newton_clone_utils import (
     _restore_visible_colliders_without_visual_shapes,
     replicate_builder_mapping,
 )
+from isaaclab_newton.physics.cable_damping import add_usd_with_cable_damping
 from isaaclab_newton.physics.featherstone_manager_cfg import FeatherstoneSolverCfg
 from isaaclab_newton.physics.mjwarp_manager_cfg import MJWarpSolverCfg
 from isaaclab_newton.physics.newton_manager_cfg import NewtonCfg, NewtonShapeCfg, NewtonSolverCfg
@@ -371,6 +372,8 @@ class NewtonManager(PhysicsManager):
     _state_0: State = None
     _state_1: State = None
     _control: Control = None
+    _body_force_snapshot: wp.array | None = None
+    """Per-tick rigid-body force input restored before every solver substep."""
 
     # Physics settings
     _gravity_vector: tuple[float, float, float] = (0.0, 0.0, -9.81)
@@ -1043,6 +1046,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._state_0 = None
         NewtonManager._state_1 = None
         NewtonManager._control = None
+        NewtonManager._body_force_snapshot = None
         NewtonManager._contacts = None
         NewtonManager._needs_collision_pipeline = False
         NewtonManager._deterministic_mode = wp.DeterministicMode.NOT_GUARANTEED
@@ -1784,7 +1788,9 @@ class NewtonManager(PhysicsManager):
 
         if not env_paths:
             # No env Xforms — flat loading
-            import_result = builder.add_usd(stage, ignore_paths=hf_ignore_paths, schema_resolvers=schema_resolvers)
+            import_result = add_usd_with_cable_damping(
+                builder, stage, ignore_paths=hf_ignore_paths, schema_resolvers=schema_resolvers
+            )
             _restore_visible_colliders_without_visual_shapes(builder, stage, import_result["path_shape_map"])
             replace_newton_builder_shape_colors(builder, stage)
             NewtonManager._world_xforms = [wp.transform()]
@@ -1794,14 +1800,16 @@ class NewtonManager(PhysicsManager):
             # Load everything except the env subtrees (ground plane, lights, etc.)
             # and any terrain colliders already added as heightfields above.
             ignore_paths = [path for _, path in env_paths] + hf_ignore_paths
-            import_result = builder.add_usd(stage, ignore_paths=ignore_paths, schema_resolvers=schema_resolvers)
+            import_result = add_usd_with_cable_damping(
+                builder, stage, ignore_paths=ignore_paths, schema_resolvers=schema_resolvers
+            )
             _restore_visible_colliders_without_visual_shapes(builder, stage, import_result["path_shape_map"])
             replace_newton_builder_shape_colors(builder, stage)
 
             _, proto_path = env_paths[0]
             source_builders = {proto_path: cls.create_builder(up_axis=up_axis)}
-            import_result = source_builders[proto_path].add_usd(
-                stage, root_path=proto_path, schema_resolvers=schema_resolvers
+            import_result = add_usd_with_cable_damping(
+                source_builders[proto_path], stage, root_path=proto_path, schema_resolvers=schema_resolvers
             )
             _restore_visible_colliders_without_visual_shapes(
                 source_builders[proto_path], stage, import_result["path_shape_map"]
@@ -2067,6 +2075,10 @@ class NewtonManager(PhysicsManager):
                     "NewtonManager._use_single_state, NewtonManager._needs_collision_pipeline, and "
                     "NewtonManager._supports_rigid_body_force_input."
                 )
+            if NewtonManager._supports_rigid_body_force_input and cls._state_0.body_f is not None:
+                NewtonManager._body_force_snapshot = wp.zeros_like(cls._state_0.body_f)
+            else:
+                NewtonManager._body_force_snapshot = None
             cls._initialize_contacts()
 
         # Picking callbacks must be registered after the concrete solver has
@@ -2295,8 +2307,35 @@ class NewtonManager(PhysicsManager):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _run_solver_substeps(cls, contacts) -> None:
-        """Run ``num_substeps`` solver iterations, handling double-buffered state swap."""
+    def _snapshot_body_force_input(cls) -> None:
+        """Snapshot the rigid-body force authored for the current physics tick."""
+        if cls._body_force_snapshot is not None:
+            wp.copy(cls._body_force_snapshot, cls._state_0.body_f)
+
+    @classmethod
+    def _restore_body_force_input(cls, state: State) -> None:
+        """Restore the per-tick rigid-body force before one solver substep."""
+        if cls._body_force_snapshot is not None:
+            wp.copy(state.body_f, cls._body_force_snapshot)
+
+    @classmethod
+    def _run_solver_substeps(cls, contacts, *, snapshot_body_force: bool = True) -> None:
+        """Run ``num_substeps`` solver iterations, handling double-buffered state swap.
+
+        Rigid-body external forces are authored once per physics tick, while Newton
+        clears force buffers after every solver substep. Snapshotting once and restoring
+        before each substep preserves the force over the full tick. State-force callbacks
+        run after restoration, so their contributions remain per-substep and cannot
+        accumulate through a single- or double-buffered state.
+
+        Args:
+            contacts: Contact data passed to the active solver.
+            snapshot_body_force: Whether to refresh the per-tick force snapshot before
+                stepping. Disable only when a caller spans one snapshot across multiple
+                internal physics iterations.
+        """
+        if snapshot_body_force:
+            cls._snapshot_body_force_input()
         collide_every = cls._collision_decimation
         # Last substep is skipped: its contact set would only feed the next tick's
         # top-of-loop collide(), not this one.
@@ -2304,6 +2343,7 @@ class NewtonManager(PhysicsManager):
 
         if cls._use_single_state:
             for i in range(cls._num_substeps):
+                cls._restore_body_force_input(cls._state_0)
                 for callback in cls._state_force_callbacks:
                     callback(cls._state_0)
                 cls._step_solver(cls._state_0, cls._state_0, cls._control, contacts, cls._solver_dt)
@@ -2314,6 +2354,7 @@ class NewtonManager(PhysicsManager):
             cfg = PhysicsManager._cfg
             need_copy_on_last = cfg is not None and cls._num_substeps % 2 == 1
             for i in range(cls._num_substeps):
+                cls._restore_body_force_input(cls._state_0)
                 for callback in cls._state_force_callbacks:
                     callback(cls._state_0)
                 cls._step_solver(cls._state_0, cls._state_1, cls._control, contacts, cls._solver_dt)
@@ -2353,6 +2394,7 @@ class NewtonManager(PhysicsManager):
         """
         physics_dt = cls._solver_dt * cls._num_substeps
         contacts = cls._contacts if cls._needs_collision_pipeline else None
+        cls._snapshot_body_force_input()
 
         for _ in range(cls._decimation):
             if cls._needs_collision_pipeline:
@@ -2363,7 +2405,7 @@ class NewtonManager(PhysicsManager):
             for cb in cls._post_actuator_callbacks:
                 cb()
 
-            cls._run_solver_substeps(contacts)
+            cls._run_solver_substeps(contacts, snapshot_body_force=False)
 
         for cb in cls._post_step_callbacks:
             cb()
@@ -3110,10 +3152,13 @@ class NewtonManager(PhysicsManager):
         Each callback runs inside the captured CUDA graph (when
         :meth:`_is_all_graphable` is ``True``) right after
         :meth:`NewtonActuatorAdapter.step` and before the solver substeps,
-        so kernel writes to ``state``/``control`` are visible to the
-        integrator on the same iteration. Multiple articulations register
-        their own implicit-DOF telemetry / FF-routing kernels here; all
-        registered callbacks fire in registration order each step.
+        so joint-state and control writes are visible to the integrator on the
+        same iteration. Rigid-body forces must instead use
+        :meth:`register_state_force_callback`: the per-tick ``body_f`` input is
+        snapshotted before this hook and restored before every solver substep.
+        Multiple articulations register their own implicit-DOF telemetry /
+        FF-routing kernels here; all registered callbacks fire in registration
+        order each step.
         """
         cls._post_actuator_callbacks.append(callback)
 

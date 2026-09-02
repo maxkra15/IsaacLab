@@ -367,7 +367,7 @@ class RigidObject(BaseRigidObject):
                 env_ids,
             ],
             outputs=[
-                self.data.root_link_pose_w,
+                self.data._sim_bind_root_joint_pose_w,
             ],
             device=self.device,
         )
@@ -415,7 +415,7 @@ class RigidObject(BaseRigidObject):
                 env_mask,
             ],
             outputs=[
-                self.data.root_link_pose_w,
+                self.data._sim_bind_root_joint_pose_w,
             ],
             device=self.device,
         )
@@ -468,7 +468,7 @@ class RigidObject(BaseRigidObject):
             ],
             outputs=[
                 self.data.root_com_pose_w,
-                self.data.root_link_pose_w,
+                self.data._sim_bind_root_joint_pose_w,
             ],
             device=self.device,
         )
@@ -519,7 +519,7 @@ class RigidObject(BaseRigidObject):
             ],
             outputs=[
                 self.data.root_com_pose_w,
-                self.data.root_link_pose_w,
+                self.data._sim_bind_root_joint_pose_w,
             ],
             device=self.device,
         )
@@ -573,7 +573,7 @@ class RigidObject(BaseRigidObject):
                 1,
             ],
             outputs=[
-                self.data.root_com_vel_w,
+                self.data._sim_bind_root_joint_vel_w,
                 self.data.body_com_acc_w,
             ],
             device=self.device,
@@ -625,7 +625,7 @@ class RigidObject(BaseRigidObject):
                 1,
             ],
             outputs=[
-                self.data.root_com_vel_w,
+                self.data._sim_bind_root_joint_vel_w,
                 self.data.body_com_acc_w,
             ],
             device=self.device,
@@ -683,7 +683,7 @@ class RigidObject(BaseRigidObject):
             ],
             outputs=[
                 self.data.root_link_vel_w,
-                self.data.root_com_vel_w,
+                self.data._sim_bind_root_joint_vel_w,
                 self.data.body_com_acc_w,
             ],
             device=self.device,
@@ -739,7 +739,7 @@ class RigidObject(BaseRigidObject):
             ],
             outputs=[
                 self.data.root_link_vel_w,
-                self.data.root_com_vel_w,
+                self.data._sim_bind_root_joint_vel_w,
                 self.data.body_com_acc_w,
             ],
             device=self.device,

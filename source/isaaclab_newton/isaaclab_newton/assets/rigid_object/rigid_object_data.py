@@ -298,6 +298,7 @@ class RigidObjectData(BaseRigidObjectData):
         This quantity is the pose of the actor frame of the root rigid body relative to the world.
         The orientation is provided in (x, y, z, w) format.
         """
+        self._ensure_fk_fresh()
         return self._root_link_pose_w_ta
 
     @property
@@ -363,6 +364,7 @@ class RigidObjectData(BaseRigidObjectData):
         This quantity contains the linear and angular velocities of the root rigid body's center of mass frame
         relative to the world.
         """
+        self._ensure_fk_fresh()
         return self._root_com_vel_w_ta
 
     """
@@ -407,8 +409,11 @@ class RigidObjectData(BaseRigidObjectData):
         This quantity contains the linear and angular velocities of the actor frame of the root
         rigid body relative to the world.
         """
+        # The cached reshape aliases the timestamped root-link velocity buffer.
+        # Refresh that buffer on every access before returning its persistent view.
+        root_link_vel_w = self.root_link_vel_w
         if self._body_link_vel_w_ta is None:
-            self._body_link_vel_w_ta = ProxyArray(self.root_link_vel_w.warp.reshape((self._num_instances, 1)))
+            self._body_link_vel_w_ta = ProxyArray(root_link_vel_w.warp.reshape((self._num_instances, 1)))
         return self._body_link_vel_w_ta
 
     @property
@@ -905,28 +910,46 @@ class RigidObjectData(BaseRigidObjectData):
         """
         # A full reset replaces simulation arrays.
         self._read_launch_cache.clear()
+        is_rebind = hasattr(self, "_root_link_pose_w_ta")
 
         # Short-hand for the number of instances, number of links, and number of joints.
         self._num_instances = self._root_view.count
         self._num_bodies = self._root_view.link_count
 
-        # -- root properties
+        # -- root write properties
+        # Floating-root generalized coordinates are the canonical pose-write target:
+        # ``SimulationManager.forward()`` propagates them to ``state.body_q``.
+        # They are not a reliable read source because body-space solvers such as VBD
+        # integrate ``body_q`` directly without writing the result back to ``joint_q``.
         if self._root_view.is_fixed_base:
-            self._sim_bind_root_link_pose_w = self._root_view.get_root_transforms(SimulationManager.get_state_0())[
+            self._sim_bind_root_joint_pose_w = self._root_view.get_root_transforms(SimulationManager.get_state_0())[
                 :, 0, 0
             ]
         else:
-            self._sim_bind_root_link_pose_w = self._root_view.get_root_transforms(SimulationManager.get_state_0())[:, 0]
-        self._sim_bind_root_com_vel_w = self._root_view.get_root_velocities(SimulationManager.get_state_0())
-        if self._sim_bind_root_com_vel_w is not None:
+            self._sim_bind_root_joint_pose_w = self._root_view.get_root_transforms(SimulationManager.get_state_0())[
+                :, 0
+            ]
+        root_joint_vel_w = self._root_view.get_root_velocities(SimulationManager.get_state_0())
+        if root_joint_vel_w is not None:
             if self._root_view.is_fixed_base:
-                self._sim_bind_root_com_vel_w = self._sim_bind_root_com_vel_w[:, 0, 0]
+                self._sim_bind_root_joint_vel_w = root_joint_vel_w[:, 0, 0]
             else:
-                self._sim_bind_root_com_vel_w = self._sim_bind_root_com_vel_w[:, 0]
+                self._sim_bind_root_joint_vel_w = root_joint_vel_w[:, 0]
+        elif not is_rebind:
+            # _create_buffers() installs a write-only zero fallback on first init.
+            # Preserve that allocation across fixed-base hard resets.
+            self._sim_bind_root_joint_vel_w = None
         # -- body properties
         self._sim_bind_body_com_pos_b = self._root_view.get_attribute("body_com", SimulationManager.get_model())[:, 0]
         self._sim_bind_body_link_pose_w = self._root_view.get_link_transforms(SimulationManager.get_state_0())[:, 0]
+        # A rigid object has exactly one body. Bind the public root-link pose to
+        # that solver-authoritative live transform rather than to ``joint_q``.
+        self._sim_bind_root_link_pose_w = self._sim_bind_body_link_pose_w[:, 0]
         self._sim_bind_body_com_vel_w = self._root_view.get_link_velocities(SimulationManager.get_state_0())[:, 0]
+        # Likewise, body-space solvers integrate ``body_qd`` without updating
+        # floating-root ``joint_qd``. The sole body's COM velocity is the live
+        # root COM velocity for a rigid object.
+        self._sim_bind_root_com_vel_w = self._sim_bind_body_com_vel_w[:, 0]
         self._sim_bind_body_mass = self._root_view.get_attribute("body_mass", SimulationManager.get_model())[:, 0]
         self._sim_bind_body_inv_mass = self._root_view.get_attribute("body_inv_mass", SimulationManager.get_model())[
             :, 0
@@ -953,24 +976,41 @@ class RigidObjectData(BaseRigidObjectData):
 
         # Re-pin ProxyArray wrappers to the newly created sim bindings.
         # On first init, _create_buffers() handles this after all buffers exist.
-        if hasattr(self, "_root_link_pose_w_ta"):
+        if is_rebind:
             self._pin_proxy_arrays()
+            # Re-seed finite-difference history from the new state and invalidate
+            # derived buffers that otherwise retain their pre-reset timestamps.
+            self._previous_body_com_vel.assign(self._sim_bind_body_com_vel_w)
+            reset_timestamps(
+                [
+                    self._root_link_vel_w,
+                    self._root_link_vel_b,
+                    self._projected_gravity_b,
+                    self._heading_w,
+                    self._body_link_vel_w,
+                    self._root_com_pose_w,
+                    self._root_com_vel_b,
+                    self._root_com_acc_w,
+                    self._body_com_acc_w,
+                    self._body_com_pose_b,
+                    self._root_state_w,
+                    self._root_link_state_w,
+                    self._root_com_state_w,
+                ]
+            )
 
     def _create_buffers(self) -> None:
         """Create buffers for the root data."""
         super()._create_buffers()
         self._num_instances = self._root_view.count
-        # Initialize history for finite differencing. If the rigid object is fixed, the root com velocity is not
-        # available, so we use zeros.
-        if self._root_view.get_root_velocities(SimulationManager.get_state_0()) is None:
+        # Fixed objects have no generalized root velocity, so keep a harmless
+        # write-only buffer for the common rigid-object writer path.
+        if self._sim_bind_root_joint_vel_w is None:
             logger.warning(
-                "Failed to get root com velocity. If the rigid object is fixed, this is expected. "
-                "Setting root com velocity to zeros."
+                "Failed to get root generalized velocity. If the rigid object is fixed, this is expected. "
+                "Setting its velocity write buffer to zeros."
             )
-            self._sim_bind_root_com_vel_w = wp.zeros(
-                (self._num_instances,), dtype=wp.spatial_vectorf, device=self.device
-            )
-            self._sim_bind_body_com_vel_w = wp.zeros(
+            self._sim_bind_root_joint_vel_w = wp.zeros(
                 (self._num_instances,), dtype=wp.spatial_vectorf, device=self.device
             )
         # -- default root pose and velocity

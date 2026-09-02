@@ -156,9 +156,11 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         }
         scalars = {
             "episode": {
-                "mean_reward": lambda: float(getattr(self, "reward_buf", None).mean())
-                if getattr(self, "reward_buf", None) is not None
-                else 0.0,
+                "mean_reward": lambda: (
+                    float(getattr(self, "reward_buf", None).mean())
+                    if getattr(self, "reward_buf", None) is not None
+                    else 0.0
+                ),
                 "episode_length": lambda: float(self.episode_length_buf.float().mean()),
             }
         }
@@ -178,7 +180,7 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
 
         Unlike the :class:`ManagerBasedEnv.step` class, the function performs the following operations:
 
-        1. Process the actions.
+        1. Update step-triggered curricula and process the actions.
         2. Perform physics stepping.
         3. Perform rendering if gui is enabled.
         4. Update the environment counters and compute the rewards and terminations.
@@ -204,6 +206,8 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         Returns:
             A tuple containing the observations, rewards, resets (terminated and truncated) and extras.
         """
+        # Apply global curricula before the action manager reads their live configuration.
+        self.curriculum_manager.compute_step()
         # process actions
         self.action_manager.process_action(action.to(self.device))
 
@@ -292,6 +296,8 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
                 self._reset_idx(manual_reset_ids)
                 self.recorder_manager.record_post_reset(manual_reset_ids)
 
+        # Prepare the next schedule phase before commands and observations are updated.
+        self.curriculum_manager.compute_step()
         # -- update command
         self.command_manager.compute(dt=self.step_dt)
         # -- step interval events

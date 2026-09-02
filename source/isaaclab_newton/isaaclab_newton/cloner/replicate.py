@@ -26,6 +26,7 @@ from isaaclab_newton.cloner.newton_clone_utils import (
     replicate_builder_mapping,
 )
 from isaaclab_newton.physics import NewtonManager
+from isaaclab_newton.physics.cable_damping import add_usd_with_cable_damping
 
 if TYPE_CHECKING:
     _MappingBatch: TypeAlias = tuple[
@@ -95,7 +96,8 @@ def _build_newton_builder_from_mapping(
     # Swap height-field-tagged terrain colliders for Newton heightfields before the
     # mesh import, and skip those prims in add_usd so the terrain is not imported twice.
     hf_ignore_paths = manager_cls._inject_terrain_heightfields(stage, builder)
-    stage_info = builder.add_usd(
+    stage_info = add_usd_with_cable_damping(
+        builder,
         stage,
         ignore_paths=["/World/envs", *sources, *hf_ignore_paths],
         schema_resolvers=schema_resolvers,

@@ -23,6 +23,10 @@ _INVALID_CABLE_MATERIAL_VALUES = [
     ("twist_stiffness", -1.0),
     ("shear_stiffness", float("nan")),
     ("twist_stiffness", float("inf")),
+    ("stretch_damping", -1.0),
+    ("shear_damping", float("nan")),
+    ("bend_damping", float("inf")),
+    ("twist_damping", -1.0),
     ("thickness", float("nan")),
 ]
 
@@ -70,6 +74,10 @@ def test_spawn_cable_authors_newton_import_contract(stage):
     # Shear/twist are left unauthored when unset.
     assert not physics_material_prim.HasAttribute("physics:shearStiffness")
     assert not physics_material_prim.HasAttribute("physics:twistStiffness")
+    assert not physics_material_prim.HasAttribute("physics:stretchDamping")
+    assert not physics_material_prim.HasAttribute("physics:shearDamping")
+    assert not physics_material_prim.HasAttribute("physics:bendDamping")
+    assert not physics_material_prim.HasAttribute("physics:twistDamping")
 
 
 def test_spawn_cable_authors_optional_shear_and_twist_stiffness(stage):
@@ -84,6 +92,26 @@ def test_spawn_cable_authors_optional_shear_and_twist_stiffness(stage):
     assert material_prim.GetAttribute("physics:shearStiffness").Get() == pytest.approx(2.5e8)
     # An authored zero is kept as zero rather than treated as unset.
     assert material_prim.GetAttribute("physics:twistStiffness").Get() == pytest.approx(0.0)
+
+
+def test_spawn_cable_authors_optional_joint_damping(stage):
+    cfg = CableCfg(
+        positions=((0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.2, 0.0, 0.0)),
+        physics_material=CableMaterialCfg(
+            stretch_damping=0.1,
+            shear_damping=0.2,
+            bend_damping=0.025,
+            twist_damping=0.03,
+        ),
+    )
+
+    cfg.func("/World/Cable", cfg)
+    material_prim = stage.GetPrimAtPath("/World/Cable/geometry/physics_material")
+
+    assert material_prim.GetAttribute("physics:stretchDamping").Get() == pytest.approx(0.1)
+    assert material_prim.GetAttribute("physics:shearDamping").Get() == pytest.approx(0.2)
+    assert material_prim.GetAttribute("physics:bendDamping").Get() == pytest.approx(0.025)
+    assert material_prim.GetAttribute("physics:twistDamping").Get() == pytest.approx(0.03)
 
 
 def test_spawn_cable_authors_optional_collision_properties(stage):

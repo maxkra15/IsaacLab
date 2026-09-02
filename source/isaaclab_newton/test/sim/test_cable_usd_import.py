@@ -5,6 +5,7 @@
 
 import newton
 import pytest
+from isaaclab_newton.physics.cable_damping import add_usd_with_cable_damping
 
 import isaaclab.sim as sim_utils
 from isaaclab.sim.spawners.materials import CableMaterialCfg
@@ -30,6 +31,24 @@ def _import_cable_joint_stiffness(**material_kwargs) -> list[float]:
     builder.add_usd(stage, root_path="/World/Cable")
     dof0 = builder.joint_qd_start[0]
     return [builder.joint_target_ke[dof0 + offset] for offset in range(4)]
+
+
+def _import_cable_joint_damping(**material_kwargs) -> list[float]:
+    """Spawn a cable, import it through Isaac Lab's Newton bridge, and return its first joint's damping."""
+    sim_utils.create_new_stage()
+    stage = sim_utils.get_current_stage()
+    cfg = CableCfg(
+        positions=[(0.0, 0.0, 0.0), (0.2, 0.0, 0.0), (0.4, 0.0, 0.0)],
+        physics_material=CableMaterialCfg(
+            thickness=0.02, density=1000.0, stretch_stiffness=1.0e6, bend_stiffness=2.0e4, **material_kwargs
+        ),
+    )
+    cfg.func("/World/Cable", cfg)
+
+    builder = newton.ModelBuilder()
+    add_usd_with_cable_damping(builder, stage, root_path="/World/Cable")
+    dof0 = builder.joint_qd_start[0]
+    return [builder.joint_target_kd[dof0 + offset] for offset in range(4)]
 
 
 def test_newton_cable_shear_and_twist_fall_back_when_unset():
@@ -61,6 +80,65 @@ def test_newton_cable_partial_and_zero_shear_twist():
     zero_twist = _import_cable_joint_stiffness(twist_stiffness=0.0)
     assert zero_twist[_TWIST] == pytest.approx(0.0)
     assert zero_twist[_BEND] > 0.0
+
+
+def test_newton_cable_damping_is_opt_in_and_per_mode():
+    """Test that bend/twist damping can be enabled without adding linear damping to other cables."""
+    assert _import_cable_joint_damping() == pytest.approx([0.0, 0.0, 0.0, 0.0])
+    assert _import_cable_joint_damping(bend_damping=0.025, twist_damping=0.025) == pytest.approx(
+        [0.0, 0.0, 0.025, 0.025]
+    )
+
+
+def test_newton_cable_damping_fallbacks_match_native_rod_api():
+    """Test Newton's isotropic fallback and explicit-mode override rules."""
+    assert _import_cable_joint_damping(stretch_damping=0.2, bend_damping=0.025) == pytest.approx(
+        [0.2, 0.2, 0.025, 0.025]
+    )
+    assert _import_cable_joint_damping(
+        stretch_damping=0.2,
+        bend_damping=0.025,
+        shear_stiffness=9.0e9,
+        twist_stiffness=7.0e7,
+    ) == pytest.approx([0.2, 0.0, 0.025, 0.0])
+
+
+def test_newton_cable_damping_routes_all_explicit_modes():
+    damping = _import_cable_joint_damping(
+        stretch_damping=0.1,
+        shear_damping=0.2,
+        bend_damping=0.025,
+        twist_damping=0.03,
+    )
+
+    assert damping == pytest.approx([0.1, 0.2, 0.025, 0.03])
+
+
+def test_newton_cable_damping_is_scoped_per_material_and_replicates():
+    """Test that the import bridge changes only the authored cable and cloning preserves its slots."""
+    sim_utils.create_new_stage()
+    stage = sim_utils.get_current_stage()
+    for name, bend_damping in (("Default", None), ("Damped", 0.025)):
+        cfg = CableCfg(
+            positions=[(0.0, 0.2 if name == "Damped" else 0.0, x) for x in (0.0, 0.2, 0.4)],
+            physics_material=CableMaterialCfg(bend_damping=bend_damping, twist_damping=bend_damping),
+        )
+        cfg.func(f"/World/{name}", cfg)
+
+    source = newton.ModelBuilder()
+    result = add_usd_with_cable_damping(source, stage, root_path="/World")
+
+    def damping_for(path: str) -> list[float]:
+        joint = result["path_cable_map"][path][1][0]
+        dof0 = source.joint_qd_start[joint]
+        return source.joint_target_kd[dof0 : dof0 + 4]
+
+    assert damping_for("/World/Default/geometry/mesh") == pytest.approx([0.0, 0.0, 0.0, 0.0])
+    assert damping_for("/World/Damped/geometry/mesh") == pytest.approx([0.0, 0.0, 0.025, 0.025])
+
+    replicated = newton.ModelBuilder()
+    replicated.replicate(source, 2)
+    assert replicated.joint_target_kd == pytest.approx(source.joint_target_kd * 2)
 
 
 def test_newton_imports_cable_without_registry():

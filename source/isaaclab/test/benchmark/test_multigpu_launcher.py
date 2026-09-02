@@ -13,6 +13,7 @@ import sys
 import pytest
 
 from isaaclab.benchmark.entrypoints import multigpu
+from isaaclab.cli import multigpu as cli_multigpu
 from isaaclab.cli.multigpu import build_launch_command, parse_launcher_args
 
 
@@ -68,16 +69,52 @@ def test_multi_node_rendezvous_options_reach_torchrun():
     """Multi-node launches forward their rendezvous configuration unchanged."""
     command = _command(
         "training",
-        ["--num_gpus", "2", "--nnodes", "3", "--node_rank", "1", "--rdzv_endpoint", "host0:29400", "--task", "X"],
+        [
+            "--num_gpus",
+            "2",
+            "--nnodes",
+            "3",
+            "--node_rank",
+            "1",
+            "--rdzv_endpoint",
+            "host0:29400",
+            "--rdzv_id",
+            "shared-job",
+            "--task",
+            "X",
+        ],
     )
 
     assert command[command.index("--nnodes") + 1] == "3"
     assert command[command.index("--node_rank") + 1] == "1"
     assert command[command.index("--rdzv_endpoint") + 1] == "host0:29400"
+    assert command[command.index("--rdzv_id") + 1] == "shared-job"
 
 
-def test_dry_run_prints_a_shell_parsable_command(capsys: pytest.CaptureFixture[str]):
+def test_single_node_launches_receive_unique_parent_generated_rendezvous_ids(monkeypatch: pytest.MonkeyPatch):
+    """Each parent invocation supplies one unique id that torchrun shares with all of its workers."""
+    generated_ids = iter(("isaaclab-first", "isaaclab-second"))
+    monkeypatch.setattr(cli_multigpu, "_new_rendezvous_id", lambda: next(generated_ids))
+
+    first_command = _command("training", ["--num_gpus", "2", "--task", "X"])
+    second_command = _command("training", ["--num_gpus", "2", "--task", "X"])
+
+    assert first_command[first_command.index("--rdzv_id") + 1] == "isaaclab-first"
+    assert second_command[second_command.index("--rdzv_id") + 1] == "isaaclab-second"
+
+
+def test_multi_node_launch_requires_explicit_shared_rendezvous_id():
+    """Independent node launchers must not generate different identities for one job."""
+    with pytest.raises(SystemExit):
+        _command(
+            "training",
+            ["--num_gpus", "2", "--nnodes", "2", "--node_rank", "0", "--rdzv_endpoint", "host0:29400"],
+        )
+
+
+def test_dry_run_prints_a_shell_parsable_command(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch):
     """``--dry_run`` reports the exact command instead of launching workers."""
+    monkeypatch.setattr(cli_multigpu, "_new_rendezvous_id", lambda: "isaaclab-dry-run")
     status = multigpu.run_multigpu_benchmark_cli("startup", ["--dry_run", "--num_gpus", "2", "--task", "X"])
 
     assert status == 0

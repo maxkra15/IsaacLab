@@ -17,6 +17,8 @@ from pxr import Usd, UsdGeom, UsdPhysics
 
 from isaaclab.sim.utils.newton_model_utils import replace_newton_builder_shape_colors
 
+from isaaclab_newton.physics.cable_damping import add_usd_with_cable_damping
+
 
 def _has_visible_non_collision_geometry(stage: Usd.Stage, prim_path: str) -> bool:
     """Return whether a prim hierarchy contains visible geometry without collision."""
@@ -132,7 +134,8 @@ def _build_source_builder(
     builder = create_builder()
     solvers.SolverMuJoCo.register_custom_attributes(builder)
     solvers.SolverKamino.register_custom_attributes(builder)
-    import_result = builder.add_usd(
+    import_result = add_usd_with_cable_damping(
+        builder,
         stage,
         root_path=source,
         load_visual_shapes=load_visual_shapes,

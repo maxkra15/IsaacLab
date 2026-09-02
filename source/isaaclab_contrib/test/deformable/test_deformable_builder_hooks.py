@@ -10,8 +10,10 @@ from types import SimpleNamespace
 import pytest
 import warp as wp
 from isaaclab_newton.cloner.replicate import NewtonReplicateContext
-from isaaclab_newton.physics import NewtonManager
+from isaaclab_newton.physics import NewtonCfg, NewtonManager
 from isaaclab_newton.sim.spawners.materials import NewtonDeformableMaterialCfg
+
+from isaaclab.sim import SimulationCfg, build_simulation_context
 
 from isaaclab_contrib.deformable import DeformableObject, VBDSolverCfg
 from isaaclab_contrib.deformable.deformable_object import (
@@ -99,6 +101,46 @@ def test_vbd_solver_force_input_capability(monkeypatch, external_rigid_solver: b
 
     assert NewtonManager._solver is solver
     assert NewtonManager._supports_rigid_body_force_input is not external_rigid_solver
+
+
+def test_vbd_integrates_rigid_external_force_over_every_substep():
+    """One per-tick rigid force must produce the full analytical velocity change."""
+    dt = 0.04
+    num_substeps = 4
+    force_x = 4.0
+    sim_cfg = SimulationCfg(
+        dt=dt,
+        device="cpu",
+        gravity=(0.0, 0.0, 0.0),
+        physics=NewtonCfg(
+            solver_cfg=VBDSolverCfg(iterations=2),
+            num_substeps=num_substeps,
+            use_cuda_graph=False,
+        ),
+    )
+
+    with build_simulation_context(sim_cfg=sim_cfg) as sim:
+        builder = sim.physics_manager.create_builder()
+        builder.add_body(mass=1.0, inertia=wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+        NewtonManager.set_builder(builder)
+        sim.reset()
+
+        external_wrench = wp.array(
+            [wp.spatial_vector(force_x, 0.0, 0.0, 0.0, 0.0, 0.0)],
+            dtype=wp.spatial_vectorf,
+            device="cpu",
+        )
+        wp.copy(NewtonManager.get_state_0().body_f, external_wrench)
+        sim.step(render=False)
+
+        velocity_x = float(NewtonManager.get_state_0().body_qd.numpy()[0, 0])
+        position_x = float(NewtonManager.get_state_0().body_q.numpy()[0, 0])
+
+    substep_dt = dt / num_substeps
+    expected_velocity_x = force_x * dt
+    expected_position_x = force_x * substep_dt**2 * num_substeps * (num_substeps + 1) / 2
+    assert velocity_x == pytest.approx(expected_velocity_x, rel=1.0e-5, abs=1.0e-6)
+    assert position_x == pytest.approx(expected_position_x, rel=1.0e-5, abs=1.0e-6)
 
 
 def test_newton_material_defaults_match_registry_defaults():

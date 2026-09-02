@@ -12,10 +12,17 @@ from types import SimpleNamespace
 import gymnasium as gym
 import numpy as np
 import pytest
+import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.managers import CurriculumManager, CurriculumTermCfg
 
 pytestmark = pytest.mark.unit
+
+
+def _record_step_curriculum(env, env_ids):
+    env.step_call_order.append(("curriculum", env.common_step_counter))
+    return float(env.common_step_counter)
 
 
 def _make_env_with_policy_obs_terms(
@@ -102,3 +109,74 @@ def test_obs_space_follows_clip_constraint():
             assert term_space.shape == expected_shapes[term_name]
             assert np.all(term_space.low == low)
             assert np.all(term_space.high == high)
+
+
+def test_step_curriculum_runs_before_action_processing_at_current_global_step():
+    """Step-triggered curricula update before the action manager reads live configuration."""
+    env = object.__new__(ManagerBasedRLEnv)
+    call_order: list[tuple[str, int]] = []
+    env._is_closed = True
+    env.step_call_order = call_order
+    env.common_step_counter = 37
+    env.episode_length_buf = torch.zeros(1, dtype=torch.long)
+    env._sim_step_counter = 0
+    env._physics_handles_decimation = True
+    env.cfg = SimpleNamespace(decimation=1, sim=SimpleNamespace(dt=0.01, render_interval=1))
+    env.action_manager = SimpleNamespace(
+        process_action=lambda action: call_order.append(("action", env.common_step_counter)),
+        apply_action=lambda: None,
+    )
+    env.recorder_manager = SimpleNamespace(
+        active_terms=(),
+        record_pre_step=lambda: None,
+        record_post_physics_decimation_step=lambda: None,
+    )
+    env.sim = SimpleNamespace(
+        device="cpu",
+        is_rendering=False,
+        is_playing=lambda: True,
+        step=lambda *, render: None,
+        consume_reset_request=lambda: False,
+    )
+    env.scene = SimpleNamespace(
+        num_envs=1,
+        write_data_to_sim=lambda: None,
+        update=lambda *, dt: None,
+    )
+    done = torch.zeros(1, dtype=torch.bool)
+    env.termination_manager = SimpleNamespace(
+        compute=lambda: done,
+        terminated=done,
+        time_outs=done,
+    )
+    env.reward_manager = SimpleNamespace(compute=lambda *, dt: torch.zeros(1))
+    env.command_manager = SimpleNamespace(compute=lambda *, dt: call_order.append(("command", env.common_step_counter)))
+    env.event_manager = SimpleNamespace(available_modes=())
+    env.video_recorders = ()
+    env.observation_manager = SimpleNamespace(
+        compute=lambda **kwargs: (
+            call_order.append(("observation", env.common_step_counter)) or {"policy": torch.zeros(1, 1)}
+        )
+    )
+    env.extras = {}
+    env.curriculum_manager = CurriculumManager(
+        {"step_probe": CurriculumTermCfg(func=_record_step_curriculum, update_mode="step")},
+        env,
+    )
+
+    ManagerBasedRLEnv.step(env, torch.zeros(1, 1))
+    ManagerBasedRLEnv.step(env, torch.zeros(1, 1))
+
+    assert call_order == [
+        ("curriculum", 37),
+        ("action", 37),
+        ("curriculum", 38),
+        ("command", 38),
+        ("observation", 38),
+        # The second pre-action hook at counter 38 is idempotent.
+        ("action", 38),
+        ("curriculum", 39),
+        ("command", 39),
+        ("observation", 39),
+    ]
+    assert env.common_step_counter == 39

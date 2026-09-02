@@ -60,7 +60,12 @@ class PhysicsMaterialCfg:
 
 @configclass
 class CableMaterialCfg(PhysicsMaterialCfg):
-    """Physics material parameters for deformable curves."""
+    """Physics material parameters for deformable curves.
+
+    The optional damping coefficients are per cable joint rather than continuum
+    material moduli. They are left unauthored by default so existing cables keep
+    their solver defaults.
+    """
 
     _usd_namespace: ClassVar[str | None] = "physics"
     _usd_applied_schema: ClassVar[str | None] = "PhysicsCurvesDeformableMaterialAPI"
@@ -93,13 +98,48 @@ class CableMaterialCfg(PhysicsMaterialCfg):
     :attr:`bend_stiffness`.
     """
 
+    stretch_damping: float | None = None
+    """The finite, nonnegative per-joint axial damping coefficient [N·s/m].
+
+    Defaults to None, in which case it is not authored and the solver uses its default.
+    """
+
+    shear_damping: float | None = None
+    """The finite, nonnegative per-joint transverse damping coefficient [N·s/m].
+
+    Defaults to None. Newton falls back to :attr:`stretch_damping` when both
+    :attr:`shear_stiffness` and this field are unset.
+    """
+
+    bend_damping: float | None = None
+    """The finite, nonnegative per-joint bending damping coefficient [N·m·s/rad].
+
+    Defaults to None, in which case it is not authored and the solver uses its default.
+    """
+
+    twist_damping: float | None = None
+    """The finite, nonnegative per-joint torsional damping coefficient [N·m·s/rad].
+
+    Defaults to None. Newton falls back to :attr:`bend_damping` when both
+    :attr:`twist_stiffness` and this field are unset.
+    """
+
     def validate_config(self) -> None:
         """Validate cable material values."""
         for field in ("thickness", "density"):
             value = getattr(self, field)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"CableMaterialCfg {field} must be finite and greater than zero.")
-        for field in ("stretch_stiffness", "bend_stiffness", "shear_stiffness", "twist_stiffness"):
+        for field in (
+            "stretch_stiffness",
+            "bend_stiffness",
+            "shear_stiffness",
+            "twist_stiffness",
+            "stretch_damping",
+            "shear_damping",
+            "bend_damping",
+            "twist_damping",
+        ):
             value = getattr(self, field)
             if value is None:
                 continue

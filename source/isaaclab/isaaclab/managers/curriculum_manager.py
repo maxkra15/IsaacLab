@@ -57,6 +57,9 @@ class CurriculumManager(ManagerBase):
         self._curriculum_state = dict()
         for term_name in self._term_names:
             self._curriculum_state[term_name] = None
+        self._has_step_terms = any(term_cfg.update_mode == "step" for term_cfg in self._term_cfgs)
+        # None ensures the first step update runs even when the global counter is zero.
+        self._last_step_compute_counter: int | None = None
 
     def __str__(self) -> str:
         """Returns: A string representation for curriculum manager."""
@@ -65,12 +68,12 @@ class CurriculumManager(ManagerBase):
         # create table for term information
         table = PrettyTable()
         table.title = "Active Curriculum Terms"
-        table.field_names = ["Index", "Name"]
+        table.field_names = ["Index", "Name", "Update Mode"]
         # set alignment of table columns
         table.align["Name"] = "l"
         # add info on each term
-        for index, name in enumerate(self._term_names):
-            table.add_row([index, name])
+        for index, (name, term_cfg) in enumerate(zip(self._term_names, self._term_cfgs)):
+            table.add_row([index, name, term_cfg.update_mode])
         # convert table to string
         msg += table.get_string()
         msg += "\n"
@@ -123,9 +126,10 @@ class CurriculumManager(ManagerBase):
         return extras
 
     def compute(self, env_ids: Sequence[int] | None = None):
-        """Update the curriculum terms.
+        """Update reset-triggered curriculum terms.
 
-        This function calls each curriculum term managed by the class.
+        This function calls each curriculum term whose
+        :attr:`~isaaclab.managers.CurriculumTermCfg.update_mode` is ``"reset"``.
 
         Args:
             env_ids: The list of environment IDs to update.
@@ -134,8 +138,32 @@ class CurriculumManager(ManagerBase):
         # resolve environment indices
         if env_ids is None:
             env_ids = slice(None)
-        # iterate over all the curriculum terms
+        self._compute_terms(env_ids, update_mode="reset")
+
+    def compute_step(self):
+        """Update step-triggered curriculum terms once for the current global control step.
+
+        Step terms always receive all environment indices. Repeated calls at the same
+        :attr:`~isaaclab.envs.ManagerBasedRLEnv.common_step_counter` are no-ops, which
+        allows checkpoint restore code to apply the restored phase before refreshing
+        observations without duplicating the normal pre-action update.
+        """
+        if not self._has_step_terms:
+            return
+
+        step_counter = int(self._env.common_step_counter)
+        if step_counter == self._last_step_compute_counter:
+            return
+
+        self._compute_terms(slice(None), update_mode="step")
+        # Cache only after all terms succeed so a failed update can be retried.
+        self._last_step_compute_counter = step_counter
+
+    def _compute_terms(self, env_ids: Sequence[int] | slice, update_mode: str):
+        """Update curriculum terms matching the requested lifecycle mode."""
         for name, term_cfg in zip(self._term_names, self._term_cfgs):
+            if term_cfg.update_mode != update_mode:
+                continue
             state = term_cfg.func(self._env, env_ids, **term_cfg.params)
             self._curriculum_state[name] = state
 
@@ -193,6 +221,11 @@ class CurriculumManager(ManagerBase):
                 raise TypeError(
                     f"Configuration for the term '{term_name}' is not of type CurriculumTermCfg."
                     f" Received: '{type(term_cfg)}'."
+                )
+            if term_cfg.update_mode not in {"reset", "step"}:
+                raise ValueError(
+                    f"Configuration for the term '{term_name}' has invalid update mode"
+                    f" '{term_cfg.update_mode}'. Expected one of: 'reset', 'step'."
                 )
             # resolve common parameters
             self._resolve_common_term_cfg(term_name, term_cfg, min_argc=2)

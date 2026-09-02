@@ -1123,6 +1123,7 @@ def test_write_root_state(num_cubes, device, with_offset, state_location):
         # Create a scene with random cubes
         cube_object, env_pos = generate_cubes_scene(num_cubes=num_cubes, height=0.0, device=device)
         env_idx = torch.tensor([x for x in range(num_cubes)], dtype=torch.int32, device=device)
+        env_mask = wp.ones(num_cubes, dtype=wp.bool, device=device)
 
         # Play sim
         sim.reset()
@@ -1157,22 +1158,17 @@ def test_write_root_state(num_cubes, device, with_offset, state_location):
             # update buffers
             cube_object.update(sim.cfg.dt)
 
-            if state_location == "com":
-                if i % 2 == 0:
-                    cube_object.write_root_com_pose_to_sim_index(root_pose=rand_state[..., :7])
-                    cube_object.write_root_com_velocity_to_sim_index(root_velocity=rand_state[..., 7:])
-                else:
-                    cube_object.write_root_com_pose_to_sim_index(root_pose=rand_state[..., :7], env_ids=env_idx)
-                    cube_object.write_root_com_velocity_to_sim_index(root_velocity=rand_state[..., 7:], env_ids=env_idx)
-            elif state_location == "link":
-                if i % 2 == 0:
-                    cube_object.write_root_link_pose_to_sim_index(root_pose=rand_state[..., :7])
-                    cube_object.write_root_link_velocity_to_sim_index(root_velocity=rand_state[..., 7:])
-                else:
-                    cube_object.write_root_link_pose_to_sim_index(root_pose=rand_state[..., :7], env_ids=env_idx)
-                    cube_object.write_root_link_velocity_to_sim_index(
-                        root_velocity=rand_state[..., 7:], env_ids=env_idx
-                    )
+            # Exercise both optimized writer variants, with and without their
+            # explicit all-environment selector, against the same state contract.
+            writer_variant = "index" if i % 4 < 2 else "mask"
+            if writer_variant == "index":
+                selection_kwargs = {} if i % 2 == 0 else {"env_ids": env_idx}
+            else:
+                selection_kwargs = {} if i % 2 == 0 else {"env_mask": env_mask}
+            pose_writer = getattr(cube_object, f"write_root_{state_location}_pose_to_sim_{writer_variant}")
+            velocity_writer = getattr(cube_object, f"write_root_{state_location}_velocity_to_sim_{writer_variant}")
+            pose_writer(root_pose=rand_state[..., :7], **selection_kwargs)
+            velocity_writer(root_velocity=rand_state[..., 7:], **selection_kwargs)
 
             # Snapshot the body-frame caches *before* reading the root-frame caches: touching a
             # root cache lazily recomputes the shared buffer and would mask a stale body cache.

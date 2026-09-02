@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from types import FrameType
 
@@ -198,8 +199,12 @@ def build_launch_command(args_cli: argparse.Namespace, worker_args: list[str], c
         return command + _worker_argv(args_cli, worker_args, cfg)
 
     command = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", str(args_cli.nproc_per_node)]
+    rendezvous_id = args_cli.rdzv_id if _has_rendezvous_id(args_cli.rdzv_id) else _new_rendezvous_id()
     for name in TORCHRUN_ARGS:
-        _append_optional_arg(command, args_cli, name)
+        if name == "rdzv_id":
+            command.extend(("--rdzv_id", rendezvous_id))
+        else:
+            _append_optional_arg(command, args_cli, name)
 
     # Every rank repeats the same startup, warning, and model-summary output. Failures still surface:
     # torchrun names the failing rank and reports the traceback that ``record`` captures per rank.
@@ -259,6 +264,27 @@ def _append_optional_arg(command: list[str], args_cli: argparse.Namespace, name:
     value = getattr(args_cli, name)
     if value is not None:
         command.extend((f"--{name}", str(value)))
+
+
+def _new_rendezvous_id() -> str:
+    """Return a unique torchrun identity generated once by the parent launcher."""
+    return f"isaaclab-{uuid.uuid4().hex}"
+
+
+def _has_rendezvous_id(rendezvous_id: str | None) -> bool:
+    """Return whether a rendezvous id is explicit rather than torchrun's static default."""
+    return rendezvous_id is not None and rendezvous_id.strip().lower() not in ("", "none")
+
+
+def _can_use_multiple_nodes(nnodes: str | None) -> bool:
+    """Return whether a valid torchrun node-count expression can exceed one node."""
+    if nnodes is None:
+        return False
+    try:
+        node_counts = tuple(int(value) for value in str(nnodes).split(":"))
+    except ValueError:
+        return False  # Let torchrun report malformed node-count expressions.
+    return len(node_counts) in (1, 2) and max(node_counts) > 1
 
 
 def _forwarded_arg_value(args: list[str], name: str) -> str | None:
@@ -346,6 +372,12 @@ def _validate_launcher_args(
             parser.error("skrl JAX multi-GPU training requires --num_gpus/--nproc_per_node to be at least 1.")
     elif getattr(args_cli, "coordinator_address", None) is not None:
         parser.error("--coordinator_address is only supported with --rl_library skrl --ml_framework jax.")
+
+    if not wants_jax and _can_use_multiple_nodes(args_cli.nnodes) and not _has_rendezvous_id(args_cli.rdzv_id):
+        parser.error(
+            "Multi-node torchrun launches require an explicit shared --rdzv_id. "
+            "Pass the same unique value to the launcher on every node."
+        )
 
     _validate_num_gpus(parser, args_cli)
 

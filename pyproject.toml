@@ -75,6 +75,7 @@ dependencies = [
     "hf-xet>=1.4.1,<2.0.0 ; platform_machine == 'x86_64' or platform_machine == 'AMD64' or platform_machine == 'aarch64'",
     # ----- tasks -----
     "tensorboard",
+    "wandb>=0.26.1,<0.27",
     "numba>=0.63.1",
     # ----- rl utilities -----
     "hydra-core",

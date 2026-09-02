@@ -57,6 +57,16 @@ from newton.solvers import SolverFeatherstone, SolverImplicitMPM, SolverKamino, 
 
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
+
+@wp.kernel
+def _add_spatial_force(
+    body_f: wp.array(dtype=wp.spatial_vectorf),
+    delta: wp.spatial_vectorf,
+):
+    tid = wp.tid()
+    body_f[tid] = body_f[tid] + delta
+
+
 # ---------------------------------------------------------------------------
 # Lightweight (no sim) parametrisation
 # ---------------------------------------------------------------------------
@@ -857,10 +867,12 @@ def test_subclass_of_newton_manager(manager):
 def test_clear_resets_rigid_body_force_capability(monkeypatch):
     """Teardown clears the canonical solver capability without subclass shadowing."""
     monkeypatch.setattr(NewtonManager, "_supports_rigid_body_force_input", True)
+    monkeypatch.setattr(NewtonManager, "_body_force_snapshot", object())
 
     NewtonManager.clear()
 
     assert NewtonManager._supports_rigid_body_force_input is False
+    assert NewtonManager._body_force_snapshot is None
     for manager in (
         NewtonMJWarpManager,
         NewtonXPBDManager,
@@ -1177,6 +1189,57 @@ def test_state_force_callback_runs_before_every_solver_substep(monkeypatch, use_
             ("force", "state_1"),
             ("step", "state_1", "state_0"),
         ]
+
+
+@pytest.mark.parametrize("use_single_state", [True, False], ids=["single_state", "double_state"])
+def test_external_body_force_is_restored_each_substep_without_accumulating_callbacks(monkeypatch, use_single_state):
+    """A per-tick body force persists while per-substep callback forces stay single-counted."""
+
+    class _State:
+        def __init__(self):
+            self.body_f = wp.zeros(1, dtype=wp.spatial_vectorf, device="cpu")
+
+        def clear_forces(self):
+            self.body_f.zero_()
+
+        def assign(self, other):
+            wp.copy(self.body_f, other.body_f)
+
+    state_0 = _State()
+    state_1 = _State()
+    external_force = wp.array([wp.spatial_vector(2.0, 0.0, 0.0, 0.0, 0.0, 0.0)], dtype=wp.spatial_vectorf, device="cpu")
+    wp.copy(state_0.body_f, external_force)
+    applied_forces: list[np.ndarray] = []
+
+    def add_callback_force(state):
+        wp.launch(
+            _add_spatial_force,
+            dim=1,
+            inputs=[state.body_f, wp.spatial_vector(3.0, 0.0, 0.0, 0.0, 0.0, 0.0)],
+            device="cpu",
+        )
+
+    def record_step(state_in, _state_out, *_args):
+        applied_forces.append(state_in.body_f.numpy().copy())
+
+    monkeypatch.setattr(NewtonManager, "_state_0", state_0)
+    monkeypatch.setattr(NewtonManager, "_state_1", state_1)
+    monkeypatch.setattr(NewtonManager, "_control", object())
+    monkeypatch.setattr(NewtonManager, "_solver_dt", 0.001)
+    monkeypatch.setattr(NewtonManager, "_num_substeps", 3)
+    monkeypatch.setattr(NewtonManager, "_collision_decimation", 0)
+    monkeypatch.setattr(NewtonManager, "_needs_collision_pipeline", False)
+    monkeypatch.setattr(NewtonManager, "_use_single_state", use_single_state)
+    monkeypatch.setattr(NewtonManager, "_body_force_snapshot", wp.zeros_like(state_0.body_f))
+    monkeypatch.setattr(NewtonManager, "_state_force_callbacks", [add_callback_force])
+    monkeypatch.setattr(NewtonManager, "_step_solver", staticmethod(record_step))
+
+    NewtonManager._run_solver_substeps(contacts=None)
+
+    expected = np.array([[5.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    assert len(applied_forces) == 3
+    for applied_force in applied_forces:
+        np.testing.assert_allclose(applied_force, expected)
 
 
 # ---------------------------------------------------------------------------

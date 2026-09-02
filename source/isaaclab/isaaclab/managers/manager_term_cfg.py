@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import MISSING
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -140,6 +140,14 @@ class CurriculumTermCfg(ManagerTermBaseCfg):
     and any other parameters as input and return the curriculum state for
     logging purposes. If the function returns None, the curriculum state
     is not logged.
+    """
+
+    update_mode: Literal["reset", "step"] = "reset"
+    """When to update the curriculum term. Defaults to ``"reset"``.
+
+    Reset terms update for the environments being reset. Step terms update
+    once per global control step before actions are processed and always
+    receive all environment indices.
     """
 
 

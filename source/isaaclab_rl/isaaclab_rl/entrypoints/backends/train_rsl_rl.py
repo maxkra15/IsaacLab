@@ -14,12 +14,12 @@ import logging
 import os
 import platform
 import time
-from datetime import datetime
 
 from packaging import version
 
 from isaaclab.app import add_launcher_args, report_activity
 
+from isaaclab_rl.entrypoints._torchrun import resolve_log_dir, should_write_run_metadata
 from isaaclab_rl.entrypoints.backends import cli_args_rsl_rl as cli_args
 from isaaclab_rl.entrypoints.common import (
     CHECKPOINT_SELECTORS,
@@ -46,10 +46,112 @@ import isaaclab_tasks  # noqa: F401
 logger = logging.getLogger(__name__)
 
 RSL_RL_VERSION = "5.0.1"
+_MISSING_ENVIRONMENT_STEP = object()
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 with contextlib.suppress(ImportError):
     import isaaclab_tasks_experimental  # noqa: F401
+
+
+def _bind_environment_step_checkpoint(runner: object, env: object) -> bool:
+    """Bind an optional algorithm checkpoint hook to the live environment step."""
+    algorithm = getattr(runner, "alg", None)
+    bind_provider = getattr(algorithm, "bind_environment_step_provider", None)
+    if bind_provider is None:
+        return False
+    if not callable(bind_provider):
+        raise TypeError("bind_environment_step_provider must be callable.")
+    base_env = env.unwrapped
+    bind_provider(lambda: base_env.common_step_counter)
+    return True
+
+
+def _validate_environment_step(value: object, name: str) -> int:
+    """Validate an environment control-step value used during resume."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
+    return value
+
+
+def _synchronize_environment_step(step: int, *, distributed: bool, device: str) -> int:
+    """Broadcast rank zero's restored step and assert every worker loaded it."""
+    if not distributed:
+        return step
+
+    import torch
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError("Distributed environment-step restore requires an initialized process group.")
+    local_step = torch.tensor(step, dtype=torch.int64, device=device)
+    synchronized_step = local_step.clone()
+    torch.distributed.broadcast(synchronized_step, src=0)
+    mismatch_count = torch.ne(local_step, synchronized_step).to(dtype=torch.int64)
+    torch.distributed.all_reduce(mismatch_count, op=torch.distributed.ReduceOp.SUM)
+    if mismatch_count.item() != 0:
+        raise RuntimeError(
+            "Distributed workers restored different environment control steps: "
+            f"local={local_step.item()}, rank_zero={synchronized_step.item()}, "
+            f"mismatched_workers={mismatch_count.item()}."
+        )
+    return int(synchronized_step.item())
+
+
+def _restore_environment_step_checkpoint(
+    runner: object,
+    env: object,
+    *,
+    num_steps_per_env: int,
+    distributed: bool,
+) -> int | None:
+    """Restore an optional exact environment step before the runner reads observations."""
+    algorithm = getattr(runner, "alg", None)
+    restored_step = getattr(
+        algorithm,
+        "restored_environment_common_step_counter",
+        _MISSING_ENVIRONMENT_STEP,
+    )
+    if restored_step is _MISSING_ENVIRONMENT_STEP:
+        return None
+
+    if restored_step is None:
+        completed_updates = _validate_environment_step(
+            getattr(algorithm, "completed_updates", None),
+            "completed_updates",
+        )
+        rollout_steps = _validate_environment_step(num_steps_per_env, "num_steps_per_env")
+        if rollout_steps == 0:
+            raise ValueError("num_steps_per_env must be positive.")
+        restored_step = completed_updates * rollout_steps
+        logger.warning(
+            "Checkpoint predates exact environment-step persistence; inferred common_step_counter=%d "
+            "from %d completed updates and %d rollout steps.",
+            restored_step,
+            completed_updates,
+            rollout_steps,
+        )
+    else:
+        restored_step = _validate_environment_step(
+            restored_step,
+            "restored_environment_common_step_counter",
+        )
+
+    base_env = env.unwrapped
+    restored_step = _synchronize_environment_step(
+        restored_step,
+        distributed=distributed,
+        device=base_env.device,
+    )
+    base_env.common_step_counter = restored_step
+
+    compute_curriculum_step = getattr(getattr(base_env, "curriculum_manager", None), "compute_step", None)
+    if callable(compute_curriculum_step):
+        compute_curriculum_step()
+
+    observation_manager = getattr(base_env, "observation_manager", None)
+    compute_observations = getattr(observation_manager, "compute", None)
+    if callable(compute_observations):
+        base_env.obs_buf = compute_observations()
+    return restored_step
 
 
 def _check_rsl_rl_version() -> str:
@@ -153,17 +255,19 @@ def _run(args_cli: argparse.Namespace) -> None:
 
             log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
             print(f"[INFO] Logging experiment in directory: {log_root_path}")
-            log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            print(f"Exact experiment name requested from command line: {log_dir}")
-            if agent_cfg.run_name:
-                log_dir += f"_{agent_cfg.run_name}"
-            log_dir = os.path.join(log_root_path, log_dir)
-            write_run_manifest(
-                log_dir,
-                library="rsl_rl",
-                task=args_cli.task,
-                metadata={"agent": args_cli.agent},
+            log_dir = resolve_log_dir(
+                log_root_path,
+                agent_cfg.run_name,
+                distributed=args_cli.distributed,
             )
+            print(f"Exact experiment name requested from command line: {os.path.basename(log_dir)}")
+            if should_write_run_metadata(args_cli.distributed):
+                write_run_manifest(
+                    log_dir,
+                    library="rsl_rl",
+                    task=args_cli.task,
+                    metadata={"agent": args_cli.agent},
+                )
 
             configure_io_descriptors(env_cfg, args_cli, logger)
             env_cfg.log_dir = log_dir
@@ -206,6 +310,7 @@ def _run(args_cli: argparse.Namespace) -> None:
             else:
                 raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
             report_activity(None)
+            _bind_environment_step_checkpoint(runner, env)
 
             # configure_seed must run after runner construction so torch determinism does not disturb its initialization
             if args_cli.deterministic:
@@ -215,8 +320,15 @@ def _run(args_cli: argparse.Namespace) -> None:
             if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
                 print(f"[INFO]: Loading model checkpoint from: {resume_path}")
                 runner.load(resume_path)
+                _restore_environment_step_checkpoint(
+                    runner,
+                    env,
+                    num_steps_per_env=agent_cfg.num_steps_per_env,
+                    distributed=args_cli.distributed,
+                )
 
-            dump_train_configs(log_dir, env_cfg, agent_cfg)
+            if should_write_run_metadata(args_cli.distributed):
+                dump_train_configs(log_dir, env_cfg, agent_cfg)
 
             screen.close()
             try:

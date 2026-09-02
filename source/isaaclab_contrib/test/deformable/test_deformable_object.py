@@ -20,6 +20,7 @@ import pytest
 import torch
 import warp as wp
 from flaky import flaky
+from isaaclab_newton.assets import RigidObject
 from isaaclab_newton.physics import NewtonCfg, NewtonManager
 from isaaclab_newton.sim.schemas import NewtonDeformableBodyPropertiesCfg
 from isaaclab_newton.sim.spawners.materials import (
@@ -29,7 +30,7 @@ from isaaclab_newton.sim.spawners.materials import (
 
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
-from isaaclab.assets import DeformableObject, DeformableObjectCfg
+from isaaclab.assets import DeformableObject, DeformableObjectCfg, RigidObjectCfg
 from isaaclab.sim import SimulationCfg, build_simulation_context
 
 from isaaclab_contrib.deformable.newton_manager_cfg import VBDSolverCfg
@@ -547,6 +548,111 @@ def test_freefall_analytical(sim):
     dz = x1[..., 2] - x0[..., 2]
     # Every vertex should have the same Z displacement under uniform gravity
     torch.testing.assert_close(dz, torch.full_like(dz, expected_dz), rtol=1e-2, atol=1e-5)
+
+
+def test_vbd_rigid_root_state_follows_integrated_body():
+    """Rigid-object root poses and velocities must follow VBD's live body state."""
+    cfg = SimulationCfg(
+        dt=1.0 / 60.0,
+        device="cuda:0",
+        gravity=(0.0, 0.0, -9.81),
+        physics=NewtonCfg(
+            solver_cfg=VBDSolverCfg(iterations=3),
+            num_substeps=2,
+            use_cuda_graph=False,
+        ),
+    )
+
+    with build_simulation_context(sim_cfg=cfg, auto_add_lighting=True) as sim:
+        sim._app_control_on_stop_handle = None
+        sim_utils.create_prim("/World/env_0", "Xform")
+        rigid_object = RigidObject(
+            cfg=RigidObjectCfg(
+                prim_path="/World/env_.*/Cube",
+                spawn=sim_utils.CuboidCfg(
+                    size=(0.1, 0.1, 0.1),
+                    rigid_props=sim_utils.RigidBodyBaseCfg(),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                    collision_props=sim_utils.CollisionBaseCfg(),
+                ),
+                init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
+            )
+        )
+        sim.reset()
+
+        initial_body_link_pose = rigid_object.data.body_link_pose_w.torch[:, 0].clone()
+        # Prime the lazy body-link velocity view so the post-step assertion also
+        # detects a cached reshape whose timestamped backing buffer was not refreshed.
+        _ = rigid_object.data.body_link_vel_w.torch.clone()
+        for _ in range(3):
+            sim.step(render=False)
+            rigid_object.update(sim.cfg.dt)
+
+        body_link_pose = rigid_object.data.body_link_pose_w.torch[:, 0]
+        root_link_pose = rigid_object.data.root_link_pose_w.torch
+        body_com_pose = rigid_object.data.body_com_pose_w.torch[:, 0]
+        root_com_pose = rigid_object.data.root_com_pose_w.torch
+        body_com_vel = rigid_object.data.body_com_vel_w.torch[:, 0]
+        body_link_vel = rigid_object.data.body_link_vel_w.torch[:, 0].clone()
+        root_com_vel = rigid_object.data.root_com_vel_w.torch
+        root_link_vel = rigid_object.data.root_link_vel_w.torch
+        expected_com_pos, expected_com_quat = math_utils.combine_frame_transforms(
+            body_link_pose[:, :3],
+            body_link_pose[:, 3:],
+            rigid_object.data.body_com_pos_b.torch[:, 0],
+        )
+        expected_com_pose = torch.cat((expected_com_pos, expected_com_quat), dim=-1)
+        com_offset_w = math_utils.quat_apply(
+            body_link_pose[:, 3:],
+            rigid_object.data.body_com_pos_b.torch[:, 0],
+        )
+        expected_link_lin_vel = body_com_vel[:, :3] + torch.linalg.cross(body_com_vel[:, 3:], -com_offset_w, dim=-1)
+        expected_link_vel = torch.cat((expected_link_lin_vel, body_com_vel[:, 3:]), dim=-1)
+
+        assert torch.all(body_link_pose[:, 2] < initial_body_link_pose[:, 2] - 1.0e-4)
+        assert torch.all(body_com_vel[:, 2] < -1.0e-4)
+        torch.testing.assert_close(root_link_pose, body_link_pose, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(root_com_pose, body_com_pose, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(root_com_pose, expected_com_pose, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(root_com_vel, body_com_vel, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(root_link_vel, expected_link_vel, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(body_link_vel, expected_link_vel, rtol=1.0e-5, atol=1.0e-6)
+
+        # A hard reset recreates Newton's state arrays. The root views and derived
+        # velocity caches must rebind immediately, and acceleration history must
+        # be seeded from the reset state rather than the pre-reset falling state.
+        assert torch.any(torch.abs(rigid_object.data.body_com_acc_w.torch) > 1.0e-4)
+        moved_body_link_pose = body_link_pose.clone()
+        sim.reset()
+
+        reset_body_link_pose = rigid_object.data.body_link_pose_w.torch[:, 0]
+        reset_root_link_pose = rigid_object.data.root_link_pose_w.torch
+        reset_body_com_vel = rigid_object.data.body_com_vel_w.torch[:, 0]
+        # Read the body-link view first so a stale timestamped backing buffer
+        # cannot be hidden by refreshing the root-link property beforehand.
+        reset_body_link_vel = rigid_object.data.body_link_vel_w.torch[:, 0].clone()
+        reset_root_com_vel = rigid_object.data.root_com_vel_w.torch
+        reset_root_link_vel = rigid_object.data.root_link_vel_w.torch
+        reset_com_offset_w = math_utils.quat_apply(
+            reset_body_link_pose[:, 3:],
+            rigid_object.data.body_com_pos_b.torch[:, 0],
+        )
+        reset_link_lin_vel = reset_body_com_vel[:, :3] + torch.linalg.cross(
+            reset_body_com_vel[:, 3:], -reset_com_offset_w, dim=-1
+        )
+        reset_expected_link_vel = torch.cat((reset_link_lin_vel, reset_body_com_vel[:, 3:]), dim=-1)
+
+        assert torch.all(reset_body_link_pose[:, 2] > moved_body_link_pose[:, 2] + 1.0e-4)
+        torch.testing.assert_close(reset_root_link_pose, reset_body_link_pose, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(reset_root_com_vel, reset_body_com_vel, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(reset_root_link_vel, reset_expected_link_vel, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(reset_body_link_vel, reset_expected_link_vel, rtol=1.0e-5, atol=1.0e-6)
+        torch.testing.assert_close(
+            rigid_object.data.body_com_acc_w.torch,
+            torch.zeros_like(rigid_object.data.body_com_acc_w.torch),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
 
 
 def test_nodal_pos_reads_current_state_after_odd_substep_swap():
