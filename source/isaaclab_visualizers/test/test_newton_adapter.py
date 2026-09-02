@@ -125,6 +125,71 @@ def test_newton_visualizer_cfg_exposes_viewer_options():
     assert cfg.particle_color == (0.1, 0.2, 0.3)
 
 
+def test_newton_visualizer_log_mesh_stages_for_next_frame():
+    viewer = Mock()
+    visualizer = _make_newton_visualizer(None)
+    visualizer._viewer = viewer
+    points = wp.zeros(3, dtype=wp.vec3)
+    indices = wp.zeros(3, dtype=wp.int32)
+    normals = wp.zeros(3, dtype=wp.vec3)
+
+    visualizer.log_mesh(
+        "/surface",
+        points,
+        indices,
+        normals=normals,
+        color=(0.1, 0.2, 0.3),
+        roughness=0.2,
+        dynamic=True,
+        opacity=0.35,
+    )
+
+    viewer.log_mesh.assert_not_called()
+    visualizer._log_pending_meshes()
+
+    viewer.log_mesh.assert_called_once_with(
+        "/surface",
+        points,
+        indices,
+        normals=normals,
+        uvs=None,
+        texture=None,
+        hidden=False,
+        backface_culling=True,
+        color=(0.1, 0.2, 0.3),
+        roughness=0.2,
+        metallic=None,
+        dynamic=True,
+        opacity=0.35,
+    )
+    assert visualizer._pending_mesh_submissions == {}
+
+
+def test_newton_visualizer_log_mesh_keeps_latest_submission_per_name():
+    viewer = Mock()
+    visualizer = _make_newton_visualizer(None)
+    visualizer._viewer = viewer
+    points_0 = wp.zeros(3, dtype=wp.vec3)
+    points_1 = wp.zeros(6, dtype=wp.vec3)
+    indices = wp.zeros(3, dtype=wp.int32)
+
+    visualizer.log_mesh("/surface", points_0, indices, dynamic=True)
+    visualizer.log_mesh("/surface", points_1, indices, dynamic=True)
+    visualizer._log_pending_meshes()
+
+    viewer.log_mesh.assert_called_once()
+    assert viewer.log_mesh.call_args.args[:3] == ("/surface", points_1, indices)
+
+
+def test_newton_visualizer_log_mesh_requires_initialized_viewer():
+    visualizer = _make_newton_visualizer(None)
+    points = wp.zeros(3, dtype=wp.vec3)
+    indices = wp.zeros(3, dtype=wp.int32)
+
+    with pytest.raises(RuntimeError, match="must be initialized"):
+        visualizer.log_mesh("/surface", points, indices)
+
+
 def test_newton_marker_registry_lifecycle(monkeypatch: pytest.MonkeyPatch):
     """Construction caches the registry; close survives context teardown and is idempotent."""
 
@@ -439,6 +504,8 @@ class _Viewer:
         self.logged_state = None
         self.logged_contacts = None
         self.logged_arrows = None
+        self.logged_mesh = None
+        self.events = []
 
     def is_paused(self):
         return False
@@ -447,10 +514,15 @@ class _Viewer:
         return True
 
     def begin_frame(self, _time):
-        pass
+        self.events.append("begin_frame")
 
     def log_state(self, state):
+        self.events.append("log_state")
         self.logged_state = state
+
+    def log_mesh(self, name, points, indices, **kwargs):
+        self.events.append("log_mesh")
+        self.logged_mesh = (name, points, indices, kwargs)
 
     def log_contacts(self, contacts, state):
         self.logged_contacts = (contacts, state)
@@ -459,7 +531,7 @@ class _Viewer:
         self.logged_arrows = (name, starts, ends, colors)
 
     def end_frame(self):
-        pass
+        self.events.append("end_frame")
 
     def get_frame(self):
         return SimpleNamespace(numpy=lambda: np.zeros((4, 6, 3), dtype=np.uint8))
@@ -584,6 +656,42 @@ def test_newton_visualizer_logs_native_contacts_when_available(monkeypatch):
 
     assert viewer.logged_state is state
     assert viewer.logged_contacts == (contacts, state)
+
+
+def test_newton_visualizer_logs_staged_mesh_inside_frame(monkeypatch):
+    from isaaclab_newton.physics import NewtonManager
+
+    state = SimpleNamespace(body_q=_BodyQ())
+    viewer = _Viewer()
+    visualizer = _make_newton_visualizer(viewer)
+    points = wp.zeros(3, dtype=wp.vec3)
+    indices = wp.zeros(3, dtype=wp.int32)
+
+    monkeypatch.setattr(NewtonManager, "get_state", lambda _scene_data_provider=None: state)
+    monkeypatch.setattr(NewtonManager, "get_contacts", lambda: None)
+    monkeypatch.setattr(NewtonManager, "get_num_envs", lambda: 1)
+
+    visualizer.log_mesh("/surface", points, indices, dynamic=True)
+    visualizer.step(0.1)
+
+    assert viewer.events == ["begin_frame", "log_state", "log_mesh", "end_frame"]
+    assert viewer.logged_mesh == (
+        "/surface",
+        points,
+        indices,
+        {
+            "normals": None,
+            "uvs": None,
+            "texture": None,
+            "hidden": False,
+            "backface_culling": True,
+            "color": None,
+            "roughness": None,
+            "metallic": None,
+            "dynamic": True,
+            "opacity": None,
+        },
+    )
 
 
 def test_newton_visualizer_headless_renders_frame_on_demand(monkeypatch):
