@@ -1,0 +1,35 @@
+{
+  "format": "isaaclab-franka-rj45-pick-insert-policy",
+  "schema_version": 1,
+  "policy_file": "best_policy.pt",
+  "checkpoint": {
+    "sha256": "f0a1e7498efc89fa88e87febd444d95b5a6bc11f2c27095efd11762a7c064659",
+    "size_bytes": 5671541,
+    "iteration": 5400,
+    "actor_observation_dim": 135,
+    "critic_observation_dim": 138,
+    "action_dim": 8,
+    "all_tensors_finite": true
+  },
+  "training": {
+    "task": "IsaacContrib-Franka-RJ45-Pick-Insert",
+    "task_contract_version": 7,
+    "run_id": "rj45-pick-insert-scratch16-alignedgrasp-v7-20260824-210737-68e4808d",
+    "run_name": "2026-08-24_21-30-36_osmo-16xl40-scratch-alignedgrasp-v7-20260824-210737-3072env-franka-rj45-pick-insert-scratch16-alignedgrasp-v7-20260824-210737-1",
+    "wandb_url": "https://wandb.ai/nvidia-isaac/franka_rj45_pick_insert/runs/rj45-pick-insert-scratch16-alignedgrasp-v7-20260824-210737-68e4808d",
+    "final_reported_success_rate": 0.988101601600647
+  },
+  "selection_evaluation": {
+    "created_utc": "2026-09-03T07:44:15Z",
+    "runtime_commit": "d835a78e45dc1f2ae12913532bb7751b529448ed",
+    "reset_source": "procedural",
+    "phase": "full_pick",
+    "seed": 20260903,
+    "episodes": 128,
+    "success_count": 112,
+    "success_rate": 0.875,
+    "grasp_acquisition_count": 121,
+    "grasp_acquisition_rate": 0.9453125,
+    "nonfinite_count": 0
+  }
+}

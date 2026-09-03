@@ -53,8 +53,7 @@ def verify_gb300_external_usd(path: str | Path) -> Path:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if digest != GB300_SIMREADY_EXTERNAL_USD_SHA256:
         raise RuntimeError(
-            "GB300 external USD SHA-256 mismatch: "
-            f"expected {GB300_SIMREADY_EXTERNAL_USD_SHA256}, got {digest}."
+            f"GB300 external USD SHA-256 mismatch: expected {GB300_SIMREADY_EXTERNAL_USD_SHA256}, got {digest}."
         )
     return resolved
 

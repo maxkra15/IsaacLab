@@ -74,9 +74,7 @@ class FrankaRJ45DualRackInsertEnvCfg(FrankaRJ45PickInsertEnvCfg):
     proxy_body_patterns: tuple[str, ...] = DUAL_RACK_ROBOT_PROXY_BODY_PATTERNS
 
     reset_dataset_path: str = "datasets/franka_rj45_dual_rack_insert/reset_dataset.pt"
-    reset_validation_report_path: str = (
-        "logs/rsl_rl/franka_rj45_dual_rack_insert/validation/reset_validation.json"
-    )
+    reset_validation_report_path: str = "logs/rsl_rl/franka_rj45_dual_rack_insert/validation/reset_validation.json"
     reset_source: Literal["dataset"] = "dataset"
 
     # The target socket is mechanically fixed in the upper rack.  Diversity

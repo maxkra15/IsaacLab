@@ -294,10 +294,23 @@ the settled cable/table contact manifold and both VBD history buffers. Playback
 therefore does not read or sample the training reset bank or validation report:
 
 ```bash
+git lfs pull --include="source/isaaclab_tasks/isaaclab_tasks/contrib/franka_rj45_insertion/data/best_policy.pt"
+
 uv run isaaclab play --rl_library rsl_rl \
   --task IsaacContrib-Franka-RJ45-Pick-Insert \
-  --checkpoint latest --num_envs 1 --device cuda:0
+  --checkpoint source/isaaclab_tasks/isaaclab_tasks/contrib/franka_rj45_insertion/data/best_policy.pt \
+  --num_envs 1 --device cuda:0
 ```
+
+The packaged checkpoint is the final iteration-5400 policy from the aligned-grasp
+v7 scratch run. It is stored through Git LFS, has SHA-256
+`f0a1e7498efc89fa88e87febd444d95b5a6bc11f2c27095efd11762a7c064659`,
+and retains the 135D actor / 138D critic / 8D action ABI. Selection against the
+current procedural full-pick reset produced 112 successes in 128 deterministic
+episodes, with 121 successful grasp acquisitions and no non-finite episodes.
+`data/best_policy.json` records the exact W&B run, checkpoint, runtime commit,
+and selection evidence. A clone must have Git LFS installed; a tiny text pointer
+instead of a 5,671,541-byte checkpoint means `git lfs pull` has not completed.
 
 Pass `--train_env_cfg` only when deliberately replaying the training reset bank
 and its curriculum-compatible configuration.

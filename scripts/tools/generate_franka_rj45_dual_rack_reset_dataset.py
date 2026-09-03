@@ -27,10 +27,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import generate_franka_rj45_pick_insert_reset_dataset as base
 import torch
 import warp as wp
-
-import generate_franka_rj45_pick_insert_reset_dataset as base
 from _franka_rj45_reset_tools import _RJ45ResetToolMixin, save_torch_atomic
 
 from isaaclab.app import add_launcher_args, launch_simulation
@@ -62,9 +61,7 @@ DEFAULT_DATASET_PATH = _REPO_ROOT / "datasets/franka_rj45_dual_rack_insert/reset
 DEFAULT_VALIDATION_REPORT_PATH = (
     _REPO_ROOT / "logs/rsl_rl/franka_rj45_dual_rack_insert/validation/reset_validation.json"
 )
-DEFAULT_CERTIFICATE_PATH = (
-    _REPO_ROOT / "datasets/franka_rj45_dual_rack_insert/canonical_goal_certificate.pt"
-)
+DEFAULT_CERTIFICATE_PATH = _REPO_ROOT / "datasets/franka_rj45_dual_rack_insert/canonical_goal_certificate.pt"
 DUAL_RACK_GOAL_EQUILIBRIUM_RELAX_S = 60.0
 """Warm relaxation before capturing a two-ended cable goal [s]."""
 

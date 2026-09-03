@@ -5,7 +5,11 @@
 
 """Configuration and pure task-logic tests for Franka RJ45 pick-and-insert."""
 
+import hashlib
+import io
+import json
 import math
+from importlib import resources
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -85,6 +89,29 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.rj45_env_cfg import (
     FrankaRJ45InsertionEnvCfg,
 )
 from isaaclab_tasks.contrib.franka_rj45_insertion.table_scene_cfg import configure_seattle_table_external_asset
+
+
+def test_packaged_best_policy_matches_manifest_and_runtime_abi():
+    data = resources.files("isaaclab_tasks.contrib.franka_rj45_insertion").joinpath("data")
+    manifest = json.loads(data.joinpath("best_policy.json").read_text(encoding="utf-8"))
+    checkpoint_bytes = data.joinpath(manifest["policy_file"]).read_bytes()
+
+    assert manifest["format"] == "isaaclab-franka-rj45-pick-insert-policy"
+    assert manifest["schema_version"] == 1
+    assert len(checkpoint_bytes) == manifest["checkpoint"]["size_bytes"]
+    assert hashlib.sha256(checkpoint_bytes).hexdigest() == manifest["checkpoint"]["sha256"]
+
+    checkpoint = torch.load(io.BytesIO(checkpoint_bytes), map_location="cpu", weights_only=True)
+    assert checkpoint["iter"] == manifest["checkpoint"]["iteration"]
+    assert checkpoint["actor_state_dict"]["mlp.0.weight"].shape[1] == manifest["checkpoint"]["actor_observation_dim"]
+    assert checkpoint["actor_state_dict"]["mlp.6.weight"].shape[0] == manifest["checkpoint"]["action_dim"]
+    assert checkpoint["critic_state_dict"]["mlp.0.weight"].shape[1] == manifest["checkpoint"]["critic_observation_dim"]
+    assert all(
+        bool(value.isfinite().all())
+        for state in (checkpoint["actor_state_dict"], checkpoint["critic_state_dict"])
+        for value in state.values()
+        if value.is_floating_point()
+    )
 
 
 class _FakeArmAsset:
