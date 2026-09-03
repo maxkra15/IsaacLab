@@ -173,6 +173,43 @@ class RslRlVecEnvWrapper(VecEnv):
         """Returns the current observations of the environment."""
         return TensorDict(self.unwrapped.obs_buf, batch_size=[self.num_envs])
 
+    def get_checkpoint_state(self) -> dict[str, object]:
+        """Return opt-in environment-manager state for training checkpoints."""
+        curriculum_manager = getattr(self.unwrapped, "curriculum_manager", None)
+        get_state = getattr(curriculum_manager, "get_checkpoint_state", None)
+        if not callable(get_state):
+            return {}
+        state = get_state()
+        if not state:
+            return {}
+        return {"curriculum_manager": state}
+
+    def set_checkpoint_state(
+        self,
+        state: dict[str, object],
+        *,
+        source_global_rank: int = 0,
+        current_global_rank: int = 0,
+    ) -> None:
+        """Restore environment-manager state and reset into its resumed sampling distribution."""
+        if not isinstance(state, dict):
+            raise TypeError("RSL-RL environment checkpoint state must be a dictionary.")
+        if set(state) != {"curriculum_manager"}:
+            raise ValueError("RSL-RL environment checkpoint state contains unsupported manager names.")
+        curriculum_manager = getattr(self.unwrapped, "curriculum_manager", None)
+        set_state = getattr(curriculum_manager, "set_checkpoint_state", None)
+        if not callable(set_state):
+            raise RuntimeError("The checkpoint contains curriculum state, but this environment cannot restore it.")
+        set_state(
+            state["curriculum_manager"],
+            source_global_rank=source_global_rank,
+            current_global_rank=current_global_rank,
+        )
+        # The wrapper performs its initial reset before the runner loads a
+        # checkpoint. Resample now so the first resumed rollout is drawn from
+        # the restored curriculum instead of its construction-time state.
+        self.env.reset()
+
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         # clip actions
         if self.clip_actions is not None:

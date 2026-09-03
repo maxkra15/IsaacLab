@@ -139,6 +139,71 @@ class CurriculumManager(ManagerBase):
             state = term_cfg.func(self._env, env_ids, **term_cfg.params)
             self._curriculum_state[name] = state
 
+    def get_checkpoint_state(self) -> dict[str, object]:
+        """Return snapshots for curriculum terms that opt into checkpointing.
+
+        Class-based terms opt in by setting ``checkpoint_state_enabled = True``
+        and implementing matching ``get_state()`` and ``set_state(state)``
+        methods. Terms remain stateless from the checkpointing perspective by
+        default, which preserves existing training and checkpoint behavior.
+        """
+        state: dict[str, object] = {}
+        for term_name, term_cfg in zip(self._term_names, self._term_cfgs):
+            term = term_cfg.func
+            if not getattr(term, "checkpoint_state_enabled", False):
+                continue
+            get_state = getattr(term, "get_state", None)
+            set_state = getattr(term, "set_state", None)
+            if not callable(get_state) or not callable(set_state):
+                raise TypeError(
+                    f"Checkpoint-enabled curriculum term '{term_name}' must implement get_state() and set_state()."
+                )
+            state[term_name] = get_state()
+        return state
+
+    def set_checkpoint_state(
+        self,
+        state: dict[str, object],
+        *,
+        source_global_rank: int = 0,
+        current_global_rank: int = 0,
+    ) -> None:
+        """Restore snapshots for all checkpoint-enabled curriculum terms.
+
+        The provider names must match exactly. This prevents a checkpoint from
+        silently restoring only part of a changed curriculum configuration.
+        Individual terms own validation and atomic restoration of their state.
+
+        Args:
+            state: Snapshot keyed by checkpoint-enabled curriculum term name.
+            source_global_rank: Distributed rank that produced the snapshot.
+            current_global_rank: Distributed rank restoring the snapshot.
+        """
+        if not isinstance(state, dict):
+            raise TypeError("Curriculum checkpoint state must be a dictionary.")
+        for name, rank in (("source_global_rank", source_global_rank), ("current_global_rank", current_global_rank)):
+            if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
+        providers = {
+            term_name: term_cfg.func
+            for term_name, term_cfg in zip(self._term_names, self._term_cfgs)
+            if getattr(term_cfg.func, "checkpoint_state_enabled", False)
+        }
+        if set(state) != set(providers):
+            raise ValueError(
+                "Curriculum checkpoint term names must match the enabled terms exactly: "
+                f"expected {sorted(providers)}, received {sorted(state)}."
+            )
+        for term_name, term in providers.items():
+            set_state = getattr(term, "set_state", None)
+            if not callable(set_state):
+                raise TypeError(f"Checkpoint-enabled curriculum term '{term_name}' must implement set_state().")
+            set_state(state[term_name])
+            if current_global_rank != source_global_rank:
+                reseed = getattr(term, "reseed_checkpoint_generators", None)
+                if callable(reseed):
+                    reseed(current_global_rank)
+
     def get_active_iterable_terms(self, env_idx: int) -> Sequence[tuple[str, Sequence[float]]]:
         """Returns the active terms as iterable sequence of tuples.
 

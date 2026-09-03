@@ -22,6 +22,7 @@ __all__ = [
     "RslRlRndCfg",
     "RslRlSymmetryCfg",
     "RslRlVecEnvWrapper",
+    "IsaacLabOnPolicyRunner",
 ]
 
 from .distillation_cfg import (
@@ -31,6 +32,7 @@ from .distillation_cfg import (
     RslRlDistillationStudentTeacherRecurrentCfg,
 )
 from .exporter import export_policy_as_jit, export_policy_as_onnx
+from .on_policy_runner import IsaacLabOnPolicyRunner
 from .rl_cfg import (
     RslRlBaseRunnerCfg,
     RslRlCNNModelCfg,
