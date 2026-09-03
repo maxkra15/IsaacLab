@@ -26,6 +26,14 @@ from isaaclab_tasks.contrib.franka_rj45_insertion.asset_provenance import (
     configured_franka_rj45_asset_closure,
     franka_rj45_asset_contract,
 )
+from isaaclab_tasks.contrib.franka_rj45_insertion.dual_rack_env_cfg import (
+    FrankaRJ45DualRackInsertEnvCfg,
+    dual_rack_reset_dataset_task_contract,
+)
+from isaaclab_tasks.contrib.franka_rj45_insertion.gb300_env_cfg import (
+    FrankaRJ45Gb300InsertEnvCfg,
+    gb300_reset_dataset_task_contract,
+)
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     FrankaRJ45PickInsertEnvCfg,
     pick_insert_phase_0_reverse_curriculum_sampling_contract,
@@ -98,7 +106,9 @@ def _copy_atomic(source: Path, output: Path) -> Path:
     return output
 
 
-def _artifact_bound_env_cfg(payload: Mapping[str, Any]) -> FrankaRJ45PickInsertEnvCfg:
+def _artifact_bound_env_cfg(
+    payload: Mapping[str, Any],
+) -> FrankaRJ45PickInsertEnvCfg | FrankaRJ45DualRackInsertEnvCfg | FrankaRJ45Gb300InsertEnvCfg:
     """Configure only artifact-cardinality fields before exact contract validation."""
     metadata = payload.get("metadata")
     states = payload.get("states")
@@ -130,21 +140,41 @@ def _artifact_bound_env_cfg(payload: Mapping[str, Any]) -> FrankaRJ45PickInsertE
             "minimum_unique_arm_rows",
         )
     )
-    if (
-        any(type(value) is not int for value in unique_minima)
-        or len(set(unique_minima)) != 1
-        or not 1 <= unique_minima[0] <= rows_per_phase
+    task_variant = task_contract.get("task_variant")
+    if any(type(value) is not int for value in unique_minima) or any(
+        not 1 <= value <= rows_per_phase for value in unique_minima
     ):
-        raise ValueError(
-            "Artifact full-pick unique-row minima must be one shared positive integer no larger than "
-            "reset_dataset_rows_per_phase."
-        )
-
-    env_cfg = FrankaRJ45PickInsertEnvCfg()
+        raise ValueError("Artifact full-pick unique-row minima must be positive and no larger than the phase pool.")
+    if task_variant == "franka-rj45-gb300-insert":
+        if unique_minima[0] != 8 or unique_minima[1] != unique_minima[2]:
+            raise ValueError("GB300 diversity requires eight socket anchors and shared plug/arm minima.")
+        env_cfg = FrankaRJ45Gb300InsertEnvCfg()
+        shared_minimum = unique_minima[1]
+    elif task_variant == "franka-rj45-dual-rack-insert":
+        if unique_minima[0] != 1 or unique_minima[1] != unique_minima[2]:
+            raise ValueError("Dual-rack diversity requires one fixed socket row and shared plug/arm minima.")
+        env_cfg = FrankaRJ45DualRackInsertEnvCfg()
+        shared_minimum = unique_minima[1]
+    else:
+        if task_variant != "franka-rj45-pick-insert" or len(set(unique_minima)) != 1:
+            raise ValueError("Pick-insert diversity requires one shared socket/plug/arm minimum.")
+        env_cfg = FrankaRJ45PickInsertEnvCfg()
+        shared_minimum = unique_minima[0]
     env_cfg.reset_dataset_rows_per_phase = rows_per_phase
-    env_cfg.reset_dataset_min_unique_full_pick_rows = unique_minima[0]
+    env_cfg.reset_dataset_min_unique_full_pick_rows = shared_minimum
     env_cfg.validate_config()
     return env_cfg
+
+
+def _task_contract_for_cfg(
+    env_cfg: FrankaRJ45PickInsertEnvCfg | FrankaRJ45DualRackInsertEnvCfg | FrankaRJ45Gb300InsertEnvCfg,
+) -> dict[str, object]:
+    """Return the exact variant contract selected by the artifact-bound config."""
+    if isinstance(env_cfg, FrankaRJ45Gb300InsertEnvCfg):
+        return gb300_reset_dataset_task_contract(env_cfg)
+    if isinstance(env_cfg, FrankaRJ45DualRackInsertEnvCfg):
+        return dual_rack_reset_dataset_task_contract(env_cfg)
+    return pick_insert_reset_dataset_task_contract(env_cfg)
 
 
 def _require_reference_promotion(payload: Mapping[str, Any]) -> None:
@@ -597,7 +627,7 @@ def _screen_rows(
 
 def build_report(payload: Mapping[str, Any], *, prior_validation_report: Path | None) -> dict[str, Any]:
     env_cfg = _artifact_bound_env_cfg(payload)
-    task_contract = pick_insert_reset_dataset_task_contract(env_cfg)
+    task_contract = _task_contract_for_cfg(env_cfg)
     metadata, states, _ = reset_dataset_validate_runtime(payload, expected_task_contract=task_contract)
     reset_dataset_validate_phase_row_counts(
         states["phase"], expected_rows_per_phase=env_cfg.reset_dataset_rows_per_phase

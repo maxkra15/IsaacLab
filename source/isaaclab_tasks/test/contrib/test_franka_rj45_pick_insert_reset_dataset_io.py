@@ -172,6 +172,8 @@ def test_public_validation_source_helper_hashes_the_complete_canonical_closure(t
     for relative_name in (
         "scripts/tools/validate_franka_rj45_pick_insert_resets.py",
         "scripts/tools/_franka_rj45_reset_tools.py",
+        "scripts/tools/generate_franka_rj45_dual_rack_reset_dataset.py",
+        "scripts/tools/generate_franka_rj45_gb300_reset_dataset.py",
         "scripts/tools/generate_franka_rj45_pick_insert_reset_dataset.py",
         "scripts/tools/validate_franka_rj45_pick_insert_fast_resets.py",
         "uv.lock",
@@ -192,6 +194,8 @@ def test_public_validation_source_helper_hashes_the_complete_canonical_closure(t
     assert first[changed.relative_to(tmp_path).as_posix()] != second[changed.relative_to(tmp_path).as_posix()]
     assert set(fast) == {
         *first,
+        "scripts/tools/generate_franka_rj45_dual_rack_reset_dataset.py",
+        "scripts/tools/generate_franka_rj45_gb300_reset_dataset.py",
         "scripts/tools/generate_franka_rj45_pick_insert_reset_dataset.py",
         "scripts/tools/validate_franka_rj45_pick_insert_fast_resets.py",
     }

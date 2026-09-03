@@ -100,9 +100,9 @@ def _network_switch_boxes() -> tuple[_PresentationBox, ...]:
 _NETWORK_SWITCH_BOXES = _network_switch_boxes()
 
 
-def should_enable_newton_gl_network_switch(sim, *, reset_source: str) -> bool:
-    """Return whether a standalone Newton GL play session needs the marker proxy."""
-    if sim is None or reset_source != "procedural":
+def should_enable_newton_gl_marker_presentation(sim) -> bool:
+    """Return whether a standalone Newton GL session needs marker presentation."""
+    if sim is None:
         return False
     needs_kit_backend = (
         sim.has_gui
@@ -124,7 +124,16 @@ def should_enable_newton_gl_network_switch(sim, *, reset_source: str) -> bool:
     return has_newton_gl_backend and not needs_kit_backend
 
 
-def _network_switch_marker_cfg() -> VisualizationMarkersCfg:
+def should_enable_newton_gl_network_switch(sim, *, reset_source: str) -> bool:
+    """Return whether the original procedural-play task needs its marker proxy."""
+    return reset_source == "procedural" and should_enable_newton_gl_marker_presentation(sim)
+
+
+def _network_switch_marker_cfg(
+    *,
+    prim_path: str = "/Visuals/RJ45PickInsert/NetworkSwitch",
+    active_port_color: tuple[float, float, float] = (0.04, 0.65, 0.95),
+) -> VisualizationMarkersCfg:
     """Return shared marker prototypes for the Newton GL presentation."""
 
     def _box(color: tuple[float, float, float]) -> sim_utils.CuboidCfg:
@@ -134,11 +143,11 @@ def _network_switch_marker_cfg() -> VisualizationMarkersCfg:
         )
 
     return VisualizationMarkersCfg(
-        prim_path="/Visuals/RJ45PickInsert/NetworkSwitch",
+        prim_path=prim_path,
         markers={
             "chassis": _box((0.22, 0.25, 0.29)),
             "ports": _box((0.018, 0.026, 0.04)),
-            "active_port": _box((0.04, 0.65, 0.95)),
+            "active_port": _box(active_port_color),
         },
     )
 
@@ -179,10 +188,19 @@ def _network_switch_marker_state(
 class NewtonGlNetworkSwitchPresentation:
     """Render a socket-following network switch through Isaac Lab's marker API."""
 
-    def __init__(self, sim, socket_pose_provider: Callable[[], torch.Tensor]):
+    def __init__(
+        self,
+        sim,
+        socket_pose_provider: Callable[[], torch.Tensor],
+        *,
+        prim_path: str = "/Visuals/RJ45PickInsert/NetworkSwitch",
+        active_port_color: tuple[float, float, float] = (0.04, 0.65, 0.95),
+    ):
         self._sim = sim
         self._socket_pose_provider = socket_pose_provider
-        self._marker = VisualizationMarkers(_network_switch_marker_cfg())
+        self._marker = VisualizationMarkers(
+            _network_switch_marker_cfg(prim_path=prim_path, active_port_color=active_port_color)
+        )
         self._callback_id = f"rj45_pick_insert_network_switch:{id(self)}"
         self._closed = False
         self._sim.vis_marker_registry.add_callback(self._callback_id, self._update)

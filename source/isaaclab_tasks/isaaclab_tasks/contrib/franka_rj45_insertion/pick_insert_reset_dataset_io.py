@@ -199,6 +199,8 @@ _VALIDATION_SOURCE_FILES = (
 )
 _FAST_VALIDATION_SOURCE_FILES = (
     *_VALIDATION_SOURCE_FILES,
+    "scripts/tools/generate_franka_rj45_dual_rack_reset_dataset.py",
+    "scripts/tools/generate_franka_rj45_gb300_reset_dataset.py",
     "scripts/tools/generate_franka_rj45_pick_insert_reset_dataset.py",
     "scripts/tools/validate_franka_rj45_pick_insert_fast_resets.py",
 )
@@ -952,6 +954,54 @@ def pick_insert_fast_reset_phase_0_band_fraction_tolerance(row_count: int) -> fl
     )
 
 
+def _full_pick_diversity_failures(evidence: Mapping[str, Any], *, fixed_socket: bool) -> list[str]:
+    """Return failed phase-5 diversity requirements from computed evidence."""
+    failures: list[str] = []
+    if evidence["row_count"] != evidence["required_row_count"]:
+        failures.append("row_count")
+    if evidence["unique_socket_rows"] < evidence["required_unique_socket_rows"]:
+        failures.append("unique_socket_rows")
+    if fixed_socket and evidence["unique_socket_rows"] != 1:
+        failures.append("fixed_socket_pose")
+    if evidence["unique_plug_rows"] < evidence["required_unique_plug_rows"]:
+        failures.append("unique_plug_rows")
+    if evidence["unique_arm_rows"] < evidence["required_unique_arm_rows"]:
+        failures.append("unique_arm_rows")
+    if any(
+        observed < required
+        for observed, required in zip(
+            evidence["socket_xy_span_m"],
+            evidence["required_socket_xy_span_m"],
+            strict=True,
+        )
+    ):
+        failures.append("socket_xy_span")
+    if evidence["socket_yaw_span_rad"] < evidence["required_socket_yaw_span_rad"]:
+        failures.append("socket_yaw_span")
+    fixed_socket_tolerance = 10.0 ** (-evidence["round_decimals"])
+    if fixed_socket and (
+        any(span > fixed_socket_tolerance for span in evidence["socket_xy_span_m"])
+        or evidence["socket_yaw_span_rad"] > fixed_socket_tolerance
+    ):
+        failures.append("fixed_socket_span")
+    if any(
+        observed < required
+        for observed, required in zip(
+            evidence["plug_pickup_xy_span_m"],
+            evidence["required_plug_pickup_xy_span_m"],
+            strict=True,
+        )
+    ):
+        failures.append("plug_pickup_xy_span")
+    if evidence["plug_pickup_yaw_span_rad"] < evidence["required_plug_pickup_yaw_span_rad"]:
+        failures.append("plug_pickup_yaw_span")
+    if any(observed < evidence["required_each_arm_joint_span_rad"] for observed in evidence["arm_joint_span_rad"]):
+        failures.append("arm_joint_span")
+    if evidence["initial_tcp_grasp_distance_span_m"] < evidence["required_initial_tcp_grasp_distance_span_m"]:
+        failures.append("initial_tcp_grasp_distance_span")
+    return failures
+
+
 def reset_dataset_validate_full_pick_diversity(
     states: Mapping[str, torch.Tensor],
     *,
@@ -1019,12 +1069,15 @@ def reset_dataset_validate_full_pick_diversity(
     if any(minimum > rows_per_phase for minimum in (unique_socket_minimum, unique_plug_minimum, unique_arm_minimum)):
         raise ValueError("task_contract unique-row minima cannot exceed reset_dataset_rows_per_phase.")
 
+    fixed_socket = pick_contract.get("socket_pose_policy") == "fixed-upper-rack-opening"
     socket_fraction = _finite_contract_scalar(
         diversity_contract,
         "minimum_socket_span_fraction",
-        positive=True,
+        positive=not fixed_socket,
         maximum=1.0,
     )
+    if socket_fraction < 0.0:
+        raise ValueError("task_contract minimum_socket_span_fraction cannot be negative.")
     pickup_fraction = _finite_contract_scalar(
         diversity_contract,
         "minimum_pickup_span_fraction",
@@ -1049,13 +1102,16 @@ def reset_dataset_validate_full_pick_diversity(
     pickup_upper = _finite_contract_vector(pick_contract, "pickup_position_upper", length=3)
     socket_yaw_range = _finite_contract_vector(pick_contract, "socket_yaw_range", length=2)
     pickup_yaw_range = _finite_contract_vector(pick_contract, "pickup_yaw_range", length=2)
-    for name, lower, upper, indices in (
-        ("socket_position", socket_lower, socket_upper, (0, 1)),
-        ("pickup_position", pickup_lower, pickup_upper, (0, 1)),
+    if fixed_socket:
+        if socket_lower != socket_upper or socket_yaw_range[0] != socket_yaw_range[1]:
+            raise ValueError("Fixed-socket diversity requires identical position and yaw bounds.")
+    elif any(socket_upper[index] <= socket_lower[index] for index in (0, 1)):
+        raise ValueError("task_contract socket_position XY ranges must have positive span.")
+    if any(pickup_upper[index] <= pickup_lower[index] for index in (0, 1)):
+        raise ValueError("task_contract pickup_position XY ranges must have positive span.")
+    if (not fixed_socket and socket_yaw_range[1] <= socket_yaw_range[0]) or (
+        pickup_yaw_range[1] <= pickup_yaw_range[0]
     ):
-        if any(upper[index] <= lower[index] for index in indices):
-            raise ValueError(f"task_contract {name} XY ranges must have positive span.")
-    if socket_yaw_range[1] <= socket_yaw_range[0] or pickup_yaw_range[1] <= pickup_yaw_range[0]:
         raise ValueError("task_contract socket/pickup yaw ranges must have positive span.")
 
     phase_mask = phases == PICK_INSERT_RESET_PHASE_IDS[-1]
@@ -1105,27 +1161,7 @@ def reset_dataset_validate_full_pick_diversity(
         "initial_tcp_grasp_distance_span_m": tcp_distance_span,
         "required_initial_tcp_grasp_distance_span_m": tcp_distance_minimum,
     }
-    failures: list[str] = []
-    if full_pick_count != rows_per_phase:
-        failures.append("row_count")
-    if unique_socket_rows < unique_socket_minimum:
-        failures.append("unique_socket_rows")
-    if unique_plug_rows < unique_plug_minimum:
-        failures.append("unique_plug_rows")
-    if unique_arm_rows < unique_arm_minimum:
-        failures.append("unique_arm_rows")
-    if any(observed < required for observed, required in zip(socket_xy_span, socket_required_xy_span, strict=True)):
-        failures.append("socket_xy_span")
-    if socket_yaw_span < socket_required_yaw_span:
-        failures.append("socket_yaw_span")
-    if any(observed < required for observed, required in zip(plug_xy_span, pickup_required_xy_span, strict=True)):
-        failures.append("plug_pickup_xy_span")
-    if plug_yaw_span < pickup_required_yaw_span:
-        failures.append("plug_pickup_yaw_span")
-    if any(observed < arm_required_span for observed in arm_joint_span):
-        failures.append("arm_joint_span")
-    if tcp_distance_span < tcp_distance_minimum:
-        failures.append("initial_tcp_grasp_distance_span")
+    failures = _full_pick_diversity_failures(evidence, fixed_socket=fixed_socket)
     evidence["passed"] = not failures
     evidence["failures"] = failures
     if failures:

@@ -864,7 +864,7 @@ def test_pick_insert_config_rejects_mutated_vbd_body_ownership():
     cfg = FrankaRJ45PickInsertEnvCfg()
     cfg.rj45_entry_body_patterns = (PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS[0],)
 
-    with pytest.raises(ValueError, match="exact validated.*VBD ownership selectors"):
+    with pytest.raises(ValueError, match="VBD ownership selectors do not match"):
         cfg.validate_config()
 
 

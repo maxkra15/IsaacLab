@@ -301,7 +301,8 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
         self._network_switch_presentation = None
         closure = configured_franka_rj45_asset_closure(required=True)
         configure_franka_rj45_external_asset(cfg.scene.robot, closure)
-        configure_seattle_table_external_asset(cfg.scene.table, closure)
+        if cfg.scene.table.spawn is not None:
+            configure_seattle_table_external_asset(cfg.scene.table, closure)
         self._external_asset_closure = closure
         super().__init__(cfg, render_mode, **kwargs)
         sim = getattr(self, "sim", None)
@@ -831,10 +832,14 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
         shape_count = int(destination_view.shape_count)
         shape_labels = [str(label) for label in destination_view.shape_label[:shape_count]]
         body_labels = [str(label) for label in destination_view.body_label]
-        if not any(label.endswith("/TableContactSurface") for label in body_labels):
+        has_table_contact = any(label.endswith("/TableContactSurface") for label in body_labels)
+        table_policy = self.cfg.validated_table_scene_policy()
+        if table_policy == "seattle-contact" and not has_table_contact:
             raise RuntimeError(
                 "RJ45 pick-insert requires the kinematic Seattle TableContactSurface body in the VBD entry."
             )
+        if table_policy == "absent" and has_table_contact:
+            raise RuntimeError("A table-free RJ45 variant unexpectedly resolved a TableContactSurface body.")
         shape_body = wp.to_torch(destination_view.shape_body).detach().cpu().tolist()
         combined_labels = [
             f"{body_labels[body_id] if 0 <= body_id < len(body_labels) else ''} {shape_label}"
@@ -903,9 +908,7 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
     def _load_reset_dataset(self, configured_path: str) -> None:
         path = _resolve_reset_dataset_path(configured_path)
         payload = torch.load(path, map_location="cpu", weights_only=True)
-        from .pick_insert_env_cfg import pick_insert_reset_dataset_task_contract
-
-        task_contract = pick_insert_reset_dataset_task_contract(self.cfg)
+        task_contract = self._reset_dataset_task_contract()
         metadata, states, canonical_goal = reset_dataset_validate_runtime(
             payload,
             expected_content_sha256=self.cfg.reset_dataset_content_sha256,
@@ -975,6 +978,12 @@ class FrankaRJ45PickInsertEnv(FrankaRJ45InsertionEnv):
             report_path,
             metadata.get("generator", "unknown"),
         )
+
+    def _reset_dataset_task_contract(self) -> dict[str, object]:
+        """Return the artifact contract for this pick-insert task variant."""
+        from .pick_insert_env_cfg import pick_insert_reset_dataset_task_contract
+
+        return pick_insert_reset_dataset_task_contract(self.cfg)
 
     def _write_task_state(self, env_ids: torch.Tensor, rows: torch.Tensor) -> None:
         self.goal_task_body_pose[env_ids] = self._reset_dataset_states["goal_task_body_pose"][rows]

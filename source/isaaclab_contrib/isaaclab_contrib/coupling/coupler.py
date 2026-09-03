@@ -1757,7 +1757,14 @@ class NewtonCouplerManager(NewtonVBDManager):
 
     @classmethod
     def _reset_solver_internals(cls, world_mask: wp.array | None) -> None:
-        """Promote a selected single MPM world to the solver's full-reset path."""
+        """Reset coupled entries with the local-world portion of Newton's canonical mask.
+
+        Isaac Lab keeps one trailing mask entry for global (world ``-1``)
+        entities. Newton's coupled solver and its nested solvers instead accept
+        exactly one entry per local world. Passing the canonical mask through
+        unchanged therefore makes a one-world MJWarp entry reject a two-entry
+        mask during an environment reset.
+        """
         model = NewtonManager._model
         solver_cfg = getattr(PhysicsManager._cfg, "solver_cfg", None)
         has_mpm_entry = any(isinstance(entry.solver_cfg, MPMSolverCfg) for entry in getattr(solver_cfg, "entries", ()))
@@ -1768,7 +1775,17 @@ class NewtonCouplerManager(NewtonVBDManager):
             if selected[0] and not selected[-1]:
                 NewtonManager._solver.reset(NewtonManager._state_0, world_mask=None, flags=0)
                 return
-        super()._reset_solver_internals(world_mask)
+        local_world_mask = world_mask
+        if world_mask is not None and model is not None:
+            if world_mask.shape[0] == model.world_count + 1:
+                local_world_mask = world_mask[: model.world_count]
+            elif world_mask.shape[0] != model.world_count:
+                raise ValueError(
+                    "Coupled solver reset mask must contain one entry per local world, "
+                    f"optionally followed by Newton's global slot; got {world_mask.shape[0]} "
+                    f"entries for {model.world_count} worlds."
+                )
+        super()._reset_solver_internals(local_world_mask)
 
     @classmethod
     def _resolve_entry(

@@ -174,15 +174,37 @@ class NewtonInverseKinematicsAction(ActionTerm):
         if not pose_cfgs:
             raise ValueError("NewtonInverseKinematicsAction requires at least one pose objective.")
 
-        # Resolve the controlled asset to its clone-plan source and finalize the
-        # single-env prototype builder the cloner already retained -- the same
-        # source resolution other Newton consumers use, no bespoke registry.
+        # Resolve the controlled asset to its clone-plan source and build a
+        # single-articulation IK prototype from the asset's USD subtree.
         plan = sim_utils.SimulationContext.instance().get_clone_plan()
         source_path, _, asset_suffix = cloner.query.path_to_source(plan, self._asset.cfg.prim_path)
-        # The proto builder is keyed by the bare clone source; the articulation
-        # lives at the asset suffix below it (e.g. ".../env_0" + "/Robot").
-        self._source_path = source_path + asset_suffix
-        prototype_model = NewtonManager._cl_protos[source_path].finalize(device=NewtonManager.get_model().device)
+        # The articulation lives at the asset suffix below the clone source
+        # (e.g. ".../env_0" + "/Robot"), optionally deeper when the asset
+        # authors its articulation root on a child prim.
+        articulation_root = getattr(self._asset.cfg, "articulation_root_prim_path", None) or ""
+        source_asset_path = source_path + asset_suffix
+        self._source_path = source_asset_path + articulation_root
+
+        from newton import ModelBuilder  # noqa: PLC0415
+        from newton.usd import SchemaResolverNewton, SchemaResolverPhysx  # noqa: PLC0415
+
+        from pxr import UsdGeom  # noqa: PLC0415
+
+        from isaaclab.sim.utils.stage import get_current_stage  # noqa: PLC0415
+
+        stage = get_current_stage()
+        if stage is None:
+            raise RuntimeError("Newton IK requires an active USD stage to build its articulation prototype.")
+        proto_builder = ModelBuilder(up_axis=UsdGeom.GetStageUpAxis(stage))
+        proto_builder.add_usd(
+            stage,
+            root_path=source_asset_path,
+            load_visual_shapes=False,
+            load_static_visual_shapes=False,
+            skip_mesh_approximation=True,
+            schema_resolvers=[SchemaResolverNewton(), SchemaResolverPhysx()],
+        )
+        prototype_model = proto_builder.finalize(device=NewtonManager.get_model().device)
         prototype_view = ArticulationView(
             prototype_model,
             self._source_path,
@@ -200,6 +222,7 @@ class NewtonInverseKinematicsAction(ActionTerm):
             device=self.device,
             objectives=self.cfg.objectives,
             link_resolver=lambda body_name: self._resolve_prototype_link_index(prototype_view, body_name),
+            joint_resolver=lambda joint_name: self._resolve_prototype_scalar_joint_indices(prototype_view, joint_name),
         )
 
         # Bind each pose objective to the live body it reads and its action slice.
@@ -366,6 +389,32 @@ class NewtonInverseKinematicsAction(ActionTerm):
         selected_indices = self._layout_indices(layout)
         local_link_index = prototype_view.link_names.index(body_name)
         return layout.offset + selected_indices[local_link_index]
+
+    def _resolve_prototype_scalar_joint_indices(
+        self, prototype_view: ArticulationView, joint_name: str
+    ) -> tuple[int, int]:
+        """Resolve one-coordinate/one-DoF joint indices in the prototype model."""
+        if joint_name not in prototype_view.joint_names:
+            raise ValueError(f"Newton IK joint-posture objective could not find joint '{joint_name}'.")
+        joint_index = prototype_view.joint_names.index(joint_name)
+        coord_count = prototype_view.joint_coord_counts[joint_index]
+        dof_count = prototype_view.joint_dof_counts[joint_index]
+        if coord_count != 1 or dof_count != 1:
+            raise ValueError(
+                "Newton IK joint-posture objectives currently support only scalar joints; "
+                f"'{joint_name}' has {coord_count} coordinates and {dof_count} DoFs."
+            )
+
+        coord_layout = prototype_view.frequency_layouts[NewtonModel.AttributeFrequency.JOINT_COORD]
+        dof_layout = prototype_view.frequency_layouts[NewtonModel.AttributeFrequency.JOINT_DOF]
+        coord_selected = self._layout_indices(coord_layout)
+        dof_selected = self._layout_indices(dof_layout)
+        coord_local = prototype_view.joint_coord_names.index(joint_name)
+        dof_local = prototype_view.joint_dof_names.index(joint_name)
+        return (
+            coord_layout.offset + coord_selected[coord_local],
+            dof_layout.offset + dof_selected[dof_local],
+        )
 
     @staticmethod
     def _layout_indices(layout) -> list[int]:

@@ -6766,17 +6766,54 @@ class PickInsertResetDatasetGenerator:
             goal_task_q[:, self.plug_index, :3] = authored_target_e
             goal_task_q[:, self.plug_index, 3:7] = authored_plug_orientation
         starting_mask = torch.as_tensor(active_mask, device=self.device, dtype=torch.bool).clone()
+        first_cable_speed_failure: dict[str, Any] | None = None
 
         def goal_gate(snapshot: dict[str, Any]) -> dict[str, torch.Tensor]:
+            nonlocal first_cable_speed_failure
             if not bool(snapshot["active_mask"].any()):
-                raise RuntimeError(f"{stage_name} cold proof has zero surviving lanes.")
-            return self._canonical_cold_goal_violation_masks(
+                failures = {
+                    reason: torch.where(mask)[0].detach().cpu().tolist()
+                    for reason, mask in lane_hold.reason_masks.items()
+                    if bool(mask.any())
+                }
+                raise RuntimeError(
+                    f"{stage_name} cold proof has zero surviving lanes: reasons={failures}, "
+                    f"first_cable_speed_failure={first_cable_speed_failure}."
+                )
+            violations = self._canonical_cold_goal_violation_masks(
                 snapshot,
                 captured_state=quarantined,
                 authored_seat_target_e=authored_target_e,
                 authored_plug_orientation=authored_plug_orientation,
                 history_evidence=history_evidence,
             )
+            cable_speed_failure = snapshot["active_mask"] & violations["cable-speed"]
+            if first_cable_speed_failure is None and bool(cable_speed_failure.any()):
+                cable_velocity = snapshot["task_qd"][:, self.cable_slice, :3]
+                body_speed = torch.linalg.vector_norm(cable_velocity, dim=-1)
+                peak_speed, peak_cable_index = body_speed.max(dim=-1)
+                lane_ids = torch.where(cable_speed_failure)[0]
+                peak_task_index = peak_cable_index[lane_ids] + self.cable_body_start
+                first_cable_speed_failure = {
+                    "step": int(snapshot["step"]),
+                    "time_s": float(snapshot["step"]) * float(self.env.advance_dt),
+                    "limit_m_s": self.cfg.maximum_goal_cable_speed_m_s,
+                    "lane_ids": lane_ids.detach().cpu().tolist(),
+                    "peak_speed_m_s": peak_speed[lane_ids].detach().cpu().tolist(),
+                    "peak_task_body_index": peak_task_index.detach().cpu().tolist(),
+                    "peak_task_body_name": [
+                        self.layout.body_names[int(index)] for index in peak_task_index.detach().cpu()
+                    ],
+                    "peak_linear_velocity_m_s": cable_velocity[
+                        lane_ids,
+                        peak_cable_index[lane_ids],
+                    ]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "peak_position_m": snapshot["task_q"][lane_ids, peak_task_index, :3].detach().cpu().tolist(),
+                }
+            return violations
 
         with _PerLaneTargetHold(
             self.env,
@@ -6817,7 +6854,7 @@ class PickInsertResetDatasetGenerator:
         if not bool(survivors.any()):
             raise RuntimeError(
                 f"{stage_name} cold proof has zero surviving lanes after {duration_s:.1f} seconds: "
-                f"reasons={reason_masks}."
+                f"reasons={reason_masks}, first_cable_speed_failure={first_cable_speed_failure}."
             )
 
         def serializable(value: Any) -> Any:

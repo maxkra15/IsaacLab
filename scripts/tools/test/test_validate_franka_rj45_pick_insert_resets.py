@@ -17,6 +17,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from isaaclab_tasks.contrib.franka_rj45_insertion.gb300_env_cfg import (
+    FrankaRJ45Gb300InsertEnvCfg,
+    gb300_reset_dataset_task_contract,
+)
 from isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env_cfg import (
     PICK_INSERT_CLOSED_FINGER_POSITION,
     PICK_INSERT_GRASP_PROXY_FRICTION,
@@ -5038,6 +5042,24 @@ def test_fast_validator_derives_nonlegacy_balanced_shape_from_artifact_contract(
     assert resolved.reset_dataset_rows_per_phase == 7
     assert resolved.reset_dataset_min_unique_full_pick_rows == 6
     assert pick_insert_reset_dataset_task_contract(resolved) == payload["metadata"]["task_contract"]
+
+
+def test_fast_validator_derives_gb300_shape_without_collapsing_socket_candidate_diversity():
+    env_cfg = FrankaRJ45Gb300InsertEnvCfg()
+    env_cfg.reset_dataset_rows_per_phase = 12
+    env_cfg.reset_dataset_min_unique_full_pick_rows = 11
+    payload = {
+        "metadata": {"task_contract": gb300_reset_dataset_task_contract(env_cfg)},
+        "states": {"phase": torch.arange(6, dtype=torch.int64).repeat_interleave(12)},
+    }
+
+    resolved = fast_validator._artifact_bound_env_cfg(payload)
+
+    assert isinstance(resolved, FrankaRJ45Gb300InsertEnvCfg)
+    assert resolved.reset_dataset_rows_per_phase == 12
+    assert resolved.reset_dataset_min_unique_full_pick_rows == 11
+    assert gb300_reset_dataset_task_contract(resolved) == payload["metadata"]["task_contract"]
+    assert fast_validator._task_contract_for_cfg(resolved) == payload["metadata"]["task_contract"]
 
 
 def test_fast_validator_rejects_artifact_cardinality_that_disagrees_with_state_rows():

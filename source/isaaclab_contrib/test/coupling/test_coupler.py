@@ -51,6 +51,13 @@ class _FakeArray:
 
     data: np.ndarray
 
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.data.shape
+
+    def __getitem__(self, item) -> _FakeArray:
+        return _FakeArray(self.data[item])
+
     def numpy(self) -> np.ndarray:
         return self.data.copy()
 
@@ -540,6 +547,7 @@ def test_proxy_build_uses_custom_and_default_collision_pipelines(monkeypatch):
                 destination="soft",
                 bodies=["/World/envs/env_[^/]+/Robot/base"],
                 mode="staggered",
+                proxy_relaxation=0.0,
                 mass_scale=0.25,
                 collide_interval=4,
                 collision_pipeline=custom_pipeline,
@@ -560,6 +568,7 @@ def test_proxy_build_uses_custom_and_default_collision_pipelines(monkeypatch):
 
     assert solver.coupling.iterations == 3
     assert solver.coupling.proxies[0].mode == "staggered"
+    assert solver.coupling.proxies[0].proxy_relaxation == pytest.approx(0.0)
     assert solver.coupling.proxies[0].mass_scale == pytest.approx(0.25)
     assert solver.coupling.proxies[0].collide_interval == 4
     assert solver.coupling.proxies[0].collision_pipeline is custom_pipeline
@@ -756,8 +765,8 @@ def test_single_world_mpm_reset_promotes_local_mask(monkeypatch, mask_values, sh
     assert calls == ([(state_0, None, 0)] if should_reset else [])
 
 
-def test_single_world_non_mpm_reset_does_not_read_mask_on_host(monkeypatch):
-    """A non-MPM coupled reset must keep the device mask on the device."""
+def test_single_world_non_mpm_reset_strips_global_slot_without_host_read(monkeypatch):
+    """A coupled solver receives its local-world mask, not Newton's trailing global slot."""
     state = object()
     calls: list[tuple[object, object, int]] = []
     solver = SimpleNamespace(
@@ -765,9 +774,16 @@ def test_single_world_non_mpm_reset_does_not_read_mask_on_host(monkeypatch):
     )
 
     class _DeviceMask:
+        shape = (2,)
+
+        def __getitem__(self, item):
+            assert item == slice(None, 1, None)
+            return local_mask
+
         def numpy(self):
             raise AssertionError("non-MPM reset unexpectedly copied its mask to the host")
 
+    local_mask = object()
     mask = _DeviceMask()
     solver_cfg = CouplerProxyCfg(entries=[CouplerEntryCfg(name="rigid", solver_cfg=XPBDSolverCfg())])
     monkeypatch.setattr(coupler.PhysicsManager, "_cfg", SimpleNamespace(solver_cfg=solver_cfg))
@@ -777,7 +793,7 @@ def test_single_world_non_mpm_reset_does_not_read_mask_on_host(monkeypatch):
 
     NewtonCouplerManager._reset_solver_internals(mask)
 
-    assert calls == [(state, mask, 0)]
+    assert calls == [(state, local_mask, 0)]
 
 
 def test_multi_world_mpm_reset_is_not_promoted(monkeypatch):
@@ -797,7 +813,10 @@ def test_multi_world_mpm_reset_is_not_promoted(monkeypatch):
 
     NewtonCouplerManager._reset_solver_internals(mask)
 
-    assert calls == [(state, mask, 0)]
+    assert len(calls) == 1
+    assert calls[0][0] is state
+    assert calls[0][2] == 0
+    np.testing.assert_array_equal(calls[0][1].data, np.asarray([True, False], dtype=np.bool_))
 
 
 @pytest.mark.parametrize(

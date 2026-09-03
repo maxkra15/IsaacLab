@@ -22,6 +22,11 @@ The script automatically detects which stack to use based on the environment con
 # time spent building kernels on a cold kernel cache.
 import warp as wp
 
+# Coupled VBD/MPM discovery may import Warp FEM after Kit starts. Preload the
+# lockfile version so Kit's bundled omni.warp extension cannot mix its older
+# FEM modules with this environment's newer Warp core.
+import warp.fem  # noqa: F401
+
 wp.config.enable_backward = False
 
 import argparse
@@ -320,7 +325,7 @@ def main() -> None:  # noqa: C901
                 " ignored."
             )
     except Exception as e:
-        logger.error(f"Failed to create environment: {e}")
+        logger.exception(f"Failed to create environment: {e}")
         simulation_app.close()
         return
 
@@ -466,14 +471,19 @@ def main() -> None:  # noqa: C901
         """Inner function to run the teleop loop with access to nonlocal variables."""
         nonlocal should_reset_recording_instance, teleoperation_active
 
+        auto_start_teleoperation = use_isaac_teleop and (
+            not args_cli.xr or env_cfg.isaac_teleop.teleoperation_active_default
+        )
+
         # reset environment
         env.reset()
         teleop_interface.reset()
 
-        # Without --xr there is no headset to send START, so start locally ([B]/[P] can
-        # still pause/resume). The reset() above is a host reset (a pure pulse), so it does
-        # not cancel this start.
-        if use_isaac_teleop and not args_cli.xr:
+        # Without --xr there is no headset to send START. XR tasks may also opt into
+        # immediate control with ``teleoperation_active_default`` so the Kit timeline and
+        # teleop state machine cannot appear to disagree. The reset() above is a host reset
+        # (a pure pulse), so it does not cancel this start.
+        if auto_start_teleoperation:
             teleop_interface.request_start()
 
         stack_name = "IsaacTeleop" if use_isaac_teleop else "native"
@@ -514,6 +524,8 @@ def main() -> None:  # noqa: C901
                     if should_reset_recording_instance:
                         env.reset()
                         teleop_interface.reset()
+                        if auto_start_teleoperation:
+                            teleop_interface.request_start()
                         camera_feed_session.refresh()
                         should_reset_recording_instance = False
                         print("Environment reset complete")

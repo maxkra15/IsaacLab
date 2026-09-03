@@ -20,6 +20,30 @@ gym.register(
 )
 
 gym.register(
+    id="IsaacContrib-Franka-RJ45-Dual-Rack-Insert",
+    entry_point="isaaclab_tasks.contrib.franka_rj45_insertion.dual_rack_env:FrankaRJ45DualRackInsertEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaaclab_tasks.contrib.franka_rj45_insertion.dual_rack_env_cfg:FrankaRJ45DualRackInsertEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.dual_rack_rsl_rl_ppo_cfg:FrankaRJ45DualRackInsertPPORunnerCfg"),
+    },
+)
+
+gym.register(
+    id="IsaacContrib-Franka-RJ45-GB300-Insert",
+    entry_point="isaaclab_tasks.contrib.franka_rj45_insertion.gb300_env:FrankaRJ45Gb300InsertEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            "isaaclab_tasks.contrib.franka_rj45_insertion.gb300_env_cfg:FrankaRJ45Gb300InsertEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.gb300_rsl_rl_ppo_cfg:FrankaRJ45Gb300InsertPPORunnerCfg"),
+    },
+)
+
+gym.register(
     id="IsaacContrib-Franka-RJ45-Pick-Insert",
     entry_point="isaaclab_tasks.contrib.franka_rj45_insertion.pick_insert_env:FrankaRJ45PickInsertEnv",
     disable_env_checker=True,

@@ -36,6 +36,7 @@ from .franka_robot_cfg import (
 )
 from .rj45_env_cfg import (
     RJ45_ENTRY,
+    RJ45_GRASP_PROXY_BODY_PATTERNS,
     ActionsCfg,
     CurriculumCfg,
     FrankaRJ45InsertionEnvCfg,
@@ -350,11 +351,23 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
         self.reset_source = "procedural"
         self.curriculum = None
 
+    def validated_proxy_body_patterns(self) -> tuple[str, ...]:
+        """Return the task-specific rigid bodies copied into the VBD view."""
+        return RJ45_GRASP_PROXY_BODY_PATTERNS
+
+    def validated_rj45_entry_body_patterns(self) -> tuple[str, ...]:
+        """Return the task bodies owned by the VBD solver entry."""
+        return PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS
+
+    def validated_table_scene_policy(self) -> Literal["seattle-contact", "absent"]:
+        """Return the static table policy admitted by this environment variant."""
+        return "seattle-contact"
+
     def validate_config(self) -> None:
-        if tuple(self.rj45_entry_body_patterns) != PICK_INSERT_RJ45_ENTRY_BODY_PATTERNS:
-            raise ValueError(
-                "Franka RJ45 pick-insert requires the exact validated RJ45/TableContactSurface VBD ownership selectors."
-            )
+        if tuple(self.rj45_entry_body_patterns) != self.validated_rj45_entry_body_patterns():
+            raise ValueError("Franka RJ45 pick-insert VBD ownership selectors do not match this task variant.")
+        if tuple(self.proxy_body_patterns) != self.validated_proxy_body_patterns():
+            raise ValueError("Franka RJ45 pick-insert proxy selectors do not match this task variant.")
         if self.is_finite_horizon is not True:
             raise ValueError("Franka RJ45 pick-insert requires a finite task horizon without timeout bootstrapping.")
         _validate_pick_insert_reset_source(self)
@@ -367,109 +380,139 @@ class FrankaRJ45PickInsertEnvCfg(FrankaRJ45InsertionEnvCfg):
         layout = make_rj45_task_layout(topology)
         if layout.body_count != 48 or layout.socket_body_index != 0:
             raise ValueError("Franka RJ45 pick-insert requires socket, plug, latch, and 45 cable bodies.")
-        if (
-            float(self.actions.gripper_action.neutral_position) != PICK_INSERT_OPEN_FINGER_POSITION
-            or float(self.actions.gripper_action.default_position) != PICK_INSERT_OPEN_FINGER_POSITION
-        ):
-            raise ValueError("Franka RJ45 pick-insert requires the exact 0.04 m open neutral/default gripper posture.")
-        _validate_pick_insert_grasp_contract(self)
-        if float(self.success_max_plug_speed) != PICK_INSERT_SUCCESS_MAX_PLUG_SPEED:
-            raise ValueError("Franka RJ45 pick-insert requires the exact 0.10 plug success-speed limit.")
-        if not isinstance(self.actions.arm_action, mdp.PersistentResetTargetEMAJointPositionActionCfg):
-            raise ValueError("Franka RJ45 pick-insert requires the persistent absolute-target arm action.")
-        if self.actions.arm_action.gravity_compensation:
-            raise ValueError("Pick-insert action-level inverse-dynamics gravity compensation must remain disabled.")
-        if tuple(self.actions.arm_action.tracking_error_limits) != PICK_INSERT_ARM_TARGET_TRACKING_LIMITS:
-            raise ValueError("Pick-insert requires the validated per-joint target-tracking envelope.")
-        joint_drive_props = self.scene.robot.spawn.joint_drive_props
-        if (
-            not isinstance(joint_drive_props, list)
-            or len(joint_drive_props) != 1
-            or not isinstance(joint_drive_props[0], MujocoJointCfg)
-            or joint_drive_props[0].actuatorgravcomp is not True
-        ):
-            raise ValueError("Pick-insert requires robot-scoped native MJWarp actuator gravity compensation.")
-        for lower_name, upper_name in (
-            ("socket_position_lower", "socket_position_upper"),
-            ("pickup_position_lower", "pickup_position_upper"),
-        ):
-            lower = tuple(float(value) for value in getattr(self, lower_name))
-            upper = tuple(float(value) for value in getattr(self, upper_name))
-            if len(lower) != 3 or len(upper) != 3 or any(low > high for low, high in zip(lower, upper, strict=True)):
-                raise ValueError(f"{lower_name}/{upper_name} must contain ordered xyz bounds.")
-        for name in ("socket_yaw_range", "pickup_yaw_range"):
-            bounds = tuple(float(value) for value in getattr(self, name))
-            if len(bounds) != 2 or not bounds[0] < bounds[1]:
-                raise ValueError(f"{name} must contain increasing bounds.")
-        for name in (
-            "minimum_pickup_socket_distance",
-            "arm_reset_joint_noise",
-            "grasp_acquisition_distance_m",
-            "grasp_proxy_face_tolerance_m",
-            "transport_stage_distance_m",
-            "preinsert_stage_distance_m",
-            "reach_reward_scale_m",
-            "reach_orientation_reward_scale_rad",
-            "transport_reward_scale_m",
-            "insertion_reward_scale",
-            "max_cable_socket_offset",
-        ):
-            value = float(getattr(self, name))
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{name} must be finite and positive.")
-        acquisition_tolerance = float(self.grasp_acquisition_axis_tolerance_rad)
-        retention_tolerance = float(self.grasp_retention_axis_tolerance_rad)
-        if not (
-            math.isfinite(acquisition_tolerance)
-            and math.isfinite(retention_tolerance)
-            and 0.0 < acquisition_tolerance < retention_tolerance < math.pi / 2.0
-        ):
-            raise ValueError("grasp axis tolerances must be finite and satisfy 0 < acquisition < retention < pi/2.")
-        from .physics import GRASP_PROXY_HALF_EXTENTS
+        _validate_pick_insert_robot_control(self)
+        _validate_pick_insert_sampling_bounds(self)
+        _validate_pick_insert_dataset_contract(self)
+        _validate_pick_insert_table_scene(self)
 
-        if float(self.grasp_proxy_face_tolerance_m) >= min(GRASP_PROXY_HALF_EXTENTS):
-            raise ValueError("grasp_proxy_face_tolerance_m must be smaller than every proxy half extent.")
-        if isinstance(self.grasp_loss_grace_steps, bool) or int(self.grasp_loss_grace_steps) < 1:
-            raise ValueError("grasp_loss_grace_steps must be a positive integer.")
-        if not 0.0 < float(self.reach_orientation_reward_weight) < 1.0:
-            raise ValueError("reach_orientation_reward_weight must lie strictly inside (0, 1).")
-        if type(self.reset_dataset_rows_per_phase) is not int or self.reset_dataset_rows_per_phase < 1:
-            raise ValueError("reset_dataset_rows_per_phase must be a positive plain integer.")
+
+def _validate_pick_insert_robot_control(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
+    """Validate the grasp and robot-control contracts."""
+    if (
+        float(cfg.actions.gripper_action.neutral_position) != PICK_INSERT_OPEN_FINGER_POSITION
+        or float(cfg.actions.gripper_action.default_position) != PICK_INSERT_OPEN_FINGER_POSITION
+    ):
+        raise ValueError("Franka RJ45 pick-insert requires the exact 0.04 m open neutral/default gripper posture.")
+    _validate_pick_insert_grasp_contract(cfg)
+    if float(cfg.success_max_plug_speed) != PICK_INSERT_SUCCESS_MAX_PLUG_SPEED:
+        raise ValueError("Franka RJ45 pick-insert requires the exact 0.10 plug success-speed limit.")
+    if not isinstance(cfg.actions.arm_action, mdp.PersistentResetTargetEMAJointPositionActionCfg):
+        raise ValueError("Franka RJ45 pick-insert requires the persistent absolute-target arm action.")
+    if cfg.actions.arm_action.gravity_compensation:
+        raise ValueError("Pick-insert action-level inverse-dynamics gravity compensation must remain disabled.")
+    if tuple(cfg.actions.arm_action.tracking_error_limits) != PICK_INSERT_ARM_TARGET_TRACKING_LIMITS:
+        raise ValueError("Pick-insert requires the validated per-joint target-tracking envelope.")
+    joint_drive_props = cfg.scene.robot.spawn.joint_drive_props
+    if (
+        not isinstance(joint_drive_props, list)
+        or len(joint_drive_props) != 1
+        or not isinstance(joint_drive_props[0], MujocoJointCfg)
+        or joint_drive_props[0].actuatorgravcomp is not True
+    ):
+        raise ValueError("Pick-insert requires robot-scoped native MJWarp actuator gravity compensation.")
+
+
+def _validate_pick_insert_sampling_bounds(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
+    """Validate procedural placement, shaping, and grasp bounds."""
+    for lower_name, upper_name in (
+        ("socket_position_lower", "socket_position_upper"),
+        ("pickup_position_lower", "pickup_position_upper"),
+    ):
+        lower = tuple(float(value) for value in getattr(cfg, lower_name))
+        upper = tuple(float(value) for value in getattr(cfg, upper_name))
+        if len(lower) != 3 or len(upper) != 3 or any(low > high for low, high in zip(lower, upper, strict=True)):
+            raise ValueError(f"{lower_name}/{upper_name} must contain ordered xyz bounds.")
+    for name in ("socket_yaw_range", "pickup_yaw_range"):
+        bounds = tuple(float(value) for value in getattr(cfg, name))
+        if len(bounds) != 2 or bounds[0] > bounds[1]:
+            raise ValueError(f"{name} must contain non-decreasing bounds.")
+    for name in (
+        "minimum_pickup_socket_distance",
+        "arm_reset_joint_noise",
+        "grasp_acquisition_distance_m",
+        "grasp_proxy_face_tolerance_m",
+        "transport_stage_distance_m",
+        "preinsert_stage_distance_m",
+        "reach_reward_scale_m",
+        "reach_orientation_reward_scale_rad",
+        "transport_reward_scale_m",
+        "insertion_reward_scale",
+        "max_cable_socket_offset",
+    ):
+        value = float(getattr(cfg, name))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and positive.")
+    acquisition_tolerance = float(cfg.grasp_acquisition_axis_tolerance_rad)
+    retention_tolerance = float(cfg.grasp_retention_axis_tolerance_rad)
+    if not (
+        math.isfinite(acquisition_tolerance)
+        and math.isfinite(retention_tolerance)
+        and 0.0 < acquisition_tolerance < retention_tolerance < math.pi / 2.0
+    ):
+        raise ValueError("grasp axis tolerances must be finite and satisfy 0 < acquisition < retention < pi/2.")
+    from .physics import GRASP_PROXY_HALF_EXTENTS
+
+    if float(cfg.grasp_proxy_face_tolerance_m) >= min(GRASP_PROXY_HALF_EXTENTS):
+        raise ValueError("grasp_proxy_face_tolerance_m must be smaller than every proxy half extent.")
+    if isinstance(cfg.grasp_loss_grace_steps, bool) or int(cfg.grasp_loss_grace_steps) < 1:
+        raise ValueError("grasp_loss_grace_steps must be a positive integer.")
+    if not 0.0 < float(cfg.reach_orientation_reward_weight) < 1.0:
+        raise ValueError("reach_orientation_reward_weight must lie strictly inside (0, 1).")
+    quat_norm = math.sqrt(sum(float(value) ** 2 for value in cfg.plug_grasp_orientation_xyzw))
+    if not math.isclose(quat_norm, 1.0, rel_tol=0.0, abs_tol=1.0e-6):
+        raise ValueError("plug_grasp_orientation_xyzw must be normalized.")
+
+
+def _validate_pick_insert_dataset_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
+    """Validate reset-bank cardinality, diversity, and phase contracts."""
+    if type(cfg.reset_dataset_rows_per_phase) is not int or cfg.reset_dataset_rows_per_phase < 1:
+        raise ValueError("reset_dataset_rows_per_phase must be a positive plain integer.")
+    if (
+        type(cfg.reset_dataset_min_unique_full_pick_rows) is not int
+        or not 1 <= cfg.reset_dataset_min_unique_full_pick_rows <= cfg.reset_dataset_rows_per_phase
+    ):
+        raise ValueError(
+            "reset_dataset_min_unique_full_pick_rows must be a positive plain integer no larger than "
+            "reset_dataset_rows_per_phase."
+        )
+    if (
+        type(cfg.reset_dataset_diversity_round_decimals) is not int
+        or not 0 <= cfg.reset_dataset_diversity_round_decimals <= 8
+    ):
+        raise ValueError("reset_dataset_diversity_round_decimals must be a plain integer in [0, 8].")
+    for name in (
+        "reset_dataset_min_socket_span_fraction",
+        "reset_dataset_min_pickup_span_fraction",
+        "reset_dataset_min_arm_joint_span_fraction",
+    ):
+        value = float(getattr(cfg, name))
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise ValueError(f"{name} must be finite and lie in (0, 1].")
+    if (
+        not math.isfinite(float(cfg.reset_dataset_min_full_pick_tcp_distance_span))
+        or cfg.reset_dataset_min_full_pick_tcp_distance_span <= 0.0
+    ):
+        raise ValueError("reset_dataset_min_full_pick_tcp_distance_span must be finite and positive.")
+    _validate_pick_insert_reset_phase_fractions(cfg)
+
+
+def _validate_pick_insert_table_scene(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
+    """Validate the variant-specific static table policy."""
+    table_policy = cfg.validated_table_scene_policy()
+    if table_policy == "seattle-contact":
         if (
-            type(self.reset_dataset_min_unique_full_pick_rows) is not int
-            or not 1 <= self.reset_dataset_min_unique_full_pick_rows <= self.reset_dataset_rows_per_phase
+            not isinstance(cfg.scene.table.spawn, sim_utils.UsdFileCfg)
+            or not cfg.scene.table.spawn.make_uninstanceable
+            or cfg.scene.table_contact_surface.spawn is None
         ):
-            raise ValueError(
-                "reset_dataset_min_unique_full_pick_rows must be a positive plain integer no larger than "
-                "reset_dataset_rows_per_phase."
-            )
-        if (
-            type(self.reset_dataset_diversity_round_decimals) is not int
-            or not 0 <= self.reset_dataset_diversity_round_decimals <= 8
-        ):
-            raise ValueError("reset_dataset_diversity_round_decimals must be a plain integer in [0, 8].")
-        for name in (
-            "reset_dataset_min_socket_span_fraction",
-            "reset_dataset_min_pickup_span_fraction",
-            "reset_dataset_min_arm_joint_span_fraction",
-        ):
-            value = float(getattr(self, name))
-            if not math.isfinite(value) or not 0.0 < value <= 1.0:
-                raise ValueError(f"{name} must be finite and lie in (0, 1].")
-        if (
-            not math.isfinite(float(self.reset_dataset_min_full_pick_tcp_distance_span))
-            or self.reset_dataset_min_full_pick_tcp_distance_span <= 0.0
-        ):
-            raise ValueError("reset_dataset_min_full_pick_tcp_distance_span must be finite and positive.")
-        _validate_pick_insert_reset_phase_fractions(self)
-        quat_norm = math.sqrt(sum(float(value) ** 2 for value in self.plug_grasp_orientation_xyzw))
-        if not math.isclose(quat_norm, 1.0, rel_tol=0.0, abs_tol=1.0e-6):
-            raise ValueError("plug_grasp_orientation_xyzw must be normalized.")
-        if (
-            not isinstance(self.scene.table.spawn, sim_utils.UsdFileCfg)
-            or not self.scene.table.spawn.make_uninstanceable
-        ):
-            raise ValueError("The Seattle table must be recursively editable so authored collision can be disabled.")
+            raise ValueError("The Seattle table must be recursively editable and retain its native contact surface.")
+    elif table_policy == "absent":
+        if cfg.scene.table.spawn is not None or cfg.scene.table_contact_surface.spawn is not None:
+            raise ValueError("A table-free variant must disable both table scene spawners.")
+        if cfg.reset_source == "procedural":
+            raise ValueError("Table-free variants require reset-bank states certified without table contact.")
+    else:
+        raise ValueError(f"Unsupported static table scene policy: {table_policy!r}.")
 
 
 def _validate_pick_insert_reset_source(cfg: FrankaRJ45PickInsertEnvCfg) -> None:
@@ -556,7 +599,8 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
     # contracts are identical across hosts and cache roots.
     contract["robot"]["asset"] = FRANKA_RJ45_FRANKA_LOGICAL_URI
     contract["robot"]["spawn"]["usd_path"] = FRANKA_RJ45_FRANKA_LOGICAL_URI
-    contract["static_scene"]["table_spawn"]["usd_path"] = FRANKA_RJ45_SEATTLE_TABLE_LOGICAL_URI
+    if contract["static_scene"]["table_spawn"] is not None:
+        contract["static_scene"]["table_spawn"]["usd_path"] = FRANKA_RJ45_SEATTLE_TABLE_LOGICAL_URI
     contract["external_assets"] = franka_rj45_asset_contract()
     contract["task_body_count"] = layout.body_count
     contract["task_body_order"] = layout.body_names
@@ -594,9 +638,10 @@ def pick_insert_reset_dataset_task_contract(cfg: FrankaRJ45PickInsertEnvCfg) -> 
     contract["static_scene"]["table_contact_initial_state"] = _config_contract(
         cfg.scene.table_contact_surface.init_state
     )
-    contract["static_scene"]["table_contact_spawn"] = _config_contract(
-        cfg.scene.table_contact_surface.spawn,
-        exclude=("spawn_path",),
+    contract["static_scene"]["table_contact_spawn"] = (
+        None
+        if cfg.scene.table_contact_surface.spawn is None
+        else _config_contract(cfg.scene.table_contact_surface.spawn, exclude=("spawn_path",))
     )
     from .task_success import RJ45_GOAL_LOCAL_SUCCESS_PREDICATE_VERSION
 

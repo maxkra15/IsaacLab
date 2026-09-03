@@ -53,6 +53,8 @@ _PROXY_BODY_PATTERNS = (
     r"/World/envs/env_[^/]+/Robot/Geometry/.*panda_hand",
     r"/World/envs/env_[^/]+/Robot/Geometry/.*panda_(left|right)finger",
 )
+RJ45_GRASP_PROXY_BODY_PATTERNS = _PROXY_BODY_PATTERNS
+"""Validated hand/finger-only proxy selectors used by the original tasks."""
 
 RJ45_TASK_TRANSLATION = (0.55, 0.0, 0.25)
 RJ45_TASK_ROTATION_XYZW = (0.0, 0.0, 0.0, 1.0)
@@ -300,6 +302,8 @@ class FrankaRJ45InsertionEnvCfg(ManagerBasedRLEnvCfg):
     task_rotation_xyzw: tuple[float, float, float, float] = RJ45_TASK_ROTATION_XYZW
     plug_grasp_offset: tuple[float, float, float] = RJ45_PLUG_GRASP_OFFSET
     rj45_entry_body_patterns: tuple[str, ...] = _RJ45_ENTRY_BODY_PATTERNS
+    proxy_body_patterns: tuple[str, ...] = _PROXY_BODY_PATTERNS
+    """Rigid-entry body selectors copied into the task's VBD collision view."""
 
     reset_dataset_path: str = "datasets/franka_rj45_insertion/reset_dataset.pt"
     reset_validation_report_path: str = "logs/rsl_rl/franka_rj45_insertion/validation/reset_validation.json"
@@ -377,7 +381,7 @@ class FrankaRJ45InsertionEnvCfg(ManagerBasedRLEnvCfg):
                     CouplerProxyMappingCfg(
                         source=RIGID_ENTRY,
                         destination=RJ45_ENTRY,
-                        bodies=list(_PROXY_BODY_PATTERNS),
+                        bodies=list(self.proxy_body_patterns),
                         mode="staggered",
                         collide_interval=1,
                         collision_pipeline=NewtonCollisionPipelineCfg(),
@@ -391,6 +395,10 @@ class FrankaRJ45InsertionEnvCfg(ManagerBasedRLEnvCfg):
             collision_decimation=1,
             use_cuda_graph=True,
         )
+
+    def validated_task_rotation_xyzw(self) -> tuple[float, float, float, float]:
+        """Return the task-frame rotation admitted by this exact environment variant."""
+        return RJ45_TASK_ROTATION_XYZW
 
     def validate_config(self) -> None:
         """Reject overrides that break the fixed-goal/reset contract."""
@@ -434,8 +442,15 @@ class FrankaRJ45InsertionEnvCfg(ManagerBasedRLEnvCfg):
                 raise ValueError(f"{lower_name}/{upper_name} must contain three finite values.")
             if any(float(low) >= float(high) for low, high in zip(lower, upper, strict=True)):
                 raise ValueError(f"{lower_name} must be strictly smaller than {upper_name}.")
-        if tuple(self.task_rotation_xyzw) != RJ45_TASK_ROTATION_XYZW:
-            raise ValueError("The validated RJ45 insertion geometry currently requires identity task rotation.")
+        if not self.proxy_body_patterns or any(
+            not isinstance(pattern, str) or not pattern for pattern in self.proxy_body_patterns
+        ):
+            raise ValueError("proxy_body_patterns must contain non-empty selector strings.")
+        validated_task_rotation = tuple(self.validated_task_rotation_xyzw())
+        if tuple(self.task_rotation_xyzw) != validated_task_rotation:
+            if validated_task_rotation == RJ45_TASK_ROTATION_XYZW:
+                raise ValueError("The validated RJ45 insertion geometry currently requires identity task rotation.")
+            raise ValueError("The task rotation does not match this RJ45 environment variant's validated frame.")
         coupler = _coupler_cfg(self)
         rigid_entry = _coupler_entry(coupler, RIGID_ENTRY)
         rj45_entry = _coupler_entry(coupler, RJ45_ENTRY)
@@ -448,7 +463,7 @@ class FrankaRJ45InsertionEnvCfg(ManagerBasedRLEnvCfg):
             raise ValueError(f"Coupled entry {RIGID_ENTRY!r} body selectors do not match the validated task.")
         if tuple(rj45_entry.bodies) != tuple(self.rj45_entry_body_patterns):
             raise ValueError(f"Coupled entry {RJ45_ENTRY!r} body selectors do not match the validated task.")
-        if tuple(proxy.bodies) != _PROXY_BODY_PATTERNS:
+        if tuple(proxy.bodies) != tuple(self.proxy_body_patterns):
             raise ValueError("The Franka-to-RJ45 proxy body selectors do not match the validated task.")
         validate_rj45_vbd_solver_cfg(rj45_entry.solver_cfg)
         solver_dt = float(self.sim.dt) / int(self.sim.physics.num_substeps)
@@ -506,7 +521,11 @@ def reset_dataset_task_contract(cfg: FrankaRJ45InsertionEnvCfg) -> dict[str, obj
         },
         "static_scene": {
             "table_initial_state": _config_contract(cfg.scene.table.init_state),
-            "table_spawn": _config_contract(cfg.scene.table.spawn, exclude=("spawn_path",)),
+            "table_spawn": (
+                None
+                if cfg.scene.table.spawn is None
+                else _config_contract(cfg.scene.table.spawn, exclude=("spawn_path",))
+            ),
             "ground_initial_state": _config_contract(cfg.scene.ground.init_state),
             "ground_spawn": _config_contract(cfg.scene.ground.spawn, exclude=("spawn_path",)),
         },
@@ -559,7 +578,7 @@ def reset_dataset_task_contract(cfg: FrankaRJ45InsertionEnvCfg) -> dict[str, obj
                 "destination": proxy.destination,
                 # Coupler resolution rewrites this field to world-count-dependent
                 # body ids, so the validated immutable selectors are recorded.
-                "body_patterns": _PROXY_BODY_PATTERNS,
+                "body_patterns": tuple(cfg.proxy_body_patterns),
                 "particles": tuple(proxy.particles),
                 "mode": proxy.mode,
                 "mass_scale": float(proxy.mass_scale),

@@ -17,7 +17,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,6 +33,11 @@ from pxr import Gf, Usd, UsdGeom, Vt
 
 from isaaclab.utils.assets import NVIDIA_NUCLEUS_DIR
 
+from ..dual_rack_workcell import (
+    DualRackWorkcellCfg,
+    dual_rack_cable_workcell_intersections_numpy,
+    route_dual_rack_cable_points_numpy,
+)
 from ._kernels import (
     align_cable_orientations,
     apply_connector_forces,
@@ -311,6 +316,17 @@ _GRASP_PROXY_SHAPE_CFG = newton.ModelBuilder.ShapeConfig(
     is_visible=False,
 )
 
+_WORKCELL_SHAPE_CFG = newton.ModelBuilder.ShapeConfig(
+    density=0.0,
+    ke=CONTACT_KE,
+    kd=CONTACT_KD,
+    mu=0.8,
+    mu_torsional=0.002,
+    mu_rolling=0.0001,
+    gap=CONNECTOR_GAP,
+    has_particle_collision=False,
+)
+
 _VBD_ATTRIBUTE_NAMES = ("vbd:joint_is_hard", "vbd:dahl_eps_max", "vbd:dahl_tau")
 _FRANKA_HAND_BODY_SUFFIX = "/panda_hand"
 _FRANKA_FINGER_BODY_SUFFIXES = ("/panda_leftfinger", "/panda_rightfinger")
@@ -385,6 +401,10 @@ class Rj45WorldBodyIds:
     latch_joint_id: int
     cable_body_ids: tuple[int, ...]
     cable_joint_ids: tuple[int, ...]
+    anchored_socket_shape_id: int | None = None
+    anchored_plug_shape_id: int | None = None
+    anchored_latch_shape_id: int | None = None
+    workcell_shape_ids: tuple[int, ...] = ()
 
     @property
     def task_body_ids(self) -> tuple[int, ...]:
@@ -405,6 +425,12 @@ class Rj45WorldBodyIds:
     def pinned_cable_body_id(self) -> int:
         """Fixed far-end cable body index."""
         return self.cable_body_ids[-1]
+
+    @property
+    def pinned_cable_body_ids(self) -> tuple[int, ...]:
+        """All fixed far-end cable bodies for this world topology."""
+        count = CABLE_KINEMATIC_COUNT if self.anchored_socket_shape_id is not None else 1
+        return self.cable_body_ids[-count:]
 
 
 @dataclass(frozen=True)
@@ -451,6 +477,20 @@ class _WorldBuildRecord:
     root_label: str
     default_body_q: tuple[tuple[float, ...], ...]
     goal_target_w: tuple[float, float, float]
+    render_cable_points_e: tuple[tuple[float, float, float], ...]
+    anchored_connector_q_w: tuple[tuple[float, ...], ...] | None = None
+    anchored_cable_endpoint_w: tuple[float, float, float] | None = None
+
+
+@dataclass(frozen=True)
+class _WorkcellBuildRecord:
+    """Static connector/workcell additions for one two-ended cable world."""
+
+    anchored_connector_shapes: tuple[int, int, int]
+    anchored_connector_q_w: tuple[tuple[float, ...], ...]
+    anchored_cable_endpoint_w: tuple[float, float, float]
+    workcell_shape_ids: tuple[int, ...]
+    render_cable_points_e: tuple[tuple[float, float, float], ...]
 
 
 def verify_rj45_asset(path: str | Path = RJ45_ASSET_PATH) -> None:
@@ -903,8 +943,13 @@ def _presentation_switch_transform() -> Gf.Matrix4d:
     )
 
 
-def _author_pick_insert_network_switch(stage: Usd.Stage, socket_path: str) -> None:
-    """Author a visual-only AS4610 switch that follows the active socket."""
+def _author_pick_insert_network_switch(
+    stage: Usd.Stage,
+    socket_path: str,
+    *,
+    accent_color: tuple[float, float, float] = _PRESENTATION_ACTIVE_PORT_COLOR,
+) -> None:
+    """Author a visual-only AS4610 switch that follows one physical socket."""
     presentation_path = f"{socket_path}/Presentation"
     UsdGeom.Xform.Define(stage, presentation_path)
     switch = UsdGeom.Xform.Define(stage, f"{presentation_path}/NetworkSwitch")
@@ -928,7 +973,7 @@ def _author_pick_insert_network_switch(stage: Usd.Stage, socket_path: str) -> No
             f"{accent_path}/{name}",
             center,
             size,
-            _PRESENTATION_ACTIVE_PORT_COLOR,
+            accent_color,
         )
 
 
@@ -980,6 +1025,10 @@ class Rj45NewtonAssemblyBuilder:
             Newton insertion topology.
         grasp_proxy_friction: Friction applied only to the invisible,
             finger-only grasp proxy. Franka finger materials remain unchanged.
+        workcell_cfg: Optional static anchored connector, rack colliders, and
+            T-slot presentation. Omitted for the existing single-rack tasks.
+        grasp_shape_resolver: Resolves the robot palm and grasping colliders
+            imported into each Newton world. Defaults to the Franka profile.
     """
 
     def __init__(
@@ -990,6 +1039,10 @@ class Rj45NewtonAssemblyBuilder:
         task_rotation_xyzw: Sequence[float] = (0.0, 0.0, 0.0, 1.0),
         topology_cfg: Rj45AssemblyTopologyCfg = RJ45_DEFAULT_TOPOLOGY,
         grasp_proxy_friction: float = GRASP_FRICTION,
+        workcell_cfg: DualRackWorkcellCfg | None = None,
+        grasp_shape_resolver: Callable[[newton.ModelBuilder, int], FrankaGraspShapeIds] = (
+            resolve_franka_grasp_shape_ids
+        ),
     ) -> None:
         self.asset_path = Path(asset_path).resolve()
         self.drive_cfg = drive_cfg or Rj45InsertionDriveCfg()
@@ -1004,6 +1057,21 @@ class Rj45NewtonAssemblyBuilder:
         ):
             raise ValueError("grasp_proxy_friction must be finite and non-negative.")
         self.grasp_proxy_friction = float(grasp_proxy_friction)
+        if workcell_cfg is not None and not isinstance(workcell_cfg, DualRackWorkcellCfg):
+            raise TypeError("workcell_cfg must be DualRackWorkcellCfg or None.")
+        workcell_semantics = dataclasses.replace(
+            topology_cfg,
+            extra_cable_segments=RJ45_PICK_INSERT_TOPOLOGY.extra_cable_segments,
+        )
+        if workcell_cfg is not None and workcell_semantics != RJ45_PICK_INSERT_TOPOLOGY:
+            raise ValueError(
+                "The dual-rack workcell requires resettable, free-rotation pick-insert semantics; "
+                "only the cable segment count may differ."
+            )
+        self.workcell_cfg = workcell_cfg
+        if not callable(grasp_shape_resolver):
+            raise TypeError("grasp_shape_resolver must be callable.")
+        self.grasp_shape_resolver = grasp_shape_resolver
         self.layout = make_rj45_task_layout(topology_cfg)
         self._task_transform = _world_transform(task_translation, task_rotation_xyzw)
         self._geometry: _Rj45Geometry | None = None
@@ -1051,8 +1119,10 @@ class Rj45NewtonAssemblyBuilder:
         builder.rigid_gap = RIGID_GAP
         if self._geometry is None:
             self._geometry = _load_geometry(self.asset_path, self.topology_cfg)
-        franka_grasp_shape_ids = resolve_franka_grasp_shape_ids(builder, env_id)
-        finger_shape_ids = franka_grasp_shape_ids.finger_shape_ids
+        grasp_shape_ids = self.grasp_shape_resolver(builder, env_id)
+        if not isinstance(grasp_shape_ids, FrankaGraspShapeIds):
+            raise TypeError("grasp_shape_resolver must return FrankaGraspShapeIds.")
+        finger_shape_ids = grasp_shape_ids.finger_shape_ids
         for shape_id in finger_shape_ids:
             builder.shape_material_mu[shape_id] = GRASP_FRICTION
         collide_shapes = int(newton.ShapeFlags.COLLIDE_SHAPES)
@@ -1085,7 +1155,7 @@ class Rj45NewtonAssemblyBuilder:
             position,
             quaternion,
             self._geometry,
-            franka_grasp_shape_ids,
+            grasp_shape_ids,
             robot_collision_shape_ids,
             nonfinger_collision_shape_ids,
         )
@@ -1121,12 +1191,17 @@ class Rj45NewtonAssemblyBuilder:
             _compose_transform(self._task_transform, unplugged_plug_position, wp.quat_identity()),
             _compose_transform(self._task_transform, unplugged_latch_position, wp.quat_identity()),
         )
-        cable_points = Vt.Vec3fArray(
-            [
-                Gf.Vec3f(*_as_vec3_tuple(wp.transform_point(self._task_transform, point)))
-                for point in geometry.cable_points
-            ]
-        )
+        anchored_connector_transforms: tuple[wp.transform, ...] | None = None
+        if self.workcell_cfg is not None:
+            anchored_task_transform = _world_transform(
+                self.workcell_cfg.anchored_connector.task_translation_m,
+                self.workcell_cfg.anchored_connector.task_rotation_xyzw,
+            )
+            anchored_connector_transforms = (
+                _compose_transform(anchored_task_transform, geometry.socket_position, wp.quat_identity()),
+                _compose_transform(anchored_task_transform, geometry.plug_position, wp.quat_identity()),
+                _compose_transform(anchored_task_transform, geometry.latch_position, wp.quat_identity()),
+            )
 
         for record in (record for _, record in sorted(self._records.items())):
             UsdGeom.Xform.Define(stage, record.root_label)
@@ -1136,19 +1211,55 @@ class Rj45NewtonAssemblyBuilder:
                 body_path = f"{record.root_label}/{body_name}"
                 _define_xform(stage, body_path, transform)
                 UsdGeom.Scope.Define(stage, f"{body_path}/geometry")
-                _author_reference_mesh(
-                    stage,
-                    f"{body_path}/geometry/mesh",
-                    self.asset_path,
-                    source_prim_path,
-                    color,
+                mesh_path = f"{body_path}/geometry/mesh"
+                hide_socket_visual = (
+                    body_name == "Socket"
+                    and self.workcell_cfg is not None
+                    and self.workcell_cfg.presentation_kind == "gb300"
                 )
+                if hide_socket_visual:
+                    existing = stage.GetPrimAtPath(mesh_path)
+                    if existing.IsValid() and existing.IsA(UsdGeom.Imageable):
+                        UsdGeom.Imageable(existing).MakeInvisible()
+                else:
+                    _author_reference_mesh(
+                        stage,
+                        mesh_path,
+                        self.asset_path,
+                        source_prim_path,
+                        color,
+                    )
+
+            if anchored_connector_transforms is not None:
+                anchored_root = f"{record.root_label}/AnchoredConnector"
+                UsdGeom.Xform.Define(stage, anchored_root)
+                for (body_name, source_prim_path, color), transform in zip(
+                    _CONNECTOR_VISUAL_SPECS,
+                    anchored_connector_transforms,
+                    strict=True,
+                ):
+                    body_path = f"{anchored_root}/{body_name}"
+                    _define_xform(stage, body_path, transform)
+                    UsdGeom.Scope.Define(stage, f"{body_path}/geometry")
+                    mesh_path = f"{body_path}/geometry/mesh"
+                    if body_name == "Socket" and self.workcell_cfg.presentation_kind == "gb300":
+                        existing = stage.GetPrimAtPath(mesh_path)
+                        if existing.IsValid() and existing.IsA(UsdGeom.Imageable):
+                            UsdGeom.Imageable(existing).MakeInvisible()
+                    else:
+                        _author_reference_mesh(
+                            stage,
+                            mesh_path,
+                            self.asset_path,
+                            source_prim_path,
+                            color,
+                        )
 
             cable_root = f"{record.root_label}/Cable"
             UsdGeom.Xform.Define(stage, cable_root)
             UsdGeom.Scope.Define(stage, f"{cable_root}/geometry")
             curve = UsdGeom.BasisCurves.Define(stage, f"{cable_root}/geometry/mesh")
-            curve.CreatePointsAttr(cable_points)
+            curve.CreatePointsAttr(Vt.Vec3fArray([Gf.Vec3f(*point) for point in record.render_cable_points_e]))
             curve.CreateCurveVertexCountsAttr(Vt.IntArray([self.layout.cable_segment_count + 1]))
             curve.CreateTypeAttr(UsdGeom.Tokens.linear)
             curve.CreateWrapAttr(UsdGeom.Tokens.nonperiodic)
@@ -1160,8 +1271,235 @@ class Rj45NewtonAssemblyBuilder:
                 if not curve_prim.AddAppliedSchema("PhysicsCurvesDeformableSimAPI"):
                     raise RuntimeError(f"Failed to tag RJ45 cable render curve {curve_prim.GetPath()}.")
 
-            if include_network_switch_presentation and self.topology_cfg == RJ45_PICK_INSERT_TOPOLOGY:
-                _author_pick_insert_network_switch(stage, f"{record.root_label}/Socket")
+            if (
+                include_network_switch_presentation
+                and self.topology_cfg == RJ45_PICK_INSERT_TOPOLOGY
+                and (self.workcell_cfg is None or self.workcell_cfg.presentation_kind == "dual-as4610")
+            ):
+                accent_color = (
+                    _PRESENTATION_ACTIVE_PORT_COLOR
+                    if self.workcell_cfg is None
+                    else self.workcell_cfg.target_accent_color
+                )
+                _author_pick_insert_network_switch(
+                    stage,
+                    f"{record.root_label}/Socket",
+                    accent_color=accent_color,
+                )
+                if self.workcell_cfg is not None:
+                    _author_pick_insert_network_switch(
+                        stage,
+                        f"{record.root_label}/AnchoredConnector/Socket",
+                        accent_color=self.workcell_cfg.anchored_connector.accent_color,
+                    )
+
+            if self.workcell_cfg is not None:
+                workcell_root = f"{record.root_label}/Workcell"
+                UsdGeom.Xform.Define(stage, workcell_root)
+                for box in self.workcell_cfg.boxes:
+                    if box.visible:
+                        _author_visual_cuboid(
+                            stage,
+                            f"{workcell_root}/{box.name}",
+                            box.center_m,
+                            box.size_m,
+                            box.color,
+                        )
+                if include_network_switch_presentation and self.workcell_cfg.presentation_kind == "gb300":
+                    from ..gb300_presentation import author_gb300_kit_presentation
+
+                    author_gb300_kit_presentation(stage, f"{workcell_root}/GB300Rack")
+
+    def add_workcell_collision_copy(
+        self,
+        builder: newton.ModelBuilder,
+        env_id: int,
+        position: Sequence[float],
+        quaternion: Sequence[float],
+        *,
+        label_scope: str,
+    ) -> tuple[int, ...]:
+        """Duplicate the invisible workcell shell for a second coupled solver.
+
+        Newton coupled-solver entries require exclusive shape ownership.  A
+        scene in which both the rigid robot and VBD cable contact the same
+        cabinet therefore needs two geometrically identical, separately
+        labelled static proxies, matching the Samsung water-hose demo's robot
+        and cable housing proxies.
+
+        The canonical workcell shapes remain the cable-side copy.  This method
+        adds the rigid-side copy and filters it from all RJ45-owned geometry so
+        it cannot create duplicate cable contacts in the parent collision
+        pipeline.
+        """
+        if self.workcell_cfg is None:
+            raise RuntimeError("Cannot duplicate workcell collisions without a workcell configuration.")
+        if builder is not self._builder:
+            raise RuntimeError("Workcell collision copies must use the builder owned by this RJ45 assembly.")
+        if builder.current_world != env_id:
+            raise RuntimeError(
+                f"Workcell collision copy expected builder.current_world={env_id}, got {builder.current_world}."
+            )
+        if not isinstance(label_scope, str) or not label_scope or "/" in label_scope:
+            raise ValueError("label_scope must be one non-empty Newton label component.")
+        record = self._records.get(env_id)
+        if record is None:
+            raise RuntimeError(f"RJ45 world {env_id} must be authored before duplicating its workcell collisions.")
+
+        env_tf = _world_transform(position, quaternion)
+        shape_ids = tuple(
+            builder.add_shape_box(
+                -1,
+                xform=wp.transform_multiply(env_tf, wp.transform(wp.vec3(*box.center_m), wp.quat_identity())),
+                hx=0.5 * box.size_m[0],
+                hy=0.5 * box.size_m[1],
+                hz=0.5 * box.size_m[2],
+                cfg=dataclasses.replace(_WORKCELL_SHAPE_CFG, is_visible=False),
+                color=wp.vec3(*box.color),
+                label=f"{record.root_label}/{label_scope}/{box.name}",
+            )
+            for box in self.workcell_cfg.boxes
+            if box.collidable
+        )
+
+        ids = record.ids
+        task_shapes = [
+            ids.socket_shape_id,
+            ids.plug_shape_id,
+            ids.grasp_proxy_shape_id,
+            ids.latch_shape_id,
+            *ids.workcell_shape_ids,
+        ]
+        task_shapes.extend(shape_id for body_id in ids.cable_body_ids for shape_id in builder.body_shapes[body_id])
+        task_shapes.extend(
+            shape_id
+            for shape_id in (
+                ids.anchored_socket_shape_id,
+                ids.anchored_plug_shape_id,
+                ids.anchored_latch_shape_id,
+            )
+            if shape_id is not None
+        )
+        for copy_shape_id in shape_ids:
+            for task_shape_id in task_shapes:
+                builder.add_shape_collision_filter_pair(copy_shape_id, task_shape_id)
+        return shape_ids
+
+    def _add_workcell_world(
+        self,
+        builder: newton.ModelBuilder,
+        *,
+        env_tf: wp.transform,
+        root_label: str,
+        geometry: _Rj45Geometry,
+        render_cable_points_e: tuple[tuple[float, float, float], ...],
+    ) -> _WorkcellBuildRecord:
+        """Add the seated far connector, routed cable tail, and static workcell."""
+        workcell_cfg = self.workcell_cfg
+        if workcell_cfg is None:
+            raise RuntimeError("A two-ended workcell build requires workcell_cfg.")
+
+        anchored_task_tf_e = _world_transform(
+            workcell_cfg.anchored_connector.task_translation_m,
+            workcell_cfg.anchored_connector.task_rotation_xyzw,
+        )
+        anchored_world_tf = wp.transform_multiply(env_tf, anchored_task_tf_e)
+        anchored_connector_transforms = (
+            _compose_transform(anchored_world_tf, geometry.socket_position, wp.quat_identity()),
+            _compose_transform(anchored_world_tf, geometry.plug_position, wp.quat_identity()),
+            _compose_transform(anchored_world_tf, geometry.latch_position, wp.quat_identity()),
+        )
+        anchored_connector_shapes = tuple(
+            builder.add_shape_mesh(
+                -1,
+                mesh=mesh,
+                xform=transform,
+                cfg=_CONNECTOR_SHAPE_CFG,
+                label=f"{root_label}/AnchoredConnector/{name}/Collision",
+            )
+            for name, mesh, transform in zip(
+                ("Socket", "Plug", "Latch"),
+                (geometry.socket_mesh, geometry.plug_mesh, geometry.latch_mesh),
+                anchored_connector_transforms,
+                strict=True,
+            )
+        )
+
+        cable_exit_offset = geometry.cable_points[0] - (geometry.plug_position + wp.vec3(0.0, PLUG_Y_OFFSET, 0.0))
+        anchored_cable_endpoint_e = wp.transform_point(
+            anchored_task_tf_e,
+            geometry.plug_position + cable_exit_offset,
+        )
+        anchored_cable_endpoint_w = _as_vec3_tuple(wp.transform_point(env_tf, anchored_cable_endpoint_e))
+
+        fixed_prefix_e = np.asarray(render_cable_points_e[: CABLE_KINEMATIC_COUNT + 1], dtype=np.float64)
+        segment_lengths = np.asarray(
+            [
+                float(wp.length(geometry.cable_points[index + 1] - geometry.cable_points[index]))
+                for index in range(self.layout.cable_segment_count)
+            ],
+            dtype=np.float64,
+        )
+        unplugged_plug_position = geometry.plug_position + wp.vec3(0.0, PLUG_Y_OFFSET, 0.0)
+        source_prefix_offsets = np.asarray(
+            [
+                _as_vec3_tuple(geometry.cable_points[index] - unplugged_plug_position)
+                for index in range(CABLE_KINEMATIC_COUNT + 1)
+            ],
+            dtype=np.float64,
+        )
+        source_directions = np.diff(source_prefix_offsets, axis=0)
+        source_directions /= np.linalg.norm(source_directions, axis=-1, keepdims=True)
+        anchored_outward_local = [
+            np.asarray(_as_vec3_tuple(geometry.plug_position), dtype=np.float64) + source_prefix_offsets[0]
+        ]
+        for index, direction in enumerate(source_directions):
+            anchored_outward_local.append(anchored_outward_local[-1] + direction * segment_lengths[-1 - index])
+        anchored_suffix_e = np.asarray(
+            [
+                _as_vec3_tuple(wp.transform_point(anchored_task_tf_e, wp.vec3(*point)))
+                for point in reversed(anchored_outward_local)
+            ],
+            dtype=np.float64,
+        )
+        routed_points = route_dual_rack_cable_points_numpy(
+            fixed_prefix_e,
+            np.asarray(_as_vec3_tuple(anchored_cable_endpoint_e), dtype=np.float64),
+            segment_lengths,
+            fixed_suffix_points=anchored_suffix_e,
+        )
+        workcell_intersections = dual_rack_cable_workcell_intersections_numpy(
+            routed_points,
+            cable_radius_m=CABLE_RADIUS,
+            cfg=workcell_cfg,
+        )
+        if workcell_intersections:
+            raise RuntimeError(
+                f"The authored two-ended cable intersects hidden workcell contacts: {workcell_intersections}."
+            )
+        routed_cable_points_e = tuple(tuple(float(value) for value in point) for point in routed_points)
+
+        workcell_shape_ids = tuple(
+            builder.add_shape_box(
+                -1,
+                xform=wp.transform_multiply(env_tf, wp.transform(wp.vec3(*box.center_m), wp.quat_identity())),
+                hx=0.5 * box.size_m[0],
+                hy=0.5 * box.size_m[1],
+                hz=0.5 * box.size_m[2],
+                cfg=dataclasses.replace(_WORKCELL_SHAPE_CFG, is_visible=box.visible),
+                color=wp.vec3(*box.color),
+                label=f"{root_label}/Workcell/{box.name}",
+            )
+            for box in workcell_cfg.boxes
+            if box.collidable
+        )
+        return _WorkcellBuildRecord(
+            anchored_connector_shapes=anchored_connector_shapes,
+            anchored_connector_q_w=tuple(_as_transform_tuple(transform) for transform in anchored_connector_transforms),
+            anchored_cable_endpoint_w=anchored_cable_endpoint_w,
+            workcell_shape_ids=workcell_shape_ids,
+            render_cable_points_e=routed_cable_points_e,
+        )
 
     def _add_world(
         self,
@@ -1170,7 +1508,7 @@ class Rj45NewtonAssemblyBuilder:
         position: Sequence[float],
         quaternion: Sequence[float],
         geometry: _Rj45Geometry,
-        franka_grasp_shape_ids: FrankaGraspShapeIds,
+        grasp_shape_ids: FrankaGraspShapeIds,
         robot_collision_shape_ids: tuple[int, ...],
         nonfinger_collision_shape_ids: tuple[int, ...],
     ) -> _WorldBuildRecord:
@@ -1179,6 +1517,13 @@ class Rj45NewtonAssemblyBuilder:
         world_tf = wp.transform_multiply(env_tf, self._task_transform)
         world_rotation = wp.transform_get_rotation(world_tf)
         root_label = f"/World/envs/env_{env_id}/Rj45Assembly"
+        render_cable_points_e = tuple(
+            _as_vec3_tuple(wp.transform_point(self._task_transform, point)) for point in geometry.cable_points
+        )
+        anchored_connector_shapes: tuple[int, ...] = ()
+        anchored_connector_q_w: tuple[tuple[float, ...], ...] | None = None
+        anchored_cable_endpoint_w: tuple[float, float, float] | None = None
+        workcell_shape_ids: tuple[int, ...] = ()
 
         support_plane_shape = None
         if self.topology_cfg.include_task_support_plane:
@@ -1272,6 +1617,22 @@ class Rj45NewtonAssemblyBuilder:
         )
         connector_shapes = (socket_shape, plug_shape, latch_shape)
 
+        anchored_socket_shape = anchored_plug_shape = anchored_latch_shape = None
+        if self.workcell_cfg is not None:
+            workcell = self._add_workcell_world(
+                builder,
+                env_tf=env_tf,
+                root_label=root_label,
+                geometry=geometry,
+                render_cable_points_e=render_cable_points_e,
+            )
+            anchored_connector_shapes = workcell.anchored_connector_shapes
+            anchored_socket_shape, anchored_plug_shape, anchored_latch_shape = anchored_connector_shapes
+            anchored_connector_q_w = workcell.anchored_connector_q_w
+            anchored_cable_endpoint_w = workcell.anchored_cable_endpoint_w
+            workcell_shape_ids = workcell.workcell_shape_ids
+            render_cable_points_e = workcell.render_cable_points_e
+
         joint_dof = newton.ModelBuilder.JointDofConfig
         angular_axes = None
         if self.topology_cfg.free_plug_rotation:
@@ -1314,10 +1675,14 @@ class Rj45NewtonAssemblyBuilder:
             label=f"{root_label}/ConnectorArticulation",
         )
 
-        cable_points_w = tuple(wp.transform_point(world_tf, point) for point in geometry.cable_points)
-        cable_quaternions_w = tuple(
-            wp.normalize(wp.mul(world_rotation, rotation)) for rotation in geometry.cable_quaternions
-        )
+        if self.workcell_cfg is None:
+            cable_points_w = tuple(wp.transform_point(world_tf, point) for point in geometry.cable_points)
+            cable_quaternions_w = tuple(
+                wp.normalize(wp.mul(world_rotation, rotation)) for rotation in geometry.cable_quaternions
+            )
+        else:
+            cable_points_w = tuple(wp.transform_point(env_tf, wp.vec3(*point)) for point in render_cable_points_e)
+            cable_quaternions_w = tuple(newton.utils.create_parallel_transport_cable_quaternions(cable_points_w))
         cable_bodies, cable_joints = builder.add_rod(
             positions=cable_points_w,
             quaternions=cable_quaternions_w,
@@ -1325,7 +1690,7 @@ class Rj45NewtonAssemblyBuilder:
             cfg=dataclasses.replace(
                 builder.default_shape_cfg,
                 ke=CONTACT_KE,
-                kd=CONTACT_KD,
+                kd=(CONTACT_KD if self.workcell_cfg is None else self.workcell_cfg.cable_contact_damping_n_s_m),
                 mu=CABLE_MU,
             ),
             bend_stiffness=CABLE_BEND_STIFFNESS,
@@ -1358,6 +1723,15 @@ class Rj45NewtonAssemblyBuilder:
             for cable_shape in builder.body_shapes[body_id]:
                 for connector_shape in connector_shapes:
                     builder.add_shape_collision_filter_pair(cable_shape, connector_shape)
+        if anchored_connector_shapes:
+            # The final four spans are the fixed strain-relief region of the
+            # already-seated cable end.  Suppress only their intentional
+            # overlap with that connector; all remaining cable/rack and
+            # robot/workcell contacts stay physical.
+            for body_id in cable_bodies[-CABLE_KINEMATIC_COUNT:]:
+                for cable_shape in builder.body_shapes[body_id]:
+                    for connector_shape in anchored_connector_shapes:
+                        builder.add_shape_collision_filter_pair(cable_shape, connector_shape)
 
         # The hand/finger bodies are staggered rigid proxies from the robot's
         # MJWarp entry. Keep the palm clear of the complete task and keep the
@@ -1369,10 +1743,10 @@ class Rj45NewtonAssemblyBuilder:
         if support_plane_shape is not None:
             official_task_shapes.insert(0, support_plane_shape)
         official_task_shapes.extend(builder.body_shapes[body_id][0] for body_id in cable_bodies)
-        for robot_shape_id in franka_grasp_shape_ids.hand_shape_ids:
+        for robot_shape_id in grasp_shape_ids.hand_shape_ids:
             for task_shape_id in official_task_shapes:
                 builder.add_shape_collision_filter_pair(robot_shape_id, task_shape_id)
-        for finger_shape_id in franka_grasp_shape_ids.finger_shape_ids:
+        for finger_shape_id in grasp_shape_ids.finger_shape_ids:
             for task_shape_id in (socket_shape, latch_shape):
                 builder.add_shape_collision_filter_pair(finger_shape_id, task_shape_id)
 
@@ -1383,13 +1757,20 @@ class Rj45NewtonAssemblyBuilder:
 
         # The grasp proxy is deliberately finger-only. Its overlap with the
         # official connector/cable geometry must not alter insertion physics.
-        for shape_id in (*nonfinger_collision_shape_ids, *connector_shapes):
+        for shape_id in (
+            *nonfinger_collision_shape_ids,
+            *connector_shapes,
+            *anchored_connector_shapes,
+            *workcell_shape_ids,
+        ):
             builder.add_shape_collision_filter_pair(grasp_proxy_shape, shape_id)
         for body_id in cable_bodies:
             for cable_shape in builder.body_shapes[body_id]:
                 builder.add_shape_collision_filter_pair(grasp_proxy_shape, cable_shape)
 
-        for body_id in (*cable_bodies[:CABLE_KINEMATIC_COUNT], cable_bodies[-1]):
+        pinned_tail_count = CABLE_KINEMATIC_COUNT if self.workcell_cfg is not None else 1
+        pinned_cable_bodies = (*cable_bodies[:CABLE_KINEMATIC_COUNT], *cable_bodies[-pinned_tail_count:])
+        for body_id in pinned_cable_bodies:
             builder.body_mass[body_id] = 0.0
             builder.body_inv_mass[body_id] = 0.0
             builder.body_inertia[body_id] = wp.mat33(0.0)
@@ -1409,6 +1790,10 @@ class Rj45NewtonAssemblyBuilder:
             latch_joint_id=latch_joint,
             cable_body_ids=tuple(cable_bodies),
             cable_joint_ids=tuple(cable_joints),
+            anchored_socket_shape_id=anchored_socket_shape,
+            anchored_plug_shape_id=anchored_plug_shape,
+            anchored_latch_shape_id=anchored_latch_shape,
+            workcell_shape_ids=workcell_shape_ids,
         )
         if len(ids.task_body_ids) != self.layout.body_count:
             raise RuntimeError(
@@ -1421,6 +1806,9 @@ class Rj45NewtonAssemblyBuilder:
             root_label=root_label,
             default_body_q=default_body_q,
             goal_target_w=goal_target_w,
+            render_cable_points_e=render_cable_points_e,
+            anchored_connector_q_w=anchored_connector_q_w,
+            anchored_cable_endpoint_w=anchored_cable_endpoint_w,
         )
 
     def bind(self, model: newton.Model) -> Rj45NewtonAssembly:
@@ -1508,6 +1896,17 @@ class Rj45NewtonAssembly:
         cable_body_ids = [record.ids.cable_body_ids for record in records]
         align_start = CABLE_KINEMATIC_COUNT - 1
 
+        pinned_tail_counts = {len(record.ids.pinned_cable_body_ids) for record in records}
+        if len(pinned_tail_counts) != 1:
+            raise RuntimeError(f"RJ45 worlds cannot mix pinned cable tail counts: {sorted(pinned_tail_counts)}.")
+        (pinned_tail_count,) = pinned_tail_counts
+        align_stop = layout.cable_segment_count - pinned_tail_count
+        if align_stop <= align_start:
+            raise RuntimeError(
+                "RJ45 cable has no deformable span between its plug anchors and fixed tail: "
+                f"segments={layout.cable_segment_count}, pinned_tail={pinned_tail_count}."
+            )
+
         self.world_ids = wp.array(world_ids, dtype=wp.int32, device=device)
         self.socket_shape_ids = wp.array(
             [record.ids.socket_shape_id for record in records], dtype=wp.int32, device=device
@@ -1536,7 +1935,7 @@ class Rj45NewtonAssembly:
         )
         self.cable_body_ids = wp.array(cable_body_ids, dtype=wp.int32, device=device)
         self.cable_preserved_input_body_ids = wp.array(
-            [body_id for body_ids in cable_body_ids for body_id in body_ids[:-1]],
+            [body_id for body_ids in cable_body_ids for body_id in body_ids[:-pinned_tail_count]],
             dtype=wp.int32,
             device=device,
         )
@@ -1544,8 +1943,47 @@ class Rj45NewtonAssembly:
             [ids[:CABLE_KINEMATIC_COUNT] for ids in cable_body_ids], dtype=wp.int32, device=device
         )
         self.pinned_cable_body_ids = wp.array([ids[-1] for ids in cable_body_ids], dtype=wp.int32, device=device)
+        self.pinned_cable_tail_body_ids = wp.array(
+            [ids[-pinned_tail_count:] for ids in cable_body_ids], dtype=wp.int32, device=device
+        )
         self.task_body_ids = wp.array([record.ids.task_body_ids for record in records], dtype=wp.int32, device=device)
         self.default_body_q = wp.array([record.default_body_q for record in records], dtype=wp.transform, device=device)
+        unplugged_plug_position = geometry.plug_position + wp.vec3(0.0, PLUG_Y_OFFSET, 0.0)
+        self.cable_prefix_point_offsets = wp.array(
+            [point - unplugged_plug_position for point in geometry.cable_points[: CABLE_KINEMATIC_COUNT + 1]],
+            dtype=wp.vec3,
+            device=device,
+        )
+        self.cable_segment_lengths = wp.array(
+            [
+                float(wp.length(geometry.cable_points[index + 1] - geometry.cable_points[index]))
+                for index in range(layout.cable_segment_count)
+            ],
+            dtype=wp.float32,
+            device=device,
+        )
+        self.cable_prefix_rotations = wp.array(
+            geometry.cable_quaternions[:CABLE_KINEMATIC_COUNT],
+            dtype=wp.quat,
+            device=device,
+        )
+        has_anchored_connector = [record.anchored_connector_q_w is not None for record in records]
+        if any(has_anchored_connector) and not all(has_anchored_connector):
+            raise RuntimeError("RJ45 worlds cannot mix anchored and unanchored workcell topology.")
+        if all(has_anchored_connector):
+            self.anchored_connector_q_w = wp.array(
+                [record.anchored_connector_q_w for record in records],
+                dtype=wp.transform,
+                device=device,
+            )
+            self.anchored_cable_endpoint_w = wp.array(
+                [record.anchored_cable_endpoint_w for record in records],
+                dtype=wp.vec3,
+                device=device,
+            )
+        else:
+            self.anchored_connector_q_w = None
+            self.anchored_cable_endpoint_w = None
         self.default_goal_target_w = wp.array(
             [record.goal_target_w for record in records], dtype=wp.vec3, device=device
         )
@@ -1561,12 +1999,16 @@ class Rj45NewtonAssembly:
         self._all_env_mask = wp.ones(self.num_worlds, dtype=wp.bool, device=device)
         self._anchor_offsets = wp.array(geometry.anchor_offsets, dtype=wp.vec3, device=device)
         self._anchor_rotations = wp.array(geometry.anchor_rotations, dtype=wp.quat, device=device)
-        self._align_body_ids = wp.array([ids[align_start:-1] for ids in cable_body_ids], dtype=wp.int32, device=device)
-        self._align_next_body_ids = wp.array(
-            [ids[align_start + 1 :] for ids in cable_body_ids], dtype=wp.int32, device=device
+        self._align_body_ids = wp.array(
+            [ids[align_start:align_stop] for ids in cable_body_ids], dtype=wp.int32, device=device
         )
-        self._align_next_start_offsets = wp.array(geometry.align_next_start_offsets, dtype=wp.vec3, device=device)
-        self._align_count = len(geometry.align_next_start_offsets)
+        self._align_next_body_ids = wp.array(
+            [ids[align_start + 1 : align_stop + 1] for ids in cable_body_ids], dtype=wp.int32, device=device
+        )
+        self._align_count = align_stop - align_start
+        self._align_next_start_offsets = wp.array(
+            geometry.align_next_start_offsets[: self._align_count], dtype=wp.vec3, device=device
+        )
 
     def prepare_step(self, state: newton.State) -> None:
         """Apply anti-gravity/drive forces and synchronize cable anchors.

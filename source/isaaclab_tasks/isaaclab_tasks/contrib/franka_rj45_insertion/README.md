@@ -7,12 +7,18 @@ SPDX-License-Identifier: BSD-3-Clause
 
 # Franka RJ45 tasks
 
-This package provides two distinct reset-driven tasks. The original
+This package provides four distinct reset-driven Franka tasks. The original
 `IsaacContrib-Franka-RJ45-Insertion` starts with the cable already grasped near
 the socket. `IsaacContrib-Franka-RJ45-Pick-Insert` adds the complete open-hand
 approach, grasp, transport, alignment, and insertion problem described below.
+`IsaacContrib-Franka-RJ45-Dual-Rack-Insert` extends that workflow to one
+two-ended cable between two rack-mounted connectors. The
+`IsaacContrib-Franka-RJ45-GB300-Insert` variant presents the same physical
+two-ended problem at native modeled ports on NVIDIA's SimReady GB300 rack.
+The separate, small Rizon/Sharpa cable teleoperation task now lives in the
+sibling `rizon_sharpa_cable` package and does not import this Franka task.
 
-Both tasks combine Newton's mechanically latched RJ45 plug example with the
+All four tasks combine Newton's mechanically latched RJ45 plug example with the
 reset-dataset learning workflow used by the contributed Franka tasks. The
 socket, plug, latch, source cable curve, SDF settings, cable rod, four
 plug-relative cable anchors, pinned tail, latch joint, and contact parameters
@@ -20,7 +26,7 @@ come from Newton commit
 `7bb6d02d8eeab2cffc3adfa453ddd63799a2ac6a`. The unmodified source USD and its
 Apache-2.0 attribution are kept in `physics/assets/`.
 
-Both tasks add a Menagerie Franka driven by MJWarp and couple its hand and
+All four tasks add a Menagerie Franka driven by MJWarp and couple its hand and
 finger collision proxies into the VBD-owned RJ45 assembly. A massless,
 invisible, finger-only collider covers the plug's rear housing so the gripper
 can transfer force without changing the original plug/socket/latch contact
@@ -55,7 +61,7 @@ commands. The pick-only Franka enables native MJWarp joint
 disabled, so the cable model is never passed through inverse dynamics. A 7D
 arm-target-error term exposes the controller state to the policy, making the
 actor input 135D and the asymmetric critic input 138D. These choices are
-fail-closed in task contract 6, pick-insert semantics 6, reset-dataset schema 3,
+fail-closed in task contract 8, pick-insert semantics 8, reset-dataset schema 3,
 and validation-report schema 5.
 
 The scene uses the Seattle Lab table USD at the Franka-stack pose
@@ -81,6 +87,80 @@ Newton GL does not traverse the USD stage, so standalone play uses a lightweight
 marker proxy with the same outer bounds, 47 neighboring port openings, and an
 accent around the one active port. These markers are also render-only and never
 enter the Newton model or task contract.
+
+## Two-ended rack variants
+
+`IsaacContrib-Franka-RJ45-Dual-Rack-Insert` adds one second exact socket, plug,
+and latch, pins the final four cable strain-relief segments to that already
+seated end, and leaves only the opposite plug learnable. The actor retains every
+135D pick-and-insert term and appends the occupied socket pose, occupied plug
+pose, and anchored cable-end error for a 152D actor / 155D critic interface.
+Two detailed AS4610 presentations and a grooved T-slot frame are render-only;
+the physical workcell uses inexpensive cuboids with open connector and robot
+service corridors.
+
+`IsaacContrib-Franka-RJ45-GB300-Insert` keeps that two-ended policy interface
+and replaces the decorative workcell with the pinned SimReady GB300 exterior.
+The source CAD already contains two detailed SN2201 switches with 48 modeled
+1GBase-T RJ45 jacks each. The rack is placed so one native switch bank is in the
+Franka workspace; eight of its actual jacks are target candidates and a ninth
+holds the already-seated cable end. No service panel, bezel, or replacement
+port is drawn. Every persisted reset row selects one target uniformly and moves
+one hidden exact RJ45 socket SDF behind that native jack for insertion physics.
+All other authored ports remain CAD-only and create no SDFs, bodies, or contact
+pairs. Recessed cabinet cuboids and a service-bay backstop approximate the
+GB300 for robot/cable collision while leaving its front approach open.
+Kit presents the active cabinet and seven neighboring GB200/GB300 cabinets in
+one gapless, consistently front-facing row, reusing the same immutable source
+payload and layer caches. The cabinets retain their native -90-degree yaw:
+their local +X front maps to environment -Y, while the Franka and exact RJ45
+task remain in the standard identity frame. This maps the hidden sockets to
+the visible jack apertures instead of the cabinet side. The GB300 variant has
+no Seattle table visual or contact slab; the anchored physical cable hangs in
+the open workcell. A glossy white floor, matte backwall, robot pedestal, and
+the seven neighboring cabinets complete the presentation. This task contains
+only its one physical task cable; the standalone Rizon/Sharpa teleoperation
+scene and cable live exclusively in the sibling package.
+
+The GB300 exterior is presentation-only and is never loaded by headless
+training, reset generation, or task-contract discovery. Kit verifies revision
+`5938869019f0d2afb6b9b808ed1ab1bc6e0e0961` of NVIDIA's
+`nvidia/simready-dsx` dataset: `external.usd` is 473,434,496 bytes with SHA-256
+`5e0b7b3b58d005b24909b8d2e735c49997f8dbea72352b51911326343ef1e7bb`
+and is used under CC-BY-4.0. Place it at:
+
+```text
+~/.cache/isaaclab/simready-dsx/sha256/5e0b7b3b58d005b24909b8d2e735c49997f8dbea72352b51911326343ef1e7bb/external.usd
+```
+
+or set `ISAACLAB_SIMREADY_DSX_GB300_ROOT` to that file or its containing
+directory. Newton GL uses a cheap marker silhouette and therefore does not need
+the CAD payload.
+
+Generate each two-ended bank in two fail-closed steps: first certify one
+physically seated canonical goal, then create the balanced 20,004-row fast bank
+with batched IK, analytic geometry checks, exact Newton collide-only queries,
+and a source-bound validation report:
+
+```bash
+uv run python scripts/tools/generate_franka_rj45_dual_rack_reset_dataset.py \
+  --canonical-goal-certificate-output datasets/franka_rj45_dual_rack_insert/canonical_goal_certificate.pt \
+  --device cuda:0 --visualizer none
+uv run python scripts/tools/generate_franka_rj45_dual_rack_reset_dataset.py \
+  --canonical-goal-certificate-input datasets/franka_rj45_dual_rack_insert/canonical_goal_certificate.pt \
+  --validate --device cuda:0 --visualizer none
+
+uv run python scripts/tools/generate_franka_rj45_gb300_reset_dataset.py \
+  --canonical-goal-certificate-output datasets/franka_rj45_gb300_insert/canonical_goal_certificate.pt \
+  --device cuda:0 --visualizer none
+uv run python scripts/tools/generate_franka_rj45_gb300_reset_dataset.py \
+  --canonical-goal-certificate-input datasets/franka_rj45_gb300_insert/canonical_goal_certificate.pt \
+  --validate --device cuda:0 --visualizer none
+```
+
+The fast report certifies only the persisted IK, finite/joint/workspace,
+analytic separation, and instantaneous Newton collision state; it deliberately
+does not claim dynamic reset replay or scripted recovery.
 
 ### Pinned external scene assets
 

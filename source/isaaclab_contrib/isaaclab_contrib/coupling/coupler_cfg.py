@@ -107,6 +107,14 @@ class CouplerProxyMappingCfg:
     mode: Literal["lagged", "staggered"] = "lagged"
     """Proxy transfer mode passed to Newton's coupled-proxy solver."""
 
+    proxy_relaxation: float = 1.0
+    """Fixed relaxation applied to feedback returned to the source entry.
+
+    A value of ``1`` preserves Newton's normal bidirectional proxy coupling.
+    A value of ``0`` keeps source-to-destination pose transfer and destination
+    contacts, but suppresses all destination-to-source feedback.
+    """
+
     mass_scale: float = 1.0
     """Scale applied to proxy body mass/inertia and particle mass in the destination view."""
 
