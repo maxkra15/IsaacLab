@@ -19,6 +19,10 @@ GB300_SIMREADY_EXTERNAL_USD_SHA256 = "5e0b7b3b58d005b24909b8d2e735c49997f8dbea72
 GB300_SIMREADY_EXTERNAL_USD_SIZE = 473_434_496
 GB300_SIMREADY_LICENSE = "CC-BY-4.0"
 GB300_SIMREADY_ASSET_ROOT_ENV = "ISAACLAB_SIMREADY_DSX_GB300_ROOT"
+GB300_SIMREADY_DOWNLOAD_URL = (
+    "https://huggingface.co/datasets/nvidia/simready-dsx/resolve/"
+    f"{GB300_SIMREADY_REVISION}/{GB300_SIMREADY_RELATIVE_PATH}?download=true"
+)
 
 GB300_SHOWROOM_RACK_COUNT = 8
 GB300_SHOWROOM_RACK_SPACING_X_M = 0.6569000133217894
@@ -82,7 +86,7 @@ def configured_gb300_external_usd() -> Path:
     if not candidate.is_file():
         raise FileNotFoundError(
             "The Rizon Sharpa showroom requires the pinned SimReady GB300 payload at "
-            f"{candidate}, or via {GB300_SIMREADY_ASSET_ROOT_ENV}."
+            f"{candidate}. Download {GB300_SIMREADY_DOWNLOAD_URL}, or set {GB300_SIMREADY_ASSET_ROOT_ENV}."
         )
     return verify_gb300_external_usd(candidate)
 

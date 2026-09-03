@@ -85,12 +85,33 @@ uv run --frozen --no-sync isaaclab teleop run \
   --kit_args "--/renderer/multiGpu/enabled=false --/renderer/multiGpu/autoEnable=false --/renderer/multiGpu/maxGpuCount=1"
 ```
 
-The pinned robot bundle is resolved from
-`ISAACLAB_FABRICS_SIM_RIZON_SHARPA_ROOT`, or from its content-addressed cache
-under `~/.cache/isaaclab/fabrics-sim/rizon4s-sharpa/sha256/`.
-The render-only rack payload is resolved from
-`ISAACLAB_SIMREADY_DSX_GB300_ROOT`, or from its pinned content-addressed cache
-under `~/.cache/isaaclab/simready-dsx/sha256/`.
+### External asset downloads
+
+Download the render-only rack from NVIDIA's public
+[`GB300 external.usd`](https://huggingface.co/datasets/nvidia/simready-dsx/resolve/5938869019f0d2afb6b9b808ed1ab1bc6e0e0961/GB300/simready_usd/payloads/external.usd?download=true)
+at pinned SimReady-DSX revision
+`5938869019f0d2afb6b9b808ed1ab1bc6e0e0961`. Place the 473,434,496-byte file
+at:
+
+```text
+~/.cache/isaaclab/simready-dsx/sha256/5e0b7b3b58d005b24909b8d2e735c49997f8dbea72352b51911326343ef1e7bb/external.usd
+```
+
+Download the robot USD and its `textures/` directory from the SSO-gated
+[`rizon4s_sharpa_no_spheres` source directory](https://gitlab-master.nvidia.com/dex/fabrics-sim/-/tree/d0dbd1ddaefc4996db546949a7dfb37e39afcbeb/src/fabrics_sim/models/robots/urdf/rizon4s_sharpa/rizon4s_sharpa_no_spheres)
+at pinned Fabrics-Sim revision
+`d0dbd1ddaefc4996db546949a7dfb37e39afcbeb`. Preserve this layout:
+
+```text
+~/.cache/isaaclab/fabrics-sim/rizon4s-sharpa/sha256/ae5d22792b44fb6d29a7691d4276bc061a5529132f01e7a0eb5795a482595d63/
+|-- rizon4s_sharpa_no_spheres_generated.usd
+`-- textures/
+```
+
+Alternatively, set `ISAACLAB_SIMREADY_DSX_GB300_ROOT` to the downloaded GB300
+file (or its directory) and `ISAACLAB_FABRICS_SIM_RIZON_SHARPA_ROOT` to the
+downloaded robot bundle directory. Startup verifies the pinned sizes and
+SHA-256 digests before loading either asset.
 
 The finger-retargeting reference is NVIDIA's public
 [`IsaacTeleop`](https://github.com/NVIDIA/IsaacTeleop) repository at commit

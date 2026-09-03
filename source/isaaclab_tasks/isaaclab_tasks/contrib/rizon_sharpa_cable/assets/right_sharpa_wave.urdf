@@ -2,7 +2,7 @@
 <robot name="right_sharpa_wave">
   <mujoco>
     <compiler meshdir="meshes" balanceinertia="true" discardvisual="false" />
-  </mujoco>
+  </mujoco>  
   <link name="right_hand_C_MC">
     <inertial>
       <origin

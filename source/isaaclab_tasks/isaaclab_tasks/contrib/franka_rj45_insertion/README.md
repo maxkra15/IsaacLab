@@ -124,8 +124,11 @@ scene and cable live exclusively in the sibling package.
 
 The GB300 exterior is presentation-only and is never loaded by headless
 training, reset generation, or task-contract discovery. Kit verifies revision
-`5938869019f0d2afb6b9b808ed1ab1bc6e0e0961` of NVIDIA's
-`nvidia/simready-dsx` dataset: `external.usd` is 473,434,496 bytes with SHA-256
+`5938869019f0d2afb6b9b808ed1ab1bc6e0e0961` of NVIDIA's public
+[`nvidia/simready-dsx` dataset](https://huggingface.co/datasets/nvidia/simready-dsx/tree/5938869019f0d2afb6b9b808ed1ab1bc6e0e0961/GB300/simready_usd/payloads).
+Download the pinned
+[`external.usd`](https://huggingface.co/datasets/nvidia/simready-dsx/resolve/5938869019f0d2afb6b9b808ed1ab1bc6e0e0961/GB300/simready_usd/payloads/external.usd?download=true);
+it is 473,434,496 bytes with SHA-256
 `5e0b7b3b58d005b24909b8d2e735c49997f8dbea72352b51911326343ef1e7bb`
 and is used under CC-BY-4.0. Place it at:
 

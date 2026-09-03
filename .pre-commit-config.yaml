@@ -16,6 +16,8 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # Preserve byte-pinned third-party assets exactly as published upstream.
+        exclude: '^source/isaaclab_tasks/isaaclab_tasks/contrib/rizon_sharpa_cable/assets/right_sharpa_wave\.urdf$'
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: check-added-large-files
@@ -57,7 +59,7 @@ repos:
           - --license-filepath
           - .github/LICENSE_HEADER.txt
           - --use-current-year
-        exclude: "source/isaaclab_mimic/|scripts/imitation_learning/isaaclab_mimic/"
+        exclude: 'source/isaaclab_mimic/|scripts/imitation_learning/isaaclab_mimic/|source/isaaclab_tasks/isaaclab_tasks/contrib/rizon_sharpa_cable/assets/sharpa_wave_right_dexpilot\.yml$'
   # Apache 2.0 license for mimic files
   - repo: https://github.com/Lucas-C/pre-commit-hooks
     rev: v1.5.5

@@ -19,6 +19,11 @@ RIZON_SHARPA_RELATIVE_PATH = (
     "src/fabrics_sim/models/robots/urdf/rizon4s_sharpa/"
     "rizon4s_sharpa_no_spheres/rizon4s_sharpa_no_spheres_generated.usd"
 )
+RIZON_SHARPA_SOURCE_TREE_URL = (
+    "https://gitlab-master.nvidia.com/dex/fabrics-sim/-/tree/"
+    f"{RIZON_SHARPA_REVISION}/src/fabrics_sim/models/robots/urdf/"
+    "rizon4s_sharpa/rizon4s_sharpa_no_spheres"
+)
 RIZON_SHARPA_USD_NAME = "rizon4s_sharpa_no_spheres_generated.usd"
 RIZON_SHARPA_USD_SHA256 = "24f59deb88db896563aa74a4001e8522b75af6060493ab7bb652f21d81efcff8"
 RIZON_SHARPA_BUNDLE_SHA256 = "ae5d22792b44fb6d29a7691d4276bc061a5529132f01e7a0eb5795a482595d63"
@@ -182,7 +187,8 @@ def configured_rizon_sharpa_usd(*, required: bool) -> Path | None:
         if required:
             raise FileNotFoundError(
                 "The Rizon Sharpa task needs the pinned Fabrics-Sim bundle. "
-                f"Check out {RIZON_SHARPA_REPOSITORY} at {RIZON_SHARPA_REVISION}, copy "
+                f"Download the SSO-gated source directory from {RIZON_SHARPA_SOURCE_TREE_URL}, "
+                f"or check out {RIZON_SHARPA_REPOSITORY} at {RIZON_SHARPA_REVISION}; copy "
                 f"{RIZON_SHARPA_RELATIVE_PATH} and its sibling textures to {candidate}, "
                 f"or set {RIZON_SHARPA_ASSET_ROOT_ENV}."
             )
@@ -237,6 +243,7 @@ __all__ = [
     "RIZON_SHARPA_RIGHT_HAND_LIMITS_RAD",
     "RIZON_SHARPA_RIGHT_HAND_JOINT_NAMES",
     "RIZON_SHARPA_RIGHT_HAND_OPEN_RAD",
+    "RIZON_SHARPA_SOURCE_TREE_URL",
     "RIZON_SHARPA_USD_NAME",
     "RIZON_SHARPA_USD_SHA256",
     "configured_rizon_sharpa_usd",
