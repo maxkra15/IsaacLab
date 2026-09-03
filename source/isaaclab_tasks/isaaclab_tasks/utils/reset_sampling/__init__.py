@@ -6,13 +6,16 @@
 """Task-independent building blocks for adaptive reset-state sampling."""
 
 from .catalog import ResetStateCatalog
-from .cfg import AdaptiveResetSamplerCfg, RollingOutcomeMonitorCfg
+from .cfg import AdaptiveResetSamplerCfg, ContinuousAdaptiveResetSamplerCfg, RollingOutcomeMonitorCfg
+from .continuous_sampler import ContinuousAdaptiveResetSampler
 from .monitor import RollingOutcomeMonitor
 from .sampler import AdaptiveResetSampler
 
 __all__ = [
     "AdaptiveResetSampler",
     "AdaptiveResetSamplerCfg",
+    "ContinuousAdaptiveResetSampler",
+    "ContinuousAdaptiveResetSamplerCfg",
     "ResetStateCatalog",
     "RollingOutcomeMonitor",
     "RollingOutcomeMonitorCfg",

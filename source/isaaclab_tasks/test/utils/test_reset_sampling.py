@@ -11,6 +11,8 @@ import torch
 from isaaclab_tasks.utils.reset_sampling import (
     AdaptiveResetSampler,
     AdaptiveResetSamplerCfg,
+    ContinuousAdaptiveResetSampler,
+    ContinuousAdaptiveResetSamplerCfg,
     ResetStateCatalog,
     RollingOutcomeMonitor,
     RollingOutcomeMonitorCfg,
@@ -191,3 +193,92 @@ def test_sampler_state_roundtrip_restores_rng_and_coverage_cycle() -> None:
 
     assert torch.equal(first.sample(31, rates), restored.sample(31, rates))
     assert first.metrics(rates) == restored.metrics(rates)
+
+
+def test_continuous_sampler_learns_a_target_rate_frontier_from_nearby_outcomes() -> None:
+    """Kernel evidence generalizes in parameter space and peaks sampling near 50% success."""
+    features = torch.linspace(0.0, 1.0, 5).unsqueeze(1)
+    sampler = ContinuousAdaptiveResetSampler(
+        features,
+        torch.zeros(5, dtype=torch.long),
+        ContinuousAdaptiveResetSamplerCfg(
+            history_length=128,
+            prior_strength=1.0,
+            kernel_bandwidth=0.12,
+            kappa=4.0,
+            coverage_fraction=0.20,
+        ),
+        "cpu",
+        generator=torch.Generator(device="cpu").manual_seed(7),
+    )
+    sampler.record(
+        torch.tensor([0] * 32 + [2] * 32 + [4] * 32),
+        torch.tensor([False] * 32 + [False, True] * 16 + [True] * 32),
+    )
+
+    rates = sampler.predicted_success_rates()
+    probabilities = sampler.sampling_probabilities()
+    assert rates[0] < 0.05
+    assert rates[2] == pytest.approx(0.5, abs=1.0e-5)
+    assert rates[4] > 0.95
+    assert probabilities[2] > probabilities[0]
+    assert probabilities[2] > probabilities[4]
+    # Uniform coverage gives every eligible point non-zero probability even
+    # when the adaptive frontier considers it mastered or impossible.
+    assert (probabilities >= 0.20 / 5).all()
+
+
+def test_continuous_sampler_does_not_smooth_across_categorical_groups() -> None:
+    """Identical continuous coordinates retain separate physical-phase outcomes."""
+    sampler = ContinuousAdaptiveResetSampler(
+        torch.tensor(((0.4,), (0.4,))),
+        torch.tensor((0, 1)),
+        ContinuousAdaptiveResetSamplerCfg(
+            history_length=64,
+            prior_strength=1.0,
+            kernel_bandwidth=1.0,
+        ),
+        "cpu",
+    )
+    sampler.record(
+        torch.tensor([0] * 16 + [1] * 16),
+        torch.tensor([False] * 16 + [True] * 16),
+    )
+
+    rates = sampler.predicted_success_rates()
+    assert rates[0] < 0.1
+    assert rates[1] > 0.9
+
+
+def test_continuous_sampler_state_roundtrip_restores_model_and_proposal_stream() -> None:
+    """Outcome history, uniform-coverage cursor, and RNG all survive checkpoints."""
+    features = torch.tensor(((0.0,), (0.25,), (0.5,), (0.75,), (1.0,)))
+    groups = torch.tensor((0, 0, 0, 1, 1))
+    cfg = ContinuousAdaptiveResetSamplerCfg(
+        history_length=8,
+        prior_strength=2.0,
+        kernel_bandwidth=0.25,
+        coverage_fraction=0.35,
+    )
+    first = ContinuousAdaptiveResetSampler(
+        features,
+        groups,
+        cfg,
+        "cpu",
+        generator=torch.Generator(device="cpu").manual_seed(19),
+    )
+    first.record(torch.tensor((0, 1, 2, 3, 4)), torch.tensor((False, False, True, True, True)))
+    first.sample(7)
+
+    restored = ContinuousAdaptiveResetSampler(
+        features,
+        groups,
+        cfg,
+        "cpu",
+        generator=torch.Generator(device="cpu").manual_seed(99),
+    )
+    restored.load_state_dict(first.state_dict())
+
+    torch.testing.assert_close(restored.predicted_success_rates(), first.predicted_success_rates())
+    torch.testing.assert_close(restored.sampling_probabilities(), first.sampling_probabilities())
+    torch.testing.assert_close(restored.sample(31), first.sample(31))

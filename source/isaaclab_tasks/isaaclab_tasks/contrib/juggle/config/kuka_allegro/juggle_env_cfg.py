@@ -26,7 +26,11 @@ from isaaclab.visualizers import VisualizerCfg
 
 from isaaclab_tasks.contrib.juggle import mdp
 from isaaclab_tasks.contrib.stack.mdp.kuka_allegro_reset import KUKA_ALLEGRO_ALL_HAND_JOINT_NAMES
-from isaaclab_tasks.utils.reset_sampling import AdaptiveResetSamplerCfg, RollingOutcomeMonitorCfg
+from isaaclab_tasks.utils.reset_sampling import (
+    AdaptiveResetSamplerCfg,
+    ContinuousAdaptiveResetSamplerCfg,
+    RollingOutcomeMonitorCfg,
+)
 
 from isaaclab_assets.robots import KUKA_ALLEGRO_CFG
 
@@ -266,13 +270,19 @@ class EventCfg:
     reset_from_catalog = EventTerm(
         func=mdp.JuggleResetEvent,
         mode="reset",
-        params={"rows_per_phase": 64, "fixed_phase": None, "static_held_only": False},
+        params={
+            "rows_per_phase": 64,
+            "fixed_phase": None,
+            "static_held_only": False,
+            "sampling_mode": "semantic",
+            "continuous_seed": 0,
+        },
     )
 
 
 @configclass
 class CurriculumCfg:
-    """Thirty-five percent held starts, fifteen percent coverage, and fifty percent frontier."""
+    """Configure uniform, semantic-item, or continuous success-model reset sampling."""
 
     reset_sampling = CurrTerm(
         func=mdp.JuggleResetCurriculum,
@@ -288,14 +298,30 @@ class CurriculumCfg:
                 coverage_fraction=0.15 / 0.65,
                 epsilon=1.0e-4,
             ),
+            # Used only by the third, continuously parameterized mode. The
+            # coverage stream walks the complete Sobol proposal bank, while
+            # Gaussian regression shares outcomes between nearby resets but
+            # never across physical phase discontinuities.
+            "continuous_sampler": ContinuousAdaptiveResetSamplerCfg(
+                target_success_rate=0.50,
+                kappa=1.0,
+                temperature=1.0,
+                coverage_fraction=0.15 / 0.65,
+                epsilon=1.0e-4,
+                history_length=4096,
+                prior_strength=2.0,
+                kernel_bandwidth=0.35,
+                prediction_chunk_size=1024,
+            ),
             "canonical_fraction": 0.35,
+            "sampling_mode": "semantic",
         },
     )
 
 
 @configclass
-class KukaAllegroJuggleRLEnvCfg(ManagerBasedRLEnvCfg):
-    """Learn one full vertical toss/catch with the fully actuated KUKA-Allegro."""
+class _KukaAllegroJuggleBaseEnvCfg(ManagerBasedRLEnvCfg):
+    """Internal fully actuated foundation for the standard Juggle task."""
 
     decimation = 2
     episode_length_s = 3.0
@@ -362,10 +388,22 @@ class KukaAllegroJuggleRLEnvCfg(ManagerBasedRLEnvCfg):
         if not self.actions.arm_action.gravity_compensation:
             raise ValueError("The KUKA arm action must enable model-based gravity compensation.")
         if self.curriculum is not None:
+            sampling_mode = self.curriculum.reset_sampling.params.get("sampling_mode", "semantic")
+            reset_sampling_mode = self.events.reset_from_catalog.params.get("sampling_mode", "semantic")
+            if sampling_mode not in ("uniform", "semantic", "continuous"):
+                raise ValueError("Reset sampling mode must be 'uniform', 'semantic', or 'continuous'.")
+            if reset_sampling_mode != sampling_mode:
+                raise ValueError("The reset event and curriculum must use the same sampling mode.")
             canonical = float(self.curriculum.reset_sampling.params["canonical_fraction"])
-            frontier_coverage = float(self.curriculum.reset_sampling.params["adaptive_sampler"].coverage_fraction)
-            if abs(canonical - 0.35) > 1.0e-9 or abs((1.0 - canonical) * frontier_coverage - 0.15) > 1.0e-9:
-                raise ValueError("Reset sampling must retain the 35/15/50 canonical/coverage/adaptive mixture.")
+            sampler_name = "continuous_sampler" if sampling_mode == "continuous" else "adaptive_sampler"
+            frontier_coverage = float(self.curriculum.reset_sampling.params[sampler_name].coverage_fraction)
+            if abs(canonical - 0.35) > 1.0e-9:
+                raise ValueError("Reset sampling must retain 35% canonical held starts.")
+            if (
+                sampling_mode in ("semantic", "continuous")
+                and abs((1.0 - canonical) * frontier_coverage - 0.15) > 1.0e-9
+            ):
+                raise ValueError("Adaptive reset sampling must retain 15% global uniform coverage.")
 
     def play_mode(self) -> None:
         """Evaluate from the canonical held start without adaptive reassignment."""

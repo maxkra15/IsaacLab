@@ -7,16 +7,18 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as functional
 
-from isaaclab.managers import ManagerTermBase, SceneEntityCfg, TerminationTermCfg
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg, TerminationTermCfg
 from isaaclab.utils import math as math_utils
 
 from .reset import (
+    GRAVITY_Z,
     JUGGLE_SPHERE_CENTER_OFFSET,
     JUGGLE_SPHERE_OPEN_HAND_POSITION,
     JUGGLE_SPHERE_PRELOAD_HAND_POSITION,
@@ -88,6 +90,35 @@ def ball_height_and_velocity(
     ball: RigidObject = env.scene[ball_cfg.name]
     height = (ball.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]).unsqueeze(1)
     return torch.cat((height, ball.data.root_lin_vel_w.torch), dim=1)
+
+
+def ball_height_above_release_hand_and_velocity(
+    env: ManagerBasedRLEnv,
+    target_height_gain: float = 1.0,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+    """Return normalized height above the release hand and world velocity.
+
+    The first component is the ball-center height above the last supported hand
+    height, divided by ``target_height_gain``. The remaining three components
+    are the unscaled world-frame ball linear velocity [m/s], preserving the
+    four-element width of :func:`ball_height_and_velocity`.
+
+    Args:
+        env: Manager-based juggling environment.
+        target_height_gain: Positive target height used to normalize the height difference [m].
+        ball_cfg: Ball scene entity.
+
+    Returns:
+        Normalized release-relative height and ball linear velocity, shape ``(N, 4)``.
+    """
+    if target_height_gain <= 0.0:
+        raise ValueError("target_height_gain must be positive.")
+    ball: RigidObject = env.scene[ball_cfg.name]
+    state = get_juggle_runtime_state(env)
+    local_height = ball.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
+    normalized_height = ((local_height - state.release_heights) / float(target_height_gain)).unsqueeze(1)
+    return torch.cat((normalized_height, ball.data.root_lin_vel_w.torch), dim=1)
 
 
 def fingertips_relative_to_ball(
@@ -241,6 +272,7 @@ class JuggleProgressContext(ManagerTermBase):
             env_ids = slice(None)
         state.new_local_success[env_ids] = False
         state.new_cycle_success[env_ids] = False
+        state.new_height_success[env_ids] = False
 
     def __call__(
         self,
@@ -257,13 +289,25 @@ class JuggleProgressContext(ManagerTermBase):
         contact_maximum_relative_speed: float = 0.45,
         stable_maximum_relative_speed: float = 0.20,
         stable_catch_steps: int = 15,
+        apex_maximum_horizontal_displacement: float | None = None,
+        track_supported_release_reference: bool = False,
+        rearm_after_stable_catch: bool = False,
     ) -> torch.Tensor:
         """Update phase progress and return an all-false context mask."""
         if release_clear_steps < 1 or stable_catch_steps < 1:
             raise ValueError("Release-clear and stable-catch dwell lengths must be positive.")
+        if apex_maximum_horizontal_displacement is not None and (
+            not math.isfinite(apex_maximum_horizontal_displacement) or apex_maximum_horizontal_displacement <= 0.0
+        ):
+            raise ValueError("The apex horizontal-displacement limit must be finite and positive.")
+        if not isinstance(track_supported_release_reference, bool):
+            raise TypeError("track_supported_release_reference must be a Boolean value.")
+        if not isinstance(rearm_after_stable_catch, bool):
+            raise TypeError("rearm_after_stable_catch must be a Boolean value.")
         state = get_juggle_runtime_state(env)
         state.new_local_success.zero_()
         state.new_cycle_success.zero_()
+        state.new_height_success.zero_()
         ball: RigidObject = env.scene[ball_cfg.name]
         tool_position, _, tool_linear_velocity, _ = tool_state(env, tool_body_cfg, tool_offset)
         ball_position = ball.data.root_pos_w.torch
@@ -281,9 +325,26 @@ class JuggleProgressContext(ManagerTermBase):
         next_phase = phase.clone()
 
         prethrow = (phase == int(JugglePhase.HELD_PRETHROW)) | (phase == int(JugglePhase.STABLE_CATCH))
+        if track_supported_release_reference:
+            # Preserve the last physically supported hand pose. Once support
+            # is lost this reference stays fixed, so moving the hand after
+            # release cannot make the one-metre target easier. The short-toss
+            # task deliberately retains its original authored reset reference
+            # for checkpoint-compatible success semantics.
+            tool_height = tool_position[:, 2] - env.scene.env_origins[:, 2]
+            tool_position_xy = tool_position[:, :2] - env.scene.env_origins[:, :2]
+            # The calibrated cradle can be supported by proximal/palm geometry
+            # before the public fingertip proxy becomes true. Distance remains
+            # a reliable ownership signal up to the clear-release boundary.
+            supported_prethrow = prethrow & (sphere_supported | (distance < release_separation_distance))
+            state.release_heights.copy_(torch.where(supported_prethrow, tool_height, state.release_heights))
+            state.release_origins_xy.copy_(
+                torch.where(supported_prethrow.unsqueeze(1), tool_position_xy, state.release_origins_xy)
+            )
         state.seen_initial_ascent |= prethrow & (vertical_velocity > 0.25)
         state.first_ascent_active &= ~(prethrow & ~state.seen_initial_ascent & (vertical_velocity < -0.10))
         predicted_apex = local_height + torch.square(torch.clamp_min(vertical_velocity, 0.0)) / (2.0 * 9.81)
+        ball_position_xy = ball_position[:, :2] - env.scene.env_origins[:, :2]
         fresh_release = (
             prethrow
             & state.first_ascent_active
@@ -313,10 +374,16 @@ class JuggleProgressContext(ManagerTermBase):
             vertical_velocity,
         )
         state.first_ascent_active &= ~first_apex_crossing
+        if apex_maximum_horizontal_displacement is None:
+            within_apex_corridor = torch.ones_like(first_apex_crossing)
+        else:
+            horizontal_displacement = torch.linalg.vector_norm(ball_position_xy - state.release_origins_xy, dim=1)
+            within_apex_corridor = horizontal_displacement <= apex_maximum_horizontal_displacement
         valid_apex_clearance = (
             remains_clear
             & (state.release_clear_steps >= release_clear_steps)
             & (local_height >= state.release_heights + apex_height_gain)
+            & within_apex_corridor
         )
         invalid_release = release_or_ascent & first_apex_crossing & ~valid_apex_clearance
         state.seen_release[invalid_release] = False
@@ -338,6 +405,8 @@ class JuggleProgressContext(ManagerTermBase):
         )
         next_phase[fresh_apex] = int(JugglePhase.APEX)
         state.seen_apex[fresh_apex] = True
+        state.new_height_success.copy_(fresh_apex & ~state.height_success)
+        state.height_success |= state.new_height_success
 
         mask = (phase == int(JugglePhase.APEX)) & (vertical_velocity < -0.12)
         next_phase[mask] = int(JugglePhase.DESCENDING)
@@ -379,7 +448,8 @@ class JuggleProgressContext(ManagerTermBase):
         )
         state.current_phases.copy_(next_phase)
         state.visited_phase_bits |= torch.bitwise_left_shift(torch.ones_like(next_phase), next_phase)
-        goal_ids = self._local_goals[state.start_phases]
+        phase_goal_ids = self._local_goals[state.start_phases]
+        goal_ids = torch.where(state.local_goal_ids >= 0, state.local_goal_ids, phase_goal_ids)
         apex_goal = goal_ids == int(JuggleLocalGoal.FLIGHT_APEX)
         approach_goal = goal_ids == int(JuggleLocalGoal.CATCH_APPROACH)
         contact_goal = goal_ids == int(JuggleLocalGoal.CATCH_CONTACT)
@@ -396,18 +466,264 @@ class JuggleProgressContext(ManagerTermBase):
 
         required_bits = sum(1 << int(phase_id) for phase_id in JugglePhase if phase_id != JugglePhase.HELD_PRETHROW)
         visited_cycle = (state.visited_phase_bits & required_bits) == required_bits
-        cycle_eligible = state.start_phases == int(JugglePhase.HELD_PRETHROW)
+        cycle_eligible = state.canonical_start
         completed_cycle = cycle_eligible & state.seen_release & state.seen_apex & visited_cycle & became_stable
-        state.new_cycle_success.copy_(completed_cycle & ~state.cycle_success)
+        # Non-rearmed callers latch their first completion. Juggle training
+        # retains episode-level success while emitting a fresh reward pulse for
+        # every later physical catch-and-relaunch cycle.
+        state.new_cycle_success.copy_(
+            completed_cycle if rearm_after_stable_catch else completed_cycle & ~state.cycle_success
+        )
         state.cycle_success |= state.new_cycle_success
-        env.extras["successes"] = state.cycle_success
-        env.extras["static_held_successes"] = state.cycle_success & state.static_held_start
+        # Extras may outlive the termination pass and the runtime tensors are
+        # cleared in-place during autoreset. Clone terminal values so logging
+        # cannot observe the reset mutation instead of the completed episode.
+        env.extras["successes"] = state.cycle_success.clone()
+        env.extras["static_held_successes"] = (state.cycle_success & state.static_held_start).clone()
+        if rearm_after_stable_catch:
+            # Endless play keeps the physical catch untouched and only starts
+            # a fresh logical cycle. The phase label matches a pre-throw start,
+            # but the caught posture remains physical and must be covered by
+            # multi-cycle training rather than being teleported to a reset row.
+            rearm = became_stable
+            held_phase = int(JugglePhase.HELD_PRETHROW)
+            state.current_phases[rearm] = held_phase
+            state.visited_phase_bits[rearm] = 1 << held_phase
+            state.stable_catch_steps[rearm] = 0
+            state.release_clear_steps[rearm] = 0
+            state.first_ascent_active[rearm] = True
+            state.seen_initial_ascent[rearm] = False
+            state.seen_release[rearm] = False
+            state.seen_apex[rearm] = False
+            state.height_success[rearm] = False
         return self._no_termination
 
 
 def local_transition_pulse(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return a unit-integral pulse on the first phase-local success."""
     return get_juggle_runtime_state(env).new_local_success.float() / max(float(env.step_dt), 1.0e-6)
+
+
+def apex_height_pulse(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return a unit-integral pulse for an apex caused by the trained reset goal."""
+    state = get_juggle_runtime_state(env)
+    apex_goal = state.local_goal_ids <= int(JuggleLocalGoal.FLIGHT_APEX)
+    success = state.new_height_success & (state.canonical_start | apex_goal)
+    return success.float() / max(float(env.step_dt), 1.0e-6)
+
+
+def non_height_local_transition_pulse(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return a unit-integral pulse for a fresh local success other than apex height."""
+    state = get_juggle_runtime_state(env)
+    success = state.new_local_success & ~state.new_height_success
+    return success.float() / max(float(env.step_dt), 1.0e-6)
+
+
+def juggle_physical_progress_potential(
+    env: ManagerBasedRLEnv,
+    tool_body_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=["palm_link"]),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+    tool_offset: tuple[float, float, float] = JUGGLE_SPHERE_CENTER_OFFSET,
+    target_height_gain: float = 1.0,
+    apex_maximum_horizontal_displacement: float = 0.15,
+    catch_distance_scale: float = 0.12,
+    catch_relative_speed_scale: float = 0.45,
+    canonical_launch_fraction: float = 0.5,
+) -> torch.Tensor:
+    """Return bounded, label-free launch/catch progress from live physics.
+
+    Launch progress predicts the first ballistic apex from the ball's current
+    height and velocity, then discounts trajectories whose predicted apex
+    leaves the configured horizontal corridor. Catch progress rewards reducing
+    both ball/tool distance and relative speed. Non-canonical reset episodes
+    use the complete ``[0, 1]`` range until their local goal succeeds, then
+    continue with the same launch/catch staging as a full-cycle episode. The
+    first half is reserved for launch and the second for catch, making the
+    stage boundary continuous at a qualified apex.
+    """
+    positive_parameters = (
+        ("target_height_gain", target_height_gain),
+        ("apex_maximum_horizontal_displacement", apex_maximum_horizontal_displacement),
+        ("catch_distance_scale", catch_distance_scale),
+        ("catch_relative_speed_scale", catch_relative_speed_scale),
+    )
+    for name, value in positive_parameters:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and positive.")
+    if (
+        isinstance(canonical_launch_fraction, bool)
+        or not isinstance(canonical_launch_fraction, (int, float))
+        or not math.isfinite(canonical_launch_fraction)
+        or not 0.0 < canonical_launch_fraction < 1.0
+    ):
+        raise ValueError("canonical_launch_fraction must lie strictly inside (0, 1).")
+
+    state = get_juggle_runtime_state(env)
+    ball: RigidObject = env.scene[ball_cfg.name]
+    ball_position = ball.data.root_pos_w.torch
+    ball_velocity = ball.data.root_lin_vel_w.torch
+    local_position = ball_position - env.scene.env_origins
+    upward_velocity = ball_velocity[:, 2].clamp_min(0.0)
+    time_to_apex = upward_velocity / -float(GRAVITY_Z)
+    predicted_height_gain = (
+        local_position[:, 2] - state.release_heights + torch.square(upward_velocity) / (-2.0 * float(GRAVITY_Z))
+    )
+    height_quality = (predicted_height_gain / float(target_height_gain)).clamp(0.0, 1.0)
+    predicted_apex_xy = local_position[:, :2] + ball_velocity[:, :2] * time_to_apex.unsqueeze(1)
+    predicted_apex_displacement = torch.linalg.vector_norm(predicted_apex_xy - state.release_origins_xy, dim=1)
+    corridor_quality = (1.0 - predicted_apex_displacement / float(apex_maximum_horizontal_displacement)).clamp(0.0, 1.0)
+    launch_potential = height_quality * corridor_quality
+
+    tool_position, _, tool_linear_velocity, _ = tool_state(env, tool_body_cfg, tool_offset)
+    distance = torch.linalg.vector_norm(ball_position - tool_position, dim=1)
+    relative_speed = torch.linalg.vector_norm(ball_velocity - tool_linear_velocity, dim=1)
+    distance_ratio = distance / float(catch_distance_scale)
+    speed_ratio = relative_speed / float(catch_relative_speed_scale)
+    catch_potential = torch.reciprocal(1.0 + torch.square(distance_ratio)) * torch.reciprocal(
+        1.0 + torch.square(speed_ratio)
+    )
+
+    legacy_goal_lookup = torch.tensor(
+        [int(local_goal_for_phase(phase)) for phase in JugglePhase],
+        dtype=torch.long,
+        device=state.local_goal_ids.device,
+    )
+    goal_ids = torch.where(state.local_goal_ids >= 0, state.local_goal_ids, legacy_goal_lookup[state.start_phases])
+    apex_goal = goal_ids == int(JuggleLocalGoal.FLIGHT_APEX)
+    continuous_cycle = state.canonical_start | state.local_success
+    continuous_catch_stage = continuous_cycle & state.height_success
+    continuous_launch_stage = continuous_cycle & ~state.height_success
+    potential = torch.where(apex_goal, launch_potential, catch_potential)
+    potential = torch.where(
+        continuous_launch_stage,
+        float(canonical_launch_fraction) * launch_potential,
+        potential,
+    )
+    potential = torch.where(
+        continuous_catch_stage,
+        float(canonical_launch_fraction) + (1.0 - float(canonical_launch_fraction)) * catch_potential,
+        potential,
+    )
+    return torch.nan_to_num(potential, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+
+
+class JugglePhysicalProgressReward(ManagerTermBase):
+    """Return reset-aware discounted differences of physical juggling progress."""
+
+    _POTENTIAL_PARAMETER_NAMES = (
+        "tool_body_cfg",
+        "ball_cfg",
+        "tool_offset",
+        "target_height_gain",
+        "apex_maximum_horizontal_displacement",
+        "catch_distance_scale",
+        "catch_relative_speed_scale",
+        "canonical_launch_fraction",
+    )
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._previous = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+        self._baseline_valid = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._skip_next = torch.ones_like(self._baseline_valid)
+        self._previous_phase = get_juggle_runtime_state(env).current_phases.clone()
+        self._potential_parameters = {
+            name: cfg.params[name] for name in self._POTENTIAL_PARAMETER_NAMES if name in cfg.params
+        }
+
+    def _potential(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        return juggle_physical_progress_potential(env, **self._potential_parameters)
+
+    def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
+        """Latch the post-event physical reset as a zero-credit baseline."""
+        selected = slice(None) if env_ids is None else env_ids
+        current = self._potential(self._env)
+        self._previous[selected] = current[selected]
+        self._baseline_valid[selected] = True
+        self._previous_phase[selected] = get_juggle_runtime_state(self._env).current_phases[selected]
+        # The first manager evaluation may include simulator settling from the
+        # authored row. Re-baseline it instead of crediting that passive motion.
+        self._skip_next[selected] = True
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        gamma: float = 1.0,
+        drop_termination_name: str = "ball_out_of_workspace",
+        tool_body_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=["palm_link"]),
+        ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+        tool_offset: tuple[float, float, float] = JUGGLE_SPHERE_CENTER_OFFSET,
+        target_height_gain: float = 1.0,
+        apex_maximum_horizontal_displacement: float = 0.15,
+        catch_distance_scale: float = 0.12,
+        catch_relative_speed_scale: float = 0.45,
+        canonical_launch_fraction: float = 0.5,
+    ) -> torch.Tensor:
+        """Return ``(gamma * Phi(next) - Phi(previous)) / step_dt``.
+
+        A dropped-ball terminal has zero potential on the same step, repaying
+        progress already collected. RewardManager multiplies the returned rate
+        by ``step_dt``, leaving an integrated shaping delta bounded by one.
+        """
+        if isinstance(gamma, bool) or not isinstance(gamma, (int, float)) or not math.isfinite(gamma):
+            raise ValueError("gamma must be finite.")
+        if not 0.0 < gamma <= 1.0:
+            raise ValueError("gamma must lie inside (0, 1].")
+        if not isinstance(drop_termination_name, str) or not drop_termination_name:
+            raise ValueError("drop_termination_name must not be empty.")
+        step_dt = float(env.step_dt)
+        if not math.isfinite(step_dt) or step_dt <= 0.0:
+            raise ValueError("The environment step_dt must be finite and positive.")
+
+        current = juggle_physical_progress_potential(
+            env,
+            tool_body_cfg=tool_body_cfg,
+            ball_cfg=ball_cfg,
+            tool_offset=tool_offset,
+            target_height_gain=target_height_gain,
+            apex_maximum_horizontal_displacement=apex_maximum_horizontal_displacement,
+            catch_distance_scale=catch_distance_scale,
+            catch_relative_speed_scale=catch_relative_speed_scale,
+            canonical_launch_fraction=canonical_launch_fraction,
+        )
+        try:
+            dropped = env.termination_manager.get_term(drop_termination_name).to(dtype=torch.bool)
+        except KeyError as error:
+            raise ValueError(f"Unknown termination term: {drop_termination_name!r}.") from error
+        terminal_potential = torch.where(dropped, torch.zeros_like(current), current)
+        missing_baseline = ~self._baseline_valid
+        previous = torch.where(missing_baseline, current, self._previous)
+        delta = float(gamma) * terminal_potential - previous
+        state = get_juggle_runtime_state(env)
+        held_phase = state.current_phases == int(JugglePhase.HELD_PRETHROW)
+        rearmed_cycle = held_phase & (self._previous_phase != int(JugglePhase.HELD_PRETHROW))
+        completed_local_stage = state.new_local_success & ~state.canonical_start
+        zero_credit_rebaseline = (
+            self._skip_next | missing_baseline | state.new_cycle_success | rearmed_cycle | completed_local_stage
+        ) & ~dropped
+        delta = torch.where(zero_credit_rebaseline, torch.zeros_like(delta), delta)
+        self._previous.copy_(terminal_potential)
+        self._previous_phase.copy_(state.current_phases)
+        self._baseline_valid.fill_(True)
+        self._skip_next.zero_()
+        return torch.nan_to_num(delta / step_dt, nan=0.0, posinf=1.0 / step_dt, neginf=-1.0 / step_dt).clamp_(
+            -1.0 / step_dt,
+            1.0 / step_dt,
+        )
+
+
+def ball_out_of_workspace_pulse(
+    env: ManagerBasedRLEnv,
+    termination_term_name: str = "ball_out_of_workspace",
+) -> torch.Tensor:
+    """Return a unit-integral pulse for the configured ball-workspace termination."""
+    if not termination_term_name:
+        raise ValueError("termination_term_name must not be empty.")
+    try:
+        out_of_workspace = env.termination_manager.get_term(termination_term_name)
+    except KeyError as error:
+        raise ValueError(f"Unknown termination term: {termination_term_name!r}.") from error
+    return out_of_workspace.float() / max(float(env.step_dt), 1.0e-6)
 
 
 def full_cycle_pulse(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -421,10 +737,9 @@ def cycle_success(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def noncanonical_local_goal_success(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """End phase-reset episodes at their goal while preserving canonical full cycles."""
+    """End a phase-local episode on its fresh physical success event."""
     state = get_juggle_runtime_state(env)
-    canonical = state.start_phases == int(JugglePhase.HELD_PRETHROW)
-    return state.local_success & ~canonical
+    return state.local_success & ~state.canonical_start
 
 
 def ball_out_of_workspace(

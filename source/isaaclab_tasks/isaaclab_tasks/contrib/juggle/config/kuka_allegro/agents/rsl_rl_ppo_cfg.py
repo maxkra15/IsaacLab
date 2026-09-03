@@ -52,7 +52,7 @@ class JuggleGaussianDistribution(GaussianDistribution):
 
 @configclass
 class JuggleGaussianDistributionCfg(RslRlMLPModelCfg.GaussianDistributionCfg):
-    """Configuration for bounded 7-arm plus 16-hand exploration."""
+    """Configuration for bounded arm plus task-specific hand exploration."""
 
     class_name: str = (
         "isaaclab_tasks.contrib.juggle.config.kuka_allegro.agents.rsl_rl_ppo_cfg:JuggleGaussianDistribution"
@@ -64,11 +64,13 @@ class JuggleGaussianDistributionCfg(RslRlMLPModelCfg.GaussianDistributionCfg):
 
 @configclass
 class KukaAllegroJugglePPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """PPO hyperparameters for the sparse, phase-reset juggling task."""
+    """PPO hyperparameters for continuous one-metre juggling."""
 
-    num_steps_per_env = 32
+    # Two nominal cycles fit inside one rollout while GAE can bootstrap longer
+    # five-second episodes across rollout boundaries.
+    num_steps_per_env = 192
     max_iterations = 10_000
-    save_interval = 50
+    save_interval = 10
     init_at_random_ep_len = False
     empirical_normalization = False
     experiment_name = "kuka_allegro_juggle"
@@ -78,19 +80,26 @@ class KukaAllegroJugglePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=True,
-        distribution_cfg=JuggleGaussianDistributionCfg(init_std=0.12),
+        # Raw observations stay in fixed SI/local coordinates, so collection
+        # and PPO updates evaluate likelihoods in the same coordinate system.
+        obs_normalization=False,
+        distribution_cfg=JuggleGaussianDistributionCfg(
+            init_std=0.30,
+            hand_init_std=0.40,
+            arm_action_dim=3,
+            std_range=(0.002, 0.50),
+        ),
     )
     critic = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=True,
+        obs_normalization=False,
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=1.0e-4,
+        entropy_coef=1.0e-3,
         num_learning_epochs=5,
         num_mini_batches=8,
         learning_rate=5.0e-5,
