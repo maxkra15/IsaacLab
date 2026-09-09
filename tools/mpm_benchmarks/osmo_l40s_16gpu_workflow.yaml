@@ -3,8 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# Sixteen independent one-GPU shards. Each GPU executes its assigned points
-# sequentially; the final CPU task joins every raw result into slide-ready CSVs.
+# Eight two-GPU tasks launch sixteen independent shards. Each GPU executes its
+# assigned points sequentially; a CPU task joins the raw result sets afterward.
 
 workflow:
   name: "{{ workflow_name }}"
@@ -13,30 +13,30 @@ workflow:
     queue_timeout: 4h
   resources:
     benchmark:
-      gpu: 1
-      cpu: 16
-      memory: 128Gi
-      storage: 128Gi
+      gpu: 2
+      cpu: 28
+      memory: 220Gi
+      storage: 256Gi
       platform: ovx-l40s
     aggregate:
-      gpu: 0
+      gpu: 2
       cpu: 4
       memory: 16Gi
       storage: 128Gi
-      platform: cpu
+      platform: ovx-l40s
 
   tasks:
-  {% for shard in range(16) %}
-  - name: "shard-{{ '%02d' | format(shard) }}"
+  {% for task_index in range(8) %}
+  - name: "shard-pair-{{ '%02d' | format(task_index) }}"
     image: "{{ image }}"
     resource: benchmark
-    command: ["bash", "/tmp/run_benchmark_shard.sh", "{{ shard }}"]
+    command: ["bash", "/tmp/run_benchmark_shard_pair.sh", "{{ task_index }}"]
     environment:
       ACCEPT_EULA: Y
       OMNI_KIT_ACCEPT_EULA: "YES"
       PYTHONUNBUFFERED: "1"
     files:
-    - path: /tmp/run_benchmark_shard.sh
+    - path: /tmp/run_benchmark_shard_pair.sh
       contents: |
         set -uo pipefail
 
@@ -62,20 +62,32 @@ workflow:
         if [ ! -x "${python_bin}" ]; then
           python_bin="$(command -v python3)"
         fi
-        shard_index="$1"
-        set +e
-        "${python_bin}" tools/mpm_benchmarks/run_suite.py \
-          --manifest "tools/mpm_benchmarks/{{ manifest }}" \
-          --output_root "${output_root}" \
-          --suite_id "osmo-{{workflow_id}}-shard-${shard_index}" \
-          --repetitions "{{ repetitions }}" \
-          --num_shards 16 \
-          --shard_index "${shard_index}"
-        status=$?
-        set -e
-        if [ "${status}" -ne 0 ]; then
-          echo "suite runner exited with ${status}" > "${output_root}/task_failure.txt"
-        fi
+        task_index="$1"
+        first_shard=$((task_index * 2))
+        second_shard=$((first_shard + 1))
+
+        run_shard() {
+          local shard_index="$1"
+          local gpu_index="$2"
+          CUDA_VISIBLE_DEVICES="${gpu_index}" "${python_bin}" tools/mpm_benchmarks/run_suite.py \
+            --manifest "tools/mpm_benchmarks/{{ manifest }}" \
+            --output_root "${output_root}" \
+            --suite_id "osmo-{{workflow_id}}-shard-${shard_index}" \
+            --repetitions "{{ repetitions }}" \
+            --num_shards 16 \
+            --shard_index "${shard_index}"
+          local status=$?
+          if [ "${status}" -ne 0 ]; then
+            echo "suite runner exited with ${status}" > "${output_root}/task_failure_${shard_index}.txt"
+          fi
+        }
+
+        run_shard "${first_shard}" 0 &
+        first_pid=$!
+        run_shard "${second_shard}" 1 &
+        second_pid=$!
+        wait "${first_pid}"
+        wait "${second_pid}"
         exit 0
   {% endfor %}
 
@@ -102,36 +114,20 @@ workflow:
           --input "{{input:4}}" \
           --input "{{input:5}}" \
           --input "{{input:6}}" \
-          --input "{{input:7}}" \
-          --input "{{input:8}}" \
-          --input "{{input:9}}" \
-          --input "{{input:10}}" \
-          --input "{{input:11}}" \
-          --input "{{input:12}}" \
-          --input "{{input:13}}" \
-          --input "{{input:14}}" \
-          --input "{{input:15}}"
+          --input "{{input:7}}"
     inputs:
-    - task: shard-00
-    - task: shard-01
-    - task: shard-02
-    - task: shard-03
-    - task: shard-04
-    - task: shard-05
-    - task: shard-06
-    - task: shard-07
-    - task: shard-08
-    - task: shard-09
-    - task: shard-10
-    - task: shard-11
-    - task: shard-12
-    - task: shard-13
-    - task: shard-14
-    - task: shard-15
+    - task: shard-pair-00
+    - task: shard-pair-01
+    - task: shard-pair-02
+    - task: shard-pair-03
+    - task: shard-pair-04
+    - task: shard-pair-05
+    - task: shard-pair-06
+    - task: shard-pair-07
 
 default-values:
   workflow_name: mpm-benchmark-qualification
-  image: nvcr.io/0947644777160149/internal/isaac-lab:latest-develop
+  image: nvcr.io/nvidia/isaac-lab:3.0.0-beta2
   benchmark_branch: maximiliank/mpm-benchmark-osmo-20260909
   manifest: osmo_l40s_qualification.toml
   repetitions: 1
