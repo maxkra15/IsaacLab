@@ -28,11 +28,19 @@ workflow:
     - path: /tmp/run_smoke.sh
       contents: |
         set -euo pipefail
+        repo_dir=/tmp/isaaclab-mpm-benchmark
+        env_dir=/workspace/isaaclab/.venv
         git clone --depth 1 --branch "{{ benchmark_branch }}" \
-          https://github.com/maxkra15/IsaacLab.git /tmp/isaaclab-mpm-benchmark
-        cp -a /tmp/isaaclab-mpm-benchmark/. /workspace/isaaclab/
-        cd /workspace/isaaclab
-        uv sync --locked --inexact --no-install-local --no-progress
+          https://github.com/maxkra15/IsaacLab.git "${repo_dir}"
+        cd "${repo_dir}"
+        UV_PROJECT_ENVIRONMENT="${env_dir}" uv sync --locked --inexact --no-progress
+        source_path=""
+        for package_dir in source/*; do
+          if [ -d "${package_dir}" ]; then
+            source_path="${PWD}/${package_dir}:${source_path}"
+          fi
+        done
+        export PYTHONPATH="${source_path}${PYTHONPATH:+:${PYTHONPATH}}"
         python_cmd=(/workspace/isaaclab/.venv/bin/python)
         "${python_cmd[@]}" -c \
           "import importlib.metadata as m; from isaaclab.app import launch_simulation; assert m.version('newton') == '1.6.0rc1'; assert m.version('warp-lang') == '1.17.0'; print('imports-ok', m.version('newton'), m.version('warp-lang'), m.version('newton-usd-schemas'))"

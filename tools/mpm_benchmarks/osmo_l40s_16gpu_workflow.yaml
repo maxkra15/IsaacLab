@@ -50,15 +50,23 @@ workflow:
           exit 0
         fi
 
-        cp -a "${repo_dir}/." /workspace/isaaclab/
-        cd /workspace/isaaclab
-        if ! uv sync --locked --inexact --no-install-local --no-progress; then
+        env_dir=/workspace/isaaclab/.venv
+        cd "${repo_dir}"
+        if ! UV_PROJECT_ENVIRONMENT="${env_dir}" uv sync --locked --inexact --no-progress; then
           echo "uv sync failed" > "${output_root}/task_failure.txt"
           exit 0
         fi
 
+        source_path=""
+        for package_dir in source/*; do
+          if [ -d "${package_dir}" ]; then
+            source_path="${PWD}/${package_dir}:${source_path}"
+          fi
+        done
+        export PYTHONPATH="${source_path}${PYTHONPATH:+:${PYTHONPATH}}"
+
         shard_index="$1"
-        if ! /workspace/isaaclab/.venv/bin/python tools/mpm_benchmarks/run_suite.py \
+        if ! "${env_dir}/bin/python" tools/mpm_benchmarks/run_suite.py \
           --manifest "tools/mpm_benchmarks/{{ manifest }}" \
           --output_root "${output_root}" \
           --suite_id "osmo-{{workflow_id}}-shard-${shard_index}" \
