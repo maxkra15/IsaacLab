@@ -1,0 +1,170 @@
+[suite]
+name = "Newton MPM L40S full-trajectory qualification"
+randomization_seed = 20260909
+max_initial_gpu_memory_used_mib = 4096
+max_initial_gpu_utilization_percent = 25
+
+[defaults]
+repetitions = 1
+device = "cuda:0"
+num_envs = 1
+voxel_size = 0.1
+particles_per_cell = 2.0
+dt = 0.008333333333333333
+substeps = 1
+warmup_steps = 50
+warmup_min_wall_s = 1.0
+measurement_duration = 5.0
+timing_batch_steps = 20
+gpu_monitor_interval_ms = 500
+max_iterations = 250
+tolerance = 0.0001
+capacity_factor = 4.0
+collider_margin = 0.05
+disable_cuda_graph = false
+project_outside_colliders = true
+preflight_max_total_particles = 5000000
+preflight_max_active_cell_count = 524288
+preflight_max_leaf_node_count = 131072
+preflight_max_lower_node_count = 16384
+preflight_max_upper_node_count = 8192
+
+# Nine full-trajectory environment points locate the L40S weak-scaling and
+# memory frontier without extrapolating from pre-impact smoke tests.
+[[sweeps]]
+name = "environment_scaling"
+x_parameter = "num_envs"
+x_unit = "environments"
+
+[[sweeps.cases]]
+id = "env_0001"
+label = "1 environment"
+x_value = 1
+num_envs = 1
+
+[[sweeps.cases]]
+id = "env_0002"
+label = "2 environments"
+x_value = 2
+num_envs = 2
+
+[[sweeps.cases]]
+id = "env_0004"
+label = "4 environments"
+x_value = 4
+num_envs = 4
+
+[[sweeps.cases]]
+id = "env_0008"
+label = "8 environments"
+x_value = 8
+num_envs = 8
+
+[[sweeps.cases]]
+id = "env_0016"
+label = "16 environments"
+x_value = 16
+num_envs = 16
+
+[[sweeps.cases]]
+id = "env_0032"
+label = "32 environments"
+x_value = 32
+num_envs = 32
+
+[[sweeps.cases]]
+id = "env_0064"
+label = "64 environments"
+x_value = 64
+num_envs = 64
+
+[[sweeps.cases]]
+id = "env_0128"
+label = "128 environments"
+x_value = 128
+num_envs = 128
+
+[[sweeps.cases]]
+id = "env_0256"
+label = "256 environments"
+x_value = 256
+num_envs = 256
+
+# Resolution endpoints. Both retain two particles per voxel axis.
+[[sweeps]]
+name = "practical_resolution_fixed_ppc"
+x_parameter = "voxel_size_m"
+x_unit = "m"
+
+[[sweeps.cases]]
+id = "resolution_050mm_qualification"
+label = "50 mm, 4 environments"
+x_value = 0.05
+num_envs = 4
+voxel_size = 0.05
+
+[[sweeps.cases]]
+id = "resolution_025mm_qualification"
+label = "25 mm, 4 environments"
+x_value = 0.025
+num_envs = 4
+voxel_size = 0.025
+
+# The three-particles-per-axis endpoint gets one fixed worst-case allocation;
+# the two-particles-per-axis case confirms the same allocation is runnable.
+[[sweeps]]
+name = "particle_sampling_fixed_grid"
+x_parameter = "particles_per_cell_axis"
+x_unit = "particles/voxel-axis"
+
+[[sweeps.cases]]
+id = "ppc_axis_2_qualification"
+label = "2/axis, 64 environments"
+x_value = 2
+num_envs = 64
+particles_per_cell = 2
+capacity_factor = 8
+
+[[sweeps.cases]]
+id = "ppc_axis_3_qualification"
+label = "3/axis, 64 environments"
+x_value = 3
+num_envs = 64
+particles_per_cell = 3
+capacity_factor = 8
+
+# Finest grid with an identical 50 mm particle lattice.
+[[sweeps]]
+name = "voxel_size_fixed_particles"
+x_parameter = "voxel_size_m"
+x_unit = "m"
+
+[[sweeps.cases]]
+id = "voxel_050mm_fixed_n_qualification"
+label = "50 mm voxels, 16 environments"
+x_value = 0.05
+num_envs = 16
+voxel_size = 0.05
+particles_per_cell = 1
+
+# Both timestep extremes use the same 128-world allocation and physical span.
+[[sweeps]]
+name = "time_step_fixed_scene"
+x_parameter = "dt_s"
+x_unit = "s"
+
+[[sweeps.cases]]
+id = "dt_16_667ms_qualification"
+label = "60 Hz, 128 environments"
+x_value = 0.016666666666666666
+num_envs = 128
+dt = 0.016666666666666666
+timing_batch_steps = 10
+
+[[sweeps.cases]]
+id = "dt_4_167ms_qualification"
+label = "240 Hz, 128 environments"
+x_value = 0.004166666666666667
+num_envs = 128
+dt = 0.004166666666666667
+timing_batch_steps = 40

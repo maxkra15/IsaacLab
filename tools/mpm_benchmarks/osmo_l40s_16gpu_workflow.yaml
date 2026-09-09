@@ -1,0 +1,137 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Sixteen independent one-GPU shards. Each GPU executes its assigned points
+# sequentially; the final CPU task joins every raw result into slide-ready CSVs.
+
+workflow:
+  name: "{{ workflow_name }}"
+  timeout:
+    exec_timeout: 8h
+    queue_timeout: 4h
+  resources:
+    benchmark:
+      gpu: 1
+      cpu: 16
+      memory: 128Gi
+      storage: 128Gi
+      platform: ovx-l40s
+    aggregate:
+      gpu: 0
+      cpu: 4
+      memory: 16Gi
+      storage: 128Gi
+      platform: cpu
+
+  tasks:
+  {% for shard in range(16) %}
+  - name: "shard-{{ '%02d' | format(shard) }}"
+    image: "{{ image }}"
+    resource: benchmark
+    command: ["bash", "/tmp/run_benchmark_shard.sh", "{{ shard }}"]
+    environment:
+      ACCEPT_EULA: Y
+      OMNI_KIT_ACCEPT_EULA: "YES"
+      PYTHONUNBUFFERED: "1"
+    files:
+    - path: /tmp/run_benchmark_shard.sh
+      contents: |
+        set -uo pipefail
+
+        output_root="{{output}}"
+        mkdir -p "${output_root}"
+        repo_dir="/tmp/isaaclab-mpm-benchmark"
+        if ! git clone --depth 1 --branch "{{ benchmark_branch }}" \
+          https://github.com/maxkra15/IsaacLab.git "${repo_dir}"; then
+          echo "git clone failed" > "${output_root}/task_failure.txt"
+          exit 0
+        fi
+        cd "${repo_dir}"
+
+        source_path=""
+        for package_dir in source/*; do
+          if [ -d "${package_dir}" ]; then
+            source_path="${repo_dir}/${package_dir}:${source_path}"
+          fi
+        done
+        export PYTHONPATH="${source_path}${PYTHONPATH:+:${PYTHONPATH}}"
+
+        python_bin="/workspace/isaaclab/.venv/bin/python"
+        if [ ! -x "${python_bin}" ]; then
+          python_bin="$(command -v python3)"
+        fi
+        shard_index="$1"
+        set +e
+        "${python_bin}" tools/mpm_benchmarks/run_suite.py \
+          --manifest "tools/mpm_benchmarks/{{ manifest }}" \
+          --output_root "${output_root}" \
+          --suite_id "osmo-{{workflow_id}}-shard-${shard_index}" \
+          --repetitions "{{ repetitions }}" \
+          --num_shards 16 \
+          --shard_index "${shard_index}"
+        status=$?
+        set -e
+        if [ "${status}" -ne 0 ]; then
+          echo "suite runner exited with ${status}" > "${output_root}/task_failure.txt"
+        fi
+        exit 0
+  {% endfor %}
+
+  - name: aggregate
+    image: python:3.12-slim
+    resource: aggregate
+    command: ["bash", "/tmp/aggregate.sh"]
+    files:
+    - path: /tmp/aggregate.sh
+      contents: |
+        set -euo pipefail
+        apt-get update -qq
+        apt-get install -y -qq git
+        git clone --depth 1 --branch "{{ benchmark_branch }}" \
+          https://github.com/maxkra15/IsaacLab.git /tmp/isaaclab-mpm-benchmark
+        cd /tmp/isaaclab-mpm-benchmark/tools/mpm_benchmarks
+        python merge_osmo_shards.py \
+          --workflow_id "{{workflow_id}}" \
+          --output "{{output}}/mpm_benchmark_{{workflow_id}}" \
+          --input "{{input:0}}" \
+          --input "{{input:1}}" \
+          --input "{{input:2}}" \
+          --input "{{input:3}}" \
+          --input "{{input:4}}" \
+          --input "{{input:5}}" \
+          --input "{{input:6}}" \
+          --input "{{input:7}}" \
+          --input "{{input:8}}" \
+          --input "{{input:9}}" \
+          --input "{{input:10}}" \
+          --input "{{input:11}}" \
+          --input "{{input:12}}" \
+          --input "{{input:13}}" \
+          --input "{{input:14}}" \
+          --input "{{input:15}}"
+    inputs:
+    - task: shard-00
+    - task: shard-01
+    - task: shard-02
+    - task: shard-03
+    - task: shard-04
+    - task: shard-05
+    - task: shard-06
+    - task: shard-07
+    - task: shard-08
+    - task: shard-09
+    - task: shard-10
+    - task: shard-11
+    - task: shard-12
+    - task: shard-13
+    - task: shard-14
+    - task: shard-15
+
+default-values:
+  workflow_name: mpm-benchmark-qualification
+  image: nvcr.io/0947644777160149/internal/isaac-lab:latest-develop
+  benchmark_branch: maximiliank/mpm-benchmark-osmo-20260909
+  manifest: osmo_l40s_qualification.toml
+  repetitions: 1
