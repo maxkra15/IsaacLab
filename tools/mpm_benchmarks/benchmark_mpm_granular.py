@@ -324,13 +324,24 @@ def _gpu_index(device: str) -> int:
     return int(suffix) if separator else 0
 
 
+def _nvidia_smi_selector(device: str) -> str:
+    """Map a process-local CUDA device to its physical index or UUID."""
+    logical_index = _gpu_index(device)
+    visible_devices = [value.strip() for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if value]
+    if visible_devices:
+        if logical_index >= len(visible_devices):
+            raise ValueError(f"CUDA device {device!r} is outside CUDA_VISIBLE_DEVICES={','.join(visible_devices)!r}.")
+        return visible_devices[logical_index]
+    return str(logical_index)
+
+
 def query_gpu(device: str) -> dict[str, Any]:
     """Capture one GPU state snapshot through ``nvidia-smi``."""
     output = _command_output(
         [
             "nvidia-smi",
             "-i",
-            str(_gpu_index(device)),
+            _nvidia_smi_selector(device),
             f"--query-gpu={','.join(_GPU_FIELDS)}",
             "--format=csv,noheader,nounits",
         ]
@@ -353,7 +364,7 @@ class GpuMonitor:
         command = [
             "nvidia-smi",
             "-i",
-            str(_gpu_index(self._device)),
+            _nvidia_smi_selector(self._device),
             f"--query-gpu={','.join(_GPU_FIELDS)}",
             "--format=csv,noheader,nounits",
             "-lms",

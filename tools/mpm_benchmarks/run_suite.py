@@ -676,12 +676,34 @@ def _gpu_snapshot() -> dict[str, Any]:
     return {"gpus": rows, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "")}
 
 
+def _selected_gpu(manifest: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Select the physical GPU addressed by the manifest inside this process."""
+    device = str(manifest.get("defaults", {}).get("device", "cuda:0"))
+    if not device.startswith("cuda"):
+        raise ValueError(f"Newton MPM benchmark requires a CUDA device, received {device!r}.")
+    _, separator, suffix = device.partition(":")
+    logical_index = int(suffix) if separator else 0
+    visible_devices = [value.strip() for value in snapshot.get("cuda_visible_devices", "").split(",") if value]
+    if visible_devices:
+        if logical_index >= len(visible_devices):
+            raise RuntimeError(f"Device {device!r} is outside CUDA_VISIBLE_DEVICES={visible_devices!r}.")
+        selector = visible_devices[logical_index]
+    else:
+        selector = str(logical_index)
+    for gpu in snapshot.get("gpus", []):
+        if selector.isdigit() and gpu["index"] == int(selector):
+            return gpu
+        if selector == gpu["uuid"] or gpu["uuid"].startswith(selector):
+            return gpu
+    raise RuntimeError(f"Could not map CUDA device {device!r} (physical selector {selector!r}) to nvidia-smi output.")
+
+
 def _enforce_idle_gpu(manifest: dict[str, Any], snapshot: dict[str, Any], allow_busy: bool) -> None:
     """Reject benchmark collection under obvious GPU contention unless explicitly overridden."""
     if allow_busy or not snapshot.get("gpus"):
         return
     suite_cfg = manifest.get("suite", {})
-    gpu = snapshot["gpus"][0]
+    gpu = _selected_gpu(manifest, snapshot)
     memory_limit = float(suite_cfg.get("max_initial_gpu_memory_used_mib", 4096.0))
     utilization_limit = float(suite_cfg.get("max_initial_gpu_utilization_percent", 25.0))
     violations = []

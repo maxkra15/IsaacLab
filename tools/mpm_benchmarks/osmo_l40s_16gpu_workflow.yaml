@@ -58,9 +58,13 @@ workflow:
         done
         export PYTHONPATH="${source_path}${PYTHONPATH:+:${PYTHONPATH}}"
 
-        python_bin="/workspace/isaaclab/.venv/bin/python"
-        if [ ! -x "${python_bin}" ]; then
-          python_bin="$(command -v python3)"
+        if [ -x /workspace/isaaclab/isaaclab.sh ]; then
+          python_cmd=(/workspace/isaaclab/isaaclab.sh -p)
+        elif [ -x /isaac-sim/python.sh ]; then
+          python_cmd=(/isaac-sim/python.sh)
+        else
+          echo "Isaac Lab Python entry point not found" > "${output_root}/task_failure.txt"
+          exit 127
         fi
         task_index="$1"
         first_shard=$((task_index * 2))
@@ -69,7 +73,7 @@ workflow:
         run_shard() {
           local shard_index="$1"
           local gpu_index="$2"
-          CUDA_VISIBLE_DEVICES="${gpu_index}" "${python_bin}" tools/mpm_benchmarks/run_suite.py \
+          CUDA_VISIBLE_DEVICES="${gpu_index}" "${python_cmd[@]}" tools/mpm_benchmarks/run_suite.py \
             --manifest "tools/mpm_benchmarks/{{ manifest }}" \
             --output_root "${output_root}" \
             --suite_id "osmo-{{workflow_id}}-shard-${shard_index}" \

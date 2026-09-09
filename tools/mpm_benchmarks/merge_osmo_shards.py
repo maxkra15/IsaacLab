@@ -49,6 +49,7 @@ def main() -> None:
     outcomes_by_key: dict[tuple[str, str, int, int], dict[str, Any]] = {}
     successful_by_key: dict[tuple[str, str, int, int], dict[str, Any]] = {}
     shard_inventory: list[dict[str, Any]] = []
+    task_failure_paths: list[Path] = []
 
     for shard_index, input_root in enumerate(args.input):
         input_root = input_root.resolve()
@@ -57,6 +58,8 @@ def main() -> None:
         planned_paths = sorted(input_root.glob("**/planned_runs.json"))
         outcome_paths = sorted(input_root.glob("**/outcomes.json"))
         result_paths = sorted(input_root.glob("**/result.json"))
+        shard_task_failures = sorted(input_root.glob("**/task_failure*.txt"))
+        task_failure_paths.extend(shard_task_failures)
         shard_inventory.append(
             {
                 "shard_index": shard_index,
@@ -64,7 +67,7 @@ def main() -> None:
                 "planned_files": len(planned_paths),
                 "outcome_files": len(outcome_paths),
                 "result_files": len(result_paths),
-                "task_failure_files": len(list(input_root.glob("**/task_failure.txt"))),
+                "task_failure_files": len(shard_task_failures),
             }
         )
         for path in planned_paths:
@@ -86,6 +89,9 @@ def main() -> None:
             if key in successful_by_key:
                 raise RuntimeError(f"Duplicate successful result {key} in {path}")
             successful_by_key[key] = flat
+
+    if task_failure_paths:
+        raise RuntimeError(f"OSMO shard process failures: {[str(path) for path in task_failure_paths]}")
 
     planned = [planned_by_key[key] for key in sorted(planned_by_key, key=lambda item: item[3])]
     outcomes = [outcomes_by_key[key] for key in sorted(outcomes_by_key, key=lambda item: item[3])]
@@ -114,6 +120,8 @@ def main() -> None:
     if skipped:
         run_suite._write_csv(output / "skipped.csv", skipped)
     gpu_names = sorted({str(row.get("gpu_name", "")) for row in successful if row.get("gpu_name")})
+    if len(gpu_names) > 1:
+        raise RuntimeError(f"Refusing to merge a mixed GPU cohort: {gpu_names}")
     run_suite._write_json(
         output / "osmo_provenance.json",
         {

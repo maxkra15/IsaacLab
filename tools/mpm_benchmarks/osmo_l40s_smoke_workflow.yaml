@@ -1,0 +1,61 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+workflow:
+  name: "{{ workflow_name }}"
+  timeout:
+    exec_timeout: 1h
+    queue_timeout: 1h
+  resources:
+    smoke:
+      gpu: 1
+      cpu: 14
+      memory: 110Gi
+      storage: 256Gi
+      platform: ovx-l40s
+  tasks:
+  - name: smoke
+    image: "{{ image }}"
+    resource: smoke
+    command: ["bash", "/tmp/run_smoke.sh"]
+    environment:
+      ACCEPT_EULA: Y
+      OMNI_KIT_ACCEPT_EULA: "YES"
+      PYTHONUNBUFFERED: "1"
+    files:
+    - path: /tmp/run_smoke.sh
+      contents: |
+        set -euo pipefail
+        git clone --depth 1 --branch "{{ benchmark_branch }}" \
+          https://github.com/maxkra15/IsaacLab.git /tmp/isaaclab-mpm-benchmark
+        cd /tmp/isaaclab-mpm-benchmark
+
+        source_path=""
+        for package_dir in source/*; do
+          if [ -d "${package_dir}" ]; then
+            source_path="${PWD}/${package_dir}:${source_path}"
+          fi
+        done
+        export PYTHONPATH="${source_path}${PYTHONPATH:+:${PYTHONPATH}}"
+
+        if [ -x /workspace/isaaclab/isaaclab.sh ]; then
+          python_cmd=(/workspace/isaaclab/isaaclab.sh -p)
+        elif [ -x /isaac-sim/python.sh ]; then
+          python_cmd=(/isaac-sim/python.sh)
+        else
+          echo "Isaac Lab Python entry point not found" >&2
+          exit 127
+        fi
+        "${python_cmd[@]}" -c \
+          "import isaaclab, newton, warp; print('imports-ok', newton.__version__, warp.__version__)"
+        "${python_cmd[@]}" tools/mpm_benchmarks/run_suite.py \
+          --manifest tools/mpm_benchmarks/osmo_l40s_smoke.toml \
+          --output_root "{{output}}" \
+          --suite_id "osmo-{{workflow_id}}-smoke"
+
+default-values:
+  workflow_name: mpm-benchmark-smoke
+  image: nvcr.io/nvidia/isaac-lab:3.0.0-beta2
+  benchmark_branch: maximiliank/mpm-benchmark-osmo-20260909
