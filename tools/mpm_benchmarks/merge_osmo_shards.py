@@ -101,9 +101,23 @@ def main() -> None:
         missing = sorted(completed_outcome_keys - set(successful_by_key))
         unexpected = sorted(set(successful_by_key) - completed_outcome_keys)
         raise RuntimeError(f"Completed outcome/result mismatch: missing={missing}, unexpected={unexpected}")
-    gpu_names = sorted({str(row.get("gpu_name", "")) for row in successful if row.get("gpu_name")})
-    if len(gpu_names) > 1:
-        raise RuntimeError(f"Refusing to merge a mixed GPU cohort: {gpu_names}")
+    cohort_fields = (
+        "gpu_name",
+        "gpu_total_memory_mib",
+        "driver_version",
+        "git_commit",
+        "newton_version",
+        "warp_version",
+        "isaaclab_version",
+    )
+    cohort_values = {
+        field: sorted({str(row.get(field, "")) for row in successful if row.get(field) not in (None, "")})
+        for field in cohort_fields
+    }
+    mixed_fields = {field: values for field, values in cohort_values.items() if len(values) > 1}
+    if mixed_fields:
+        raise RuntimeError(f"Refusing to merge a mixed hardware/software cohort: {mixed_fields}")
+    gpu_names = cohort_values["gpu_name"]
 
     run_suite._write_json(output / "planned_runs.json", planned)
     run_suite._write_json(output / "outcomes.json", outcomes)
@@ -132,7 +146,9 @@ def main() -> None:
             "outcomes": len(outcomes),
             "successful_runs": len(successful),
             "gpu_names": gpu_names,
-            "mixed_gpu_cohort": len(gpu_names) > 1,
+            "cohort": {field: values[0] if values else "" for field, values in cohort_values.items()},
+            "mixed_gpu_cohort": False,
+            "mixed_hardware_or_software_cohort": False,
         },
     )
     print(
