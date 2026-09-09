@@ -678,6 +678,9 @@ def _gpu_snapshot() -> dict[str, Any]:
 
 def _selected_gpu(manifest: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
     """Select the physical GPU addressed by the manifest inside this process."""
+    gpus = snapshot.get("gpus", [])
+    if len(gpus) == 1:
+        return gpus[0]
     device = str(manifest.get("defaults", {}).get("device", "cuda:0"))
     if not device.startswith("cuda"):
         raise ValueError(f"Newton MPM benchmark requires a CUDA device, received {device!r}.")
@@ -690,7 +693,7 @@ def _selected_gpu(manifest: dict[str, Any], snapshot: dict[str, Any]) -> dict[st
         selector = visible_devices[logical_index]
     else:
         selector = str(logical_index)
-    for gpu in snapshot.get("gpus", []):
+    for gpu in gpus:
         if selector.isdigit() and gpu["index"] == int(selector):
             return gpu
         if selector == gpu["uuid"] or gpu["uuid"].startswith(selector):

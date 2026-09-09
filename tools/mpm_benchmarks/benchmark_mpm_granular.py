@@ -331,8 +331,22 @@ def _nvidia_smi_selector(device: str) -> str:
     if visible_devices:
         if logical_index >= len(visible_devices):
             raise ValueError(f"CUDA device {device!r} is outside CUDA_VISIBLE_DEVICES={','.join(visible_devices)!r}.")
-        return visible_devices[logical_index]
-    return str(logical_index)
+        selector = visible_devices[logical_index]
+    else:
+        selector = str(logical_index)
+    inventory = _command_output(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits"])
+    rows = (
+        []
+        if not inventory
+        else [tuple(value.strip() for value in line.split(",", 1)) for line in inventory.splitlines()]
+    )
+    if len(rows) == 1:
+        return rows[0][1]
+    if selector.isdigit() and any(index == selector for index, _ in rows):
+        return selector
+    if logical_index < len(rows):
+        return rows[logical_index][1]
+    return selector
 
 
 def query_gpu(device: str) -> dict[str, Any]:
