@@ -48,24 +48,11 @@ workflow:
           echo "git clone failed" > "${output_root}/task_failure.txt"
           exit 0
         fi
-        cd "${repo_dir}"
-
-        source_path=""
-        for package_dir in source/*; do
-          if [ -d "${package_dir}" ]; then
-            source_path="${repo_dir}/${package_dir}:${source_path}"
-          fi
-        done
-        export PYTHONPATH="${source_path}${PYTHONPATH:+:${PYTHONPATH}}"
-
-        if [ -x /workspace/isaaclab/isaaclab.sh ]; then
-          python_cmd=(/workspace/isaaclab/isaaclab.sh -p)
-        elif [ -x /isaac-sim/python.sh ]; then
-          python_cmd=(/isaac-sim/python.sh)
-        else
-          echo "Isaac Lab Python entry point not found" > "${output_root}/task_failure.txt"
-          exit 127
-        fi
+        workspace_dir=/workspace/isaaclab
+        cp -a "${repo_dir}/." "${workspace_dir}/"
+        cd "${workspace_dir}"
+        uv sync --locked --inexact --no-install-local --no-progress
+        python_cmd=("${workspace_dir}/isaaclab.sh" -p)
         task_index="$1"
         first_shard=$((task_index * 2))
         second_shard=$((first_shard + 1))
@@ -131,7 +118,7 @@ workflow:
 
 default-values:
   workflow_name: mpm-benchmark-qualification
-  image: nvcr.io/nvidia/isaac-lab:3.0.0-beta2
+  image: nvcr.io/nvidian/octi-isaac-lab:factory@sha256:48c339c6dd48f07aa067d55dd237aefda17acc44e43ca498def8082d34da44a1
   benchmark_branch: maximiliank/mpm-benchmark-osmo-20260909
   manifest: osmo_l40s_qualification.toml
   repetitions: 1

@@ -29,8 +29,14 @@ preflight_max_leaf_node_count = 131072
 preflight_max_lower_node_count = 16384
 preflight_max_upper_node_count = 8192
 
-# Nine full-trajectory environment points locate the L40S weak-scaling and
-# memory frontier without extrapolating from pre-impact smoke tests.
+# Qualification-only candidate matrix for an L40S 48 GB cohort. The manifest
+# has exactly 16 cases for --num_shards 16: one full five-second run per GPU
+# worker. One-repetition values are pass/fail evidence, not slide statistics.
+# Never fill a missing L40S row from a local RTX 4090 result. Freeze a separate
+# five-repetition L40S manifest only after every intended endpoint qualifies.
+
+# Nine full-trajectory environment points qualify the candidate range through
+# N=256 without extrapolating from pre-impact smoke tests.
 [[sweeps]]
 name = "environment_scaling"
 x_parameter = "num_envs"
