@@ -1,0 +1,76 @@
+[suite]
+name = "Newton MPM Jacobi low-environment scaling"
+randomization_seed = 20260909
+max_initial_gpu_memory_used_mib = 4096
+max_initial_gpu_utilization_percent = 25
+
+[defaults]
+repetitions = 4
+device = "cuda:0"
+voxel_size = 0.1
+particles_per_cell = 2.0
+dt = 0.008333333333333333
+substeps = 1
+warmup_steps = 50
+warmup_min_wall_s = 1.0
+measurement_duration = 5.0
+timing_batch_steps = 20
+gpu_monitor_interval_ms = 500
+max_iterations = 250
+tolerance = 0.0001
+solver = "jacobi"
+warmstart_mode = "auto"
+young_modulus = 1.0e15
+capacity_factor = 2.0
+collider_margin = 0.05
+disable_cuda_graph = false
+project_outside_colliders = true
+no_obstacle = true
+sample_grid_topology = false
+preflight_max_total_particles = 1200000
+preflight_max_active_cell_count = 524288
+preflight_max_lower_node_count = 8192
+preflight_max_upper_node_count = 1024
+
+# Four repetitions of each point produce 24 independent runs distributed over
+# the existing 16-shard OSMO workflow.
+[[sweeps]]
+name = "environment_scaling"
+x_parameter = "num_envs"
+x_unit = "environments"
+
+[[sweeps.cases]]
+id = "env_0001"
+label = "1 environment"
+x_value = 1
+num_envs = 1
+
+[[sweeps.cases]]
+id = "env_0002"
+label = "2 environments"
+x_value = 2
+num_envs = 2
+
+[[sweeps.cases]]
+id = "env_0004"
+label = "4 environments"
+x_value = 4
+num_envs = 4
+
+[[sweeps.cases]]
+id = "env_0008"
+label = "8 environments"
+x_value = 8
+num_envs = 8
+
+[[sweeps.cases]]
+id = "env_0016"
+label = "16 environments"
+x_value = 16
+num_envs = 16
+
+[[sweeps.cases]]
+id = "env_0032"
+label = "32 environments"
+x_value = 32
+num_envs = 32
