@@ -3,10 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# Eight two-GPU tasks launch sixteen independent shards. Each GPU executes its
-# assigned points sequentially; a lightweight downstream task joins the raw
-# result sets afterward. The pool requires that task to reserve a GPU, but it
-# starts only after all 16 benchmark workers have released theirs.
+# Sixteen one-GPU tasks execute independent shards. Each GPU runs its assigned
+# points sequentially. A lightweight downstream task joins the raw result sets
+# after all 16 benchmark GPUs have been released.
 
 workflow:
   name: "{{ workflow_name }}"
@@ -15,72 +14,59 @@ workflow:
     queue_timeout: 4h
   resources:
     benchmark:
-      gpu: 2
-      cpu: 28
-      memory: 220Gi
+      gpu: 1
+      cpu: 14
+      memory: 110Gi
       storage: 256Gi
       platform: ovx-l40s
     aggregate:
-      gpu: 2
+      gpu: 1
       cpu: 4
       memory: 16Gi
       storage: 128Gi
       platform: ovx-l40s
 
   tasks:
-  {% for task_index in range(8) %}
-  - name: "shard-pair-{{ '%02d' | format(task_index) }}"
+  {% for shard_index in range(16) %}
+  - name: "shard-{{ '%02d' | format(shard_index) }}"
     image: "{{ image }}"
     resource: benchmark
-    command: ["bash", "/tmp/run_benchmark_shard_pair.sh", "{{ task_index }}"]
+    command: ["bash", "/tmp/run_benchmark_shard.sh", "{{ shard_index }}"]
     environment:
       ACCEPT_EULA: Y
       OMNI_KIT_ACCEPT_EULA: "YES"
       PYTHONUNBUFFERED: "1"
     files:
-    - path: /tmp/run_benchmark_shard_pair.sh
+    - path: /tmp/run_benchmark_shard.sh
       contents: |
         set -uo pipefail
 
         output_root="{{output}}"
         mkdir -p "${output_root}"
-        repo_dir="/tmp/isaaclab-mpm-benchmark"
+        repo_dir=/tmp/isaaclab-mpm-benchmark
         if ! git clone --depth 1 --branch "{{ benchmark_branch }}" \
           https://github.com/maxkra15/IsaacLab.git "${repo_dir}"; then
           echo "git clone failed" > "${output_root}/task_failure.txt"
           exit 0
         fi
-        workspace_dir=/workspace/isaaclab
-        cp -a "${repo_dir}/." "${workspace_dir}/"
-        cd "${workspace_dir}"
-        uv sync --locked --inexact --no-install-local --no-progress
-        python_cmd=("${workspace_dir}/isaaclab.sh" -p)
-        task_index="$1"
-        first_shard=$((task_index * 2))
-        second_shard=$((first_shard + 1))
 
-        run_shard() {
-          local shard_index="$1"
-          local gpu_index="$2"
-          CUDA_VISIBLE_DEVICES="${gpu_index}" "${python_cmd[@]}" tools/mpm_benchmarks/run_suite.py \
-            --manifest "tools/mpm_benchmarks/{{ manifest }}" \
-            --output_root "${output_root}" \
-            --suite_id "osmo-{{workflow_id}}-shard-${shard_index}" \
-            --repetitions "{{ repetitions }}" \
-            --num_shards 16 \
-            --shard_index "${shard_index}"
-          local status=$?
-          if [ "${status}" -ne 0 ]; then
-            echo "suite runner exited with ${status}" > "${output_root}/task_failure_${shard_index}.txt"
-          fi
-        }
+        cp -a "${repo_dir}/." /workspace/isaaclab/
+        cd /workspace/isaaclab
+        if ! uv sync --locked --inexact --no-install-local --no-progress; then
+          echo "uv sync failed" > "${output_root}/task_failure.txt"
+          exit 0
+        fi
 
-        run_shard "${first_shard}" 0 &
-        first_pid=$!
-        run_shard "${second_shard}" 1 &
-        second_pid=$!
-        wait "${first_pid}"
-        wait "${second_pid}"
+        shard_index="$1"
+        if ! /workspace/isaaclab/.venv/bin/python tools/mpm_benchmarks/run_suite.py \
+          --manifest "tools/mpm_benchmarks/{{ manifest }}" \
+          --output_root "${output_root}" \
+          --suite_id "osmo-{{workflow_id}}-shard-${shard_index}" \
+          --repetitions "{{ repetitions }}" \
+          --num_shards 16 \
+          --shard_index "${shard_index}"; then
+          echo "suite runner failed" > "${output_root}/task_failure.txt"
+        fi
         exit 0
   {% endfor %}
 
@@ -107,16 +93,20 @@ workflow:
           --input "{{input:4}}" \
           --input "{{input:5}}" \
           --input "{{input:6}}" \
-          --input "{{input:7}}"
+          --input "{{input:7}}" \
+          --input "{{input:8}}" \
+          --input "{{input:9}}" \
+          --input "{{input:10}}" \
+          --input "{{input:11}}" \
+          --input "{{input:12}}" \
+          --input "{{input:13}}" \
+          --input "{{input:14}}" \
+          --input "{{input:15}}" \
+          --expected_input_count 16
     inputs:
-    - task: shard-pair-00
-    - task: shard-pair-01
-    - task: shard-pair-02
-    - task: shard-pair-03
-    - task: shard-pair-04
-    - task: shard-pair-05
-    - task: shard-pair-06
-    - task: shard-pair-07
+    {% for shard_index in range(16) %}
+    - task: "shard-{{ '%02d' | format(shard_index) }}"
+    {% endfor %}
 
 default-values:
   workflow_name: mpm-benchmark-qualification

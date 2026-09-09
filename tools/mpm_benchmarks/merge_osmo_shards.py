@@ -23,6 +23,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, action="append", required=True, help="One OSMO task output root.")
     parser.add_argument("--output", type=Path, required=True, help="New aggregate output directory.")
     parser.add_argument("--workflow_id", required=True, help="OSMO workflow identifier recorded in provenance.")
+    parser.add_argument(
+        "--expected_input_count", type=int, help="Fail unless exactly this many task output roots were supplied."
+    )
     return parser
 
 
@@ -38,6 +41,8 @@ def _run_key(row: dict[str, Any]) -> tuple[str, str, int, int]:
 def main() -> None:
     """Copy raw shards, validate their union, and emit combined CSV/JSON artifacts."""
     args = create_parser().parse_args()
+    if args.expected_input_count is not None and len(args.input) != args.expected_input_count:
+        raise ValueError(f"Expected {args.expected_input_count} shard inputs, received {len(args.input)}.")
     output = args.output.resolve()
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite aggregate output: {output}")

@@ -33,7 +33,7 @@ workflow:
         cp -a /tmp/isaaclab-mpm-benchmark/. /workspace/isaaclab/
         cd /workspace/isaaclab
         uv sync --locked --inexact --no-install-local --no-progress
-        python_cmd=(/workspace/isaaclab/isaaclab.sh -p)
+        python_cmd=(/workspace/isaaclab/.venv/bin/python)
         "${python_cmd[@]}" -c \
           "import importlib.metadata as m; from isaaclab.app import launch_simulation; assert m.version('newton') == '1.6.0rc1'; assert m.version('warp-lang') == '1.17.0'; print('imports-ok', m.version('newton'), m.version('warp-lang'), m.version('newton-usd-schemas'))"
         "${python_cmd[@]}" tools/mpm_benchmarks/run_suite.py \
