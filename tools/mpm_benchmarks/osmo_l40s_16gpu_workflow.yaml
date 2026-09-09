@@ -17,13 +17,13 @@ workflow:
       gpu: 1
       cpu: 14
       memory: 110Gi
-      storage: 256Gi
+      storage: 88Gi
       platform: "{{ platform }}"
     aggregate:
       gpu: 1
       cpu: 4
       memory: 16Gi
-      storage: 128Gi
+      storage: 88Gi
       platform: "{{ platform }}"
 
   tasks:
