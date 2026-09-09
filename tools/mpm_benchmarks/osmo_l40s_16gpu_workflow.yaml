@@ -4,7 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Eight two-GPU tasks launch sixteen independent shards. Each GPU executes its
-# assigned points sequentially; a CPU task joins the raw result sets afterward.
+# assigned points sequentially; a lightweight downstream task joins the raw
+# result sets afterward. The pool requires that task to reserve a GPU, but it
+# starts only after all 16 benchmark workers have released theirs.
 
 workflow:
   name: "{{ workflow_name }}"

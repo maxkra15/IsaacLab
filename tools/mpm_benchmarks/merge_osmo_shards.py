@@ -101,6 +101,9 @@ def main() -> None:
         missing = sorted(completed_outcome_keys - set(successful_by_key))
         unexpected = sorted(set(successful_by_key) - completed_outcome_keys)
         raise RuntimeError(f"Completed outcome/result mismatch: missing={missing}, unexpected={unexpected}")
+    gpu_names = sorted({str(row.get("gpu_name", "")) for row in successful if row.get("gpu_name")})
+    if len(gpu_names) > 1:
+        raise RuntimeError(f"Refusing to merge a mixed GPU cohort: {gpu_names}")
 
     run_suite._write_json(output / "planned_runs.json", planned)
     run_suite._write_json(output / "outcomes.json", outcomes)
@@ -119,9 +122,6 @@ def main() -> None:
         run_suite._write_csv(output / "failures.csv", failed)
     if skipped:
         run_suite._write_csv(output / "skipped.csv", skipped)
-    gpu_names = sorted({str(row.get("gpu_name", "")) for row in successful if row.get("gpu_name")})
-    if len(gpu_names) > 1:
-        raise RuntimeError(f"Refusing to merge a mixed GPU cohort: {gpu_names}")
     run_suite._write_json(
         output / "osmo_provenance.json",
         {
