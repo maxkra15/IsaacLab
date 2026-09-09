@@ -39,7 +39,7 @@ from typing import Any
 from isaaclab.app import launch_simulation
 
 SCHEMA_VERSION = "1.0"
-BENCHMARK_NAME = "newton_mpm_granular_cylinder_impact"
+BENCHMARK_NAME = "newton_mpm_granular_drop"
 SPECIMEN_LO = (-0.34, -0.25, -0.36)
 SPECIMEN_HI = (0.34, 0.25, 0.36)
 BLOCK_EXTENT = tuple(upper - lower for lower, upper in zip(SPECIMEN_LO, SPECIMEN_HI, strict=True))
@@ -47,7 +47,10 @@ SPECIMEN_INITIAL_Z = 1.55
 GRAVITY = (0.0, 0.0, -9.81)
 JITTER_SEED = 42
 JITTER_FRACTION = 0.30
-ENV_SPACING = 2.0
+# Newton's isolated MPM worlds use independent particle and collider world IDs,
+# so they can remain colocated. Spatially laying them out adds a world-position
+# variable to what should be a pure weak-scaling experiment.
+ENV_SPACING = 0.0
 
 
 def _positive_int(value: str) -> int:
@@ -124,6 +127,24 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_iterations", type=_positive_int, default=250, help="Rheology solver iteration cap.")
     parser.add_argument("--tolerance", type=_positive_float, default=1.0e-4, help="Rheology solver tolerance.")
     parser.add_argument(
+        "--solver",
+        default="auto",
+        choices=("auto", "gs", "gs-batched", "jacobi"),
+        help="Newton rheology solver used for the benchmark.",
+    )
+    parser.add_argument(
+        "--warmstart_mode",
+        default="auto",
+        choices=("auto", "none", "particles"),
+        help="Newton rheology warm-start policy.",
+    )
+    parser.add_argument(
+        "--young_modulus",
+        type=_positive_float,
+        default=1.0e15,
+        help="Granular material Young's modulus [Pa].",
+    )
+    parser.add_argument(
         "--capacity_factor",
         type=_positive_float,
         default=8.0,
@@ -143,6 +164,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--no_project_outside_colliders",
         action="store_true",
         help="Disable the granular demo's post-substep particle/collider projection pass.",
+    )
+    parser.add_argument(
+        "--no_obstacle",
+        action="store_true",
+        help="Use only the ground plane, omitting the central impact obstacle.",
     )
     parser.add_argument(
         "--sample_grid_topology",
@@ -176,21 +202,19 @@ def derive_grid_capacities(num_envs: int, voxel_size: float, capacity_factor: fl
 
     The active-cell budget scales with initial physical grid occupancy, not
     particle count. This keeps the fixed-voxel particle-sampling study from
-    accidentally changing the grid workload.
+    accidentally changing the grid workload. Newton packs isolated worlds
+    into one NanoVDB hierarchy, so hierarchy-node counts do not require a
+    separate fixed allowance per world. Let Newton derive the leaf capacity
+    from the active-cell capacity and keep small proportional lower/upper
+    bounds for the packed trajectory.
     """
     initial_cells = num_envs * initial_grid_cell_count(voxel_size)
     active = _next_power_of_two(initial_cells * capacity_factor, minimum=1 << 12)
-    leaf = _next_power_of_two(max(active / 4, num_envs * 256), minimum=1 << 8)
-    # Isolated worlds occupy disjoint hierarchy branches even when the total
-    # number of active cells is modest.  Retain per-world branch headroom as
-    # well as the aggregate sparse-grid ratio.
-    lower = _next_power_of_two(max(active / 32, num_envs * 64), minimum=1 << 5)
-    upper = _next_power_of_two(max(active / 128, num_envs * 32), minimum=1 << 3)
     return {
         "max_active_cell_count": active,
-        "max_leaf_node_count": min(leaf, active),
-        "max_lower_node_count": min(lower, leaf),
-        "max_upper_node_count": min(upper, lower),
+        "max_leaf_node_count": -1,
+        "max_lower_node_count": _next_power_of_two(max(32, 16 * num_envs)),
+        "max_upper_node_count": _next_power_of_two(max(8, 2 * num_envs)),
     }
 
 
@@ -442,8 +466,8 @@ def _create_sim_cfg(args: argparse.Namespace, capacities: dict[str, int]):
                 separate_worlds=True,
                 max_iterations=args.max_iterations,
                 tolerance=args.tolerance,
-                solver="auto",
-                warmstart_mode="auto",
+                solver=args.solver,
+                warmstart_mode=args.warmstart_mode,
                 transfer_scheme="apic",
                 integration_scheme="pic",
                 strain_basis="P0",
@@ -466,6 +490,7 @@ def _create_scene_cfg(args: argparse.Namespace, particle_points):
     import isaaclab.sim as sim_utils
     from isaaclab.assets import AssetBaseCfg
     from isaaclab.scene import InteractiveSceneCfg
+    from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
     from isaaclab.utils.configclass import configclass
 
     particle_spacing = args.voxel_size / args.particles_per_cell
@@ -479,26 +504,27 @@ def _create_scene_cfg(args: argparse.Namespace, particle_points):
     class GranularBenchmarkSceneCfg(InteractiveSceneCfg):
         """Replicated, renderer-free granular impact workload."""
 
-        floor = AssetBaseCfg(
-            prim_path="{ENV_REGEX_NS}/Floor",
-            spawn=sim_utils.CuboidCfg(
-                size=(2.0, 2.0, 0.1),
-                collision_props=collision_props,
+        # An infinite plane keeps spreading particles inside the intended
+        # workload instead of turning the run into an unbounded free fall.
+        ground = AssetBaseCfg(
+            prim_path="/World/Ground",
+            spawn=sim_utils.GroundPlaneCfg(
+                usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Environments/Grid/default_ground_plane.usda",
                 physics_material=collider_material,
             ),
-            init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.05)),
         )
-        cylinder = AssetBaseCfg(
-            prim_path="{ENV_REGEX_NS}/Cylinder",
-            spawn=sim_utils.CylinderCfg(
-                radius=0.20,
-                height=1.15,
-                axis="Y",
-                collision_props=collision_props,
-                physics_material=collider_material,
-            ),
-            init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.12, 0.42)),
-        )
+        if not args.no_obstacle:
+            cylinder = AssetBaseCfg(
+                prim_path="/World/Cylinder",
+                spawn=sim_utils.CylinderCfg(
+                    radius=0.20,
+                    height=1.15,
+                    axis="Y",
+                    collision_props=collision_props,
+                    physics_material=collider_material,
+                ),
+                init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.12, 0.15)),
+            )
         media = MPMObjectCfg(
             prim_path="{ENV_REGEX_NS}/GranularMedia",
             spawn=MPMPointsCfg(
@@ -508,7 +534,7 @@ def _create_scene_cfg(args: argparse.Namespace, particle_points):
                 visible=False,
                 material=MPMParticleMaterialCfg(
                     density=1000.0,
-                    young_modulus=1.0e15,
+                    young_modulus=args.young_modulus,
                     poisson_ratio=0.3,
                     friction=0.68,
                     yield_pressure=1.0e12,
@@ -581,11 +607,16 @@ def _flatten_result(result: dict[str, Any]) -> dict[str, Any]:
         "timing_batch_steps": config["timing_batch_steps"],
         "max_iterations": config["max_iterations"],
         "tolerance": config["tolerance"],
+        "solver_requested": config["solver_requested"],
+        "solver_resolved": ",".join(config["solver_resolved"]),
+        "warmstart_mode_requested": config["warmstart_mode_requested"],
         "cuda_graph_requested": config["cuda_graph_requested"],
         "cuda_graph_active": config["cuda_graph_active"],
         "grid_type": config["grid_type"],
         "separate_worlds": config["separate_worlds"],
         "project_outside_colliders": config["project_outside_colliders"],
+        "obstacle": config["obstacle"],
+        "young_modulus_pa": config["material"]["young_modulus_pa"],
         "max_active_cell_count": config["max_active_cell_count"],
         "max_leaf_node_count": config["max_leaf_node_count"],
         "max_lower_node_count": config["max_lower_node_count"],
@@ -628,6 +659,8 @@ def _flatten_result(result: dict[str, Any]) -> dict[str, Any]:
         "gpu_temperature_max_c": telemetry.get("temperature_c", {}).get("max", ""),
         "finite_state": validation["finite_state"],
         "evolved": validation["evolved"],
+        "physically_bounded": validation["physically_bounded"],
+        "final_excursion_environment_count": validation["final_excursion_environment_count"],
         "reset_position_max_error_m": validation["reset_position_max_error_m"],
         "reset_velocity_max_error_m_s": validation["reset_velocity_max_error_m_s"],
         "root_displacement_mean_m": validation["root_displacement_mean_m"],
@@ -744,6 +777,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if len(implicit_solvers) != 1:
             raise RuntimeError(f"Expected one implicit MPM solver, received {len(implicit_solvers)}.")
         solver = implicit_solvers[0]
+        cell_grid_rebuild_info = solver._scratchpad.grid.cell_grid.get_rebuild_info()
+        resolved_grid_capacities = {
+            "max_active_cell_count": int(cell_grid_rebuild_info.max_voxel_count),
+            "max_leaf_node_count": int(cell_grid_rebuild_info.max_leaf_node_count),
+            "max_lower_node_count": int(cell_grid_rebuild_info.max_lower_node_count),
+            "max_upper_node_count": int(cell_grid_rebuild_info.max_upper_node_count),
+        }
 
         raw_batch_samples: list[tuple[int, int, float]] = []
         raw_step_samples: list[tuple[int, float]] = []
@@ -850,6 +890,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("The final MPM particle state contains non-finite values.")
         root_displacement = torch.linalg.vector_norm(final_root - initial_root, dim=-1)
         final_aabb_extent = final_pos.amax(dim=1) - final_pos.amin(dim=1)
+        final_environment_abs_max = final_pos.abs().amax(dim=(1, 2))
+        final_excursion_indices = (final_environment_abs_max > 10.0).nonzero().flatten()
         final_particle_rms_radius = torch.sqrt(
             torch.mean(torch.sum((final_pos - final_root.unsqueeze(1)) ** 2, dim=-1), dim=-1)
         )
@@ -887,6 +929,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         evolved = root_displacement_mean_m > 1.0e-3
         if not evolved:
             raise RuntimeError("The granular specimen did not evolve measurably during the timed trajectory.")
+        final_height_min_m = float(final_pos[..., 2].min().item())
+        physically_bounded = final_excursion_indices.numel() == 0 and final_height_min_m >= -args.voxel_size
+        if not physically_bounded:
+            raise RuntimeError(
+                "The final MPM state is finite but physically invalid: "
+                f"minimum height={final_height_min_m:g} m, "
+                f"excursion environments={final_excursion_indices.numel()}."
+            )
         metrics = {
             "setup_wall_s": setup_wall_s,
             "first_step_wall_s": first_step_wall_s,
@@ -931,13 +981,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         validation = {
             "finite_state": finite_state,
             "evolved": evolved,
+            "physically_bounded": physically_bounded,
             "reset_position_max_error_m": reset_position_max_error_m,
             "reset_velocity_max_error_m_s": reset_velocity_max_error_m_s,
             "root_displacement_mean_m": root_displacement_mean_m,
             "final_aabb_extent_mean_m": [float(value) for value in final_aabb_extent.mean(dim=0).tolist()],
+            "final_excursion_environment_count": int(final_excursion_indices.numel()),
+            "final_excursion_environment_indices_first_16": final_excursion_indices[:16].tolist(),
             "final_particle_rms_radius_mean_m": float(final_particle_rms_radius.mean().item()),
             "final_height_mean_m": float(final_pos[..., 2].mean().item()),
-            "final_height_min_m": float(final_pos[..., 2].min().item()),
+            "final_height_min_m": final_height_min_m,
             "final_height_max_m": float(final_pos[..., 2].max().item()),
             "final_speed_max_m_s": float(torch.linalg.vector_norm(final_vel, dim=-1).max().item()),
             "final_active_cell_count_private": final_active_cell_count,
@@ -961,6 +1014,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
         }
         del initial_root, final_root, final_pos, final_vel, root_displacement, final_aabb_extent
+        del final_environment_abs_max, final_excursion_indices
         del final_particle_rms_radius
         torch.cuda.empty_cache()
 
@@ -1024,9 +1078,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "separate_worlds": True,
             "capacity_factor": args.capacity_factor,
             **capacities,
-            "solver_requested": "auto",
+            "resolved_grid_capacities": resolved_grid_capacities,
+            "solver_requested": args.solver,
             "solver_resolved": list(getattr(solver, "solver", ())),
-            "warmstart_mode_requested": "auto",
+            "warmstart_mode_requested": args.warmstart_mode,
             "warmstart_mode_resolved": getattr(solver, "_stress_warmstart", None),
             "transfer_scheme": "apic",
             "integration_scheme": "pic",
@@ -1034,10 +1089,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "velocity_basis": "Q1",
             "collider_basis": "S2",
             "project_outside_colliders": not args.no_project_outside_colliders,
+            "obstacle": "none" if args.no_obstacle else "cylinder",
             "collider_margin_m": args.collider_margin,
             "material": {
                 "density_kg_m3": 1000.0,
-                "young_modulus_pa": 1.0e15,
+                "young_modulus_pa": args.young_modulus,
                 "poisson_ratio": 0.3,
                 "friction": 0.68,
                 "yield_pressure_pa": 1.0e12,

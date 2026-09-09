@@ -98,14 +98,11 @@ def _grid_capacities(case: dict[str, Any]) -> dict[str, int]:
     num_envs = int(case["num_envs"])
     initial_cells = num_envs * _initial_grid_cell_count(float(case["voxel_size"]))
     active = _next_power_of_two(initial_cells * float(case["capacity_factor"]), minimum=1 << 12)
-    leaf = _next_power_of_two(max(active / 4, num_envs * 256), minimum=1 << 8)
-    lower = _next_power_of_two(max(active / 32, num_envs * 64), minimum=1 << 5)
-    upper = _next_power_of_two(max(active / 128, num_envs * 32), minimum=1 << 3)
     return {
         "max_active_cell_count": active,
-        "max_leaf_node_count": min(leaf, active),
-        "max_lower_node_count": min(lower, leaf),
-        "max_upper_node_count": min(upper, lower),
+        "max_leaf_node_count": -1,
+        "max_lower_node_count": _next_power_of_two(max(32, 16 * num_envs)),
+        "max_upper_node_count": _next_power_of_two(max(8, 2 * num_envs)),
     }
 
 
@@ -277,6 +274,9 @@ def _point_command(case: dict[str, Any], suite_id: str, output_dir: Path, run_or
         "gpu_monitor_interval_ms": "--gpu_monitor_interval_ms",
         "max_iterations": "--max_iterations",
         "tolerance": "--tolerance",
+        "solver": "--solver",
+        "warmstart_mode": "--warmstart_mode",
+        "young_modulus": "--young_modulus",
         "capacity_factor": "--capacity_factor",
         "collider_margin": "--collider_margin",
         "device": "--device",
@@ -288,6 +288,10 @@ def _point_command(case: dict[str, Any], suite_id: str, output_dir: Path, run_or
         command.append("--disable_cuda_graph")
     if not case.get("project_outside_colliders", True):
         command.append("--no_project_outside_colliders")
+    if case.get("no_obstacle", False):
+        command.append("--no_obstacle")
+    if case.get("sample_grid_topology", False):
+        command.append("--sample_grid_topology")
     return command
 
 
@@ -352,6 +356,10 @@ def _planned_summary_base(case: dict[str, Any]) -> dict[str, Any]:
         "measured_simulated_s": case["measurement_duration"],
         "max_iterations": case["max_iterations"],
         "tolerance": case["tolerance"],
+        "solver_requested": case.get("solver", "auto"),
+        "warmstart_mode_requested": case.get("warmstart_mode", "auto"),
+        "young_modulus_pa": case.get("young_modulus", 1.0e15),
+        "obstacle": "none" if case.get("no_obstacle", False) else "cylinder",
         "cuda_graph_requested": not case.get("disable_cuda_graph", False),
         "grid_type": "rebuildable_sparse",
         "max_active_cell_count": case["estimated_max_active_cell_count"],
@@ -387,6 +395,10 @@ def _aggregate(
         "substeps",
         "max_iterations",
         "tolerance",
+        "solver_requested",
+        "warmstart_mode_requested",
+        "young_modulus_pa",
+        "obstacle",
         "max_active_cell_count",
         "max_leaf_node_count",
         "max_lower_node_count",

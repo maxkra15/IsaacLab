@@ -1,0 +1,65 @@
+[suite]
+name = "Newton MPM Jacobi environment scaling"
+randomization_seed = 20260909
+max_initial_gpu_memory_used_mib = 4096
+max_initial_gpu_utilization_percent = 25
+
+[defaults]
+repetitions = 4
+device = "cuda:0"
+voxel_size = 0.1
+particles_per_cell = 2.0
+dt = 0.008333333333333333
+substeps = 1
+warmup_steps = 50
+warmup_min_wall_s = 1.0
+measurement_duration = 5.0
+timing_batch_steps = 20
+gpu_monitor_interval_ms = 500
+max_iterations = 250
+tolerance = 0.0001
+solver = "jacobi"
+warmstart_mode = "auto"
+young_modulus = 1.0e15
+capacity_factor = 2.0
+collider_margin = 0.05
+disable_cuda_graph = false
+project_outside_colliders = true
+no_obstacle = true
+sample_grid_topology = false
+preflight_max_total_particles = 1200000
+preflight_max_active_cell_count = 524288
+preflight_max_lower_node_count = 8192
+preflight_max_upper_node_count = 1024
+
+# Four repetitions of each point produce exactly 16 independent shards for the
+# OSMO workflow. The obstacle-free granular drop retains large deformation and
+# plane contact while avoiding a curved-collider instability at high world counts.
+[[sweeps]]
+name = "environment_scaling"
+x_parameter = "num_envs"
+x_unit = "environments"
+
+[[sweeps.cases]]
+id = "env_0064"
+label = "64 environments"
+x_value = 64
+num_envs = 64
+
+[[sweeps.cases]]
+id = "env_0128"
+label = "128 environments"
+x_value = 128
+num_envs = 128
+
+[[sweeps.cases]]
+id = "env_0256"
+label = "256 environments"
+x_value = 256
+num_envs = 256
+
+[[sweeps.cases]]
+id = "env_0512"
+label = "512 environments"
+x_value = 512
+num_envs = 512

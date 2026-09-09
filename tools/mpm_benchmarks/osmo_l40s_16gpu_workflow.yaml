@@ -18,13 +18,13 @@ workflow:
       cpu: 14
       memory: 110Gi
       storage: 256Gi
-      platform: ovx-l40s
+      platform: "{{ platform }}"
     aggregate:
       gpu: 1
       cpu: 4
       memory: 16Gi
       storage: 128Gi
-      platform: ovx-l40s
+      platform: "{{ platform }}"
 
   tasks:
   {% for shard_index in range(16) %}
@@ -122,3 +122,4 @@ default-values:
   benchmark_branch: maximiliank/mpm-benchmark-osmo-20260909
   manifest: osmo_l40s_qualification.toml
   repetitions: 1
+  platform: ovx-l40s
