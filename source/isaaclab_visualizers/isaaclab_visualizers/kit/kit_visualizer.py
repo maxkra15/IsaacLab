@@ -36,7 +36,7 @@ from isaaclab.envs.utils.camera_view import (
     resolve_streaming_envs,
 )
 from isaaclab.utils.math import create_rotation_matrix_from_view, quat_from_matrix
-from isaaclab.utils.renderers import isaac_rtx_per_env_scene_partition_enabled
+from isaaclab.utils.renderers import ISAAC_RTX_SHOW_ALL_PARTITIONS_BY_DEFAULT_SETTING
 from isaaclab.visualizers.base_visualizer import BaseVisualizer
 
 from isaaclab_visualizers.newton_adapter import resolve_visible_env_indices
@@ -136,6 +136,13 @@ class KitVisualizer(BaseVisualizer):
 
     # ---- Lifecycle ------------------------------------------------------------------------
 
+    @property
+    def visual_material_writer(self):
+        """Write material channels directly through Fabric."""
+        from isaaclab_physx.renderers.visual_material import FabricVisualMaterialWriter
+
+        return FabricVisualMaterialWriter
+
     def initialize(self, scene_data_provider: SceneDataProvider) -> None:
         """Initialize viewport resources and bind scene data provider.
 
@@ -154,6 +161,8 @@ class KitVisualizer(BaseVisualizer):
 
         self._ensure_simulation_app()
         self._setup_viewport()
+        if self._viewport_api is not None:
+            self._apply_render_product_background(usd_stage, self._viewport_api.render_product_path)
 
         self._env_ids = self._compute_visualized_env_ids()
         self._resolved_visible_env_ids = resolve_visible_env_indices(self._env_ids, self.cfg.max_visible_envs, num_envs)
@@ -172,6 +181,7 @@ class KitVisualizer(BaseVisualizer):
             rows=[
                 ("eye", self.cfg.eye),
                 ("lookat", self.cfg.lookat),
+                ("background_color", self.cfg.background_color),
                 ("streaming_view", self.cfg.streaming_view),
                 ("streaming_gt_types", list(self.cfg.streaming_gt_types)),
                 ("max_visible_envs", self.cfg.max_visible_envs),
@@ -280,6 +290,7 @@ class KitVisualizer(BaseVisualizer):
         # captured frame contains real rendered output, not empty/blank data.
         if self._rgb_annotator is None:
             self._rgb_render_product = rep.create.render_product(camera_path, (w, h))
+            self._apply_render_product_background(self._scene_data_provider.usd_stage, self._rgb_render_product.path)
             self._rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
             self._rgb_annotator.attach([self._rgb_render_product])
         elif self._runtime_headless and self._rgb_render_product is not None:
@@ -566,6 +577,24 @@ class KitVisualizer(BaseVisualizer):
                     logger.warning("[KitVisualizer] Running in headless mode. Viewport may not display.")
         except ImportError:
             pass
+
+    def _apply_render_product_background(self, stage: Usd.Stage, render_product_path: str | Sdf.Path) -> None:
+        """Apply the configured solid background to an Isaac RTX render product."""
+        if self.cfg.background_color is None:
+            return
+        render_product = stage.GetPrimAtPath(render_product_path)
+        if not render_product.IsValid():
+            logger.warning(
+                "[KitVisualizer] Render product '%s' was not found; background was not applied.",
+                render_product_path,
+            )
+            return
+
+        with Usd.EditContext(stage, stage.GetSessionLayer()), Sdf.ChangeBlock():
+            render_product.CreateAttribute("omni:rtx:background:source:type", Sdf.ValueTypeNames.Token).Set("color")
+            render_product.CreateAttribute("omni:rtx:background:source:color", Sdf.ValueTypeNames.Float3).Set(
+                Gf.Vec3f(*self.cfg.background_color)
+            )
 
     def _setup_viewport(self) -> None:
         """Create/resolve viewport and configure initial camera."""
@@ -898,32 +927,23 @@ class KitVisualizer(BaseVisualizer):
             self._controlled_camera_path = _DEFAULT_VIEWPORT_CAMERA_PATH
 
     def _apply_viewport_camera_scene_partition(self, usd_stage: Usd.Stage, num_envs: int) -> None:
-        """Tag the viewport camera with the first visible env partition.
+        """Configure the viewport camera for partitioned or all-environment viewing.
 
         RTX scene partitioning culls per-env geometry by the camera's non-primvar
         ``omni:scenePartition`` token. Interactive viewport cameras live outside
         ``/World/envs`` and are created by Kit, so they do not inherit the env-root
-        primvar authored by :class:`~isaaclab.scene.InteractiveScene`.
-
-        This method is a no-op unless ``ISAAC_LAB_ENABLE_ISAAC_RTX_PER_ENV_SCENE_PARTITION=1``,
-        matching the opt-in behaviour of
-        :meth:`~isaaclab_physx.renderers.IsaacRtxRenderer.prepare_stage`.
+        primvar authored by the renderer. When the RTX spectator-view setting is
+        enabled, leaving the viewport camera unpartitioned shows all environments.
+        Otherwise, the viewport is assigned to the first visible environment.
         """
-
-        if not isaac_rtx_per_env_scene_partition_enabled():
-            return
 
         if num_envs <= 0 or self._controlled_camera_path is None:
             return
 
-        logger.debug(
-            "[KitVisualizer] Per-environment Isaac RTX scene partitioning is enabled"
-            " (ISAAC_LAB_ENABLE_ISAAC_RTX_PER_ENV_SCENE_PARTITION=1)."
-            " Authoring omni:scenePartition attribute onto viewport camera '%s'.",
-            self._controlled_camera_path,
-        )
-
-        env_id = self._resolved_visible_env_ids[0] if self._resolved_visible_env_ids else 0
+        env_prim = usd_stage.GetPrimAtPath("/World/envs/env_0")
+        env_partition_attr = env_prim.GetAttribute("primvars:omni:scenePartition")
+        if not env_partition_attr.IsValid() or env_partition_attr.Get() is None:
+            return
         camera_prim = usd_stage.GetPrimAtPath(self._controlled_camera_path)
         if not camera_prim.IsValid() or not camera_prim.IsA(UsdGeom.Camera):
             logger.debug(
@@ -931,7 +951,23 @@ class KitVisualizer(BaseVisualizer):
                 self._controlled_camera_path,
             )
             return
+
         attr = camera_prim.GetAttribute("omni:scenePartition")
+        if get_settings_manager().get(ISAAC_RTX_SHOW_ALL_PARTITIONS_BY_DEFAULT_SETTING, False):
+            if attr.IsValid():
+                camera_prim.RemoveProperty("omni:scenePartition")
+            logger.debug(
+                "[KitVisualizer] Leaving viewport camera '%s' unpartitioned for the all-environment spectator view.",
+                self._controlled_camera_path,
+            )
+            return
+
+        env_id = self._resolved_visible_env_ids[0] if self._resolved_visible_env_ids else 0
+        logger.debug(
+            "[KitVisualizer] Assigning viewport camera '%s' to scene partition env_%d.",
+            self._controlled_camera_path,
+            env_id,
+        )
         if not attr.IsValid():
             attr = camera_prim.CreateAttribute("omni:scenePartition", Sdf.ValueTypeNames.Token)
         attr.Set(f"env_{env_id}")

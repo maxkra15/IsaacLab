@@ -7,7 +7,6 @@ from isaaclab_teleop import (
     ControllerHapticFeedbackCfg,
     IsaacTeleopCfg,
     XrAnchorRotationMode,
-    XrCameraFeedCfg,
     XrCfg,
 )
 
@@ -22,8 +21,8 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
+from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
-from isaaclab.utils.configclass import configclass
 
 from isaaclab_tasks.contrib.locomanip_pick_place import mdp as locomanip_mdp
 from isaaclab_tasks.contrib.locomanip_pick_place.configs.action_cfg import AgileBasedLowerBodyActionCfg
@@ -313,12 +312,12 @@ class LocomanipulationG1SceneCfg(InteractiveSceneCfg):
     # haptics (see HapticFeedbackCfg below). Requires activate_contact_sensors
     # on the robot spawn, enabled in the env __post_init__.
     left_hand_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/left_hand_.*_link",
+        prim_path="{ENV_REGEX_NS}/Robot/left_hand_[^/]*_link",
         update_period=0.0,
         history_length=3,
     )
     right_hand_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/right_hand_.*_link",
+        prim_path="{ENV_REGEX_NS}/Robot/right_hand_[^/]*_link",
         update_period=0.0,
         history_length=3,
     )
@@ -486,15 +485,6 @@ class LocomanipulationG1EnvCfg(ManagerBasedRLEnvCfg):
             pipeline_builder=_build_g1_locomanipulation_pipeline,
             sim_device=self.sim.device,
             xr_cfg=self.xr,
-            xr_camera_feeds=[
-                XrCameraFeedCfg(
-                    camera_name="robot_pov_cam",
-                    enable_dlss_ray_reconstruction=True,
-                    dlss_exec_mode="quality",
-                    offset_m=(0.0, -0.15),
-                    max_update_hz=0.0,
-                )
-            ],
         )
         self.image_obs_list = ["robot_pov_cam"]
 

@@ -167,13 +167,13 @@ def test_single_juggle_task_is_continuous_one_metre_ppo():
     assert cfg.actions.arm_action.tool_offset == mdp.JUGGLE_SPHERE_CENTER_OFFSET
     assert cfg.actions.arm_action.damping == 2.5e-3
     assert cfg.actions.hand_action.release_preload_after_first_action
-    meter_effort = cfg.scene.robot.actuators["kuka_allegro_actuators"].effort_limit_sim
+    meter_effort = cfg.scene.robot.actuators["kuka_allegro_actuators"].joint_effort_limit
     assert isinstance(meter_effort, dict)
     assert meter_effort["iiwa7_joint_(1|2)"] == 352.0
     assert meter_effort["iiwa7_joint_(3|4|5)"] == 220.0
     assert meter_effort["iiwa7_joint_(6|7)"] == 80.0
     assert meter_effort["(index|middle|ring|thumb)_joint_(0|1|2|3)"] == 0.7
-    assert KUKA_ALLEGRO_CFG.actuators["kuka_allegro_actuators"].effort_limit_sim["iiwa7_joint_(1|2)"] == 176.0
+    assert KUKA_ALLEGRO_CFG.actuators["kuka_allegro_actuators"].joint_effort_limit["iiwa7_joint_(1|2)"] == 176.0
     assert cfg.observations.policy.ball_height_and_velocity.func is mdp.ball_height_above_release_hand_and_velocity
     assert cfg.observations.policy.ball_height_and_velocity.params["target_height_gain"] == 1.0
     assert cfg.observations.policy.actions.func is mdp.last_action
@@ -325,7 +325,7 @@ def test_juggle_config_validation_rejects_broken_contracts():
             "three-dimensional numeric workspace vector",
         ),
         (
-            lambda cfg: cfg.scene.robot.actuators["kuka_allegro_actuators"].effort_limit_sim.update(
+            lambda cfg: cfg.scene.robot.actuators["kuka_allegro_actuators"].joint_effort_limit.update(
                 {"(index|middle|ring|thumb)_joint_(0|1|2|3)": 1.4}
             ),
             "Allegro effort",

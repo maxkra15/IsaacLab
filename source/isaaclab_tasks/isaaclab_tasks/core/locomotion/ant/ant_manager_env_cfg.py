@@ -24,7 +24,7 @@ from isaaclab.physics import PhysxAutoCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import JointWrenchSensorCfg
 from isaaclab.terrains import TerrainImporterCfg
-from isaaclab.utils.configclass import configclass
+from isaaclab.utils import configclass
 
 import isaaclab_tasks.core.locomotion.mdp as mdp
 from isaaclab_tasks.utils import PresetCfg
@@ -37,7 +37,6 @@ class AntPhysicsCfg(PresetCfg):
     isaacsim_physx: PhysxCfg = PhysxCfg(bounce_threshold_velocity=0.2)
     ovphysx: OvPhysxCfg = OvPhysxCfg()
     physx: PhysxAutoCfg = PhysxAutoCfg(isaacsim_physx=isaacsim_physx, ovphysx=ovphysx)
-    default: PhysxCfg = isaacsim_physx
     newton_mjwarp: NewtonCfg = NewtonCfg(
         solver_cfg=MJWarpSolverCfg(
             njmax=45,
@@ -54,6 +53,7 @@ class AntPhysicsCfg(PresetCfg):
         debug_mode=False,
         use_cuda_graph=True,
     )
+    default: NewtonCfg = newton_mjwarp
 
 
 @configclass
@@ -143,8 +143,8 @@ class ObservationsCfg:
 class AntObservationsCfg(PresetCfg):
     physx: ObservationsCfg = ObservationsCfg()
     isaacsim_physx: ObservationsCfg = physx
-    default: ObservationsCfg = isaacsim_physx
     newton_mjwarp: ObservationsCfg = ObservationsCfg()
+    default: ObservationsCfg = newton_mjwarp
 
 
 @configclass

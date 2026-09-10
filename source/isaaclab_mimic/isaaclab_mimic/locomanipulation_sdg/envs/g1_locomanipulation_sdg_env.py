@@ -13,8 +13,8 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import CameraCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR, retrieve_file_path
-from isaaclab.utils.configclass import configclass
 from isaaclab.utils.datasets import EpisodeData
 from isaaclab.visualizers import VisualizerCfg
 
@@ -40,7 +40,7 @@ NUM_BOXES = 0
 @configclass
 class G1LocomanipulationSDGSceneCfg(LocomanipulationG1SceneCfg):
     packing_table_2 = AssetBaseCfg(
-        prim_path="/World/envs/env_.*/PackingTable2",
+        prim_path="{ENV_REGEX_NS}/PackingTable2",
         init_state=AssetBaseCfg.InitialStateCfg(
             pos=[-2, -3.55, -0.3],
             # rot=[0, 0, 0, 1]),
@@ -54,7 +54,7 @@ class G1LocomanipulationSDGSceneCfg(LocomanipulationG1SceneCfg):
 
     def add_robot_pov_cam(self, height, width):
         robot_pov_cam = CameraCfg(
-            prim_path="/World/envs/env_.*/Robot/torso_link/d435_link/camera",
+            prim_path="{ENV_REGEX_NS}/Robot/torso_link/d435_link/camera",
             update_period=0.0,
             height=height,
             width=width,
@@ -66,7 +66,7 @@ class G1LocomanipulationSDGSceneCfg(LocomanipulationG1SceneCfg):
 
     def add_background_asset(self, background_usd_path: str):
         background = AssetBaseCfg(
-            prim_path="/World/envs/env_.*/Background",
+            prim_path="{ENV_REGEX_NS}/Background",
             init_state=AssetBaseCfg.InitialStateCfg(
                 pos=[0, 0, 0],
                 rot=[0.0, 0.0, 0.0, 1.0],
@@ -81,7 +81,7 @@ class G1LocomanipulationSDGSceneCfg(LocomanipulationG1SceneCfg):
     def add_forklifts(self, num_forklifts: int):
         for i in range(num_forklifts):
             forklift = AssetBaseCfg(
-                prim_path=f"/World/envs/env_.*/Forklift{i}",
+                prim_path=f"/World/envs/env_[^/]+/Forklift{i}",
                 init_state=AssetBaseCfg.InitialStateCfg(pos=[0.0, 0.0, 0.0], rot=[0.0, 0.0, 0.0, 1.0]),
                 spawn=UsdFileCfg(
                     usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Forklift/forklift.usd",
@@ -93,7 +93,7 @@ class G1LocomanipulationSDGSceneCfg(LocomanipulationG1SceneCfg):
     def add_boxes(self, num_boxes: int):
         for i in range(num_boxes):
             box = AssetBaseCfg(
-                prim_path=f"/World/envs/env_.*/Box{i}",
+                prim_path=f"/World/envs/env_[^/]+/Box{i}",
                 init_state=AssetBaseCfg.InitialStateCfg(pos=[0.0, 0.0, 0.0], rot=[0.0, 0.0, 0.0, 1.0]),
                 spawn=UsdFileCfg(
                     usd_path=f"{ISAAC_NUCLEUS_DIR}/Environments/Simple_Warehouse/Props/SM_CardBoxB_01_681.usd",
@@ -135,6 +135,10 @@ class G1LocomanipulationSDGEnvCfg(LocomanipulationG1EnvCfg, LocomanipulationSDGE
 
     def __post_init__(self):
         """Post initialization."""
+        # This class overrides LocomanipulationG1EnvCfg.__post_init__, so preserve the
+        # contact reporting required by the inherited per-hand contact sensors.
+        self.scene.robot.spawn.activate_contact_sensors = True
+
         # general settings
         self.decimation = 4
         self.episode_length_s = 50.0

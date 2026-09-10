@@ -6,7 +6,7 @@
 
 from dataclasses import MISSING
 
-from isaaclab_newton.physics import KaminoPADMMSolverCfg, MJWarpSolverCfg, NewtonCfg
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 from isaaclab_ov.physics import OvPhysxCfg
 from isaaclab_physx.physics import PhysxCfg
 
@@ -26,8 +26,8 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.sensors.frame_transformer import OffsetCfg
 from isaaclab.sim import SimulationCfg
+from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.configclass import configclass
 from isaaclab.visualizers import VisualizerCfg
 
 import isaaclab_tasks.core.cabinet.mdp as mdp
@@ -55,13 +55,13 @@ CABINET_CFG = ArticulationCfg(
     actuators={
         "drawers": ImplicitActuatorCfg(
             joint_names_expr=["drawer_top_joint", "drawer_bottom_joint"],
-            effort_limit_sim=87.0,
+            joint_effort_limit=87.0,
             stiffness=10.0,
             damping=1.0,
         ),
         "doors": ImplicitActuatorCfg(
             joint_names_expr=["door_left_joint", "door_right_joint"],
-            effort_limit_sim=87.0,
+            joint_effort_limit=87.0,
             stiffness=10.0,
             damping=2.5,
         ),
@@ -102,7 +102,6 @@ class CabinetSimCfg(PresetCfg):
     physx: SimulationCfg = isaacsim_physx.replace(
         physics=PhysxAutoCfg(isaacsim_physx=isaacsim_physx.physics, ovphysx=ovphysx.physics)
     )
-    default: SimulationCfg = isaacsim_physx
     newton_mjwarp: SimulationCfg = SimulationCfg(
         dt=1 / 600,
         render_interval=1,
@@ -119,12 +118,7 @@ class CabinetSimCfg(PresetCfg):
             debug_mode=False,
         ),
     )
-    newton_kamino: SimulationCfg = SimulationCfg(
-        dt=1 / 600,
-        render_interval=1,
-        default_visualizer_cfg=VisualizerCfg(eye=(-2.0, 2.0, 2.0), lookat=(0.8, 0.0, 0.5)),
-        physics=NewtonCfg(solver_cfg=KaminoPADMMSolverCfg(max_contacts_per_world=64)),
-    )
+    default: SimulationCfg = newton_mjwarp
 
 
 @configclass
@@ -138,9 +132,8 @@ class CabinetDecimationCfg(PresetCfg):
     isaacsim_physx: int = 1
     ovphysx: int = isaacsim_physx
     physx: int = isaacsim_physx
-    default: int = isaacsim_physx
     newton_mjwarp: int = 10
-    newton_kamino: int = 10
+    default: int = newton_mjwarp
 
 
 ##

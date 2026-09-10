@@ -197,7 +197,7 @@ class KukaAllegroJuggleRLEnvCfg(_KukaAllegroJuggleBaseEnvCfg):
         self.observations.policy.actions = ObsTerm(func=mdp.last_action)
         actuator_name = "kuka_allegro_actuators"
         actuator = self.scene.robot.actuators[actuator_name]
-        if not isinstance(actuator.effort_limit_sim, dict):
+        if not isinstance(actuator.joint_effort_limit, dict):
             raise TypeError("The one-metre task requires per-joint simulated effort limits.")
         # A live Newton feasibility bracket found that the stock iiwa effort
         # limits top out below a one-metre ballistic release, while 2x is the
@@ -205,7 +205,7 @@ class KukaAllegroJuggleRLEnvCfg(_KukaAllegroJuggleBaseEnvCfg):
         # This deliberately makes the variant a simulated juggling sport, not
         # a stock-hardware or sim-to-real claim. Allegro limits remain untouched.
         meter_actuator = actuator.replace(
-            effort_limit_sim={**actuator.effort_limit_sim, **_METER_ARM_EFFORT_LIMITS},
+            joint_effort_limit={**actuator.joint_effort_limit, **_METER_ARM_EFFORT_LIMITS},
         )
         self.scene.robot = self.scene.robot.replace(
             actuators={**self.scene.robot.actuators, actuator_name: meter_actuator},
@@ -337,12 +337,12 @@ class KukaAllegroJuggleRLEnvCfg(_KukaAllegroJuggleBaseEnvCfg):
         if workspace_lower != (0.20, -0.40, 0.08) or workspace_upper != (0.80, 0.40, _METER_WORKSPACE_UPPER_Z):
             raise ValueError("The one-metre task requires its validated workspace bounds.")
         actuator = self.scene.robot.actuators["kuka_allegro_actuators"]
-        if not isinstance(actuator.effort_limit_sim, dict) or any(
-            actuator.effort_limit_sim.get(expression) != effort
+        if not isinstance(actuator.joint_effort_limit, dict) or any(
+            actuator.joint_effort_limit.get(expression) != effort
             for expression, effort in _METER_ARM_EFFORT_LIMITS.items()
         ):
             raise ValueError("The one-metre task requires its validated simulated arm-effort tier.")
-        if actuator.effort_limit_sim.get("(index|middle|ring|thumb)_joint_(0|1|2|3)") != 0.7:
+        if actuator.joint_effort_limit.get("(index|middle|ring|thumb)_joint_(0|1|2|3)") != 0.7:
             raise ValueError("The one-metre arm override must not change the Allegro effort limit.")
         self._validate_continuous_episode_contract()
 
