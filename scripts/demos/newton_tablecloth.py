@@ -38,31 +38,7 @@ parser.set_defaults(visualizer=["newton_gl"])
 args_cli = parser.parse_args()
 
 import warp as wp
-from _newton_tablecloth_utils import (
-    BOWL_LOCAL_HEIGHT,
-    BOWL_LOCAL_RADIUS,
-    BOWL_LOCAL_Z_MIN,
-    BOWL_SCALE,
-    BOWL_USD,
-    FORK_CENTER_OF_MASS,
-    FORK_DIAGONAL_INERTIA,
-    FORK_LOCAL_Z_MIN,
-    FORK_ROTATION,
-    FORK_SCALE,
-    FORK_USD,
-    KITCHEN_ISLAND_SIZE,
-    KITCHEN_ISLAND_USD,
-    WINE_GLASS_CENTER_OF_MASS,
-    WINE_GLASS_DIAGONAL_INERTIA,
-    WINE_GLASS_LOCAL_Z_MIN,
-    WINE_GLASS_USD,
-    VisualTableUsdFileCfg,
-    collision_properties,
-    create_video_recorder,
-    rigid_material,
-    rigid_object_cfg,
-    tabletop_collider_cfg,
-)
+from _newton_tablecloth_utils import create_video_recorder
 from isaaclab_newton.physics import (
     NewtonCfg,
     NewtonCollisionPipelineCfg,
@@ -84,6 +60,31 @@ from isaaclab.assets import (
 from isaaclab.physics import PhysicsEvent
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
+
+from isaaclab_tasks.contrib.tablecloth.assets import (
+    BOWL_LOCAL_HEIGHT,
+    BOWL_LOCAL_RADIUS,
+    BOWL_LOCAL_Z_MIN,
+    BOWL_SCALE,
+    BOWL_USD,
+    FORK_CENTER_OF_MASS,
+    FORK_DIAGONAL_INERTIA,
+    FORK_LOCAL_Z_MIN,
+    FORK_ROTATION,
+    FORK_SCALE,
+    FORK_USD,
+    KITCHEN_ISLAND_SIZE,
+    KITCHEN_ISLAND_USD,
+    WINE_GLASS_CENTER_OF_MASS,
+    WINE_GLASS_DIAGONAL_INERTIA,
+    WINE_GLASS_LOCAL_Z_MIN,
+    WINE_GLASS_USD,
+    VisualTableUsdFileCfg,
+    collision_properties,
+    rigid_material,
+    rigid_object_cfg,
+    tabletop_collider_cfg,
+)
 
 FPS = 60
 SUBSTEPS = 25
