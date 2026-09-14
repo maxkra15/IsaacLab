@@ -178,7 +178,10 @@ class NewtonInverseKinematicsAction(ActionTerm):
         # single-env prototype builder the cloner already retained -- the same
         # source resolution other Newton consumers use, no bespoke registry.
         plan = sim_utils.SimulationContext.instance().get_clone_plan()
-        source_path, _, asset_suffix = cloner.query.path_to_source(plan, self._asset.cfg.prim_path)
+        articulation_path = self._asset.cfg.prim_path
+        if self._asset.cfg.articulation_root_prim_path is not None:
+            articulation_path += self._asset.cfg.articulation_root_prim_path
+        source_path, _, asset_suffix = cloner.query.path_to_source(plan, articulation_path)
         # The proto builder is keyed by the bare clone source; the articulation
         # lives at the asset suffix below it (e.g. ".../env_0" + "/Robot").
         self._source_path = source_path + asset_suffix
