@@ -41,6 +41,10 @@ def _without_controller_dependent_cfg(cfg):
     cfg_dict = cfg.to_dict()
     cfg_dict.pop("actions")
     cfg_dict.pop("teleop_devices")
+    arm_actuator_cfg = cfg_dict["scene"]["robot"]["actuators"]["panda_arm"]
+    arm_actuator_cfg.pop("stiffness")
+    arm_actuator_cfg.pop("damping")
+    arm_actuator_cfg.pop("armature")
     for rigid_props in cfg_dict["scene"]["robot"]["spawn"]["rigid_props"]:
         rigid_props.pop("disable_gravity", None)
         rigid_props.pop("gravcomp", None)
@@ -138,7 +142,52 @@ def test_reach_diffik_physx_configures_teleop_physics():
     assert physx_props.max_depenetration_velocity == pytest.approx(5.0)
     assert not cfg.scene.robot.spawn.make_uninstanceable
     assert cfg.scene.robot.spawn.collision_props is None
-    assert cfg.scene.robot.spawn.usd_path.endswith("/FrankaEmika/Legacy/panda_instanceable.usd")
+    assert cfg.scene.robot.spawn.usd_path.endswith("/FrankaEmika/franka_panda.usda")
+    assert cfg.scene.robot.spawn.variants == {
+        "Physics": "physx",
+        "Colliders": "physx_convex_hulls_compact",
+    }
+
+
+def test_reach_controllers_preserve_menagerie_arm_dynamics():
+    physx = _load_env_cfg("diffik", "isaacsim_physx")
+    ovphysx = _load_env_cfg("diffik", "ovphysx")
+    newton = _load_env_cfg("diffik", "newton_mjwarp")
+    joint_pos_physx = _load_env_cfg("joint_pos", "isaacsim_physx")
+    diffik_abs_physx = _load_env_cfg("diffik_abs", "isaacsim_physx")
+
+    for cfg in (physx, ovphysx, newton, joint_pos_physx, diffik_abs_physx):
+        arm_actuator = cfg.scene.robot.actuators["panda_arm"]
+        assert arm_actuator.stiffness is None
+        assert arm_actuator.damping is None
+        assert arm_actuator.armature is None
+
+
+def test_reach_osc_preserves_menagerie_solver_properties():
+    cfg = _load_reach_env_cfg(_OSC_TASK, "newton_mjwarp")
+    arm_actuator = cfg.scene.robot.actuators["panda_arm"]
+
+    assert isinstance(arm_actuator, IdealPDActuatorCfg)
+    assert arm_actuator.joint_effort_limit == {"panda_joint[1-4]": 100.0, "panda_joint[5-7]": 12.0}
+    assert arm_actuator.joint_velocity_limit == {"panda_joint[1-4]": 20.0, "panda_joint[5-7]": 25.0}
+    assert arm_actuator.viscous_friction == 0.0
+
+
+@pytest.mark.parametrize("physics_preset", ["isaacsim_physx", "newton_mjwarp", "ovphysx"])
+def test_reach_diffik_abs_normalizes_position_actions_to_command_workspace(physics_preset):
+    cfg = _load_env_cfg("diffik_abs", physics_preset)
+    action = cfg.actions.arm_action
+    ranges = cfg.commands.ee_pose.ranges
+
+    position_scale = torch.tensor(action.scale[:3])
+    position_offset = torch.tensor(action.offset[:3])
+    expected_lower = torch.tensor([ranges.pos_x[0], ranges.pos_y[0], ranges.pos_z[0]])
+    expected_upper = torch.tensor([ranges.pos_x[1], ranges.pos_y[1], ranges.pos_z[1]])
+
+    torch.testing.assert_close(position_offset - position_scale, expected_lower)
+    torch.testing.assert_close(position_offset + position_scale, expected_upper)
+    assert action.scale[3:] == (1.0, 1.0, 1.0, 1.0)
+    assert action.offset[3:] == (0.0, 0.0, 0.0, 0.0)
 
 
 def test_reach_newton_ik_configures_gravity_compensation():
@@ -148,6 +197,10 @@ def test_reach_newton_ik_configures_gravity_compensation():
     mujoco_props = next(props for props in rigid_props if isinstance(props, MujocoRigidBodyCfg))
     assert mujoco_props.gravcomp == pytest.approx(1.0)
     assert cfg.scene.robot.spawn.usd_path.endswith("/FrankaEmika/franka_panda.usda")
+    assert cfg.scene.robot.spawn.variants == {
+        "Physics": "mujoco",
+        "Colliders": "physx_minimal_compact",
+    }
 
 
 def test_reach_newton_ik_uses_native_se3_command_convention():

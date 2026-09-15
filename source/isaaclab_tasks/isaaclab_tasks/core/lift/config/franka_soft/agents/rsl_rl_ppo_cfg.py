@@ -73,6 +73,7 @@ class FrankaDeformableCameraPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         "critic": ["policy", "proprio", "perception"],
     }
     actor = RslRlCNNModelCfg(
+        class_name="isaaclab_tasks.core.lift.config.kuka_allegro.agents.models:SpatialSoftmaxCNNModel",
         obs_normalization=True,
         hidden_dims=[512, 256, 128],
         distribution_cfg=RslRlCNNModelCfg.GaussianDistributionCfg(init_std=1.0),
@@ -89,7 +90,7 @@ class FrankaDeformableCameraPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         hidden_dims=[512, 256, 128],
         activation="elu",
     )
-    algorithm = ALGO_CFG.replace(num_mini_batches=8)
+    algorithm = ALGO_CFG.replace(num_mini_batches=8, learning_rate=7.0e-5, schedule="fixed")
 
 
 @configclass

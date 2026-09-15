@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class out_of_bound(ManagerTermBase):
-    """Termination condition for when the object falls out of bound.
+    """Terminate when the rigid object state is non-finite or its position leaves the workspace bounds.
 
     The world-space bounds are cached and rebuilt per axis only when the corresponding
     ``in_bound_range`` entry changes. This keeps the hot path free of host-to-device
@@ -61,7 +61,12 @@ class out_of_bound(ManagerTermBase):
                 self._cached_axis[i] = bounds
 
         pos_w = self._object.data.root_pos_w.torch
-        return ((pos_w < self._lower) | (pos_w > self._upper)).any(dim=1)
+        quat_w = self._object.data.root_quat_w.torch
+        vel_w = self._object.data.root_vel_w.torch
+        invalid = (
+            ~torch.isfinite(pos_w).all(dim=1) | ~torch.isfinite(quat_w).all(dim=1) | ~torch.isfinite(vel_w).all(dim=1)
+        )
+        return invalid | ((pos_w < self._lower) | (pos_w > self._upper)).any(dim=1)
 
 
 def abnormal_robot_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -106,7 +111,7 @@ def deformable_outside_bounds(
     z_bounds: tuple[float, float],
     asset_cfg: SceneEntityCfg = SceneEntityCfg("deformable"),
 ) -> torch.Tensor:
-    """Terminate if any deformable nodal point leaves the allowed workspace box.
+    """Terminate if any deformable nodal point is non-finite or leaves the allowed workspace box.
 
     Covers both leaving the table footprint (x, y) and being dropped off it (z).
 
@@ -124,7 +129,8 @@ def deformable_outside_bounds(
     nodal_pos = asset.data.nodal_pos_w.torch - env.scene.env_origins.unsqueeze(1)
     lower = torch.tensor([x_bounds[0], y_bounds[0], z_bounds[0]], device=nodal_pos.device)
     upper = torch.tensor([x_bounds[1], y_bounds[1], z_bounds[1]], device=nodal_pos.device)
-    return ((nodal_pos < lower) | (nodal_pos > upper)).flatten(1).any(dim=1)
+    invalid = ~torch.isfinite(nodal_pos).flatten(1).all(dim=1)
+    return invalid | ((nodal_pos < lower) | (nodal_pos > upper)).flatten(1).any(dim=1)
 
 
 def cable_outside_bounds(
@@ -134,20 +140,23 @@ def cable_outside_bounds(
     z_bounds: tuple[float, float],
     asset_cfg: SceneEntityCfg = SceneEntityCfg("cable"),
 ) -> torch.Tensor:
-    """Terminate if any cable segment leaves the allowed workspace box."""
+    """Terminate if any cable segment position is non-finite or leaves the allowed workspace box."""
     asset: CableObject = env.scene[asset_cfg.name]
     segment_pos = asset.data.segment_pose_w.torch[..., :3] - env.scene.env_origins.unsqueeze(1)
     lower = torch.tensor([x_bounds[0], y_bounds[0], z_bounds[0]], device=segment_pos.device)
     upper = torch.tensor([x_bounds[1], y_bounds[1], z_bounds[1]], device=segment_pos.device)
-    return ((segment_pos < lower) | (segment_pos > upper)).flatten(1).any(dim=1)
+    invalid = ~torch.isfinite(segment_pos).flatten(1).all(dim=1)
+    return invalid | ((segment_pos < lower) | (segment_pos > upper)).flatten(1).any(dim=1)
 
 
 def joint_vel_out_of_sim_limit(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
-    """Terminate when joint velocities exceed solver limits [m/s or rad/s, depending on joint type]."""
+    """Terminate for non-finite joint state or velocity beyond its limit [m/s or rad/s, depending on joint type]."""
     asset: Articulation = env.scene[asset_cfg.name]
     joint_ids = asset_cfg.joint_ids if asset_cfg.joint_ids is not None else slice(None)
-    return torch.any(
-        torch.abs(asset.data.joint_vel.torch[:, joint_ids]) > asset.data.joint_vel_limits.torch[:, joint_ids], dim=1
-    )
+    joint_pos = asset.data.joint_pos.torch[:, joint_ids]
+    joint_vel = asset.data.joint_vel.torch[:, joint_ids]
+    joint_vel_limits = asset.data.joint_vel_limits.torch[:, joint_ids]
+    invalid = ~torch.isfinite(joint_pos).all(dim=1) | ~torch.isfinite(joint_vel).all(dim=1)
+    return invalid | torch.any(torch.abs(joint_vel) > joint_vel_limits, dim=1)

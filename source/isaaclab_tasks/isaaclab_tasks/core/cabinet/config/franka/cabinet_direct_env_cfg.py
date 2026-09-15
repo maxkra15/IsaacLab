@@ -8,15 +8,22 @@ from __future__ import annotations
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.core.cabinet.cabinet_direct_env_cfg import CabinetDirectEnvCfg, CabinetDirectSceneCfg
+from isaaclab_tasks.utils import preset
 
-from isaaclab_assets.robots.franka import FRANKA_PANDA_CFG
+from isaaclab_assets.robots.franka import FRANKA_PANDA_MENAGERIE_CFG
 
 
 @configclass
 class FrankaCabinetDirectSceneCfg(CabinetDirectSceneCfg):
     """Direct-workflow cabinet scene configured for the Franka robot."""
 
-    robot = FRANKA_PANDA_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot = FRANKA_PANDA_MENAGERIE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot.spawn.variants = preset(
+        default={"Physics": "mujoco", "Colliders": "physx_minimal_compact"},
+        isaacsim_physx={"Physics": "physx", "Colliders": "physx_convex_hulls_compact"},
+        physx={"Physics": "physx", "Colliders": "physx_convex_hulls_compact"},
+        ovphysx={"Physics": "physx", "Colliders": "physx_convex_hulls_compact"},
+    )
 
 
 @configclass

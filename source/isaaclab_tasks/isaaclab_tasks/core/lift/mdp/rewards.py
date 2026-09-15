@@ -51,7 +51,8 @@ def object_ee_distance(
     object_pos = obj.data.root_pos_w.torch
     distance = torch.linalg.norm(asset_pos - object_pos[:, None, :], dim=-1).max(dim=-1).values
     contact_bonus = contacts(env, contact_threshold, thumb_name, finger_names).float().clamp(0.1, 1.0)
-    return (1 - torch.tanh(distance / std)) * contact_bonus
+    reward = (1 - torch.tanh(distance / std)) * contact_bonus
+    return torch.where(torch.isfinite(reward), reward, torch.zeros_like(reward))
 
 
 def _contact_force_mag(sensor: ContactSensor, num_envs: int) -> torch.Tensor:
@@ -164,7 +165,7 @@ class success_reward(ManagerTermBase):
             reward = ((1 - torch.tanh(pos_dist / pos_std)) ** 2) * contact_mask.float()
             self.succeeded |= (pos_dist < pos_std) & contact_mask
 
-        return reward
+        return torch.where(torch.isfinite(reward), reward, torch.zeros_like(reward))
 
 
 def position_command_error_tanh(
@@ -199,7 +200,8 @@ def position_command_error_tanh(
         command[:, :3],
     )
     distance = torch.linalg.norm(obj.data.root_pos_w.torch - des_pos_w, dim=1)
-    return (1 - torch.tanh(distance / std)) * contacts(env, contact_threshold, thumb_name, finger_names).float()
+    reward = (1 - torch.tanh(distance / std)) * contacts(env, contact_threshold, thumb_name, finger_names).float()
+    return torch.where(torch.isfinite(reward), reward, torch.zeros_like(reward))
 
 
 def orientation_command_error_tanh(
@@ -230,7 +232,8 @@ def orientation_command_error_tanh(
     command = env.command_manager.get_command(command_name)
     des_quat_w = math_utils.quat_mul(asset.data.root_link_quat_w.torch, command[:, 3:7])
     quat_distance = math_utils.quat_error_magnitude(obj.data.root_quat_w.torch, des_quat_w)
-    return (1 - torch.tanh(quat_distance / std)) * contacts(env, contact_threshold, thumb_name, finger_names).float()
+    reward = (1 - torch.tanh(quat_distance / std)) * contacts(env, contact_threshold, thumb_name, finger_names).float()
+    return torch.where(torch.isfinite(reward), reward, torch.zeros_like(reward))
 
 
 class _ProgressReward(ManagerTermBase):
@@ -280,9 +283,11 @@ class _ProgressReward(ManagerTermBase):
         else:
             self.best_error[(self._prev_command != command).any(dim=1)] = float("inf")
             self._prev_command.copy_(command)
-        unseeded = torch.isinf(self.best_error)
+        finite = torch.isfinite(error)
+        self.best_error[~finite] = float("inf")
+        unseeded = torch.isinf(self.best_error) & finite
         self.best_error[unseeded] = error[unseeded]
-        improved = gate & (error < self.best_error - min_improvement)
+        improved = finite & gate & (error < self.best_error - min_improvement)
         self.best_error[improved] = error[improved]
         return improved.float()
 
@@ -377,8 +382,10 @@ def deformable_lifting(
 ) -> torch.Tensor:
     """Reward lifting the deformable COM above ``minimal_height`` [m] with a tanh kernel (``std`` [m])."""
     asset: DeformableObject = env.scene[asset_cfg.name]
-    com_z = asset.data.root_pos_w.torch[:, 2]
-    height = (com_z - minimal_height).clamp(min=0.0)
+    com_w = asset.data.root_pos_w.torch
+    com_z = com_w[:, 2]
+    finite = torch.isfinite(com_w).all(dim=1)
+    height = torch.where(finite, (com_z - minimal_height).clamp(min=0.0), 0.0)
     return torch.tanh(height / std)
 
 
@@ -394,7 +401,8 @@ def deformable_ee_distance(
     nodal_pos_w = asset.data.nodal_pos_w.torch
     ee_w = ee_frame.data.target_pos_w.torch[..., 0, :]
     distance = torch.linalg.norm(nodal_pos_w - ee_w.unsqueeze(1), dim=2).min(dim=1).values
-    return 1.0 - torch.tanh(distance / std)
+    finite = torch.isfinite(nodal_pos_w).flatten(1).all(dim=1) & torch.isfinite(ee_w).all(dim=1)
+    return torch.where(finite, 1.0 - torch.tanh(distance / std), 0.0)
 
 
 def deformable_com_ee_distance(
@@ -409,7 +417,8 @@ def deformable_com_ee_distance(
     com_w = asset.data.root_pos_w.torch
     ee_w = ee_frame.data.target_pos_w.torch[..., 0, :]
     distance = torch.linalg.norm(com_w - ee_w, dim=1)
-    return 1.0 - torch.tanh(distance / std)
+    finite = torch.isfinite(com_w).all(dim=1) & torch.isfinite(ee_w).all(dim=1)
+    return torch.where(finite, 1.0 - torch.tanh(distance / std), 0.0)
 
 
 def _deformable_com_goal_metrics(
@@ -425,7 +434,10 @@ def _deformable_com_goal_metrics(
     command = env.command_manager.get_command(command_name)
     des_pos_w, _ = combine_frame_transforms(robot.data.root_pos_w.torch, robot.data.root_quat_w.torch, command[:, :3])
     com_w = asset.data.root_pos_w.torch
-    return torch.linalg.norm(des_pos_w - com_w, dim=1), com_w[:, 2] > minimal_height
+    distance = torch.linalg.norm(des_pos_w - com_w, dim=1)
+    finite = torch.isfinite(des_pos_w).all(dim=1) & torch.isfinite(com_w).all(dim=1)
+    distance = torch.where(finite, distance, torch.full_like(distance, float("inf")))
+    return distance, finite & (com_w[:, 2] > minimal_height)
 
 
 class DeformableComGoalDistance(ManagerTermBase):
@@ -483,8 +495,10 @@ def cable_lifting(
 ) -> torch.Tensor:
     """Reward the average cable height above minimal_height [m] with a tanh kernel (std [m])."""
     asset: CableObject = env.scene[asset_cfg.name]
-    mean_z = asset.data.segment_pose_w.torch[..., 2].mean(dim=1)
-    height = (mean_z - minimal_height).clamp(min=0.0)
+    segment_pose_w = asset.data.segment_pose_w.torch
+    mean_z = segment_pose_w[..., 2].mean(dim=1)
+    finite = torch.isfinite(segment_pose_w).flatten(1).all(dim=1)
+    height = torch.where(finite, (mean_z - minimal_height).clamp(min=0.0), 0.0)
     return torch.tanh(height / std)
 
 
@@ -500,7 +514,8 @@ def cable_ee_distance(
     segment_pos_w = asset.data.segment_pose_w.torch[..., :3]
     ee_pos_w = ee_frame.data.target_pos_w.torch[..., 0, :]
     distance = torch.linalg.norm(segment_pos_w - ee_pos_w.unsqueeze(1), dim=2).min(dim=1).values
-    return 1.0 - torch.tanh(distance / std)
+    finite = torch.isfinite(segment_pos_w).flatten(1).all(dim=1) & torch.isfinite(ee_pos_w).all(dim=1)
+    return torch.where(finite, 1.0 - torch.tanh(distance / std), 0.0)
 
 
 def _cable_segment_goal_metrics(
@@ -518,7 +533,9 @@ def _cable_segment_goal_metrics(
         robot.data.root_pos_w.torch, robot.data.root_quat_w.torch, command[:, :3]
     )
     segment_pos_w = asset.data.segment_pose_w.torch[:, segment_index, :3]
-    return torch.linalg.norm(desired_pos_w - segment_pos_w, dim=1)
+    distance = torch.linalg.norm(desired_pos_w - segment_pos_w, dim=1)
+    finite = torch.isfinite(desired_pos_w).all(dim=1) & torch.isfinite(segment_pos_w).all(dim=1)
+    return torch.where(finite, distance, torch.full_like(distance, float("inf")))
 
 
 class CableSegmentGoalDistance(ManagerTermBase):

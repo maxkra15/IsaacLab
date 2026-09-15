@@ -26,7 +26,6 @@ from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.assets.deformable_object import DeformableObjectCfg
 from isaaclab.controllers import DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.envs import mdp as env_mdp
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -50,7 +49,7 @@ from isaaclab_contrib.coupling import (
     CouplerProxyMappingCfg,
 )
 
-from isaaclab_tasks.utils import PresetCfg
+from isaaclab_tasks.utils import PresetCfg, preset
 from isaaclab_tasks.utils.presets import MultiBackendRendererCfg
 
 from ... import mdp
@@ -201,6 +200,12 @@ class _FrankaSoftSceneCfg(InteractiveSceneCfg):
     """Scene for the Franka deformable environment."""
 
     robot: ArticulationCfg = FRANKA_PANDA_MENAGERIE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot.spawn.variants = preset(
+        default={"Physics": "mujoco", "Colliders": "physx_minimal_compact"},
+        isaacsim_physx={"Physics": "physx", "Colliders": "physx_minimal_compact"},
+        physx={"Physics": "physx", "Colliders": "physx_minimal_compact"},
+        ovphysx={"Physics": "physx", "Colliders": "physx_minimal_compact"},
+    )
 
     # end-effector frame for reward shaping
     ee_frame: FrameTransformerCfg = FrameTransformerCfg(
@@ -264,6 +269,7 @@ class _FrankaSoftSceneCfg(InteractiveSceneCfg):
                     "panda_joint6": 25.0,
                     "panda_joint7": 15.0,
                 },
+                viscous_friction=0.0,
                 armature={
                     "panda_joint[1-2]": 0.6057,
                     "panda_joint[3-4]": 0.4625,
@@ -277,6 +283,7 @@ class _FrankaSoftSceneCfg(InteractiveSceneCfg):
                 joint_velocity_limit=2.0,
                 stiffness=350.0,
                 damping=175.0,
+                viscous_friction=0.0,
                 armature=0.1,
             ),
             "panda_finger2_passive": ImplicitActuatorCfg(
@@ -286,6 +293,7 @@ class _FrankaSoftSceneCfg(InteractiveSceneCfg):
                 joint_velocity_limit=2.0,
                 stiffness=0.0,
                 damping=0.0,
+                viscous_friction=0.0,
                 armature=0.1,
             ),
         }
@@ -450,13 +458,8 @@ class FrankaCameraObservationsCfg:
     @configclass
     class BaseImageCfg(ObsGroup):
         image = ObsTerm(
-            func=env_mdp.image,
-            params={
-                "sensor_cfg": SceneEntityCfg("base_camera"),
-                "data_type": "rgb",
-                "normalize": True,
-                "permute": True,
-            },
+            func=mdp.vision_camera,
+            params={"sensor_cfg": SceneEntityCfg("base_camera")},
         )
 
     policy: PolicyCfg = PolicyCfg()

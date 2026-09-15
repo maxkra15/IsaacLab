@@ -81,21 +81,26 @@ FRANKA_PANDA_MENAGERIE_CFG.spawn.usd_path = f"{ISAACLAB_NUCLEUS_DIR}/Robots/Fran
 FRANKA_PANDA_MENAGERIE_CFG.actuators = {
     "panda_arm": ImplicitActuatorCfg(
         joint_names_expr=["panda_joint[1-7]"],
+        joint_effort_limit={"panda_joint[1-4]": 100.0, "panda_joint[5-7]": 12.0},
         joint_velocity_limit={"panda_joint[1-4]": 20.0, "panda_joint[5-7]": 25.0},
         stiffness=None,
         damping=None,
+        viscous_friction=0.0,
     ),
     "panda_hand": ImplicitActuatorCfg(
         joint_names_expr=["panda_finger_joint.*"],
+        joint_effort_limit={"panda_finger_joint1": 200.0, "panda_finger_joint2": 1.0e6},
         stiffness=None,
         damping=None,
+        viscous_friction=0.0,
     ),
 }
 """Configuration of the MuJoCo Menagerie-derived Franka Emika Panda robot.
 
 The converted model has different inertial and drive authoring from the legacy asset used by
-:attr:`FRANKA_PANDA_CFG`. The solver velocity limits provide consistent behavior across physics
-backends, while the arm and hand retain their USD-authored drives.
+:attr:`FRANKA_PANDA_CFG`. Explicit effort limits and zero passive damping keep the actuator
+contract consistent across physics payloads, while the arm and hand retain their USD-authored
+drives.
 """
 
 
