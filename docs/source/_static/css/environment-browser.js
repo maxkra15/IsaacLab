@@ -14,8 +14,8 @@
         const taskRows = [
             ["Isaac-Ant-Direct", "rl_games,rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/classic/ant.jpg", true],
             ["Isaac-Ant", "rl_games,rsl_rl,skrl,sb3", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/classic/ant.jpg", true],
-            ["Isaac-Cartpole-Direct", "rl_games,rsl_rl,skrl,sb3", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/classic/cartpole.jpg", true],
-            ["Isaac-Cartpole", "rl_games,rsl_rl,skrl,sb3", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/classic/cartpole.jpg", true],
+            ["Isaac-Cartpole-Direct", "rl_games,rsl_rl,skrl,sb3,torchrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/classic/cartpole.jpg", true],
+            ["Isaac-Cartpole", "rl_games,rsl_rl,skrl,sb3,torchrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/classic/cartpole.jpg", true],
             ["Isaac-Cartpole-Camera-Direct", "rl_games,rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "isaacsim_rtx,newton_renderer,ovrtx", "albedo,depth,rgb,semantic_segmentation,simple_shading_constant_diffuse,simple_shading_diffuse_mdl,simple_shading_full_mdl", "tasks/classic/cartpole.jpg", false, {"*": ["rgb"], "rl_games": ["depth"]}],
             ["Isaac-Cartpole-Camera", "rl_games,rsl_rl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "isaacsim_rtx,newton_renderer,ovrtx", "albedo,depth,resnet18,rgb,semantic_segmentation,simple_shading_constant_diffuse,simple_shading_diffuse_mdl,simple_shading_full_mdl,theia_tiny", "tasks/classic/cartpole.jpg", false, {"*": ["rgb"], "rsl_rl": ["resnet18", "theia_tiny"]}],
             ["Isaac-Fourbar-Pole-Swingup", "rsl_rl", "newton_kamino", "", "", "tasks/classic/fourbar_pole.jpg"],
@@ -28,8 +28,8 @@
             ["Isaac-Lift-Franka", "rsl_rl", "isaacsim_physx,newton_mjwarp,ovphysx", "", "cube,shapes", "", false, {"*": ["shapes"]}],
             ["Isaac-Lift-KukaAllegro", "rsl_rl", "isaacsim_physx,newton_mjwarp,ovphysx", "", "cube,shapes", "tasks/manipulation/kuka_allegro_lift.jpg", false, {"*": ["shapes"]}],
             ["Isaac-Lift-KukaAllegro-Camera", "rsl_rl", "isaacsim_physx,newton_mjwarp,ovphysx", "isaacsim_rtx,newton_renderer,ovrtx", "albedo128,albedo256,albedo64,cube,depth128,depth256,depth64,duo_camera,raycaster_depth128,raycaster_depth256,raycaster_depth64,rgb128,rgb256,rgb64,semantic_segmentation128,semantic_segmentation256,semantic_segmentation64,shapes,simple_shading_constant_diffuse128,simple_shading_constant_diffuse256,simple_shading_constant_diffuse64,simple_shading_diffuse_mdl128,simple_shading_diffuse_mdl256,simple_shading_diffuse_mdl64,simple_shading_full_mdl128,simple_shading_full_mdl256,simple_shading_full_mdl64,single_camera", "tasks/manipulation/kuka_allegro_lift.jpg", false, {"*": ["rgb64", "shapes", "single_camera"]}],
-            ["Isaac-Lift-Soft-Franka", "rsl_rl", "isaacsim_physx,newton_mjwarp_vbd_proxy", "", "ik,joint", "newton/franka-mjwarp-vbd-coupling.png", false, {"*": ["joint"]}],
-            ["Isaac-Lift-Soft-Franka-Camera", "rsl_rl", "isaacsim_physx,newton_mjwarp_vbd_proxy", "isaacsim_rtx,newton_renderer,ovrtx", "ik,joint", "newton/franka-mjwarp-vbd-coupling.png", false, {"*": ["joint"]}],
+            ["Isaac-Lift-Soft-Franka", "rsl_rl", "isaacsim_physx,newton_mjwarp_vbd_proxy", "", "ik,joint", "newton/franka-mjwarp-vbd-coupling.png", false, {"*": ["joint"]}, {}, "tetrahedralization"],
+            ["Isaac-Lift-Soft-Franka-Camera", "rsl_rl", "isaacsim_physx,newton_mjwarp_vbd_proxy", "isaacsim_rtx,newton_renderer,ovrtx", "ik,joint", "newton/franka-mjwarp-vbd-coupling.png", false, {"*": ["joint"]}, {}, "tetrahedralization"],
             ["Isaac-Open-Drawer-Franka-Direct", "rl_games,rsl_rl,skrl", "isaacsim_physx,newton_mjwarp,ovphysx", "", "", "tasks/manipulation/franka_open_drawer.jpg"],
             ["Isaac-Open-Drawer-Franka", "rl_games,rsl_rl,skrl", "isaacsim_physx,newton_mjwarp,ovphysx", "", "", "tasks/manipulation/franka_open_drawer.jpg"],
             ["Isaac-Pendulum-MARL-Direct", "rl_games,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/classic/cart_double_pendulum.jpg", false, {}, {"skrl": "MAPPO"}],
@@ -136,19 +136,19 @@
             ["IsaacContrib-Stack-Cube-UR10-Short-Suction-IK-Rel", "", "isaacsim_physx", "", "", "tasks/manipulation/ur10_stack_surface_gripper.jpg"],
             ["IsaacContrib-Tablecloth-H1", "", "", "", "", "tasks/manipulation/h1_tablecloth.jpg"],
             ["IsaacContrib-TrackPositionNoObstacles-ARL-Robot-1", "rl_games,rsl_rl,skrl", "", "", "", "tasks/drone_arl/arl_robot_1_track_position_state_based.jpg"],
-            ["IsaacContrib-Tracking-LocoManip-Digit", "rsl_rl", "isaacsim_physx", "", "", "tasks/locomotion/agility_digit_loco_manip.jpg"],
+            ["IsaacContrib-Tracking-LocoManip-Digit", "rsl_rl", "isaacsim_physx,newton_mjwarp", "", "", "tasks/locomotion/agility_digit_loco_manip.jpg"],
             ["IsaacContrib-UR10-Particle-Push", "rsl_rl", "", "", "", "tasks/manipulation/ur10_particle_push.jpg"],
             ["IsaacContrib-Velocity-Flat-AnymalB", "rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/locomotion/anymal_b_flat.jpg", true],
             ["IsaacContrib-Velocity-Flat-AnymalC-Direct", "rl_games,rsl_rl,skrl", "", "", "", "tasks/locomotion/anymal_c_flat.jpg"],
             ["IsaacContrib-Velocity-Flat-AnymalC", "rl_games,rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/locomotion/anymal_c_flat.jpg", true],
-            ["IsaacContrib-Velocity-Flat-Digit", "rsl_rl", "isaacsim_physx", "", "", "tasks/locomotion/agility_digit_flat.jpg"],
+            ["IsaacContrib-Velocity-Flat-Digit", "rsl_rl", "isaacsim_physx,newton_mjwarp", "", "", "tasks/locomotion/agility_digit_flat.jpg"],
             ["IsaacContrib-Velocity-Flat-Spot", "rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp", "", "", "tasks/locomotion/spot_flat.jpg"],
             ["IsaacContrib-Velocity-Flat-UnitreeA1", "rsl_rl,skrl,sb3", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/locomotion/a1_flat.jpg", true],
             ["IsaacContrib-Velocity-Flat-UnitreeGo1", "rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/locomotion/go1_flat.jpg", true],
             ["IsaacContrib-Velocity-Rough-AnymalB", "rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/locomotion/anymal_b_rough.jpg"],
             ["IsaacContrib-Velocity-Rough-AnymalC-Direct", "rl_games,rsl_rl,skrl", "", "", "", "tasks/locomotion/anymal_c_rough.jpg"],
             ["IsaacContrib-Velocity-Rough-AnymalC", "rl_games,rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/locomotion/anymal_c_rough.jpg"],
-            ["IsaacContrib-Velocity-Rough-Digit", "rsl_rl", "isaacsim_physx", "", "", "tasks/locomotion/agility_digit_rough.jpg"],
+            ["IsaacContrib-Velocity-Rough-Digit", "rsl_rl", "isaacsim_physx,newton_mjwarp", "", "", "tasks/locomotion/agility_digit_rough.jpg"],
             ["IsaacContrib-Velocity-Rough-UnitreeA1", "rsl_rl,skrl,sb3", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/locomotion/a1_rough.jpg"],
             ["IsaacContrib-Velocity-Rough-UnitreeGo1", "rsl_rl,skrl", "isaacsim_physx,newton_kamino,newton_mjwarp,ovphysx", "", "", "tasks/locomotion/go1_rough.jpg"],
         ];
@@ -159,6 +159,7 @@
         task, rl, physics, renderer, presets, previewImage = "", supportsWarpFrontend = false,
         pretrainedCheckpointPresetCompatibility = {},
         defaultAlgorithms = {},
+        requiredExtras = "",
     ]) => ({
         task,
         scope: task.startsWith("IsaacContrib-") ? "contrib" : "core",
@@ -170,6 +171,7 @@
         supportsWarpFrontend,
         pretrainedCheckpointPresetCompatibility,
         defaultAlgorithms,
+        requiredExtras: splitValues(requiredExtras),
     }));
 
     const builder = document.querySelector("[data-environment-browser]");
@@ -202,7 +204,7 @@
         benchmarkWorkload: "collection",
         benchmarkChannel: "release",
     };
-    const rlLibraryExtras = {rl_games: "rl-games", sb3: "sb3", skrl: "skrl", rlinf: "rlinf"};
+    const rlLibraryExtras = {rl_games: "rl-games", sb3: "sb3", skrl: "skrl", rlinf: "rlinf", torchrl: "torchrl"};
     let benchmarkRows = [];
     const benchmarkErrors = new Set();
 
@@ -361,6 +363,15 @@
         "Isaac-Velocity-Rough-G1": "velocity-rough-g1-newton-mjwarp-rsl-rl.mp4",
         "Isaac-Lift-KukaAllegro": "lift-kuka-allegro-newton-mjwarp-rsl-rl.mp4",
     };
+    const previewImageBaseUrl = "https://download.isaacsim.omniverse.nvidia.com/isaaclab/images/";
+    const failedPreviewVideos = new Set();
+
+    const previewImageUrl = (task) => {
+        const imagePath = previewImageFor(task);
+        return imagePath.startsWith("tasks/")
+            ? new URL(imagePath, previewImageBaseUrl).href
+            : new URL(`../../_static/${imagePath}`, window.location.href).href;
+    };
 
     const updateTaskControls = () => {
         const task = selectedTask();
@@ -374,6 +385,9 @@
 
     const updateModeControls = () => {
         const supportsRl = selectedTask().rl.length > 0;
+        if (!supportsRl) {
+            state.mode = "train";
+        }
         for (const modeButton of modeButtons) {
             modeButton.disabled = !supportsRl;
             const isActive = supportsRl && modeButton.dataset.commandMode === state.mode;
@@ -410,7 +424,8 @@
     };
 
     const currentCommand = () => {
-        const extras = [];
+        const task = selectedTask();
+        const extras = [...task.requiredExtras];
         if (fields.physics.value === "ovphysx" && fields.renderer.value === "ovrtx") {
             extras.push("ov");
         } else {
@@ -432,7 +447,6 @@
         if (extras.length) {
             parts.push("--extra", extras.join(","));
         }
-        const task = selectedTask();
         const supportsRl = task.rl.length > 0;
         parts.push("isaaclab", supportsRl ? state.mode : "zero_agent");
         if (supportsRl && fields.rl.value) {
@@ -463,11 +477,19 @@
         const videoName = fields.rl.value === "rsl_rl" && fields.physics.value === "newton_mjwarp"
             ? previewVideos[state.task]
             : undefined;
-        const previewImageName = previewImageFor(selectedTask()).split("/").pop();
-        previewImage.src = new URL(`../../_images/${previewImageName}`, window.location.href).href;
+        const videoUrl = videoName
+            ? new URL(`../../_static/tasks/previews/${videoName}`, window.location.href).href
+            : undefined;
+        previewImage.src = previewImageUrl(selectedTask());
         previewImage.alt = `${state.task} preview`;
-        if (videoName) {
-            const videoUrl = new URL(`../../_static/${videoName}`, window.location.href).href;
+        if (videoUrl && !failedPreviewVideos.has(videoUrl)) {
+            previewVideo.onerror = () => {
+                if (previewVideo.src === videoUrl) {
+                    failedPreviewVideos.add(videoUrl);
+                    previewVideo.hidden = true;
+                    previewImage.hidden = false;
+                }
+            };
             if (previewVideo.src !== videoUrl) {
                 previewVideo.src = videoUrl;
             }
@@ -476,6 +498,7 @@
             previewImage.hidden = true;
             previewVideo.play().catch(() => {});
         } else {
+            previewVideo.onerror = null;
             previewVideo.pause();
             previewVideo.hidden = true;
             previewImage.hidden = false;
@@ -564,7 +587,7 @@
         const refreshCard = () => {
             const activeTask = variants.find((task) => task.task === state.task) || variants[0];
             const isSelected = variants.includes(activeTask) && activeTask.task === state.task;
-            image.src = new URL(`../../_static/${previewImageFor(activeTask)}`, window.location.href).href;
+            image.src = previewImageUrl(activeTask);
             image.alt = "";
             selectButton.dataset.taskName = activeTask.task;
             selectButton.setAttribute("aria-pressed", String(isSelected));
