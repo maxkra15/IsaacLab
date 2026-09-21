@@ -225,8 +225,8 @@ class H1TableclothSceneCfg(InteractiveSceneCfg):
             scale=KITCHEN_ISLAND_SCALE,
             variants={"Physics": "none"},
             make_uninstanceable=True,
-            rigid_props=sim_utils.NewtonRigidBodyPropertiesCfg(rigid_body_enabled=False),
-            collision_props=sim_utils.NewtonCollisionPropertiesCfg(collision_enabled=False),
+            rigid_props=[sim_utils.UsdPhysicsRigidBodyCfg(rigid_body_enabled=False)],
+            collision_props=[sim_utils.UsdPhysicsCollisionCfg(collision_enabled=False)],
         ),
     )
     tabletop_collider = AssetBaseCfg(
@@ -493,12 +493,7 @@ class H1TableclothEnvCfg(ManagerBasedRLEnvCfg):
                 solver_cfg=VBDSolverCfg(
                     iterations=15,
                     rigid_compliant_alm=True,
-                    rigid_body_contact_buffer_size=512,
                     rigid_body_particle_contact_buffer_size=8192,
-                    rigid_joint_linear_ke=1.0e6,
-                    rigid_joint_angular_ke=1.0e6,
-                    rigid_joint_linear_kd=1.0e2,
-                    rigid_joint_angular_kd=1.0e2,
                 ),
             ),
             default_visualizer_cfg=VisualizerCfg(
