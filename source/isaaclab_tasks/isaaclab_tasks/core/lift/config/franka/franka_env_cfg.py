@@ -306,6 +306,8 @@ class FrankaReorientEnvCfg(FrankaMixinCfg, lift.ReorientEnvCfg):
         )
         pregrasp.params.pop("velocity_range")
         reset_params["valid_criteria"].pop("object_robot_clearance")
+        # Keep valid held-object starts instead of selecting distant edge poses.
+        reset_params["diversity_feature"] = None
 
     def play_mode(self):
         super().play_mode()

@@ -152,6 +152,7 @@ def test_franka_tasks_use_distinct_lift_and_reorient_bootstraps() -> None:
     assert reorient_reset["terms"]["reset_object_to_target"].func is mdp.reset_to_grasp
     assert reorient_reset["terms"]["reset_object_to_target"].params["probability"] == pytest.approx(1.0)
     assert "object_robot_clearance" not in reorient_reset["valid_criteria"]
+    assert reorient_reset["diversity_feature"] is None
     assert reorient.actions.arm_action.joint_names == ["panda_joint.*"]
     assert reorient.actions.arm_action.scale == pytest.approx(0.03)
     assert reorient.actions.gripper_action.joint_names == ["panda_finger_joint1"]
