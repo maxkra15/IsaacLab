@@ -320,16 +320,23 @@ class FrankaLiftEnvCfg(FrankaMixinCfg, lift.LiftEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # Keep the existing 25% reset mix, but make those starts aligned pre-grasps.
-        pregrasp = self.events.conditional_reset.params["terms"]["reset_object_to_target"]
+        reset = self.events.conditional_reset.params
+        terms = reset["terms"]
+        # The aligned opening must be written after the generic gripper-width reset.
+        pregrasp = terms.pop("reset_object_to_target")
+        terms["reset_object_to_target"] = pregrasp
         pregrasp.func = mdp.reset_to_grasp
         pregrasp.params.update(
+            probability=0.75,
             gripper_cfg=SceneEntityCfg("robot", joint_names="panda_finger_joint.*"),
             pose_range={"x": (-0.002, 0.002), "y": (-0.002, 0.002), "z": (0.1, 0.1)},
             gripper_joint_positions=[0.026, 0.026, 0.0135, 0.026, 0.021, 0.026, 0.026, 0.011],
             asset_orientations=[(0.0, 0.0, 0.0, 1.0)] * 5 + [(0.0, 2.0**-0.5, 0.0, 2.0**-0.5)] * 3,
         )
         pregrasp.params.pop("velocity_range")
+        # Distance-based farthest-point sampling discards most valid near-grasp states.
+        # Keep accepted candidates directly so the bank contains both reachable grasps and broad starts.
+        reset["diversity_feature"] = None
 
     def play_mode(self):
         super().play_mode()

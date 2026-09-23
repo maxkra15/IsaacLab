@@ -1,5 +1,6 @@
 Changed
 ^^^^^^^
 
-* Aligned the existing in-hand reset fraction for Franka Lift with the parallel gripper to test grasp exploration.
-  To retain random object orientations in that fraction, use the previous reset term.
+* Retained aligned Franka Lift pre-grasps in the reset bank and applied their finger opening after the
+  generic gripper reset, while keeping broad starts and success-based sampling. Re-evaluate existing Lift
+  checkpoints because the training reset distribution changed.
