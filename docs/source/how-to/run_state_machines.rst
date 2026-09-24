@@ -7,8 +7,9 @@ Run Scripted State Machines
 
 Isaac Lab includes hand-written state-machine examples for inspecting an
 environment's observations and action interface without training a policy. The
-state transitions run in parallel across environments as Warp kernels, which
-keeps the examples efficient at larger environment counts.
+first three examples below run transitions in parallel as Warp kernels, which
+keeps them efficient at larger environment counts. The contributed showcases
+use measured Torch state machines instead.
 
 Run these commands from the Isaac Lab repository root. Use ``--num_envs`` to
 change the number of parallel environments and ``--viz`` to select a
@@ -50,3 +51,30 @@ and releases it:
 Each script defines its states, wait times, transition kernel, and action loop
 in one file. Start with ``lift_cube_sm.py`` when adapting the pattern to a new
 manipulation task.
+
+Coupled-solver showcases
+------------------------
+
+Three contributed manager-based PPO tasks also have finite scripted demos. Their
+state machines advance from measured robot and object state; the scripts are
+playback controllers, not trained policies. The scenes retain the default
+ground plane, use a small visual-only USD backdrop, and report physical
+progress at the end of each run.
+
+.. code-block:: bash
+
+   # MJWarp + MPM: Franka pours particles between two cups.
+   uv run --extra video python scripts/environments/state_machine/kinetic_foundry.py \
+      --max_steps 1800 --video
+
+   # MJWarp + VBD: KUKA presses a cloth sheet while Fourier GR1T2 presents its far edge.
+   uv run --extra video python scripts/environments/state_machine/textile_atelier.py \
+      --max_steps 800 --video
+
+   # MJWarp rigid contact: KUKA-Allegro launches a ball for a GR1T2 open-hand deflection.
+   uv run --extra video python scripts/environments/state_machine/relay_juggle.py \
+      --max_steps 720 --video
+
+Use ``--viz none`` without ``--video`` to check physics and phase metrics first.
+The demos use one environment by default; each registered task retains its
+separate PPO action configuration for future training.
