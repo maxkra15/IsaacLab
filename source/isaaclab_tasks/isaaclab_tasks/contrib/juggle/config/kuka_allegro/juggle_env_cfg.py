@@ -6,7 +6,7 @@
 """Newton manager-based configuration for one-ball KUKA-Allegro juggling."""
 
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonCollisionPipelineCfg, NewtonShapeCfg
-from isaaclab_newton.sim.schemas import NewtonCollisionPropertiesCfg, NewtonMaterialPropertiesCfg
+from isaaclab_newton.sim.schemas import NewtonCollisionCfg, NewtonMaterialPropertiesCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
@@ -20,7 +20,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
-from isaaclab.sim.schemas import RigidBodyBaseCfg
+from isaaclab.sim.schemas import MassCfg, UsdPhysicsCollisionCfg, UsdPhysicsRigidBodyCfg
 from isaaclab.utils.configclass import configclass
 from isaaclab.visualizers import VisualizerCfg
 
@@ -90,9 +90,12 @@ class JuggleSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.50, 0.0, 0.30)),
         spawn=sim_utils.SphereCfg(
             radius=mdp.BALL_RADIUS,
-            rigid_props=RigidBodyBaseCfg(disable_gravity=False),
-            collision_props=NewtonCollisionPropertiesCfg(contact_margin=0.0, contact_gap=0.0),
-            mass_props=sim_utils.MassPropertiesCfg(mass=mdp.BALL_MASS),
+            rigid_props=UsdPhysicsRigidBodyCfg(rigid_body_enabled=True, kinematic_enabled=False),
+            collision_props=[
+                UsdPhysicsCollisionCfg(collision_enabled=True),
+                NewtonCollisionCfg(contact_margin=0.0, contact_gap=0.0),
+            ],
+            mass_props=MassCfg(mass=mdp.BALL_MASS),
             physics_material=NewtonMaterialPropertiesCfg(
                 static_friction=1.0,
                 dynamic_friction=0.8,

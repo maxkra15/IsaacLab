@@ -724,6 +724,97 @@ def test_rsl_distillation_runner_loads_checkpoint_for_custom_algorithm() -> None
     assert _should_load_checkpoint(resume=True, runner_class_name="OnPolicyRunner")
 
 
+@pytest.mark.parametrize(
+    ("resume", "runner_class_name"),
+    [(True, "OnPolicyRunner"), (False, "DistillationRunner")],
+)
+def test_rsl_training_resolves_implicit_checkpoint_for_resume_or_distillation(
+    monkeypatch: pytest.MonkeyPatch, resume: bool, runner_class_name: str
+) -> None:
+    """Resume and custom distillation both load a prior run without an explicit CLI path."""
+    from isaaclab_rl.entrypoints.backends import train_rsl_rl
+
+    calls = []
+    monkeypatch.setattr(
+        train_rsl_rl,
+        "get_checkpoint_path",
+        lambda *args: calls.append(args) or "/checkpoint/model.pt",
+    )
+    args_cli = SimpleNamespace(checkpoint=None)
+    agent_cfg = SimpleNamespace(
+        resume=resume,
+        class_name=runner_class_name,
+        load_run="latest",
+        load_checkpoint="model_.*.pt",
+        algorithm=SimpleNamespace(class_name="CustomDistillation"),
+    )
+
+    checkpoint = train_rsl_rl._resolve_checkpoint(args_cli, agent_cfg, "/logs")
+
+    assert checkpoint == "/checkpoint/model.pt"
+    assert calls == [("/logs", "latest", "model_.*.pt")]
+
+
+def test_rsl_implicit_resume_ignores_new_empty_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Resolve a previous checkpoint before the new training run creates its manifest."""
+    from isaaclab_rl.entrypoints.backends import train_rsl_rl
+
+    prior_run = tmp_path / "logs" / "rsl_rl" / "resume_regression" / "2000-01-01_00-00-00"
+    prior_run.mkdir(parents=True)
+    checkpoint = prior_run / "model_1.pt"
+    checkpoint.touch()
+    monkeypatch.chdir(tmp_path)
+
+    env_cfg = SimpleNamespace(sim=SimpleNamespace(device="cpu"))
+    agent_cfg = SimpleNamespace(
+        algorithm=SimpleNamespace(class_name="PPO"),
+        class_name="OnPolicyRunner",
+        experiment_name="resume_regression",
+        load_checkpoint="model_.*.pt",
+        load_run=".*",
+        resume=True,
+        run_name="",
+        seed=42,
+    )
+    args_cli = SimpleNamespace(
+        agent="rsl_rl_cfg_entry_point", checkpoint=None, distributed=False, max_iterations=None, task="Isaac-Cartpole"
+    )
+    screen = SimpleNamespace(stage=lambda _name: None)
+    monkeypatch.setattr(train_rsl_rl, "check_rsl_rl_version", lambda: None)
+    monkeypatch.setattr(train_rsl_rl, "startup_screen", lambda *_args, **_kwargs: contextlib.nullcontext(screen))
+    monkeypatch.setattr(train_rsl_rl, "resolve_task_config", lambda *_args: (env_cfg, agent_cfg))
+    monkeypatch.setattr(train_rsl_rl, "pre_launch_video_config", lambda *_args: None)
+    monkeypatch.setattr(train_rsl_rl, "show_run_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_rsl_rl, "launch_simulation", lambda *_args: contextlib.nullcontext())
+    monkeypatch.setattr(train_rsl_rl.cli_args, "update_rsl_rl_cfg", lambda cfg, _args: cfg)
+    monkeypatch.setattr(train_rsl_rl, "handle_deprecated_rsl_rl_cfg", lambda cfg, _version: cfg)
+    monkeypatch.setattr(train_rsl_rl, "apply_env_overrides", lambda *_args: None)
+    monkeypatch.setattr(train_rsl_rl, "validate_distributed_device", lambda *_args: None)
+    monkeypatch.setattr(train_rsl_rl, "apply_video_recording", lambda *_args: None)
+
+    resolved: list[str | None] = []
+    resolve_checkpoint = train_rsl_rl._resolve_checkpoint
+
+    def record_checkpoint(*args) -> str | None:
+        path = resolve_checkpoint(*args)
+        resolved.append(path)
+        return path
+
+    class StopBeforeEnvironment(Exception):
+        pass
+
+    def stop_before_environment(*_args, **_kwargs) -> None:
+        raise StopBeforeEnvironment
+
+    monkeypatch.setattr(train_rsl_rl, "_resolve_checkpoint", record_checkpoint)
+    monkeypatch.setattr(train_rsl_rl, "create_isaaclab_env", stop_before_environment)
+
+    with pytest.raises(StopBeforeEnvironment):
+        train_rsl_rl._run(args_cli)
+
+    assert resolved == [str(checkpoint)]
+
+
 def test_rsl_training_registers_external_task_before_agent_discovery(monkeypatch) -> None:
     """RSL-RL parses tasks registered by its external callback."""
     from isaaclab_rl.entrypoints.backends import train_rsl_rl

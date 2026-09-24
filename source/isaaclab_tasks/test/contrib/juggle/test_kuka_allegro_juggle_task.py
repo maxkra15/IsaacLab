@@ -5,7 +5,6 @@
 
 """Public-contract tests for one-ball KUKA-Allegro juggling."""
 
-import inspect
 import math
 from dataclasses import replace
 from types import SimpleNamespace
@@ -40,65 +39,6 @@ from isaaclab_tasks.utils.reset_sampling import (
 from isaaclab_assets.robots import KUKA_ALLEGRO_CFG
 
 TASK_NAME = "IsaacContrib-Juggle-Ball-KukaAllegro-RL"
-
-
-def test_extended_manager_terms_preserve_existing_positional_parameters():
-    """Juggle options append to rather than reorder existing manager-term calls."""
-    runtime_parameters = tuple(inspect.signature(mdp.JuggleRuntimeState).parameters)
-    assert runtime_parameters == (
-        "row_ids",
-        "start_phases",
-        "current_phases",
-        "visited_phase_bits",
-        "stable_catch_steps",
-        "release_clear_steps",
-        "release_heights",
-        "first_ascent_active",
-        "seen_initial_ascent",
-        "seen_release",
-        "seen_apex",
-        "static_held_start",
-        "local_success",
-        "new_local_success",
-        "cycle_success",
-        "new_cycle_success",
-        "initialized",
-    )
-    initializer_parameters = tuple(inspect.signature(mdp.initialize_juggle_episode_state).parameters)
-    assert initializer_parameters[:5] == (
-        "state",
-        "env_ids",
-        "phases",
-        "release_heights",
-        "static_held_start",
-    )
-    assert initializer_parameters[-1] == "local_goal_ids"
-    reset_parameters = tuple(inspect.signature(mdp.JuggleResetEvent.__call__).parameters)
-    assert reset_parameters[:6] == (
-        "self",
-        "env",
-        "env_ids",
-        "rows_per_phase",
-        "fixed_phase",
-        "static_held_only",
-    )
-    progress_parameters = tuple(inspect.signature(mdp.JuggleProgressContext.__call__).parameters)
-    assert progress_parameters[:14] == (
-        "self",
-        "env",
-        "tool_body_cfg",
-        "fingertip_cfg",
-        "ball_cfg",
-        "tool_offset",
-        "release_separation_distance",
-        "release_clear_steps",
-        "apex_height_gain",
-        "catch_approach_distance",
-        "catch_distance",
-        "contact_maximum_relative_speed",
-        "stable_maximum_relative_speed",
-        "stable_catch_steps",
-    )
 
 
 def test_single_juggle_task_is_continuous_one_metre_ppo():

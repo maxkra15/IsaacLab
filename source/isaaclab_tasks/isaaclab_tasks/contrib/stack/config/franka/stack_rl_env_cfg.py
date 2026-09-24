@@ -9,6 +9,7 @@ import math
 
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonCollisionPipelineCfg, NewtonShapeCfg
 from isaaclab_newton.sim.schemas import NewtonMaterialPropertiesCfg
+from isaaclab_physx.sim.schemas import PhysxCollisionCfg, PhysxRigidBodyCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
@@ -18,7 +19,7 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sim.schemas import CollisionBaseCfg, RigidBodyBaseCfg, UsdPhysicsRigidBodyCfg
+from isaaclab.sim.schemas import MassCfg, UsdPhysicsCollisionCfg, UsdPhysicsRigidBodyCfg
 from isaaclab.utils.configclass import configclass
 from isaaclab.visualizers import VisualizerCfg
 
@@ -184,8 +185,8 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
             spawn=sim_utils.CuboidCfg(
                 size=(1.28, 0.91, 0.04),
                 visible=False,
-                rigid_props=RigidBodyBaseCfg(kinematic_enabled=True),
-                collision_props=CollisionBaseCfg(contact_offset=0.0, rest_offset=0.0),
+                rigid_props=UsdPhysicsRigidBodyCfg(kinematic_enabled=True),
+                collision_props=[UsdPhysicsCollisionCfg(), PhysxCollisionCfg(contact_offset=0.0, rest_offset=0.0)],
                 physics_material=NewtonMaterialPropertiesCfg(
                     static_friction=1.0,
                     dynamic_friction=0.8,
@@ -316,9 +317,9 @@ class FrankaCubeStackRLEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
             cube.spawn = ColoredCuboidCfg(
                 size=(0.04, 0.04, 0.04),
                 display_color=color,
-                rigid_props=RigidBodyBaseCfg(disable_gravity=False),
-                collision_props=CollisionBaseCfg(contact_offset=0.0, rest_offset=0.0),
-                mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
+                rigid_props=[UsdPhysicsRigidBodyCfg(), PhysxRigidBodyCfg(disable_gravity=False)],
+                collision_props=[UsdPhysicsCollisionCfg(), PhysxCollisionCfg(contact_offset=0.0, rest_offset=0.0)],
+                mass_props=MassCfg(mass=0.05),
                 physics_material=NewtonMaterialPropertiesCfg(
                     static_friction=1.0,
                     dynamic_friction=0.8,

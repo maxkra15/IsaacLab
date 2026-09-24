@@ -9,8 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from rsl_rl.runners import OnPolicyRunner
 
-from isaaclab_rl.rsl_rl import IsaacLabOnPolicyRunner, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import IsaacLabOnPolicyRunner, RslRlVecEnvWrapper, create_rsl_rl_runner
 
 
 class _Algorithm:
@@ -58,6 +59,16 @@ def _runner(env, *, world_size=1, global_rank=0):
     runner.gpu_world_size = world_size
     runner.gpu_global_rank = global_rank
     return runner
+
+
+def test_runner_factory_uses_environment_state_checkpoint_runner(monkeypatch):
+    """The standard PPO factory retains Isaac Lab environment checkpoint support."""
+    monkeypatch.setattr(OnPolicyRunner, "__init__", lambda self, env, train_cfg, log_dir, device: None)
+    agent_cfg = SimpleNamespace(class_name="OnPolicyRunner", device="cpu", to_dict=lambda: {})
+
+    runner = create_rsl_rl_runner(_Environment(), agent_cfg)
+
+    assert isinstance(runner, IsaacLabOnPolicyRunner)
 
 
 def test_runner_checkpoint_roundtrip_preserves_infos_and_environment_state(tmp_path):

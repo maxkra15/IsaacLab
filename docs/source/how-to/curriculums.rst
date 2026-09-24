@@ -122,3 +122,38 @@ syntax. It otherwise behaves identically to :class:`modify_env_param`.
            }
        }
    )
+
+
+Sampling Reset States Near a Target Success Rate
+-------------------------------------------------
+
+The task-independent helpers in :mod:`isaaclab_tasks.utils.reset_sampling` select
+reset states near a chosen success rate while reserving a configurable share of
+assignments for complete, shuffled coverage cycles. Record only outcomes that
+can be attributed to the sampled reset state; then pass the monitored success
+rates back to the sampler on the next reset. Both the monitor and sampler expose
+``state_dict()`` and ``load_state_dict()`` so resumed training retains the same
+curriculum and random stream.
+
+.. code-block:: python
+
+   import torch
+
+   from isaaclab_tasks.utils.reset_sampling import (
+       AdaptiveResetSampler,
+       AdaptiveResetSamplerCfg,
+       RollingOutcomeMonitor,
+       RollingOutcomeMonitorCfg,
+   )
+
+   item_count = 32
+   monitor = RollingOutcomeMonitor(item_count, RollingOutcomeMonitorCfg(), "cuda:0", prior_success_rate=0.5)
+   sampler = AdaptiveResetSampler(item_count, AdaptiveResetSamplerCfg(target_success_rate=0.5), "cuda:0")
+
+   reset_ids = sampler.sample(16, monitor.success_rates)
+   # At the end of each corresponding episode, record measured Boolean outcomes.
+   monitor.record(reset_ids, torch.zeros(16, dtype=torch.bool, device="cuda:0"))
+
+For continuous reset parameters rather than a fixed catalog, use
+``ContinuousAdaptiveResetSampler`` with normalized candidate vectors. The
+KUKA-Allegro juggling task provides a full manager-based example of that path.

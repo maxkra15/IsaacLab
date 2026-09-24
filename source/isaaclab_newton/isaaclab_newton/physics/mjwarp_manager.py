@@ -122,8 +122,9 @@ class NewtonMJWarpManager(NewtonManager):
         step.
 
         Args:
-            world_mask: Canonical Newton bool mask of shape
-                ``(world_count + 1,)``. ``None`` is a no-op.
+            world_mask: Per-world bool mask of shape ``(world_count + 1,)``.
+                Entries before the last select local worlds; the final entry
+                selects global entities in world -1. ``None`` is a no-op.
         """
         if world_mask is None:
             return

@@ -83,8 +83,7 @@ class NewtonKaminoManager(NewtonManager):
         ``fk_mask``; the caller is then responsible for writing constraint-consistent joint values.
 
         Args:
-            world_reset_mask: Canonical Newton per-world mask, including the final global-world
-                entry. ``None`` means all worlds.
+            world_reset_mask: Per-world mask passed to :meth:`SolverKamino.reset` (``None`` means all).
             fk_mask: Per-articulation mask of articulations to update (``None`` means all).
         """
         if cls._get_kamino_solver_cfg().use_fk_solver:

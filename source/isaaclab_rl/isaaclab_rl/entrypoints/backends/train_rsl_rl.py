@@ -146,9 +146,8 @@ def _run(args_cli: argparse.Namespace) -> None:
             if agent_cfg.run_name:
                 run_name += f"_{agent_cfg.run_name}"
             log_dir = os.path.join(log_root_path, run_name)
-            write_run_manifest(log_dir, library="rsl_rl", task=args_cli.task, metadata={"agent": args_cli.agent})
-
             resume_path = _resolve_checkpoint(args_cli, agent_cfg, log_root_path)
+            write_run_manifest(log_dir, library="rsl_rl", task=args_cli.task, metadata={"agent": args_cli.agent})
             env_cfg.log_dir = log_dir
             apply_video_recording(env_cfg, log_dir, args_cli)
 
