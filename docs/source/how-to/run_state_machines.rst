@@ -67,7 +67,7 @@ progress at the end of each run.
    uv run --extra video python scripts/environments/state_machine/kinetic_foundry.py \
       --max_steps 1800 --video
 
-   # MJWarp + VBD: KUKA presses a cloth sheet while Fourier GR1T2 presents its far edge.
+   # MJWarp + VBD: KUKA and Fourier GR1T2 press opposite sides of a hanging curtain.
    uv run --extra video python scripts/environments/state_machine/textile_atelier.py \
       --max_steps 800 --video
 
@@ -78,3 +78,14 @@ progress at the end of each run.
 Use ``--viz none`` without ``--video`` to check physics and phase metrics first.
 The demos use one environment by default; each registered task retains its
 separate PPO action configuration for future training.
+
+The textile atelier suspends its VBD curtain from a pinned top material row.
+Its kinetic-tapestry artwork is mapped to the deforming mesh. The brass rail
+and warm gallery are visual-only USD dressing; they do not hold the fabric
+through collision. Its two-hand state machine commands robot IK targets and
+reports mid-height material-patch deflection, without writing cloth positions
+during an episode. Use ``--passive_baseline`` with the atelier script to compare
+the same curtain's unpressed settling. Unlike the MPM foundry, the atelier
+does not use a SimReady table. For the textured Kit-rendered clip, select
+``--video_source visualizer:kit`` and ``--device cuda:0`` after installing the
+``isaacsim`` and ``video`` extras and accepting Kit's terms.
