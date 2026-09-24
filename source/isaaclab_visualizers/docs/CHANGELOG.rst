@@ -1,6 +1,55 @@
 Changelog
 ---------
 
+1.12.1 (2026-09-24)
+~~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Routed Kit viewport transform updates through SDP, sharing a registry-owned Fabric binding with camera
+  renderers and preserving native PhysX Fabric updates. No visualizer configuration changes were required.
+  Headless viewport transforms and asset tracking refreshed only when a frame was requested.
+
+
+1.12.0 (2026-09-22)
+~~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Declared Newton-backed visualizer representations before cloning and initialized viewers afterward. Kit streaming
+  views acquired the renderer for a configured generated camera from the simulation backend registry before cloning.
+  Custom visualizers that pre-register camera renderers should use ``sim.get_or_create_backend(renderer_cfg)``.
+
+Fixed
+^^^^^
+
+* Fixed black or misplaced generated Kit streaming-camera images with Newton physics by removing
+  the redundant USD pose writes that reset the camera transform stack after its Fabric pose was updated.
+  Centered the cartpole golden-test reset pose to keep the tilted poles inside the camera frame.
+
+
+1.11.0 (2026-09-11)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added dynamic mesh logging through the public Newton visualizer interface.
+
+Changed
+^^^^^^^
+
+* Made Kit, Newton GL, and Newton RTX honor ``VisualizerCfg.background_color`` and use its solid
+  sky-blue default. Setting it to ``None`` preserved each backend's native background.
+
+Fixed
+^^^^^
+
+* Fixed :class:`~isaaclab_visualizers.newton.NewtonRTXVisualizer` so it honored its configured particle color.
+
+
 1.10.5 (2026-09-10)
 ~~~~~~~~~~~~~~~~~~~
 

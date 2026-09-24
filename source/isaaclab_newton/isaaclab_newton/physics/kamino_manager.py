@@ -84,26 +84,23 @@ class NewtonKaminoManager(NewtonManager):
 
         Args:
             world_reset_mask: Canonical Newton per-world mask, including the final global-world
-                entry. Kamino owns only the local worlds, so that entry is excluded before calling
-                :meth:`SolverKamino.reset`. ``None`` means all worlds.
+                entry. ``None`` means all worlds.
             fk_mask: Per-articulation mask of articulations to update (``None`` means all).
         """
-        # Newton's canonical mask includes a final world -1 entry for global entities. Kamino's
-        # solver model contains exactly ``world_count`` local worlds and rejects the extra entry.
-        local_world_reset_mask = world_reset_mask[: cls._model.world_count] if world_reset_mask is not None else None
         if cls._get_kamino_solver_cfg().use_fk_solver:
             cls._solver.reset(
-                cls._state_0,
-                world_mask=local_world_reset_mask,
+                cls.backend.state_0,
+                world_mask=world_reset_mask,
                 config=SolverKamino.ResetConfig.from_joints(),
             )
         else:
-            eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, fk_mask)
+            backend = cls.backend
+            eval_fk(backend.model, backend.state_0.joint_q, backend.state_0.joint_qd, backend.state_0, fk_mask)
 
             # Reset solver internals without performing Kamino's FK.
             cls._solver.reset(
-                cls._state_0,
-                world_mask=local_world_reset_mask,
+                cls.backend.state_0,
+                world_mask=world_reset_mask,
                 config=SolverKamino.ResetConfig.preserve(),
             )
 
