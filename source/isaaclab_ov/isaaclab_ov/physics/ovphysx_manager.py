@@ -924,21 +924,38 @@ class OvPhysxManager(PhysicsManager):
         return len(operations)
 
     @staticmethod
-    def _strip_nonzero_environments(layer: Any) -> int:
-        """Strip authored ``env_<i>`` prims other than ``env_0`` from a stage layer."""
+    def _strip_nonzero_environments(layer: Any, source_paths: tuple[str, ...] = ()) -> int:
+        """Keep only clone-source subtrees in authored environments other than ``env_0``."""
         envs_spec = layer.GetPrimAtPath("/World/envs")
         if envs_spec is None or not envs_spec:
             return 0
 
         env_name_re = re.compile(r"^env_(\d+)$")
-        names_to_remove = [
-            child_name
-            for child_name in list(envs_spec.nameChildren.keys())
-            if (match := env_name_re.match(child_name)) and match.group(1) != "0"
-        ]
-        for child_name in names_to_remove:
-            del envs_spec.nameChildren[child_name]
-        return len(names_to_remove)
+        sources = tuple(Sdf.Path(path) for path in source_paths)
+
+        def prune(spec: Any, path: Sdf.Path, required: tuple[Sdf.Path, ...]) -> None:
+            if path in required:
+                return
+            for name in list(spec.nameChildren.keys()):
+                child_path = path.AppendChild(name)
+                child_sources = tuple(source for source in required if source.HasPrefix(child_path))
+                if child_sources:
+                    prune(spec.nameChildren[name], child_path, child_sources)
+                else:
+                    del spec.nameChildren[name]
+
+        removed = 0
+        for name in list(envs_spec.nameChildren.keys()):
+            if not (match := env_name_re.match(name)) or match.group(1) == "0":
+                continue
+            env_path = Sdf.Path("/World/envs").AppendChild(name)
+            env_sources = tuple(source for source in sources if source.HasPrefix(env_path))
+            if env_sources:
+                prune(envs_spec.nameChildren[name], env_path, env_sources)
+            else:
+                del envs_spec.nameChildren[name]
+                removed += 1
+        return removed
 
     @classmethod
     def _serialize_selected_stage(cls, sim_stage: Any) -> str:
@@ -948,10 +965,12 @@ class OvPhysxManager(PhysicsManager):
             cls._materialize_pending_clones_in_layer(layer)
             logger.info("OvPhysxManager: serialized the full USD stage in memory")
         else:
-            removed_count = cls._strip_nonzero_environments(layer)
+            source_paths = tuple(source for source, _, _ in cls._pending_clones)
+            removed_count = cls._strip_nonzero_environments(layer, source_paths)
             if removed_count:
                 logger.info(
-                    "OvPhysxManager: stripped %d env_<i!=0> subtrees from in-memory USD (kept env_0 + globals)",
+                    "OvPhysxManager: stripped %d env_<i!=0> subtrees from in-memory USD"
+                    " (kept env_0 + clone sources + globals)",
                     removed_count,
                 )
             else:

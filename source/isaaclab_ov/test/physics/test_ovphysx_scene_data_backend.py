@@ -469,6 +469,37 @@ def test_manager_serializes_env0_only_stage_in_memory(caplog):
     assert "stripped 1 env_<i!=0> subtrees from in-memory USD" in caplog.text
 
 
+def test_manager_preserves_nonzero_clone_sources_without_unrelated_bodies():
+    """Fast cloning keeps each shape prototype without preloading its sibling assets."""
+    from isaaclab_ov.physics import OvPhysxManager
+
+    from pxr import Sdf, Usd
+
+    stage = Usd.Stage.CreateInMemory()
+    for env_id in range(3):
+        stage.DefinePrim(f"/World/envs/env_{env_id}/Robot", "Xform")
+        stage.DefinePrim(f"/World/envs/env_{env_id}/Object", "Xform")
+
+    previous_clones = OvPhysxManager._pending_clones
+    previous_full_stage = OvPhysxManager._requires_full_stage
+    try:
+        OvPhysxManager._requires_full_stage = False
+        OvPhysxManager._pending_clones = [
+            ("/World/envs/env_0/Robot", ["/World/envs/env_1/Robot"], []),
+            ("/World/envs/env_1/Object", ["/World/envs/env_2/Object"], []),
+        ]
+        layer = Sdf.Layer.CreateAnonymous("prototypes.usda")
+        assert layer.ImportFromString(OvPhysxManager._serialize_selected_stage(stage))
+        exported = Usd.Stage.Open(layer)
+        assert exported.GetPrimAtPath("/World/envs/env_0/Robot").IsValid()
+        assert exported.GetPrimAtPath("/World/envs/env_1/Object").IsValid()
+        assert not exported.GetPrimAtPath("/World/envs/env_1/Robot").IsValid()
+        assert not exported.GetPrimAtPath("/World/envs/env_2").IsValid()
+    finally:
+        OvPhysxManager._pending_clones = previous_clones
+        OvPhysxManager._requires_full_stage = previous_full_stage
+
+
 def test_manager_logs_when_serialized_stage_has_no_envs(caplog):
     """The in-memory serializer diagnoses stages without the standard env namespace."""
     from isaaclab_ov.physics import OvPhysxManager
