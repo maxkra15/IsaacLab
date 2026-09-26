@@ -286,9 +286,11 @@ class FrankaReorientEnvCfg(FrankaMixinCfg, lift.ReorientEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # Start at the held object's pose and expand to the full pose workspace with ADR.
+        # Keep one nontrivial target for the episode so success advances ADR only for that goal.
         self.commands.object_pose.difficulty_term = "adr"
-        self.commands.object_pose.initial_position_distance = 0.0
+        self.commands.object_pose.initial_position_distance = 0.1
+        goal_interval = self.episode_length_s + 1.0
+        self.commands.object_pose.resampling_time_range = (goal_interval, goal_interval)
 
         # Start every reorientation episode from a stable contact for each object shape.
         reset_params = self.events.conditional_reset.params

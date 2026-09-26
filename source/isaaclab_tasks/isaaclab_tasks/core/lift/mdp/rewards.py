@@ -114,6 +114,9 @@ class success_reward(ManagerTermBase):
     def reset(self, env_ids: Sequence[int] | None = None):
         if env_ids is None:
             env_ids = slice(None)
+        succeeded = self.succeeded[env_ids]
+        if succeeded.numel():
+            self._env.extras.setdefault("log", {})["Metrics/episode_success_rate"] = succeeded.float().mean().item()
         self.succeeded[env_ids] = False
 
     def __call__(

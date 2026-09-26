@@ -147,7 +147,9 @@ def test_franka_tasks_use_distinct_lift_and_reorient_bootstraps() -> None:
     lift = FrankaLiftEnvCfg()
 
     assert reorient.commands.object_pose.difficulty_term == "adr"
-    assert reorient.commands.object_pose.initial_position_distance == pytest.approx(0.0)
+    assert reorient.commands.object_pose.initial_position_distance > reorient.rewards.success.params["pos_std"]
+    assert min(reorient.commands.object_pose.resampling_time_range) > reorient.episode_length_s
+    assert lift.commands.object_pose.resampling_time_range == (4.0, 6.0)
     reorient_reset = reorient.events.conditional_reset.params
     assert reorient_reset["terms"]["reset_object_to_target"].func is mdp.reset_to_grasp
     assert reorient_reset["terms"]["reset_object_to_target"].params["probability"] == pytest.approx(1.0)
@@ -182,6 +184,18 @@ def test_franka_tasks_use_distinct_lift_and_reorient_bootstraps() -> None:
     assert lift.events.conditional_reset.params["terms"]["reset_object_to_target"].params[
         "probability"
     ] == pytest.approx(0.75)
+
+
+def test_rigid_episode_success_is_logged_separately_from_reset_bank_success() -> None:
+    """Episode success must be observable without conflating it with bank-slot history."""
+    term = object.__new__(mdp.success_reward)
+    term._env = SimpleNamespace(extras={})
+    term.succeeded = torch.tensor([True, False, True, False])
+
+    term.reset(torch.tensor([0, 1, 2]))
+
+    assert term._env.extras["log"]["Metrics/episode_success_rate"] == pytest.approx(2 / 3)
+    assert term.succeeded.tolist() == [False, False, False, False]
 
 
 def test_pose_command_curriculum_preserves_full_difficulty_goal() -> None:
