@@ -155,12 +155,20 @@ class reset_to_grasp(ManagerTermBase):
         asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
         gripper_cfg: SceneEntityCfg = cfg.params["gripper_cfg"]
         object_cfg = getattr(env.cfg.scene, asset_cfg.name)
-        object_rows = env.scene.clone_plan.cfg_rows.get(id(object_cfg), ())
-        if not object_rows:
-            raise ValueError(f"Could not find clone-plan rows for asset '{asset_cfg.name}'.")
-        self._variant_ids = torch.as_tensor(
-            env.scene.clone_plan.clone_mask[list(object_rows)].argmax(axis=0), device=env.device, dtype=torch.long
-        )
+        plan = env.scene.clone_plan
+        object_prototypes = cloner.path.get_asset_prototypes(plan, object_cfg.prim_path)
+        if not len(object_prototypes):
+            raise ValueError(f"Could not find clone-plan prototypes for asset '{asset_cfg.name}'.")
+        variant_ids = np.full(env.num_envs, -1, dtype=np.int64)
+        for variant_id, prototype_id in enumerate(object_prototypes):
+            world_ids, _ = cloner.query.get_asset_prototype_unique_world_index(plan.topology, int(prototype_id))
+            world_ids = world_ids[world_ids >= 0]
+            if (variant_ids[world_ids] >= 0).any():
+                raise ValueError(f"Multiple object variants are assigned to asset '{asset_cfg.name}' in one world.")
+            variant_ids[world_ids] = variant_id
+        if (variant_ids < 0).any():
+            raise ValueError(f"No object variant is assigned to asset '{asset_cfg.name}' in some worlds.")
+        self._variant_ids = torch.as_tensor(variant_ids, device=env.device)
         self._gripper_joint_ids = env.scene[gripper_cfg.name].find_joints(gripper_cfg.joint_names)[0]
 
     def __call__(

@@ -113,6 +113,9 @@ class success_reward(ManagerTermBase):
         self.succeeded = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
     def reset(self, env_ids: Sequence[int] | None = None):
+        succeeded = self.succeeded if env_ids is None else self.succeeded[env_ids]
+        if succeeded.numel():
+            self._env.extras.setdefault("log", {})["Metrics/episode_success_rate"] = succeeded.float().mean().item()
         index_fill_(self.succeeded, env_ids, False)
 
     def __call__(

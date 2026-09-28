@@ -159,6 +159,20 @@ class FrankaRelJointPosActionCfg:
 
 
 @configclass
+class FrankaReorientActionCfg:
+    """Fine arm control plus one action for the mechanically coupled gripper."""
+
+    arm_action = mdp.RelativeJointPositionActionCfg(asset_name="robot", joint_names=["panda_joint.*"], scale=0.03)
+    gripper_action = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["panda_finger_joint1"],
+        scale=0.04,
+        use_default_offset=False,
+        clip={"panda_finger_joint1": (0.0, 0.04)},
+    )
+
+
+@configclass
 class FrankaReorientRewardCfg(lift.RewardsCfg):
     """Reward terms for the MDP, with the Franka finger contact sensors filled in."""
 
@@ -211,6 +225,8 @@ class FrankaEventCfg(lift.EventCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        # Small objects must retain their geometric inertia before mass scaling.
+        self.object_physics_inertia = None
         reset_terms = self.conditional_reset.params["terms"]
         criteria = self.conditional_reset.params["valid_criteria"]
         # the coupled finger pair is one mechanical DOF: independent per-joint draws write
@@ -267,6 +283,38 @@ class FrankaMixinCfg:
 @configclass
 class FrankaReorientEnvCfg(FrankaMixinCfg, lift.ReorientEnvCfg):
     """Franka object reorientation environment."""
+
+    actions: FrankaReorientActionCfg = FrankaReorientActionCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Thin rotating shapes need a shorter Newton timestep and fresh contacts each substep.
+        self.sim.physics.newton_mjwarp.num_substeps = 4
+        self.sim.physics.newton_mjwarp.collision_decimation = 1
+        # Keep one nontrivial target for the episode so success advances ADR only for that goal.
+        self.commands.object_pose.difficulty_term = "adr"
+        self.commands.object_pose.initial_position_distance = 0.1
+        goal_interval = self.episode_length_s + 1.0
+        self.commands.object_pose.resampling_time_range = (goal_interval, goal_interval)
+
+        # Start each shape at fingertip contact without offset along the closing axis.
+        reset_params = self.events.conditional_reset.params
+        reset_terms = reset_params["terms"]
+        pregrasp = reset_terms.pop("reset_object_to_target")
+        reset_terms["reset_object_to_target"] = pregrasp
+        pregrasp.func = mdp.reset_to_grasp
+        pregrasp.params.update(
+            probability=1.0,
+            target_cfg=SceneEntityCfg("robot", body_names="panda_hand"),
+            gripper_cfg=SceneEntityCfg("robot", joint_names="panda_finger_joint.*"),
+            pose_range={"x": (-0.002, 0.002), "y": (0.0, 0.0), "z": (0.1, 0.1)},
+            gripper_joint_positions=[0.025, 0.025, 0.0125, 0.025, 0.02, 0.025, 0.025, 0.01],
+            asset_orientations=[(0.0, 0.0, 0.0, 1.0)] * 5 + [(0.0, 2.0**-0.5, 0.0, 2.0**-0.5)] * 3,
+        )
+        pregrasp.params.pop("velocity_range")
+        reset_params["valid_criteria"].pop("object_robot_clearance")
+        # Keep valid held-object starts instead of selecting distant edge poses.
+        reset_params["diversity_feature"] = None
 
     def play_mode(self):
         super().play_mode()
