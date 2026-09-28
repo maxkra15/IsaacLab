@@ -159,7 +159,9 @@ def test_franka_tasks_use_distinct_lift_and_reorient_bootstraps() -> None:
     assert reorient.actions.arm_action.scale == pytest.approx(0.03)
     assert reorient.actions.gripper_action.joint_names == ["panda_finger_joint1"]
     assert reorient.terminations.abnormal_robot.func is mdp.abnormal_robot_state
+    assert reorient.events.object_physics_inertia is None
     assert lift.commands.object_pose.difficulty_term is None
+    assert lift.events.object_physics_inertia is None
     assert lift.actions.action.joint_names == [".*"]
     assert lift.terminations.abnormal_robot.func is mdp.abnormal_robot_state
     lift_reset = lift.events.conditional_reset.params

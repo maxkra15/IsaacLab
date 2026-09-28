@@ -225,6 +225,8 @@ class FrankaEventCfg(lift.EventCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        # Small objects must retain their geometric inertia before mass scaling.
+        self.object_physics_inertia = None
         reset_terms = self.conditional_reset.params["terms"]
         criteria = self.conditional_reset.params["valid_criteria"]
         # the coupled finger pair is one mechanical DOF: independent per-joint draws write
