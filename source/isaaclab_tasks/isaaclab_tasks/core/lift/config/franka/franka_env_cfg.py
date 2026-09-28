@@ -13,7 +13,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import MeshCapsuleCfg, MeshCuboidCfg, MeshSphereCfg
-from isaaclab.utils import configclass
+from isaaclab.utils import clone, configclass, replace
 
 from isaaclab_tasks.utils import preset
 
@@ -23,7 +23,7 @@ from ... import lift_env_cfg as lift
 from ... import mdp
 
 # Lift uses task-specific actuators calibrated for contact-rich manipulation.
-FRANKA_PANDA_LIFT_CFG = FRANKA_PANDA_CFG.copy()
+FRANKA_PANDA_LIFT_CFG = clone(FRANKA_PANDA_CFG)
 FRANKA_PANDA_LIFT_CFG.actuators = {
     # inspired by libfranka's joint_impedance_control.cpp; ``actuator_velocity_limit`` is the soft task
     # limit and ``joint_velocity_limit`` the separate solver request
@@ -94,7 +94,7 @@ FINGER_SENSORS = [f"{name}_object_s" for name in FINGERTIP_LIST if name != "pand
 class FrankaSceneCfg(lift.SceneCfg):
     """Franka scene for the lift and reorient tasks."""
 
-    robot: ArticulationCfg = FRANKA_PANDA_LIFT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = replace(FRANKA_PANDA_LIFT_CFG, prim_path="{ENV_REGEX_NS}/Robot")
 
     def __post_init__(self):
         super().__post_init__()

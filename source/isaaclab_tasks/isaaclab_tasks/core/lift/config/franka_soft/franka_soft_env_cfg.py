@@ -39,7 +39,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import CameraCfg, FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
-from isaaclab.utils import configclass
+from isaaclab.utils import configclass, replace
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.visualizers import VisualizerCfg
 
@@ -195,7 +195,7 @@ class PhysicsCfg(PresetCfg):
 class FrankaSoftBaseSceneCfg(InteractiveSceneCfg):
     """Scene for the Franka deformable environment, also the base of the cloth and cable scenes."""
 
-    robot: ArticulationCfg = FRANKA_PANDA_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = replace(FRANKA_PANDA_CFG, prim_path="{ENV_REGEX_NS}/Robot")
     # Deformable contact is restricted to the hand and fingertips for throughput.
     robot.spawn.variants = {
         "Physics": preset(default="mujoco", isaacsim_physx="physx", physx="physx", ovphysx="physx"),
@@ -335,11 +335,15 @@ class CommandsCfg:
         success_visualizer_cfg=VisualizationMarkersCfg(
             prim_path="/Visuals/SuccessMarkers",
             markers={
-                "failure": TABLE_SPAWN_CFG.replace(
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.5, 0.5)), visible=True
+                "failure": replace(
+                    TABLE_SPAWN_CFG,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.5, 0.5)),
+                    visible=True,
                 ),
-                "success": TABLE_SPAWN_CFG.replace(
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.8, 0.5)), visible=True
+                "success": replace(
+                    TABLE_SPAWN_CFG,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.8, 0.5)),
+                    visible=True,
                 ),
             },
         ),
@@ -461,12 +465,11 @@ class FrankaCameraObservationsCfg:
         """Camera observations for the base image group."""
 
         image = ObsTerm(
-            func=mdp.image,
+            func=mdp.image_rgb,
             params={
                 "sensor_cfg": SceneEntityCfg("base_camera"),
-                "data_type": "rgb",
                 "normalize": True,
-                "permute": True,
+                "channel_first": True,
             },
         )
 

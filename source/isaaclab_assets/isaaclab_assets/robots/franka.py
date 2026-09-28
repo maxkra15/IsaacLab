@@ -22,6 +22,7 @@ from isaaclab_physx.sim.schemas import PhysxArticulationCfg, PhysxRigidBodyCfg
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
+from isaaclab.utils import clone
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 
 ##
@@ -80,7 +81,7 @@ FRANKA_PANDA_LEGACY_CFG = ArticulationCfg(
 """Configuration of the legacy Franka Emika Panda robot asset."""
 
 
-FRANKA_PANDA_CFG = FRANKA_PANDA_LEGACY_CFG.copy()
+FRANKA_PANDA_CFG = clone(FRANKA_PANDA_LEGACY_CFG)
 FRANKA_PANDA_CFG.spawn.usd_path = f"{ISAACLAB_NUCLEUS_DIR}/Robots/FrankaEmika/franka_panda.usda"
 FRANKA_PANDA_CFG.spawn.variants = {"Physics": "physx", "Colliders": "gripper_only"}
 next(
@@ -123,11 +124,11 @@ payload by default; direct Newton consumers must select the ``mujoco`` physics v
 """
 
 
-FRANKA_PANDA_MENAGERIE_CFG = FRANKA_PANDA_CFG.copy()
+FRANKA_PANDA_MENAGERIE_CFG = clone(FRANKA_PANDA_CFG)
 """Compatibility alias for :attr:`FRANKA_PANDA_CFG`."""
 
 
-FRANKA_PANDA_HIGH_PD_CFG = FRANKA_PANDA_CFG.copy()
+FRANKA_PANDA_HIGH_PD_CFG = clone(FRANKA_PANDA_CFG)
 FRANKA_PANDA_HIGH_PD_CFG.spawn.rigid_props.disable_gravity = True
 FRANKA_PANDA_HIGH_PD_CFG.actuators["panda_arm"].stiffness = 400.0
 FRANKA_PANDA_HIGH_PD_CFG.actuators["panda_arm"].damping = 80.0
@@ -137,7 +138,7 @@ This configuration is useful for task-space control using differential IK.
 """
 
 
-FRANKA_ROBOTIQ_GRIPPER_CFG = FRANKA_PANDA_LEGACY_CFG.copy()
+FRANKA_ROBOTIQ_GRIPPER_CFG = clone(FRANKA_PANDA_LEGACY_CFG)
 FRANKA_ROBOTIQ_GRIPPER_CFG.spawn.usd_path = f"{ISAAC_NUCLEUS_DIR}/Robots/FrankaRobotics/FrankaPanda/franka.usd"
 FRANKA_ROBOTIQ_GRIPPER_CFG.spawn.variants = {"Gripper": "Robotiq_2F_85"}
 FRANKA_ROBOTIQ_GRIPPER_CFG.spawn.rigid_props.disable_gravity = True

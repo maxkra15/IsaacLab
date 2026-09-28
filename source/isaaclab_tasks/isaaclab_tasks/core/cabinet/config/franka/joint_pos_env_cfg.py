@@ -7,7 +7,7 @@
 
 from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.sensors.frame_transformer import OffsetCfg
-from isaaclab.utils import configclass
+from isaaclab.utils import configclass, replace
 
 from isaaclab_tasks.utils import preset
 
@@ -21,7 +21,7 @@ from ...cabinet_env_cfg import FRAME_MARKER_SMALL_CFG, CabinetEnvCfg, CabinetSce
 class FrankaCabinetSceneCfg(CabinetSceneCfg):
     """Cabinet scene configured for the Franka robot."""
 
-    robot = FRANKA_PANDA_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot = replace(FRANKA_PANDA_CFG, prim_path="{ENV_REGEX_NS}/Robot")
     # Drawer interaction only requires hand and fingertip contacts.
     robot.spawn.variants = {
         "Physics": preset(default="mujoco", isaacsim_physx="physx", physx="physx", ovphysx="physx"),
@@ -30,7 +30,7 @@ class FrankaCabinetSceneCfg(CabinetSceneCfg):
     ee_frame = FrameTransformerCfg(
         prim_path="{ENV_REGEX_NS}/Robot/(Geometry/)?panda_link0",
         debug_vis=False,
-        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+        visualizer_cfg=replace(FRAME_MARKER_SMALL_CFG, prim_path="/Visuals/EndEffectorFrameTransformer"),
         target_frames=[
             FrameTransformerCfg.FrameCfg(
                 prim_path="{ENV_REGEX_NS}/Robot/(Geometry/.*/)?panda_hand",
