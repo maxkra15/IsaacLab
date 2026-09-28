@@ -146,6 +146,10 @@ def test_franka_tasks_use_distinct_lift_and_reorient_bootstraps() -> None:
     reorient = FrankaReorientEnvCfg()
     lift = FrankaLiftEnvCfg()
 
+    reorient_newton = resolve_presets(FrankaReorientEnvCfg(), selected=("newton_mjwarp",)).sim.physics
+    lift_newton = resolve_presets(FrankaLiftEnvCfg(), selected=("newton_mjwarp",)).sim.physics
+    assert (reorient_newton.num_substeps, reorient_newton.collision_decimation) == (4, 1)
+    assert (lift_newton.num_substeps, lift_newton.collision_decimation) == (2, 0)
     assert reorient.commands.object_pose.difficulty_term == "adr"
     assert reorient.commands.object_pose.initial_position_distance > reorient.rewards.success.params["pos_std"]
     assert min(reorient.commands.object_pose.resampling_time_range) > reorient.episode_length_s

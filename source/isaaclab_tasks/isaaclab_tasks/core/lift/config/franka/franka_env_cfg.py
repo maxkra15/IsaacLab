@@ -288,6 +288,9 @@ class FrankaReorientEnvCfg(FrankaMixinCfg, lift.ReorientEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        # Thin rotating shapes need a shorter Newton timestep and fresh contacts each substep.
+        self.sim.physics.newton_mjwarp.num_substeps = 4
+        self.sim.physics.newton_mjwarp.collision_decimation = 1
         # Keep one nontrivial target for the episode so success advances ADR only for that goal.
         self.commands.object_pose.difficulty_term = "adr"
         self.commands.object_pose.initial_position_distance = 0.1

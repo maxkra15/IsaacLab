@@ -8,3 +8,4 @@ Fixed
   after mass randomization. Retrain and requalify both tasks' checkpoints because their training dynamics have changed.
 * Removed initial finger-object penetration from Franka Reorient's per-shape pre-grasps, including lateral reset
   jitter along the gripper's closing axis. Retrain Reorient checkpoints because the reset distribution changed.
+* Shortened Newton Reorient solver substeps and refreshed contacts each substep to stabilize thin rotating objects.
