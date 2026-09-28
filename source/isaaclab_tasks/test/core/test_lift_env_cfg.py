@@ -154,6 +154,7 @@ def test_franka_tasks_use_distinct_lift_and_reorient_bootstraps() -> None:
     assert reorient_reset["terms"]["reset_object_to_target"].func is mdp.reset_to_grasp
     assert reorient_reset["terms"]["reset_object_to_target"].params["probability"] == pytest.approx(1.0)
     pregrasp_widths = reorient_reset["terms"]["reset_object_to_target"].params["gripper_joint_positions"]
+    assert reorient_reset["terms"]["reset_object_to_target"].params["pose_range"]["y"] == (0.0, 0.0)
     object_shapes = reorient.scene.object.spawn.shapes.assets_cfg
     object_half_widths = [
         shape.size[1] / 2 if isinstance(shape, MeshCuboidCfg) else shape.radius

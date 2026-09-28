@@ -6,5 +6,5 @@ Fixed
   checkpoints should be requalified against the updated task.
 * Removed additive object inertia from Franka rigid Lift and Reorient so small shapes retain their geometric inertia
   after mass randomization. Retrain and requalify both tasks' checkpoints because their training dynamics have changed.
-* Removed initial finger-object penetration from Franka Reorient's per-shape pre-grasps to avoid unstable Newton
-  contact impulses. Retrain Reorient checkpoints because the reset distribution changed.
+* Removed initial finger-object penetration from Franka Reorient's per-shape pre-grasps, including lateral reset
+  jitter along the gripper's closing axis. Retrain Reorient checkpoints because the reset distribution changed.
