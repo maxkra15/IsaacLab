@@ -13,7 +13,7 @@ import torch
 from pxr import Usd, UsdGeom, UsdPhysics
 
 from isaaclab.managers import CommandTerm
-from isaaclab.sim import select_usd_variants, use_stage
+from isaaclab.sim import MeshCapsuleCfg, MeshCuboidCfg, MeshSphereCfg, select_usd_variants, use_stage
 from isaaclab.utils.math import quat_box_minus
 
 from isaaclab_tasks.core.lift import mdp
@@ -153,6 +153,15 @@ def test_franka_tasks_use_distinct_lift_and_reorient_bootstraps() -> None:
     reorient_reset = reorient.events.conditional_reset.params
     assert reorient_reset["terms"]["reset_object_to_target"].func is mdp.reset_to_grasp
     assert reorient_reset["terms"]["reset_object_to_target"].params["probability"] == pytest.approx(1.0)
+    pregrasp_widths = reorient_reset["terms"]["reset_object_to_target"].params["gripper_joint_positions"]
+    object_shapes = reorient.scene.object.spawn.shapes.assets_cfg
+    object_half_widths = [
+        shape.size[1] / 2 if isinstance(shape, MeshCuboidCfg) else shape.radius
+        for shape in object_shapes
+        if isinstance(shape, (MeshCuboidCfg, MeshSphereCfg, MeshCapsuleCfg))
+    ]
+    assert len(object_half_widths) == len(object_shapes)
+    assert pregrasp_widths == pytest.approx(object_half_widths)
     assert "object_robot_clearance" not in reorient_reset["valid_criteria"]
     assert reorient_reset["diversity_feature"] is None
     assert reorient.actions.arm_action.joint_names == ["panda_joint.*"]

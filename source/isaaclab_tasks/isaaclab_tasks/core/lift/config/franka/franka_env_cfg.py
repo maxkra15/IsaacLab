@@ -294,7 +294,7 @@ class FrankaReorientEnvCfg(FrankaMixinCfg, lift.ReorientEnvCfg):
         goal_interval = self.episode_length_s + 1.0
         self.commands.object_pose.resampling_time_range = (goal_interval, goal_interval)
 
-        # Start every reorientation episode from a stable contact for each object shape.
+        # Start each shape at fingertip contact without interpenetration.
         reset_params = self.events.conditional_reset.params
         reset_terms = reset_params["terms"]
         pregrasp = reset_terms.pop("reset_object_to_target")
@@ -305,7 +305,7 @@ class FrankaReorientEnvCfg(FrankaMixinCfg, lift.ReorientEnvCfg):
             target_cfg=SceneEntityCfg("robot", body_names="panda_hand"),
             gripper_cfg=SceneEntityCfg("robot", joint_names="panda_finger_joint.*"),
             pose_range={"x": (-0.002, 0.002), "y": (-0.002, 0.002), "z": (0.1, 0.1)},
-            gripper_joint_positions=[0.024, 0.024, 0.0115, 0.024, 0.019, 0.024, 0.024, 0.009],
+            gripper_joint_positions=[0.025, 0.025, 0.0125, 0.025, 0.02, 0.025, 0.025, 0.01],
             asset_orientations=[(0.0, 0.0, 0.0, 1.0)] * 5 + [(0.0, 2.0**-0.5, 0.0, 2.0**-0.5)] * 3,
         )
         pregrasp.params.pop("velocity_range")
