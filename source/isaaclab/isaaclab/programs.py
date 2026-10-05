@@ -62,10 +62,13 @@ def _run_script(path: Path) -> None:
     module.__package__ = None
     module.__spec__ = None
     original_main = sys.modules.get("__main__")
+    original_path = sys.path
     try:
         sys.modules["__main__"] = module
+        sys.path = [str(path.parent), *original_path]
         exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     finally:
+        sys.path = original_path
         if original_main is None:
             sys.modules.pop("__main__", None)
         else:
@@ -112,6 +115,11 @@ EXAMPLES = (
         **_ISAACSIM,
     ),
     ProgramSpec("cables", "examples/cables.py", "Simulate colliding cables with Newton VBD."),
+    ProgramSpec(
+        "gb300-sharpa-insertion",
+        "examples/gb300_sharpa_insertion.py",
+        "Insert and extract an Ethernet cable with hydroelastic hand contact.",
+    ),
     ProgramSpec(
         "deformables",
         "examples/deformables.py",

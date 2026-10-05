@@ -152,6 +152,7 @@ def test_example_catalog_lists_packaged_examples(capsys):
     assert "bin-packing" in output
     assert "newton-dominoes" in output
     assert "mpm-two-way-coupling" in output
+    assert "gb300-sharpa-insertion" in output
     assert "uvx --from 'isaaclab[isaacsim]' isaaclab example camera" in output
     assert "teapot-fill" not in output
 
@@ -270,17 +271,35 @@ def test_program_command_forwards_help_to_selected_module():
     run_program.assert_called_once_with("demo", programs.DEMOS[0], ["--help"])
 
 
-def test_program_runner_preserves_command_name_and_restores_process_arguments(tmp_path):
-    """Running a program must not leak its arguments to the caller."""
+@pytest.mark.parametrize("fails", [False, True])
+def test_program_runner_preserves_command_name_and_restores_process_arguments(tmp_path, monkeypatch, fails):
+    """Sibling imports work without leaking process state, even when a script fails."""
     original_argv = sys.argv
+    original_path = sys.path.copy()
     script = tmp_path / "demos" / "example.py"
     script.parent.mkdir()
-    script.write_text("import sys\nassert sys.argv[0] == 'isaaclab demo temporary'\n", encoding="utf-8")
+    sibling = "_isaaclab_program_sibling"
+    monkeypatch.delitem(sys.modules, sibling, raising=False)
+    (script.parent / f"{sibling}.py").write_text("value = 42\n", encoding="utf-8")
+    script.write_text(
+        f"import sys\nfrom {sibling} import value\n"
+        "assert value == 42\nassert sys.argv[0] == 'isaaclab demo temporary'\n"
+        + ("raise RuntimeError('script failure')\n" if fails else ""),
+        encoding="utf-8",
+    )
     program = programs.ProgramSpec("temporary", f"examples/demos/{script.name}", "Temporary test program.")
-    with mock.patch.object(programs, "_program_root", return_value=tmp_path):
-        programs.run_program("demo", program, ["--physics", "newton_mjwarp"])
+    try:
+        with mock.patch.object(programs, "_program_root", return_value=tmp_path):
+            if fails:
+                with pytest.raises(RuntimeError, match="script failure"):
+                    programs.run_program("demo", program, ["--physics", "newton_mjwarp"])
+            else:
+                programs.run_program("demo", program, ["--physics", "newton_mjwarp"])
+    finally:
+        sys.modules.pop(sibling, None)
 
     assert sys.argv is original_argv
+    assert sys.path == original_path
 
 
 @pytest.mark.parametrize("command", [cli.demo, cli.example])

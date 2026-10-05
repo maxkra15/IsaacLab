@@ -45,18 +45,18 @@ ADMM coupling to the VBD cable. These actions and physics differ from the
 default training preset; checkpoints are not interchangeable.
 
 ```bash
-uv run python examples/gb300_sharpa_insertion.py --viz newton_gl
-uv run --extra video python examples/gb300_sharpa_insertion.py \
+uv run isaaclab example gb300-sharpa-insertion
+uv run --extra video isaaclab example gb300-sharpa-insertion \
   --viz newton_gl --video --output_dir logs/demos/gb300_sharpa
-uv run --extra video python examples/gb300_sharpa_insertion.py \
+uv run --extra video isaaclab example gb300-sharpa-insertion \
   --viz none --video --output_dir logs/demos/gb300_sharpa_headless
-uv run --extra isaacsim --extra video python examples/gb300_sharpa_insertion.py \
+uv run --extra isaacsim --extra video isaaclab example gb300-sharpa-insertion \
   --viz kit --video --output_dir logs/demos/gb300_sharpa_kit
 ```
 
-Use `--no_presentation --viz none` for physics-only verification. `--num_steps`
-bounds the episode; success requires completing both insertion and extraction
-without an environment reset. Recording uses `VideoRecorderCfg` and unique
+Use `--no_presentation --viz none` for physics-only verification. `--max_steps`
+(`--num_steps` remains an alias) bounds the episode; success requires completing
+both insertion and extraction without an environment reset. Recording uses `VideoRecorderCfg` and unique
 filenames. Promo compositing and HUD design are separate from the task.
 
 ### Newton hydroelastic dependency

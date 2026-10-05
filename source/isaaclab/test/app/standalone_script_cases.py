@@ -188,6 +188,10 @@ class SmokeResult:
 _NEWTON_MJCF = str(Path(importlib.util.find_spec("newton").origin).parent / "examples" / "assets" / "nv_ant.xml")
 
 OVERRIDES = {
+    "examples/gb300_sharpa_insertion.py": ScriptOverride(
+        fixed_physics_backend="newton_coupler",
+        skip_reason="requires authorized Rizon/Sharpa assets and a corrected Newton hydroelastic checkout",
+    ),
     "examples/haply_teleoperation.py": ScriptOverride(
         skip_reason="requires a physical Haply device and its WebSocket service"
     ),

@@ -13,9 +13,9 @@ the example never patches or replaces the installed dependency.
 
 .. code-block:: bash
 
-    uv run python examples/gb300_sharpa_insertion.py --viz newton_gl
-    uv run --extra isaacsim --extra video python examples/gb300_sharpa_insertion.py --viz kit --video
-    uv run python examples/gb300_sharpa_insertion.py --viz none --no_presentation
+    uv run isaaclab example gb300-sharpa-insertion
+    uv run --extra isaacsim --extra video isaaclab example gb300-sharpa-insertion --viz kit --video
+    uv run isaaclab example gb300-sharpa-insertion --viz none --no_presentation
 
 """
 
@@ -32,7 +32,14 @@ def main() -> int:
     from isaaclab.app import add_launcher_args, launch_simulation
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--num_steps", type=int, default=3600, help="Maximum steps in one uninterrupted episode.")
+    parser.add_argument(
+        "--max_steps",
+        "--num_steps",
+        dest="num_steps",
+        type=int,
+        default=3600,
+        help="Maximum steps in one uninterrupted episode.",
+    )
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--no_presentation", action="store_true", help="Skip render-only assets, retaining collisions.")
     parser.add_argument("--video", action="store_true", help="Record with the standard task video recorder.")
