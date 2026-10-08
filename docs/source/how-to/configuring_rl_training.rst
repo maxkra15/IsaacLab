@@ -199,7 +199,8 @@ measures both the native command distribution and a fixed 0.5 m/s forward-walkin
      logs/g1-comparison/comparison.json logs/g1-comparison/comparison.html
 
 The merge phase requires paired seeds, matching MDP fingerprints, source revisions, dependency
-versions and actual collection budgets. The offline HTML report separates rollout and learning
+versions and actual collection budgets. Warp runs also verify finite checkpoint state and changes
+to both networks' weights before accepting the training result. The offline HTML report separates rollout and learning
 time, shows return against time or samples, and includes survival, velocity tracking and forward
 walking metrics. Select algorithms, seeds, GPUs, evaluation scenarios and checkpoints interactively.
 Use the measured quality results to interpret speed differences; two seeds provide an exploratory

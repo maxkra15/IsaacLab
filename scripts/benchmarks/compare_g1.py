@@ -66,6 +66,37 @@ def write_results(path: Path, results: dict) -> None:
     temporary.replace(path)
 
 
+def warp_learning_evidence(checkpoint: Path) -> dict:
+    """Confirm finite weights moved from initialization in a saved G1 training run."""
+    import numpy as np
+
+    saved = json.loads(checkpoint.read_text())
+    cfg = saved["config"]
+    algorithm = cfg["algorithm_cfg"]
+    rng = np.random.default_rng(cfg["seed"])
+    index, changes = 0, {}
+    with np.load(checkpoint.with_suffix("") / "policy.npz", allow_pickle=False) as state:
+        if not all(np.isfinite(state[key]).all() for key in state.files):
+            raise ValueError("Warp policy or optimizer state contains nonfinite values.")
+        for name, output in (("actor", saved["action_dim"]), ("critic", 1)):
+            first_index = index
+            widths = (saved["observation_dim"], *algorithm["hidden_dims"], output)
+            maximum = 0.0
+            for input_dim, output_dim in zip(widths[:-1], widths[1:], strict=True):
+                bound = 1.0 / math.sqrt(input_dim)
+                for shape in ((output_dim, input_dim), (output_dim, 1)):
+                    initial = rng.uniform(-bound, bound, shape).astype(np.float32)
+                    maximum = max(maximum, float(np.abs(state[f"parameter_{index}"] - initial).max()))
+                    index += 1
+            changes[f"{name}_maximum_weight_change"] = maximum
+            changes[f"{name}_adam_first_moment_norm"] = float(
+                np.linalg.norm(state[f"adam_m1_{first_index}"].astype(np.float64))
+            )
+        changes["optimizer_steps"] = float(state["adam_timestep"][0])
+    changes["weights_updated"] = all(changes[f"{name}_maximum_weight_change"] > 0 for name in ("actor", "critic"))
+    return changes
+
+
 def metadata(args: argparse.Namespace) -> dict:
     """Record the hardware and normalized pre-launch MDP configuration."""
     import isaaclab_tasks  # noqa: F401
@@ -179,6 +210,8 @@ def metadata(args: argparse.Namespace) -> dict:
             "polling resolution=.1 s.",
             "Training returns use different episode windows; "
             "common deterministic evaluations support quality comparisons.",
+            "Native runner synchronization, episode statistics, full-batch shuffling and loss reads also differ; "
+            "timings do not isolate CUDA graph capture alone.",
             "Configuration hashes exclude seed, device and log paths; "
             "source fingerprints identify the MDP definitions.",
         ],
@@ -335,6 +368,11 @@ def train(args: argparse.Namespace) -> None:
         checkpoint = json.loads(final_checkpoint.read_text())
         run["observation_dim"], run["action_dim"] = checkpoint["observation_dim"], checkpoint["action_dim"]
         run["algorithm_config"] = checkpoint["config"]["algorithm_cfg"]
+        run["learning_evidence"] = warp_learning_evidence(final_checkpoint)
+        if not run["learning_evidence"]["weights_updated"]:
+            run["status"] = "invalid_learning"
+            write_results(manifest, results)
+            raise RuntimeError("Warp actor or critic weights did not change; refusing to report this as training.")
     write_results(manifest, results)
     print(
         f"Finished {run['name']}: loop={elapsed:.2f}s, process={process_seconds:.2f}s, "
