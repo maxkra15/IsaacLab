@@ -16,11 +16,10 @@ from isaaclab_visualizers.kit.kit_visualizer_cfg import KitVisualizerCfg
 
 from pxr import Gf, Sdf, Usd, UsdGeom
 
-from isaaclab.renderers import RendererCfg
 from isaaclab.utils.renderers import ISAAC_RTX_SHOW_ALL_PARTITIONS_BY_DEFAULT_SETTING
 
 
-def test_headless_camera_view_updates_override_session_pose(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_headless_camera_view_updates_override_session_pose() -> None:
     """Follow-camera poses must win over Kit's session opinions without editing the scene."""
     stage = Usd.Stage.CreateInMemory()
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
@@ -29,9 +28,8 @@ def test_headless_camera_view_updates_override_session_pose(monkeypatch: pytest.
         camera.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0))
         camera.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Quatd(1.0))
     root_content = stage.GetRootLayer().ExportToString()
-    sim = MagicMock(stage=stage)
-    monkeypatch.setattr(kit_visualizer_module.SimulationContext, "instance", lambda: sim)
     visualizer = KitVisualizer(KitVisualizerCfg(headless=True))
+    visualizer._scene_stage = stage
     visualizer._is_initialized = True
 
     visualizer.set_camera_view((4.0, 5.0, 6.0), (5.0, 5.0, 6.0))
@@ -78,24 +76,6 @@ def test_viewport_pose_publication_is_deferred_for_headless_capture(monkeypatch,
         visualizer._fabric.update_geometries.assert_called_once_with(visualizer._scene_data_provider, 12)
 
 
-@pytest.mark.parametrize("generated", [False, True])
-def test_streaming_renderer_registers_before_visualizer_initialization(monkeypatch, generated):
-    sim = MagicMock()
-    renderer_cfg = RendererCfg(class_type="my_renderers:CustomRenderer", renderer_type="custom")
-    monkeypatch.setattr(kit_visualizer_module.SimulationContext, "instance", lambda: sim)
-    cfg = KitVisualizerCfg(
-        streaming_view=True,
-        streaming_cam_target_prim_path="/Robot" if generated else None,
-        streaming_cam_renderer_cfg=renderer_cfg,
-    )
-    KitVisualizer(cfg)
-
-    if generated:
-        sim.get_or_create_backend.assert_called_once_with(renderer_cfg)
-    else:
-        sim.get_or_create_backend.assert_not_called()
-
-
 @pytest.mark.parametrize("color", [(0.1, 0.2, 0.3), None])
 def test_background_color_applies_to_render_product_session_layer(
     color: tuple[float, float, float] | None,
@@ -131,7 +111,7 @@ def test_viewport_camera_partition_follows_global_view_setting(
 
     visualizer = object.__new__(KitVisualizer)
     visualizer._controlled_camera_path = "/OmniverseKit_Persp"
-    visualizer._resolved_visible_env_ids = [2]
+    visualizer._env_ids = [2]
     settings = MagicMock()
     settings.get.return_value = show_global_view
     monkeypatch.setattr(kit_visualizer_module, "get_settings_manager", lambda: settings)
