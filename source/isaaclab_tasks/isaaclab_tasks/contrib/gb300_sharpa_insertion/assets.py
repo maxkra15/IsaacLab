@@ -25,15 +25,11 @@ RIZON_SHARPA_RELATIVE_PATH = (
     "rizon4s_sharpa_no_spheres/rizon4s_sharpa_no_spheres_generated.usd"
 )
 RIZON_SHARPA_USD_NAME = "rizon4s_sharpa_no_spheres_generated.usd"
-RIZON_SHARPA_USD_SHA256 = "24f59deb88db896563aa74a4001e8522b75af6060493ab7bb652f21d81efcff8"
 RIZON_SHARPA_BUNDLE_SHA256 = "ae5d22792b44fb6d29a7691d4276bc061a5529132f01e7a0eb5795a482595d63"
-RIZON_SHARPA_BUNDLE_FILE_COUNT = 15
 RIZON_SHARPA_BUNDLE_SIZE_BYTES = 379_258_308
 RIZON_SHARPA_ASSET_ROOT_ENV = "ISAACLAB_FABRICS_SIM_RIZON_SHARPA_ROOT"
-RIZON_SHARPA_LICENSE = "NVIDIA-Proprietary-upstream-license"
 
 RIZON_SHARPA_BASE_LINK_NAME = "base_link"
-RIZON_SHARPA_NATIVE_PALM_BODY_NAME = "right_hand_C_MC"
 # Fabrics-Sim authors this fixed child from measured knuckle geometry. Its
 # canonical axes are X toward the knuckles and Z out of the palm. The native
 # Sharpa palm swaps X/Z and must never be used directly as a pose objective.
@@ -64,8 +60,6 @@ RIZON_SHARPA_RIGHT_HAND_JOINT_NAMES = (
     "right_pinky_DIP",
 )
 
-RIZON_SHARPA_ARM_HOME_RAD = (0.0, -0.698, 0.0, 1.571, 0.0, 0.698, 0.0)
-RIZON_SHARPA_RIGHT_HAND_OPEN_RAD = (0.0,) * len(RIZON_SHARPA_RIGHT_HAND_JOINT_NAMES)
 RIZON_SHARPA_RIGHT_HAND_LIMITS_RAD = (
     (-0.1745, 1.9199),
     (-0.3491, 0.3491),
@@ -166,12 +160,10 @@ def configured_rizon_sharpa_usd(*, required: bool) -> Path | None:
     return verify_rizon_sharpa_bundle(candidate)
 
 
-GB300_SIMREADY_REPOSITORY = "nvidia/simready-dsx"
 GB300_SIMREADY_REVISION = "5938869019f0d2afb6b9b808ed1ab1bc6e0e0961"
 GB300_SIMREADY_RELATIVE_PATH = "GB300/simready_usd/payloads/external.usd"
 GB300_SIMREADY_EXTERNAL_USD_SHA256 = "5e0b7b3b58d005b24909b8d2e735c49997f8dbea72352b51911326343ef1e7bb"
 GB300_SIMREADY_EXTERNAL_USD_SIZE = 473_434_496
-GB300_SIMREADY_LICENSE = "CC-BY-4.0"
 GB300_SIMREADY_ASSET_ROOT_ENV = "ISAACLAB_SIMREADY_DSX_GB300_ROOT"
 GB300_SIMREADY_DOWNLOAD_URL = (
     "https://huggingface.co/datasets/nvidia/simready-dsx/resolve/"
@@ -236,7 +228,8 @@ RJ45_PLUG_DOWNLOAD_URL = (
     "https://raw.githubusercontent.com/newton-physics/newton/"
     "c2ca70bec5998062b0b2d35869865cbe3a49feee/newton/examples/assets/rj45_plug.usd"
 )
-LATCH_LIMIT_LOWER = -0.2
+# CAD-calibrated compression stop [rad], retaining approximately 65 micrometers of housing clearance.
+LATCH_LIMIT_LOWER = -0.225
 LATCH_LIMIT_UPPER = 0.3
 LATCH_SPRING_KE = 0.15
 LATCH_LIMIT_KD = 1.0e-4

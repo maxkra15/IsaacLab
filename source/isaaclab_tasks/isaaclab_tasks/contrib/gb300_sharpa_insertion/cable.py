@@ -18,6 +18,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.sim.spawners.shapes.shapes import spawn_cable
 from isaaclab.sim.utils import clone
 from isaaclab.utils import configclass
+from isaaclab.utils.mesh import convert_faces_to_triangles
 
 if TYPE_CHECKING:
     import newton
@@ -35,7 +36,6 @@ LATCH_HINGE_POSITION_M = (0.0, 0.004677868448, -0.030711488256)
 # The native 11.86 x 6.55 mm shank already fits the measured jack. Leave its
 # height intact and provide 0.20 mm lateral clearance without shrinking the boot.
 GB300_CONNECTOR_TIP_WIDTH_SCALE = 0.97
-GB300_CONNECTOR_TIP_HEIGHT_SCALE = 1.0
 
 
 def hanging_cable_positions(
@@ -87,7 +87,6 @@ def _gb300_connector_points(points: tuple[tuple[float, float, float], ...]) -> n
     result = np.asarray(points, dtype=np.float32).copy()
     fraction = np.clip((result[:, 2] + 0.020) / 0.005, 0.0, 1.0)
     result[:, 0] *= GB300_CONNECTOR_TIP_WIDTH_SCALE + (1.0 - GB300_CONNECTOR_TIP_WIDTH_SCALE) * fraction
-    result[:, 1] *= GB300_CONNECTOR_TIP_HEIGHT_SCALE + (1.0 - GB300_CONNECTOR_TIP_HEIGHT_SCALE) * fraction
     return result
 
 
@@ -119,11 +118,7 @@ def _connector_closed_mesh(name: str) -> newton.Mesh:
     from .assets import connector_render_parts
 
     part = next(part for part in connector_render_parts(CONNECTOR_SPAN_M) if part.name == name)
-    faces, offset = [], 0
-    for count in part.face_vertex_counts:
-        corners = part.face_vertex_indices[offset : offset + count]
-        faces.extend((corners[0], corners[j], corners[j + 1]) for j in range(1, count - 1))
-        offset += count
+    faces = convert_faces_to_triangles(np.asarray(part.face_vertex_indices), np.asarray(part.face_vertex_counts))
     mesh = trimesh.Trimesh(vertices=_gb300_connector_points(part.points), faces=faces, process=True)
     # Preserve all exterior CAD faces. Boundary caps seal exporter omissions,
     # rather than convexifying the plug or filling its visible surface details.
@@ -273,6 +268,8 @@ def spawn_patch_cable(
     if cfg.rigid_connector:
         from .assets import LATCH_LIMIT_LOWER, LATCH_LIMIT_UPPER, LATCH_SPRING_KE
 
+        if not math.isfinite(cfg.latch_damping_scale) or cfg.latch_damping_scale <= 0.0:
+            raise ValueError("latch_damping_scale must be finite and positive.")
         # MJWarp needs a tree hinge to preserve its spring and limits; a loop
         # hinge becomes two connect constraints without an actuated coordinate.
         UsdPhysics.ArticulationRootAPI.Apply(root)
@@ -290,7 +287,7 @@ def spawn_patch_cable(
         drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "angular")
         # USD angular gains are per degree; Newton imports them into SI units.
         drive.CreateStiffnessAttr(LATCH_SPRING_KE * math.pi / 180.0)
-        drive.CreateDampingAttr(_latch_hinge_damping() * math.pi / 180.0)
+        drive.CreateDampingAttr(cfg.latch_damping_scale * _latch_hinge_damping() * math.pi / 180.0)
         drive.CreateTargetPositionAttr(0.0)
         drive.CreateTargetVelocityAttr(0.0)
     return root
@@ -304,6 +301,9 @@ class PatchCableCfg(sim_utils.CableCfg):
 
     rigid_connector: bool = False
     """Whether the loose plug is a separate rigid body physically joined to the rod."""
+
+    latch_damping_scale: float = 1.0
+    """Scale the imported rigid connector's inertia-derived spring-clip damping."""
 
 
 def configure_patch_cable_rendering(stage: Usd.Stage, cable_path: str) -> None:
@@ -321,9 +321,15 @@ def configure_patch_cable_rendering(stage: Usd.Stage, cable_path: str) -> None:
 
 
 def _pin_seated_tail(builder: newton.ModelBuilder, tail: int) -> None:
-    """Fix only the plug already seated in the rack."""
+    """Prescribe the seated cable boundary without redundant plug contacts."""
+    import newton
+
+    builder.body_flags[tail] = int(newton.BodyFlags.KINEMATIC)
     builder.body_mass[tail] = builder.body_inv_mass[tail] = 0.0
     builder.body_inertia[tail] = builder.body_inv_inertia[tail] = wp.mat33(0.0)
+    # Its pose is fixed; neither the socket fit nor its embedded rod needs a solve.
+    for shape in builder.body_shapes[tail]:
+        builder.shape_flags[shape] = int(builder.shape_flags[shape]) & ~int(newton.ShapeFlags.COLLIDE_SHAPES)
 
 
 def _assign_fixed_fixtures(builder: newton.ModelBuilder, world_idx: int, env_root: str, fixtures: int) -> None:
@@ -346,6 +352,20 @@ def _filter_terminal_rod_contacts(
                 builder.add_shape_collision_filter_pair(rod_shape, other)
 
 
+def _filter_embedded_rods(
+    builder: newton.ModelBuilder, head: int, latch: int, start: int, *, one_way_cable: bool
+) -> None:
+    """Exclude the rods inside the housing, hinge, and strain relief."""
+    pairs = [(latch, start), (head, start + 1)]
+    if one_way_cable:
+        # The prescribed terminal replaces the fixed joint's parent filtering.
+        pairs.append((head, start))
+    for body, rod in pairs:
+        for shape in builder.body_shapes[body]:
+            for rod_shape in builder.body_shapes[rod]:
+                builder.add_shape_collision_filter_pair(shape, rod_shape)
+
+
 def add_connectors(
     builder: newton.ModelBuilder,
     world_idx: int,
@@ -354,6 +374,7 @@ def add_connectors(
     *,
     grasp_body_patterns: tuple[str, ...] = (),
     rigid_connector: bool = False,
+    one_way_cable: bool = False,
     rigid_connector_contact_stiffness: float = 1.0e5,
 ) -> None:
     """Add physical connector shapes to native end bodies before model finalization.
@@ -399,15 +420,24 @@ def add_connectors(
         if len(matches) != 1:
             raise ValueError(f"Expected one imported rigid connector at {root}/head, found {len(matches)}.")
         head_body = matches[0]
-        # An unconstrained root lets MJWarp import the terminal rod as an ADMM proximal body.
-        joint = builder.add_joint_free(child=start, label=f"{root}/geometry/terminal_free")
-        builder.add_articulation([joint], label=f"{root}/geometry/terminal_articulation")
-        builder.add_joint_fixed(
-            parent=start,
-            child=head_body,
-            parent_xform=wp.transform_multiply(wp.transform_inverse(builder.body_q[start]), builder.body_q[head_body]),
-            label=f"{root}/head/strain_relief",
-        )
+        if one_way_cable:
+            # Only the root terminal is prescribed; the remaining rod stays dynamic.
+            builder.body_label[start] = f"{root}/geometry/plug_endpoint"
+            builder.body_flags[start] = int(newton.BodyFlags.KINEMATIC)
+            builder.body_inv_mass[start] = 0.0
+            builder.body_inv_inertia[start] = wp.mat33(0.0)
+        else:
+            # An unconstrained root lets MJWarp import the terminal rod as an ADMM proximal body.
+            joint = builder.add_joint_free(child=start, label=f"{root}/geometry/terminal_free")
+            builder.add_articulation([joint], label=f"{root}/geometry/terminal_articulation")
+            builder.add_joint_fixed(
+                parent=start,
+                child=head_body,
+                parent_xform=wp.transform_multiply(
+                    wp.transform_inverse(builder.body_q[start]), builder.body_q[head_body]
+                ),
+                label=f"{root}/head/strain_relief",
+            )
         _filter_terminal_rod_contacts(builder, start, grasp_body_patterns)
     latch_bodies = [
         body
@@ -466,21 +496,30 @@ def add_connectors(
                 offset += count
             mesh = newton.Mesh(_gb300_connector_points(part.points), np.asarray(triangles).reshape(-1))
             if name == "latch" or (rigid_connector and name == "head"):
+                contact_stiffness = rigid_connector_contact_stiffness if name == "head" else 1.0e5
+                if rigid_connector and name == "latch":
+                    # Keep keeper contact stiff after MJWarp's timestep safety clamp on the tiny hinge.
+                    contact_stiffness = 1.0e6
                 builder.add_shape_mesh(
                     body=body,
                     mesh=_connector_contact_mesh(part.name),
                     cfg=newton.ModelBuilder.ShapeConfig(
                         density=0.0,
                         mu=1.0,
-                        ke=rigid_connector_contact_stiffness if name == "head" else 1.0e5,
-                        kd=0.1,
+                        ke=contact_stiffness,
+                        # Hydroelastic contacts supply their own gains; damp ordinary housing contact.
+                        kd=(
+                            2.0 * math.sqrt(rigid_connector_contact_stiffness * builder.body_mass[body])
+                            if name == "head"
+                            else 0.1
+                        ),
                         margin=0.0,
                         gap=0.0003,
                         is_visible=False,
                     ),
                     label=f"{root}/{name}/{'grip' if part.name == 'plug' else 'contact'}",
                 )
-            elif part.name == "plug":
+            elif part.name == "plug" and name != "tail":
                 # Support cable bending loads without stiffening the spring clip or finger grasp.
                 exact = builder.add_shape_mesh(
                     body=body,
@@ -517,7 +556,7 @@ def add_connectors(
                 color=CONNECTOR_COLORS[part.name],
                 label=f"{root}/{name}/{part.name}_visual",
             )
-        if name == "latch" or (rigid_connector and name == "head"):
+        if name in ("latch", "tail") or (rigid_connector and name == "head"):
             continue
         points = np.asarray(parts[0].points)
         center, half = (points.max(0) + points.min(0)) / 2, np.ptp(points, axis=0) / 2
@@ -530,7 +569,7 @@ def add_connectors(
                 hy=float(half[1]),
                 hz=float(half[2]),
                 cfg=newton.ModelBuilder.ShapeConfig(
-                    density=0.0 if rigid_connector and name == "head" else CONNECTOR_DENSITY_KG_M3,
+                    density=CONNECTOR_DENSITY_KG_M3,
                     mu=8.0,
                     ke=5.0e4,
                     kd=0.1,
@@ -542,10 +581,7 @@ def add_connectors(
             )
         )
     if rigid_connector:
-        # The adjoining jacket lies inside the strain relief, not against its exterior.
-        for shape in builder.body_shapes[head_body]:
-            for rod_shape in builder.body_shapes[start + 1]:
-                builder.add_shape_collision_filter_pair(shape, rod_shape)
+        _filter_embedded_rods(builder, head_body, latch_body, start, one_way_cable=one_way_cable)
     # The exact connector owns rack contact. The wider rectangular grip
     # exists only to provide a clean finger contact surface.
     for grip in grip_shapes:

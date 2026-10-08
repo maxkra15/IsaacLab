@@ -13,6 +13,7 @@ import numpy as np
 import trimesh
 
 import isaaclab.sim as sim_utils
+from isaaclab.utils.mesh import create_trimesh_from_geom_mesh
 
 if TYPE_CHECKING:
     from pxr import Usd
@@ -44,16 +45,7 @@ def spawn_sharpa_contact_meshes(
         if len(visuals) != 1 or len(colliders) != 1:
             raise ValueError(f"Expected one visual and one collision mesh for {body.GetPath()}.")
         visual, collider = UsdGeom.Mesh(visuals[0]), UsdGeom.Mesh(colliders[0])
-        vertices = np.asarray(visual.GetPointsAttr().Get(), dtype=np.float64)
-        counts = np.asarray(visual.GetFaceVertexCountsAttr().Get(), dtype=np.int32)
-        indices = np.asarray(visual.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
-        triangles = []
-        offset = 0
-        for count in counts:
-            polygon = indices[offset : offset + count]
-            triangles.extend((polygon[0], polygon[index], polygon[index + 1]) for index in range(1, count - 1))
-            offset += count
-        surface = trimesh.Trimesh(vertices=vertices, faces=triangles, process=True)
+        surface = create_trimesh_from_geom_mesh(visual.GetPrim())
         if not surface.is_watertight:
             if finger != "thumb":
                 raise ValueError(f"Unexpected open Sharpa fingertip: {visual.GetPath()}.")

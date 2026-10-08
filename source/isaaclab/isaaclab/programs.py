@@ -104,6 +104,11 @@ DEMOS = (
         "Smash rigid crates with MPM snowballs.",
     ),
     ProgramSpec("teapot-fill", "examples/demos/teapot_fill.py", "Fill and pour a teapot with MPM fluid."),
+    ProgramSpec(
+        "rizon-sharpa-rj45",
+        "examples/gb300_sharpa_insertion.py",
+        "Insert and extract an Ethernet cable with hydroelastic hand contact.",
+    ),
 )
 
 

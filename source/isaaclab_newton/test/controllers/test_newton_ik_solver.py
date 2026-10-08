@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import isaaclab_newton.controllers.ik.newton_ik_objectives as objectives_module
 import isaaclab_newton.controllers.ik.newton_ik_solver as ik_solver_module
+import newton
+import numpy as np
+import pytest
 import torch
 import warp as wp
 from isaaclab_newton.controllers.ik.newton_ik_objectives import (
@@ -22,6 +25,7 @@ from isaaclab_newton.controllers.ik.newton_ik_objectives_cfg import (
 from isaaclab_newton.controllers.ik.newton_ik_solver import NewtonIKSolver
 from isaaclab_newton.controllers.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 
+from isaaclab.test.utils import test_devices
 from isaaclab.utils import configclass
 
 # Maps the stub body names used across these tests to Newton link indices.
@@ -102,6 +106,48 @@ def test_solve_writes_output_buffer(monkeypatch):
     result = solver.solve(seed)
 
     assert torch.allclose(wp.to_torch(result), torch.tensor([[2.0, 3.0], [4.0, 5.0]]))
+
+
+@pytest.mark.parametrize("device", test_devices())
+def test_captured_solve_tracks_targets_and_replaced_seeds(device: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live targets and new seeds drive CUDA replay; CPU retains the eager solve."""
+    builder = newton.ModelBuilder()
+    carriage = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    tip = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation(
+        [
+            builder.add_joint_prismatic(-1, carriage, axis=(1.0, 0.0, 0.0)),
+            builder.add_joint_revolute(carriage, tip, axis=(1.0, 0.0, 0.0)),
+        ]
+    )
+    model = builder.finalize(device=device)
+    solver = NewtonIKSolver(
+        NewtonIKSolverCfg(use_cuda_graph=True, iterations=12),
+        model=model,
+        num_envs=2,
+        device=device,
+        objectives=[NewtonIKPoseObjectiveCfg(body_name="ee", rotation_weight=0.0)],
+        link_resolver=lambda _: tip,
+    )
+    objective = solver.objectives_by_name["ee"]
+    # The slider determines position; rotation is unconstrained and must retain each new seed.
+    for targets, seed_values in (
+        ([0.4, -0.3], [[0.0, 0.2], [0.0, -0.6]]),
+        ([-0.2, 0.7], [[0.0, 0.9], [0.0, 0.4]]),
+    ):
+        objective.position_objective.set_target_positions(
+            wp.array([(target, 0.0, 0.0) for target in targets], dtype=wp.vec3, device=device)
+        )
+        seed = wp.array(seed_values, dtype=wp.float32, device=device)
+        result = solver.solve(seed).numpy()
+
+        np.testing.assert_allclose(result[:, 0], targets, atol=1e-5, rtol=0.0)
+        np.testing.assert_allclose(result[:, 1], np.array(seed_values)[:, 1], atol=1e-6, rtol=0.0)
+        np.testing.assert_array_equal(seed.numpy(), np.array(seed_values, dtype=np.float32))
+        assert np.isfinite(solver.costs.numpy()).all()
+        if wp.get_device(device).is_cuda:
+            # A recorded solve must remain executable without rerunning the Python optimizer.
+            monkeypatch.setattr(solver.solver, "step", lambda *args, **kwargs: pytest.fail("Expected graph replay"))
 
 
 def test_multiple_pose_objectives_register_distinct_targets(monkeypatch):

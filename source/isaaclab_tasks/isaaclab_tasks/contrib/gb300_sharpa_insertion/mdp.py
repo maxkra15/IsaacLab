@@ -35,7 +35,7 @@ def tcp_pose(env: GB300SharpaInsertionEnv) -> torch.Tensor:
 def head_pose(env: GB300SharpaInsertionEnv) -> torch.Tensor:
     """Return physical connector world pose [m, XYZW], not its rod attachment proxy."""
     if env.cfg.hydroelastic_contacts:
-        return env.scene["connector"].data.root_pose_w.torch
+        return env.scene["connector"].data.body_link_pose_w.torch[:, env.head_body_id]
     return env.scene["cable"].data.segment_pose_w.torch[:, 0]
 
 
@@ -77,7 +77,7 @@ def latch_state(env: GB300SharpaInsertionEnv) -> torch.Tensor:
     relative = quat_unique(quat_mul(quat_conjugate(head[:, 3:]), pose[:, 3:]))
     angle = 2.0 * torch.atan2(-relative[:, 0], relative[:, 3])
     head_angular_velocity = (
-        env.scene["connector"].data.root_com_ang_vel_w.torch
+        env.scene["connector"].data.body_com_ang_vel_w.torch[:, env.head_body_id]
         if env.cfg.hydroelastic_contacts
         else env.scene["cable"].data.segment_velocity_w.torch[:, 0, 3:]
     )
@@ -91,20 +91,22 @@ def latch_capture_margins(env: GB300SharpaInsertionEnv) -> torch.Tensor:
     return socket_geometry.latch_engagement_margins(_latch_pose_in_socket(env))
 
 
-def latch_release_margin(env: GB300SharpaInsertionEnv) -> torch.Tensor:
-    """Return maximum vertical keeper overlap across both clip barbs [m]."""
-    return socket_geometry.latch_release_margin(_latch_pose_in_socket(env))
-
-
-def latch_keeper_exit_margin(env: GB300SharpaInsertionEnv) -> torch.Tensor:
-    """Return conservative axial clip overlap with the keeper front plane [m]."""
-    return socket_geometry.latch_keeper_exit_margin(_latch_pose_in_socket(env))
-
-
 def latch_captured(env: GB300SharpaInsertionEnv) -> torch.Tensor:
     """Detect keeper capture, allowing 50 µm loaded-contact compliance."""
     margins = latch_capture_margins(env)
     return (margins[:, 0] > -0.00005) & (margins[:, 1:] > 0.0).all(-1)
+
+
+def latch_metrics(env: GB300SharpaInsertionEnv) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return capture state and capture/release/exit margins from one measured latch pose.
+
+    Returns:
+        Captured flags, shape [N], capture margins [m], shape [N, 3], release
+        margins [m], shape [N], and keeper-exit margins [m], shape [N].
+    """
+    margins, release, exit_margin = socket_geometry.latch_geometry_margins(_latch_pose_in_socket(env))
+    captured = (margins[:, 0] > -0.00005) & (margins[:, 1:] > 0.0).all(-1)
+    return captured, margins, release, exit_margin
 
 
 def insertion_success(
@@ -164,11 +166,11 @@ def cable_invalid(env: GB300SharpaInsertionEnv) -> torch.Tensor:
 def _latch_body_state(env: GB300SharpaInsertionEnv) -> tuple[torch.Tensor, torch.Tensor]:
     if env.cfg.hydroelastic_contacts:
         connector = env.scene["connector"].data
-        return connector.body_pose_w.torch[:, env.latch_body_id], connector.body_com_ang_vel_w.torch[
+        return connector.body_link_pose_w.torch[:, env.latch_body_id], connector.body_com_ang_vel_w.torch[
             :, env.latch_body_id
         ]
     latch = env.scene["latch"].data
-    return latch.root_pose_w.torch, latch.root_com_ang_vel_w.torch
+    return latch.body_link_pose_w.torch[:, 0], latch.body_com_ang_vel_w.torch[:, 0]
 
 
 def _latch_pose_in_socket(env: GB300SharpaInsertionEnv) -> torch.Tensor:

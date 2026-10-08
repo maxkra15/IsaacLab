@@ -46,6 +46,12 @@ SOCKET_GUIDE_ROOF_M = (0.002010, 0.002060)
 """Outer and inner underside heights of the two sloped cavity guides [m]."""
 SOCKET_GUIDE_REAR_M = -0.004200
 """Rear extent of the measured front guides along the insertion axis [m]."""
+SOCKET_REAR_GUIDE_ROOF_M = 0.000960
+"""Measured underside of the rear guides beside the central keyhole [m]."""
+SOCKET_ENTRY_LIP_DEPTH_INTERVAL_M = (-0.011350, -0.010650)
+"""Front and rear coordinates of the measured lower entry support [m]."""
+SOCKET_ENTRY_LIP_TOP_M = -0.004790
+"""Measured top of the lower entry support, above the ordinary cavity floor [m]."""
 LATCH_BARB_REAR_FACES_M = (
     (
         (-0.003045795, 0.005522263, -0.026458728),
@@ -114,6 +120,24 @@ def latch_keeper_exit_margin(latch_pose_in_socket: torch.Tensor) -> torch.Tensor
     return corners[..., 1].amax(dim=-1) - SOCKET_KEEPER_DEPTH_INTERVAL_M[0]
 
 
+def latch_geometry_margins(latch_pose_in_socket: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Measure capture, release and keeper exit from one socket-relative latch pose.
+
+    Args:
+        latch_pose_in_socket: Measured latch-body pose [m, XYZW], shape (..., 7).
+
+    Returns:
+        Capture margins [m], shape (..., 3), release margin [m], shape (...), and
+        keeper-exit margin [m], shape (...), with the individual functions' semantics.
+    """
+    barb_margins = _latch_barb_engagement_margins(latch_pose_in_socket)
+    return (
+        barb_margins.amin(dim=-2),
+        barb_margins[..., 2].amax(dim=-1),
+        latch_keeper_exit_margin(latch_pose_in_socket),
+    )
+
+
 def _latch_barb_engagement_margins(latch_pose_in_socket: torch.Tensor) -> torch.Tensor:
     """Measure each barb independently before reducing capture or release margins."""
     corners = latch_pose_in_socket.new_tensor(LATCH_BARB_REAR_FACES_M)
@@ -135,10 +159,10 @@ def local_socket_mesh() -> newton.Mesh:
 
     The visual CAD contains duplicate, open and non-manifold surfaces; baking
     it directly falsely fills the cavity. This closed collision proxy retains
-    its measured keyhole profile, entry chamfer, latch shoulders and front guides.
-    The rear electrical-contact region remains simplified: its flexible contacts
-    and narrower rear step are not matched to the canonical Newton connector.
-    Both active jacks share this immutable mesh and its cached 0.2 mm SDF.
+    its measured keyhole profile, entry chamfer, lower entry support, latch
+    shoulders and both front and rear guides. Flexible electrical contacts and
+    the deeper lower rear step remain simplified.
+    Both active jacks share this immutable mesh and its cached 0.05 mm SDF.
     The checked-in measurements do not require the render-only CAD payload.
     """
     import newton
@@ -146,38 +170,46 @@ def local_socket_mesh() -> newton.Mesh:
     aperture = np.asarray(SOCKET_APERTURE_PROFILE_M)
     left, right = SOCKET_KEEPER_X_INTERVALS_M
     keeper_front, keeper_rear = SOCKET_KEEPER_DEPTH_INTERVAL_M
-    # Paired sections at each shoulder face close the step without overlapping solids.
+    lip_front, lip_rear = SOCKET_ENTRY_LIP_DEPTH_INTERVAL_M
+    # Paired sections close the keeper and floor steps without overlapping solids.
     sections = (
-        (-0.01275, 0.0006, False, True),
-        (keeper_front, 0.0004, False, True),
-        (keeper_front, 0.0004, True, True),
-        (-0.01125, 0.0, True, True),
-        (keeper_rear, 0.0, True, True),
-        (keeper_rear, 0.0, False, True),
-        (SOCKET_GUIDE_REAR_M, 0.0, False, True),
-        (SOCKET_GUIDE_REAR_M, 0.0, False, False),
-        (-0.00170, 0.0, False, False),
+        (-0.01275, 0.0006, False, True, False),
+        (keeper_front, 0.0004, False, True, False),
+        (keeper_front, 0.0004, True, True, False),
+        (-0.01175, 0.0002, True, True, False),
+        (lip_front, 0.0, True, True, True),
+        (-0.01125, 0.0, True, True, True),
+        (keeper_rear, 0.0, True, True, True),
+        (keeper_rear, 0.0, False, True, True),
+        (lip_rear, 0.0, False, True, True),
+        (lip_rear, 0.0, False, True, False),
+        (SOCKET_GUIDE_REAR_M, 0.0, False, True, False),
+        (SOCKET_GUIDE_REAR_M, 0.0, False, False, False),
+        (-0.00170, 0.0, False, False, False),
     )
     vertices = []
-    for y, expansion, has_keeper, has_guide in sections:
+    for y, expansion, has_keeper, has_front_guide, has_entry_lip in sections:
         profile = aperture.copy()
         profile[:, 0] += np.where(profile[:, 0] < -0.00018, -expansion, expansion)
         profile[:, 1] += np.where(profile[:, 1] < 0.0, -expansion, expansion)
-        throat_roof = profile[2, 1]
-        # Matching wall vertices close the guide's rear step without T-junctions.
+        if has_entry_lip:
+            profile[:2, 1] = SOCKET_ENTRY_LIP_TOP_M
+        # Matching wall vertices close the guide and floor steps without T-junctions.
         chamfer = 0.6 * max(0.0, keeper_front - y)
-        guide_outer = SOCKET_GUIDE_ROOF_M[0] + chamfer
-        if has_guide:
-            # The native guide rises 0.3 mm across the 0.5 mm mouth chamfer.
-            profile[[2, 7], 1] = guide_outer
-            profile[[3, 6], 1] = SOCKET_GUIDE_ROOF_M[1] + chamfer
+        front_guide_inner = SOCKET_GUIDE_ROOF_M[1] + chamfer
+        guide_roof = SOCKET_GUIDE_ROOF_M if has_front_guide else (SOCKET_REAR_GUIDE_ROOF_M,) * 2
+        # The native guide rises 0.3 mm across the 0.5 mm mouth chamfer.
+        guide_outer = guide_roof[0] + chamfer
+        profile[[2, 7], 1] = guide_outer
+        profile[[3, 6], 1] = guide_roof[1] + chamfer
         roof = profile[4, 1]
         underside = SOCKET_KEEPER_UNDERSIDE_M if has_keeper else roof
         outline = (
             *profile[:2],
-            (profile[2, 0], min(profile[2, 1], guide_outer)),
+            (profile[1, 0], SOCKET_ENTRY_LIP_TOP_M),
+            (profile[2, 0], min(profile[2, 1], SOCKET_REAR_GUIDE_ROOF_M + chamfer)),
             *profile[2:4],
-            (profile[3, 0], throat_roof),
+            (profile[3, 0], front_guide_inner),
             profile[4],
             (right[1], roof),
             (right[1], underside),
@@ -188,9 +220,10 @@ def local_socket_mesh() -> newton.Mesh:
             (left[0], underside),
             (left[0], roof),
             profile[5],
-            (profile[6, 0], throat_roof),
+            (profile[6, 0], front_guide_inner),
             *profile[6:],
-            (profile[7, 0], min(profile[7, 1], guide_outer)),
+            (profile[7, 0], min(profile[7, 1], SOCKET_REAR_GUIDE_ROOF_M + chamfer)),
+            (profile[0, 0], SOCKET_ENTRY_LIP_TOP_M),
         )
         vertices.extend((x, y, z) for x, z in outline)
     outer = np.array(
@@ -205,7 +238,7 @@ def local_socket_mesh() -> newton.Mesh:
             (-0.009, 0.0035),
         )
     )
-    outer = outer[[0, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 7, 7]]
+    outer = outer[[0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 7, 7, 0]]
     ring_size = len(outline)
     front_outer, back_outer = len(vertices), len(vertices) + ring_size
     for y in (-0.01275, 0.001):
@@ -236,7 +269,7 @@ def local_socket_mesh() -> newton.Mesh:
         compute_inertia=False,
     )
     contact_mesh.build_sdf(
-        target_voxel_size=0.0002,
+        target_voxel_size=0.00005,
         narrow_band_range=(-0.002, 0.002),
         margin=0.001,
         sign_method="parity",

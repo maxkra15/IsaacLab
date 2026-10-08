@@ -482,13 +482,13 @@ class ActuatorCollection(Mapping[str, "ActuatorBase | object"]):
         telemetry, so they are not executed one group at a time: their joint indices are
         aggregated while parsing and one executor computes all of them in a single fused
         kernel launch. Subclasses may override :meth:`~ActuatorBase.compute`, so they stay
-        in the per-group list along with the explicit models. On a native actuator path the
-        backend replaces :meth:`compute` entirely and the plan is left empty.
+        in the per-group list along with the explicit models. Native explicit actuators
+        replace the execution plan; an implicit-only backend may reuse the fused executor.
         """
         self._execution_actuators: list[tuple[ActuatorBase, wp.array(dtype=wp.int32)]] = []
         implicit_names: list[str] = []
         implicit_groups: list[ImplicitActuator] = []
-        if self._control.native_actuator_path_active:
+        if self._control.native_actuator_path_active and self._native_group_names:
             self._implicit_executor = None
             return
         for name, group in self._groups.items():

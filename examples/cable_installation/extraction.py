@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Contact-gated, fully physical housing-pinch and clip-press Ethernet removal."""
+"""Measured housing-pinch and clip-press Ethernet removal with optional contact diagnostics."""
 
 from __future__ import annotations
 
@@ -34,19 +34,16 @@ class CableRemovalStateMachine:
     """Support the housing, depress its real clip, then withdraw along socket -Y.
 
     The caller maps two returned hand blends to its open, supporting and clip-press
-    joint targets. ``contacts.right`` must represent underside housing support; thumb
-    contact with the separate spring latch is supplied independently. Neither
-    actuator targets nor elapsed time alone establish an unclipped connector.
+    joint targets. Measured clip clearance gates withdrawal, and relative poses
+    check slip and rotation. Optional contact diagnostics additionally check
+    underside support and thumb/clip contact. Neither actuator targets nor elapsed
+    time alone establish an unclipped connector.
 
     Args:
         tcp_pose_w: Initial measured TCP pose [m, XYZW].
         seated_head_pose_w: Measured seated connector pose [m, XYZW].
-        grasp_tcp_pose_w: Socket-aligned TCP pose for housing-under/clip-over grasp [m, XYZW].
+        grasp_tcp_pose_w: Calibrated TCP pose for housing-under/clip-over grasp [m, XYZW].
         dt: Controller interval [s].
-        approach_tcp_pose_w: Optional clear waypoint at which to rotate [m, XYZW].
-        clear_tcp_pose_w: Optional pre-rotation retreat waypoint [m, XYZW].
-            This retains the initial wrist orientation while leaving the rack.
-        staging_tcp_pose_w: Optional rolled-wrist waypoint above the cable [m, XYZW].
         settle_duration_s: Minimum stationary establishing-shot duration [s].
         withdrawal_distance_m: Straight axial extraction distance [m].
         withdrawal_duration_s: Duration of the smooth axial extraction ramp [s].
@@ -64,9 +61,6 @@ class CableRemovalStateMachine:
         grasp_tcp_pose_w: np.ndarray,
         dt: float,
         *,
-        approach_tcp_pose_w: np.ndarray | None = None,
-        clear_tcp_pose_w: np.ndarray | None = None,
-        staging_tcp_pose_w: np.ndarray | None = None,
         settle_duration_s: float = 1.0,
         withdrawal_distance_m: float = 0.06,
         withdrawal_duration_s: float = 3.0,
@@ -92,9 +86,6 @@ class CableRemovalStateMachine:
         self.settle_pose = self.command.copy()
         self.goal = _pose(seated_head_pose_w)
         self.grasp = _pose(grasp_tcp_pose_w)
-        self.approach = self.grasp.copy() if approach_tcp_pose_w is None else _pose(approach_tcp_pose_w)
-        self.clear = None if clear_tcp_pose_w is None else _pose(clear_tcp_pose_w)
-        self.staging = None if staging_tcp_pose_w is None else _pose(staging_tcp_pose_w)
         self.dt = dt
         self.settle_duration_s = settle_duration_s
         self.withdrawal_distance_m = withdrawal_distance_m
@@ -105,16 +96,13 @@ class CableRemovalStateMachine:
         self.phase = "SETTLE"
         self.elapsed = self.dwell = self.contact_loss_s = 0.0
         self.latch_loss_s = self.withdrawal_progress_s = 0.0
-        self.grip_progress_s = 0.0
         self.hand_blends = (0.0, 0.0)
         self.grip_blend = 0.0
-        """Additional housing-pinch blend in [0, 1], applied after clip depression."""
+        """Additional housing-pinch blend in [0, 1], established after measured clip release."""
         self.max_penetration_m = 0.0
-        self.minimum_latch_angle_rad = 0.0
-        self.minimum_vertical_margin_m = float("inf")
         self.measured_withdrawal_m = 0.0
+        self.withdrawal_start_distance_m = 0.0
         self.failure: str | None = None
-        self.transitions: list[str] = []
         self.press_tcp: np.ndarray | None = None
         self.withdrawal_tcp: np.ndarray | None = None
         self.withdrawal_hold_tcp: np.ndarray | None = None
@@ -125,11 +113,11 @@ class CableRemovalStateMachine:
         self,
         tcp_pose_w: np.ndarray,
         head_pose_w: np.ndarray,
-        contacts: GraspContacts,
+        contacts: GraspContacts | None = None,
         *,
         latch_angle_rad: float,
         capture_margins_m: np.ndarray,
-        thumb_latch_contact: bool,
+        thumb_latch_contact: bool | None = None,
         keeper_release_margin_m: float | None = None,
         keeper_exit_margin_m: float | None = None,
     ) -> tuple[np.ndarray, tuple[float, float]]:
@@ -138,10 +126,12 @@ class CableRemovalStateMachine:
         Args:
             tcp_pose_w: Measured TCP pose [m, XYZW].
             head_pose_w: Measured connector pose [m, XYZW].
-            contacts: Physical contacts, with underside housing support in ``right``.
+            contacts: Optional physical contacts, with underside housing support in ``right``.
+                ``None`` skips contact diagnostics, not measured pose or clip-clearance checks.
             latch_angle_rad: Measured clip hinge deflection [rad]; inward is negative.
             capture_margins_m: Measured axial, lateral and vertical keeper overlap [m].
-            thumb_latch_contact: Whether the thumb actually contacts the clip body.
+            thumb_latch_contact: Optional measured thumb/clip contact for contact diagnostics.
+                Defaults to the supplied contacts' clip measurement.
             keeper_release_margin_m: Worst vertical overlap of both clip barbs [m].
                 Defaults to the capture margin for callers that do not measure both.
             keeper_exit_margin_m: Conservative axial overlap of the entire clip with
@@ -168,60 +158,54 @@ class CableRemovalStateMachine:
             return self.command.copy(), self.hand_blends
         release_margin = margins[2] if keeper_release_margin_m is None else keeper_release_margin_m
         self.elapsed += self.dt
-        self.max_penetration_m = max(self.max_penetration_m, contacts.penetration_m)
-        self.minimum_latch_angle_rad = min(self.minimum_latch_angle_rad, latch_angle_rad)
-        self.minimum_vertical_margin_m = min(self.minimum_vertical_margin_m, release_margin)
+        if contacts is not None:
+            self.max_penetration_m = max(self.max_penetration_m, contacts.penetration_m)
+            failure = grasp_contact_failure(contacts, self.grasp_penetration_limit)
+            if failure is not None:
+                self._fail(failure)
+                return self.command.copy(), self.hand_blends
+            if thumb_latch_contact is None:
+                thumb_latch_contact = contacts.thumb_latch
         self.measured_withdrawal_m = self.goal[1] - head[1]
-        failure = grasp_contact_failure(contacts, self.grasp_penetration_limit)
-        if failure is not None:
-            self._fail(failure)
-            return self.command.copy(), self.hand_blends
         if self.elapsed > (self.settle_duration_s + 15.0 if self.phase == "SETTLE" else 15.0):
             self._fail(f"{self.phase} timed out")
             return self.command.copy(), self.hand_blends
 
         target = self.settle_pose.copy()
-        # Align the hand to the socket, not the cable-loaded plug's small tilt.
-        # Rotating around that tilt can sweep the proximal fingers into the rack.
+        # Keep the chosen grasp heading while following the housing's approach translation.
         grasp = self.grasp.copy()
         grasp[:3] += head[:3] - self.goal[:3]
-        supported = contacts.right
-        purchased = _housing_purchase(contacts, self.housing_grasp_body_names)
+        support_ready = contacts is None or contacts.right
+        grasp_ready = contacts is None or _housing_purchase(contacts, self.housing_grasp_body_names)
         # A loaded plug can pitch in its jack and release at a different hinge
         # angle. Require physical depression and actual clearance of both barbs.
         clip_clear = latch_angle_rad < 0.0 and release_margin < -0.00002
-        unclipped = supported and thumb_latch_contact and clip_clear
+        unclipped = clip_clear and (contacts is None or (support_ready and thumb_latch_contact))
         if self.phase == "SETTLE":
             seated = self._pose_error(head, self.goal, 0.003, 0.08)
             captured = margins[0] > -0.00005 and np.all(margins[1:] > 0.0)
             if self._dwelled(seated and captured, 0.3) and self.elapsed >= self.settle_duration_s:
-                self._transition("CLEAR" if self.clear is not None else "ORIENT")
-        elif self.phase in ("CLEAR", "ORIENT", "STAGE", "APPROACH"):
-            targets = {"CLEAR": self.clear, "ORIENT": self.approach, "STAGE": self.staging, "APPROACH": grasp}
-            target = targets[self.phase]
-            if self._dwelled(self._pose_error(tcp, target, 0.002, 0.03), 0.3):
-                self._transition(
-                    {
-                        "CLEAR": "ORIENT",
-                        "ORIENT": "STAGE" if self.staging is not None else "APPROACH",
-                        "STAGE": "APPROACH",
-                        "APPROACH": "SUPPORT",
-                    }[self.phase]
-                )
+                self._transition("ORIENT")
+        elif self.phase in ("ORIENT", "APPROACH"):
+            target = self.grasp if self.phase == "ORIENT" else grasp
+            hand_ready = self.phase != "ORIENT" or self.elapsed >= 1.0
+            if self._dwelled(self._pose_error(tcp, target, 0.002, 0.03), 0.3) and hand_ready:
+                self._transition("APPROACH" if self.phase == "ORIENT" else "SUPPORT")
         elif self.phase == "SUPPORT":
             # Chasing a connector lifted by the closing fingers amplifies its
             # motion against the jack roof and changes the clip-release geometry.
             if self.press_tcp is None:
                 self.press_tcp = tcp.copy()
             target = self.press_tcp
-            self.hand_blends = (_smooth(self.elapsed / 1.0), 0.0)
-            if self.elapsed >= 1.0 and self._dwelled(supported, 0.3):
+            self.hand_blends = (_smooth(self.elapsed / 2.0), 0.0)
+            # Let support settle before the thumb releases the latch.
+            if self.elapsed >= 2.0 and self._dwelled(support_ready and grasp_ready, 0.3):
                 self._transition("PRESS")
         elif self.phase in ("PRESS", "PINCH"):
             # Clip motion must not make the supported palm pivot after the plug.
             target = self.press_tcp
-            self.contact_loss_s = 0.0 if supported else self.contact_loss_s + self.dt
-            if not supported:
+            self.contact_loss_s = 0.0 if support_ready else self.contact_loss_s + self.dt
+            if not support_ready:
                 self.dwell = 0.0
                 if self.contact_loss_s > 0.2:
                     self._fail("Underside housing support lost during clip depression")
@@ -232,22 +216,22 @@ class CableRemovalStateMachine:
                 if self.elapsed >= 1.0 and self._dwelled(unclipped, 0.2):
                     self._transition("PINCH")
             else:
-                if unclipped:
-                    self.grip_progress_s += self.dt
-                self.grip_blend = _smooth(self.grip_progress_s / 1.0)
+                # Tighten the housing pinch only with opposing thumb contact after release.
+                self.grip_blend = _smooth(self.elapsed / 1.0)
                 reserved = release_margin + self.thumb_clearance_reserve_m < -0.00002
-                if self.grip_blend == 1.0 and self._dwelled(unclipped and purchased and reserved, 0.2):
+                if self._dwelled(self.grip_blend == 1.0 and unclipped and grasp_ready and reserved, 0.2):
                     rotation = Rotation.from_quat(tcp[3:]).inv()
                     self.grasp_offset_m = rotation.apply(head[:3] - tcp[:3])
                     self.grasp_rotation = rotation * Rotation.from_quat(head[3:])
                     self.withdrawal_tcp = tcp.copy()
+                    self.withdrawal_start_distance_m = self.measured_withdrawal_m
                     self._transition("WITHDRAW")
         elif self.phase in ("WITHDRAW", "HOLD"):
             clear = (
                 self.measured_withdrawal_m > 0.018 if keeper_exit_margin_m is None else keeper_exit_margin_m < -0.0003
             )
-            opposed = thumb_latch_contact or contacts.left
-            held = purchased and (not clear or opposed)
+            opposition_ready = contacts is None or thumb_latch_contact or contacts.left
+            held = grasp_ready and (not clear or opposition_ready)
             self.contact_loss_s = 0.0 if held else self.contact_loss_s + self.dt
             relative = Rotation.from_quat(tcp[3:]).inv()
             slip = np.linalg.norm(relative.apply(head[:3] - tcp[:3]) - self.grasp_offset_m)
@@ -261,36 +245,51 @@ class CableRemovalStateMachine:
                 self._update_thumb_press(latch_angle_rad, release_margin)
             target = self.withdrawal_tcp.copy()
             if self.phase == "WITHDRAW":
-                self.latch_loss_s = 0.0 if clear or clip_clear else self.latch_loss_s + self.dt
-                if clear or clip_clear:
-                    self.withdrawal_hold_tcp = None
-                    self.withdrawal_progress_s += self.dt
-                target[1] -= self.withdrawal_distance_m * _smooth(
-                    self.withdrawal_progress_s / self.withdrawal_duration_s
-                )
+                reserved = clip_clear and release_margin + self.thumb_clearance_reserve_m <= -0.00005
+                target = self._withdrawal_target(tcp, clear, reserved)
+                if self.phase == "FAILED":
+                    return self.command.copy(), self.hand_blends
             else:
-                target[1] -= self.withdrawal_distance_m
-            if self.phase == "WITHDRAW":
-                if not clear and not clip_clear:
-                    # A thumb may transfer onto the housing. Stop for measured
-                    # keeper reentry, not clip contact loss with intact purchase.
-                    if self.withdrawal_hold_tcp is None:
-                        self.withdrawal_hold_tcp = self.command.copy()
-                    target = self.withdrawal_hold_tcp
-                    if self.latch_loss_s > 0.2:
-                        self._fail("Clip rebounded before clearing the socket keepers")
-                        return self.command.copy(), self.hand_blends
+                target[1] -= max(0.0, self.withdrawal_distance_m - self.withdrawal_start_distance_m)
+            if self.phase == "WITHDRAW" and self.withdrawal_hold_tcp is None:
                 if self.withdrawal_progress_s >= self.withdrawal_duration_s and self._dwelled(
                     self.measured_withdrawal_m >= self.withdrawal_distance_m - 0.003
                     and self._pose_error(tcp, target, 0.003, 0.05),
                     0.3,
                 ):
                     self._transition("HOLD")
-            elif self._dwelled(clear and self.measured_withdrawal_m >= self.withdrawal_distance_m - 0.003, 2.0):
+            elif self.phase == "HOLD" and self._dwelled(
+                clear and self.measured_withdrawal_m >= self.withdrawal_distance_m - 0.003, 2.0
+            ):
                 self._transition("DONE")
 
         self._advance_command(target, tcp)
         return self.command.copy(), self.hand_blends
+
+    def _withdrawal_target(self, tcp: np.ndarray, clear: bool, reserved: bool) -> np.ndarray:
+        """Pause at measured TCP and smoothly restart the remaining axial travel [m, XYZW]."""
+        if not clear and not reserved and self.withdrawal_hold_tcp is None:
+            # Cancel tracking lead, retaining the original physical grasp reference.
+            self.withdrawal_hold_tcp = tcp.copy()
+            self.command = tcp.copy()
+            self.dwell = self.latch_loss_s = 0.0
+        if self.withdrawal_hold_tcp is not None:
+            self.latch_loss_s += self.dt
+            if self._dwelled(clear or reserved, 0.2):
+                self.withdrawal_tcp = tcp.copy()
+                self.withdrawal_start_distance_m = self.measured_withdrawal_m
+                self.withdrawal_progress_s = self.latch_loss_s = self.dwell = 0.0
+                self.withdrawal_hold_tcp = None
+            else:
+                if self.latch_loss_s > 2.0:
+                    self._fail("Clip rebounded before clearing the socket keepers")
+                return self.withdrawal_hold_tcp.copy()
+        else:
+            self.withdrawal_progress_s += self.dt
+        target = self.withdrawal_tcp.copy()
+        remaining = max(0.0, self.withdrawal_distance_m - self.withdrawal_start_distance_m)
+        target[1] -= remaining * _smooth(self.withdrawal_progress_s / self.withdrawal_duration_s)
+        return target
 
     def _update_thumb_press(self, latch_angle_rad: float, release_margin_m: float) -> None:
         release_margin_m += self.thumb_clearance_reserve_m
@@ -298,7 +297,7 @@ class CableRemovalStateMachine:
         clearance = -0.00005 if moving else -0.00002
         released = latch_angle_rad < 0.0 and release_margin_m <= clearance
         thumb_blend = self.hand_blends[1]
-        if latch_angle_rad < -0.215 and (not moving or release_margin_m < -0.0001):
+        if latch_angle_rad <= -0.23:
             thumb_blend = max(0.0, thumb_blend - 0.15 * self.dt)
         elif not released:
             # Full keyframe closure can overload the clip's compliant stop.
@@ -311,7 +310,6 @@ class CableRemovalStateMachine:
         self.phase = phase
         self.elapsed = self.dwell = self.contact_loss_s = 0.0
         self.latch_loss_s = 0.0
-        self.transitions.append(phase)
 
     def _fail(self, reason: str) -> None:
         self.failure = reason

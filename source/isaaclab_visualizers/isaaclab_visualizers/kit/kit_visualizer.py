@@ -1010,34 +1010,34 @@ class KitVisualizer(BaseVisualizer):
         if self._generated_camera_pose_cache.get(camera_path) == pose_key:
             return False
 
-        if camera_path not in self._generated_camera_xform_ops:
+        # Kit authors its perspective camera in the session layer. Match that layer
+        # so camera updates take effect without modifying the source scene.
+        with Usd.EditContext(usd_stage, usd_stage.GetSessionLayer()):
             camera = UsdGeom.Camera.Define(usd_stage, camera_path)
             camera_xform = UsdGeom.Xformable(camera.GetPrim())
-            camera_xform.ClearXformOpOrder()
-            # Generated visualizer cameras live under env prims, but eyes/targets are world-space.
-            # Reset the xform stack so Kit/Fabric sees the authored pose as a world pose.
-            camera_xform.SetResetXformStack(True)
-            # ClearXformOpOrder removes the ordering metadata but not the prim attributes
-            # themselves, so AddTranslateOp/AddOrientOp fail if they already exist on the
-            # prim (e.g. for /OmniverseKit_Persp which Isaac Sim pre-populates).
-            # Reuse existing attributes when present; add them only when absent.
-            prim = camera.GetPrim()
-            t_attr = prim.GetAttribute("xformOp:translate")
-            translate_op = UsdGeom.XformOp(t_attr) if t_attr else camera_xform.AddTranslateOp()
-            o_attr = prim.GetAttribute("xformOp:orient")
-            orient_op = UsdGeom.XformOp(o_attr) if o_attr else camera_xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
-            camera_xform.SetXformOpOrder([translate_op, orient_op], camera_xform.GetResetXformStack())
-            self._generated_camera_xform_ops[camera_path] = (translate_op, orient_op)
-        else:
-            translate_op, orient_op = self._generated_camera_xform_ops[camera_path]
+            if camera_path not in self._generated_camera_xform_ops:
+                camera_xform.ClearXformOpOrder()
+                # Reuse pre-existing camera attributes after clearing their ordering.
+                prim = camera.GetPrim()
+                t_attr = prim.GetAttribute("xformOp:translate")
+                translate_op = UsdGeom.XformOp(t_attr) if t_attr else camera_xform.AddTranslateOp()
+                o_attr = prim.GetAttribute("xformOp:orient")
+                orient_op = (
+                    UsdGeom.XformOp(o_attr) if o_attr else camera_xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
+                )
+                self._generated_camera_xform_ops[camera_path] = (translate_op, orient_op)
+            else:
+                translate_op, orient_op = self._generated_camera_xform_ops[camera_path]
 
-        quat_gf = Gf.Quatd(
-            float(quat_xyzw[3]),
-            Gf.Vec3d(float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2])),
-        )
-
-        translate_op.Set(Gf.Vec3d(float(eye[0, 0]), float(eye[0, 1]), float(eye[0, 2])))
-        orient_op.Set(quat_gf)
+            # Viewport utilities can replace the op order between follow-camera updates.
+            # The supplied eye and target remain world-space, including under env prims.
+            camera_xform.SetXformOpOrder([translate_op, orient_op], resetXformStack=True)
+            quat_gf = Gf.Quatd(
+                float(quat_xyzw[3]),
+                Gf.Vec3d(float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2])),
+            )
+            translate_op.Set(Gf.Vec3d(float(eye[0, 0]), float(eye[0, 1]), float(eye[0, 2])))
+            orient_op.Set(quat_gf)
         self._generated_camera_pose_cache[camera_path] = pose_key
         return True
 

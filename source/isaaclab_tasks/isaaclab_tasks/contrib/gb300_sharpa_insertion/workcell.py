@@ -35,14 +35,14 @@ GB300_PRESENTATION_RACK_TRANSLATIONS_E = tuple(
 GB300_PRESENTATION_RACK_ROTATIONS_XYZW = (GB300_PRESENTATION_ROTATION_XYZW,) * GB300_PRESENTATION_RACK_COUNT
 
 # SN2201 port face at asset X=354.6743 mm, on two levels 44.45 mm apart.
-# The 146.22 mm column separation keeps the already seated end out of the grasp.
+# The 145.96 mm column separation keeps the already seated end out of the grasp.
 SOCKET_POSITION_E, UPPER_SOCKET_POSITION_E = tuple(
     (
         GB300_PRESENTATION_TRANSLATION_E[0] + asset_y,
         GB300_PRESENTATION_TRANSLATION_E[1] - (0.3546743 - 0.01275),
         GB300_PRESENTATION_TRANSLATION_E[2] + asset_z + FLOOR_OFFSET_M,
     )
-    for asset_y, asset_z in ((-0.0568248, 2.04887), (-0.2030448, 2.04887 + 0.04445))
+    for asset_y, asset_z in ((-0.0568248, 2.04887), (-0.2027848, 2.04887 + 0.04445))
 )
 
 
@@ -50,9 +50,6 @@ def head_goal_for_socket(socket_position_e: tuple[float, float, float]) -> tuple
     """Return the connector-head center at a registered socket origin [m]."""
     # Preserve floor clearance while the clip passes the keeper at its -0.2 rad limit.
     return (socket_position_e[0] - 0.00018, socket_position_e[1] - 0.0372, socket_position_e[2] - 0.0022525)
-
-
-HEAD_GOAL_POSITION_E = head_goal_for_socket(SOCKET_POSITION_E)
 
 
 def _cabinet_shell_boxes() -> tuple[tuple[str, tuple[float, float, float], tuple[float, float, float]], ...]:

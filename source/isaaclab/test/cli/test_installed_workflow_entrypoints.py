@@ -140,6 +140,7 @@ def test_demo_catalog_lists_packaged_demos(capsys):
     output = capsys.readouterr().out
     assert "zoo" in output
     assert "teapot-fill" in output
+    assert "rizon-sharpa-rj45" in output
     assert "newton-dominoes" not in output
     assert "bin-packing" not in output
 
@@ -233,12 +234,10 @@ def test_newton_gl_selector_switches_programs_after_script_returns(monkeypatch):
     )
 
 
-@pytest.mark.parametrize(
-    ("catalog", "directory"), [(programs.DEMOS, "examples/demos"), (programs.EXAMPLES, "examples")]
-)
-def test_program_catalog_resolves_paths(catalog, directory):
+@pytest.mark.parametrize("catalog", [programs.DEMOS, programs.EXAMPLES])
+def test_program_catalog_resolves_paths(catalog):
     """Both catalogs must resolve inside the single examples tree."""
-    assert all(program.relative_path.startswith(f"{directory}/") for program in catalog)
+    assert all(program.relative_path.startswith("examples/") for program in catalog)
     assert all(program.path.is_file() for program in catalog)
 
 
@@ -250,16 +249,21 @@ def test_program_catalog_names_are_unique(catalog):
 
 
 @pytest.mark.parametrize(
-    ("command", "command_name", "program_name"),
-    [(cli.demo, "demo", "zoo"), (cli.example, "example", "cables")],
+    ("command", "command_name", "program_name", "relative_path"),
+    [
+        (cli.demo, "demo", "zoo", "examples/demos/zoo.py"),
+        (cli.example, "example", "cables", "examples/cables.py"),
+        (cli.demo, "demo", "rizon-sharpa-rj45", "examples/gb300_sharpa_insertion.py"),
+    ],
 )
-def test_program_command_dispatches_to_packaged_script(command, command_name, program_name):
+def test_program_command_dispatches_to_packaged_script(command, command_name, program_name, relative_path):
     """Program commands must forward all remaining arguments to the selected script."""
     with mock.patch.object(programs, "run_program") as run_program:
         command([program_name, "--physics", "newton_mjwarp"])
 
     catalog = programs.DEMOS if command_name == "demo" else programs.EXAMPLES
     selected = next(program for program in catalog if program.name == program_name)
+    assert selected.relative_path == relative_path
     run_program.assert_called_once_with(command_name, selected, ["--physics", "newton_mjwarp"])
 
 

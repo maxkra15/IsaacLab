@@ -18,8 +18,9 @@ _GRIP_LOCAL_M = np.array((0.0, 0.0, 0.001))
 class CableInstallStateMachine:
     """Align, insert, release and verify retention using ordinary robot targets.
 
-    The reset supplies a housing pinch, not an attachment. Transport starts only
-    after bilateral contact is measured; connector and clip poses are never written.
+    The reset supplies a housing pinch, not an attachment. Measured relative poses
+    check slip and rotation; optional contact diagnostics additionally require a
+    bilateral grasp. Connector and clip poses are never written.
 
     Args:
         tcp_pose_w: Initial TCP pose [m, XYZW].
@@ -56,7 +57,7 @@ class CableInstallStateMachine:
         self.goal = np.asarray(goal_pose_w, dtype=np.float64).copy()
         self.target = self.command.copy()
         self.dt = dt
-        self.phase = "VERIFY_GRASP"
+        self.phase = "HOLD_GRASP"
         self.elapsed = self.dwell = self.width = self.max_penetration_m = self.contact_loss_s = 0.0
         self.grasp_rotation: Rotation | None = None
         self.grasp_offset_m: np.ndarray | None = None
@@ -67,28 +68,33 @@ class CableInstallStateMachine:
         self,
         tcp_pose_w: np.ndarray,
         head_pose_w: np.ndarray,
-        contacts: GraspContacts,
+        contacts: GraspContacts | None = None,
         *,
         latch_engaged: bool,
     ) -> tuple[np.ndarray, float]:
-        """Return TCP pose [m, XYZW] and release opening [m], from 0 to 0.04."""
+        """Return TCP pose [m, XYZW] and release opening [m], from 0 to 0.04.
+
+        ``contacts=None`` skips contact diagnostics, not measured pose or latch checks.
+        """
         if self.phase in ("DONE", "FAILED"):
             return self.command.copy(), self.width
         self.elapsed += self.dt
         tcp = np.asarray(tcp_pose_w, dtype=np.float64)
         head = np.asarray(head_pose_w, dtype=np.float64)
         grip = head[:3] + Rotation.from_quat(head[3:]).apply(_GRIP_LOCAL_M)
-        self.max_penetration_m = max(self.max_penetration_m, contacts.penetration_m)
-        failure = grasp_contact_failure(contacts, self.grasp_penetration_limit)
-        if failure is not None:
-            self._fail(failure)
-            return self.command.copy(), self.width
+        if contacts is not None:
+            self.max_penetration_m = max(self.max_penetration_m, contacts.penetration_m)
+            failure = grasp_contact_failure(contacts, self.grasp_penetration_limit)
+            if failure is not None:
+                self._fail(failure)
+                return self.command.copy(), self.width
         if self.elapsed > (30.0 if self.phase in ("RAISE", "ORIENT", "ALIGN", "INSERT") else 15.0):
             self._fail(f"{self.phase} timed out")
             return self.command.copy(), self.width
 
-        if self.phase == "VERIFY_GRASP":
-            self.dwell = self.dwell + self.dt if contacts.left and contacts.right else 0.0
+        if self.phase == "HOLD_GRASP":
+            grasp_ready = contacts is None or (contacts.left and contacts.right)
+            self.dwell = self.dwell + self.dt if grasp_ready else 0.0
             if self.elapsed > 1.0 and self.dwell > 0.5:
                 rotation = Rotation.from_quat(tcp[3:]).inv()
                 self.grasp_offset_m = rotation.apply(grip - tcp[:3])
@@ -98,9 +104,10 @@ class CableInstallStateMachine:
                 self._transition("RAISE")
         if self.phase in ("RAISE", "ORIENT", "ALIGN", "INSERT"):
             grip_relative = Rotation.from_quat(tcp[3:]).inv().apply(grip - tcp[:3])
-            self.contact_loss_s = 0.0 if contacts.left and contacts.right else self.contact_loss_s + self.dt
+            if contacts is not None:
+                self.contact_loss_s = 0.0 if contacts.left and contacts.right else self.contact_loss_s + self.dt
             if np.linalg.norm(grip_relative - self.grasp_offset_m) > 0.008 or self.contact_loss_s > 0.25:
-                self._fail("Bilateral physical grasp lost during transport")
+                self._fail("Connector grasp lost during transport")
                 return self.command.copy(), self.width
             relative_rotation = Rotation.from_quat(tcp[3:]).inv() * Rotation.from_quat(head[3:])
             if (self.grasp_rotation.inv() * relative_rotation).magnitude() > 0.6:
@@ -132,10 +139,15 @@ class CableInstallStateMachine:
                     # Small preload: the measured cavity has a rigid back.
                     self.carry_target = self.goal.copy()
                     self.carry_target[1] += 0.0002
-        if self.phase == "RELEASE":
+                elif next_phase == "RELEASE":
+                    # Stop insertion preload before opening beside the seated plug.
+                    self.target = tcp.copy()
+                    self.command = tcp.copy()
+        if self.phase in ("RELEASE", "RETREAT"):
             self.width = min(0.04, self.width + 0.01 * self.dt)
-            if self.width >= 0.025 and not contacts.left and not contacts.right:
-                self.width = 0.04
+        if self.phase == "RELEASE":
+            released = contacts is None or (not contacts.left and not contacts.right)
+            if self.width >= 0.025 and released:
                 self.target = tcp.copy()
                 self.target[:3] += self.retreat_offset_w
                 self._transition("RETREAT")

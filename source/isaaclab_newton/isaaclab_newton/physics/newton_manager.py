@@ -509,6 +509,7 @@ class NewtonManager(PhysicsManager):
 
     # Newton actuator adapter (owns actuators and double-buffered states)
     _adapter: NewtonActuatorAdapter | None = None
+    _requires_eager_actuator_updates: ClassVar[bool] = False
     # In-graph hooks invoked after the actuator step and before the solver
     # substeps, in registration order. Multiple articulations register their
     # implicit-DOF telemetry / FF-routing kernels here.
@@ -830,6 +831,7 @@ class NewtonManager(PhysicsManager):
         # check, this gates whether the decimation loop can be captured into
         # a CUDA graph (see :meth:`_is_all_graphable`).
         NewtonManager._use_newton_actuators_active = False
+        NewtonManager._requires_eager_actuator_updates = False
         NewtonManager._decimation = 1
         # Per-world reset masks
         NewtonManager._world_reset_mask = None
@@ -1244,6 +1246,7 @@ class NewtonManager(PhysicsManager):
         # observe the canonical state regardless of which subclass is active.
         NewtonManager._adapter = None
         NewtonManager._use_newton_actuators_active = False
+        NewtonManager._requires_eager_actuator_updates = False
 
         # Newton's final reset-mask slot selects global entities in world -1.
         # Isaac Lab resets local environments only, so that slot remains false.
@@ -1831,12 +1834,18 @@ class NewtonManager(PhysicsManager):
         Requires:
           1. An articulation took the ``use_newton_actuators=True`` branch
              (signalled via :meth:`activate_newton_actuator_path`).
-          2. Either no actuator adapter was needed (all-implicit) or every
+          2. No articulation requires eager Isaac Lab actuator updates.
+          3. Either no actuator adapter was needed (all-implicit) or every
              actuator in the adapter is CUDA-graph-safe.
         """
-        if not cls._use_newton_actuators_active:
+        if not cls._use_newton_actuators_active or cls._requires_eager_actuator_updates:
             return False
         return cls._adapter is None or cls._adapter.is_all_graphable
+
+    @classmethod
+    def _require_eager_actuator_updates(cls) -> None:
+        """Keep per-physics-tick Isaac Lab actuator updates outside the captured decimation loop."""
+        NewtonManager._requires_eager_actuator_updates = True
 
     @classmethod
     def activate_newton_actuator_path(cls) -> None:

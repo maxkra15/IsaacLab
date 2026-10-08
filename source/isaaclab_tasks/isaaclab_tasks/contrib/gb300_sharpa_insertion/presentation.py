@@ -137,7 +137,7 @@ def spawn_installation_presentation(
     return root.GetPrim()
 
 
-def update_switchboard_lights(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None = None) -> None:
+def update_switchboard_lights(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> None:
     """Animate status colors at simulation time without changing observations or physics."""
     from isaaclab.assets import VisualMaterial
 

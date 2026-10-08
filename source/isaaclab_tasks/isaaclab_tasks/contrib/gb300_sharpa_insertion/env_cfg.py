@@ -14,6 +14,7 @@ from isaaclab_newton.controllers.ik.newton_ik_objectives_cfg import (
 from isaaclab_newton.controllers.ik.newton_ik_solver_cfg import NewtonIKSolverCfg
 from isaaclab_newton.envs.mdp.actions.newton_ik_actions_cfg import NewtonInverseKinematicsActionCfg
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonShapeCfg, VBDSolverCfg
+from isaaclab_newton.sim.schemas import NewtonCollisionCfg
 
 import isaaclab.envs.mdp as base_mdp
 import isaaclab.sim as sim_utils
@@ -117,7 +118,7 @@ class ActionsCfg:
     right_palm = NewtonInverseKinematicsActionCfg(
         asset_name="robot",
         joint_names=list(RIZON_SHARPA_ARM_JOINT_NAMES),
-        controller=NewtonIKSolverCfg(iterations=4),
+        controller=NewtonIKSolverCfg(iterations=4, use_cuda_graph=True),
         objectives=[
             NewtonIKPoseObjectiveCfg(
                 name="right_palm",
@@ -206,7 +207,9 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
     presentation_enabled: bool = False
     """Include render-only GB300 racks, architecture, installed leads and status lights."""
     hydroelastic_contacts: bool = False
-    """Use hydroelastic hand/plug/clip contacts and physical ADMM cable attachment."""
+    """Use hydroelastic hand/plug/clip contacts."""
+    one_way_cable: bool = False
+    """Anchor the VBD cable to the MJWarp plug without feeding cable loads back to the plug."""
     hydroelastic_pad_pressure_gradient: float = 5.0e8
     """Compliant finger-cover pressure gradient [N/m^3]."""
     rigid_connector_contact_stiffness: float = 1.0e5
@@ -224,6 +227,8 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
     )
 
     def __post_init__(self) -> None:
+        if self.one_way_cable and not self.hydroelastic_contacts:
+            raise ValueError("one_way_cable requires hydroelastic_contacts.")
         if not self.presentation_enabled:
             self.scene.presentation = self.scene.activity_a = self.scene.activity_b = None
             self.events.activity = None
@@ -289,7 +294,7 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
         if self.hydroelastic_contacts:
             from .hydroelastic import configure_hydroelastic_physics
 
-            configure_hydroelastic_physics(self.sim.physics)
+            configure_hydroelastic_physics(self.sim.physics, one_way_cable=self.one_way_cable)
 
 
 @configclass
@@ -297,19 +302,53 @@ class GB300SharpaScriptedEnvCfg(GB300SharpaInsertionEnvCfg):
     """Absolute controls and hydroelastic contacts for the continuous physical example."""
 
     actions = AbsoluteActionsCfg()
+    decimation = 4
     presentation_enabled: bool = True
     hydroelastic_contacts: bool = True
-    rigid_connector_contact_stiffness: float = 1.0e6
+    one_way_cable: bool = True
+    grasp_body_patterns: tuple[str, ...] = (
+        "right_hand_C_MC",
+        "right_thumb_",
+        "right_index_",
+        "right_middle_",
+    )
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.sim.physics.num_substeps = 32
+        self.sim.physics.capture_implicit_actuators = True
+        # Millimeter-scale grasps do not need the default 10 mm search halo.
+        self.scene.robot.spawn.collision_props = {
+            "/.*": [NewtonCollisionCfg(contact_gap=0.001)],
+            # Tucked digits are visual-only for this three-finger scripted pinch.
+            "/right_(?:ring|pinky)_.*/.*": [sim_utils.UsdPhysicsCollisionCfg(collision_enabled=False)],
+        }
+        rigid, cable = self.sim.physics.solver_cfg.entries
+        if self.one_way_cable:
+            # Refresh tight socket contacts without increasing rigid integration frequency.
+            self.sim.physics.num_substeps = 4
+            self.sim.physics.collision_cfg.contact_matching = "latest"
+            rigid.substeps = 2
+            rigid.solver_cfg.update_data_interval = 4
+            cable.substeps = 2
+            cable.solver_cfg.iterations = 8
+            self.scene.cable.spawn.physics_material.bend_stiffness *= 2.0
+            self.scene.cable.spawn.physics_material.twist_stiffness *= 2.0
+            self.scene.cable.spawn.latch_damping_scale = 3.0
+        else:
+            self.sim.physics.num_substeps = 32
+            # Preserve clip integration resolution while reducing coupling passes.
+            self.sim.physics.solver_cfg.iterations = 2
+            self.sim.physics.solver_cfg.rho = 200.0
         for name in ("right_thumb", "right_fingers"):
-            self.scene.robot.actuators[name].stiffness = 96.0
-            self.scene.robot.actuators[name].damping = 2.4
-        rigid = self.sim.physics.solver_cfg.entries[0].solver_cfg
-        rigid.nconmax = 2048
-        rigid.njmax = 6 * rigid.nconmax + 128
+            actuator = self.scene.robot.actuators[name]
+            actuator.stiffness = 96.0
+            actuator.damping = 2.4
+            if self.one_way_cable:
+                # Honor the authored per-joint limits; regularize tiny finger inertias.
+                actuator.joint_effort_limit = None
+                actuator.armature = 2.0e-4
+        rigid.solver_cfg.nconmax = 2048
+        rigid.solver_cfg.njmax = 2048
 
 
 @configclass

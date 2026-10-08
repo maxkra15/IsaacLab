@@ -46,6 +46,7 @@ class GB300SharpaInsertionEnv(ManagerBasedRLEnv):
                 env_rotation,
                 grasp_body_patterns=self.cfg.grasp_body_patterns,
                 rigid_connector=self.cfg.hydroelastic_contacts,
+                one_way_cable=self.cfg.one_way_cable,
                 rigid_connector_contact_stiffness=self.cfg.rigid_connector_contact_stiffness,
             )
             if self.cfg.hydroelastic_contacts:
@@ -71,5 +72,6 @@ class GB300SharpaInsertionEnv(ManagerBasedRLEnv):
     def load_managers(self) -> None:
         self.tcp_body_id = self.scene["robot"].find_bodies(self.cfg.tcp_body_name)[0][0]
         if self.cfg.hydroelastic_contacts:
+            self.head_body_id = self.scene["connector"].find_bodies("head")[0][0]
             self.latch_body_id = self.scene["connector"].find_bodies("latch")[0][0]
         super().load_managers()

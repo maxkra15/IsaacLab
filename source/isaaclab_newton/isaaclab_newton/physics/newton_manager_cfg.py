@@ -187,6 +187,21 @@ class NewtonCfg(PhysicsCfg):
     If set to False, the simulation performance will be severely degraded.
     """
 
+    capture_implicit_actuators: bool = False
+    """Allow physics-owned decimation for ordinary implicit-only actuator collections.
+
+    Requires :attr:`~isaaclab.sim.SimulationCfg.use_newton_actuators` to be ``True``.
+    When every actuator supports this execution path, Newton owns the decimation loop and
+    includes actuator updates in the physics graph if :attr:`use_cuda_graph` is enabled.
+    Manager-based environments then apply action targets once per control step rather than
+    once per physics step. This changes the update cadence of state-dependent actions such
+    as inverse kinematics and operational-space control, but not the solver's drive gains
+    or effort limits. Custom implicit actuator subclasses keep their eager execution path.
+
+    The default preserves per-physics-step action application for implicit-only collections.
+    Native explicit actuator execution is unaffected by this setting.
+    """
+
     deterministic_mode: Literal["not_guaranteed", "run_to_run", "gpu_to_gpu"] = "not_guaranteed"
     """Determinism guarantee applied to the Newton solver and collision pipeline.
 

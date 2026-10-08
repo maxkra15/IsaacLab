@@ -10,9 +10,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import warp as wp
 from isaaclab_newton.physics import HydroelasticSDFCfg, NewtonCfg, NewtonCollisionPipelineCfg
 
-from isaaclab_contrib.coupling import CouplerAdmmCfg
+from isaaclab_contrib.coupling import CouplerAdmmCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 
 if TYPE_CHECKING:
     import newton
@@ -21,8 +22,14 @@ if TYPE_CHECKING:
 _MJWARP_SOLREF_MODE_FORCE_SPACE = 0
 
 
-def configure_hydroelastic_physics(physics: NewtonCfg) -> None:
-    """Keep hydroelastic grasp contacts in MJWarp; exchange cable loads through ADMM."""
+def configure_hydroelastic_physics(physics: NewtonCfg, *, one_way_cable: bool = False) -> None:
+    """Keep hydroelastic grasp contacts in MJWarp and the flexible cable in VBD.
+
+    Args:
+        physics: Newton configuration whose entries own the rigid scene and cable.
+        one_way_cable: Transfer plug motion to a kinematic cable endpoint without cable feedback.
+            Otherwise, exchange physical attachment loads through ADMM.
+    """
     rigid, cable = physics.solver_cfg.entries
     rigid.bodies.extend((r"/World/envs/env_.*/Cable/head", r"/World/envs/env_.*/Cable/latch"))
     cable.bodies = [r"/World/envs/env_.*/Cable/(?!(?:head|latch)(?:/|$)).*"]
@@ -31,21 +38,42 @@ def configure_hydroelastic_physics(physics: NewtonCfg) -> None:
     # Up to six rows per frictional contact, plus articulation joint limits.
     rigid.solver_cfg.njmax = 6 * rigid.solver_cfg.nconmax + 128
     cable.solver_cfg.rigid_contact_history = False
-    physics.solver_cfg = CouplerAdmmCfg(
-        entries=[rigid, cable],
-        iterations=5,
-        rho=50.0,
-        # MJWarp cannot refresh proximal inertia for changing contact candidates.
-        # Keeping this optional term off avoids enormous artificial robot masses.
-        gamma=0.0,
-        baumgarte=0.01,
-        joint_stiffness=1.0e4,
-        joint_angular_stiffness=1.0e4,
-        joint_proximal_destination_entries=["rigid"],
-        rigid_contact_matching="sticky",
-    )
-    # Validated at 1/120 s: 16 substeps kept the free-swing attachment gap below 1 mm.
-    physics.num_substeps = max(physics.num_substeps, 16)
+    if one_way_cable:
+        # The fixture proxy includes the pedestal and rack; only the ground needs static ownership.
+        cable.include_static_shapes = False
+        cable.shape_label_patterns = [r"/World/GroundPlane/.*"]
+        cable.solver_cfg.class_type = "isaaclab_tasks.contrib.gb300_sharpa_insertion.endpoint:NewtonEndpointVBDManager"
+        physics.solver_cfg = CouplerProxyCfg(
+            class_type="isaaclab_tasks.contrib.gb300_sharpa_insertion.endpoint:NewtonEndpointCouplerManager",
+            entries=[rigid, cable],
+            iterations=1,
+            proxies=[
+                CouplerProxyMappingCfg(
+                    source="rigid",
+                    destination="cable",
+                    bodies=rigid.bodies.copy(),
+                    mode="staggered",
+                    collision_pipeline=_one_way_cable_collision_pipeline,
+                )
+            ],
+        )
+        physics.class_type = physics.solver_cfg.class_type
+    else:
+        physics.solver_cfg = CouplerAdmmCfg(
+            entries=[rigid, cable],
+            iterations=5,
+            rho=50.0,
+            # MJWarp cannot refresh proximal inertia for changing contact candidates.
+            # Keeping this optional term off avoids enormous artificial robot masses.
+            gamma=0.0,
+            baumgarte=0.01,
+            joint_stiffness=1.0e4,
+            joint_angular_stiffness=1.0e4,
+            joint_proximal_destination_entries=["rigid"],
+            rigid_contact_matching="sticky",
+        )
+        # Validated at 1/120 s: 16 substeps kept the free-swing attachment gap below 1 mm.
+        physics.num_substeps = max(physics.num_substeps, 16)
     physics.collision_cfg = NewtonCollisionPipelineCfg(
         sdf_hydroelastic_config=HydroelasticSDFCfg(
             output_contact_surface=True,
@@ -128,6 +156,21 @@ def configure_hydroelastic_shapes(
             continue
         if soft_pad:
             original = shape
+            # A fixed pad is part of its distal link. Inherit that link's
+            # authored adjacency exclusions without disabling cross-finger contact.
+            pad_body = builder.shape_body[original]
+            for mount, joint in builder.joint_parents.get(pad_body, ()):
+                if mount < 0 or builder.joint_type[joint] != newton.JointType.FIXED:
+                    continue
+                if not builder.joint_collision_filter_parent[joint]:
+                    continue
+                neighbours = (*builder.joint_parents.get(mount, ()), *builder.joint_children.get(mount, ()))
+                for neighbour, adjacent_joint in neighbours:
+                    if neighbour < 0 or neighbour == pad_body:
+                        continue
+                    if builder.joint_collision_filter_parent[adjacent_joint]:
+                        for other in builder.body_shapes[neighbour]:
+                            builder.add_shape_collision_filter_pair(original, other)
             # Separate pair routing without removing ordinary finger self-contact
             # or adding mass and inertia for the coincident collision surface.
             shape = builder.add_shape(
@@ -167,6 +210,10 @@ def configure_hydroelastic_shapes(
                 builder.shape_scale[shape] = (1.0, 1.0, 1.0)
             if mesh.sdf is None:
                 mesh.build_sdf(max_resolution=128, narrow_band_range=(-0.003, 0.003), margin=0.0003)
+            if soft_pad:
+                # Reuse the cooked surface for ordinary pairs that support SDF queries.
+                builder.shape_source[original] = mesh
+                builder.shape_scale[original] = (1.0, 1.0, 1.0)
         else:
             builder.shape_sdf_max_resolution[shape] = 128
             builder.shape_sdf_narrow_band_range[shape] = (-0.003, 0.003)
@@ -181,3 +228,24 @@ def configure_hydroelastic_shapes(
             thumb_clip = shape in thumb_grasp_shapes and other in latches
             if other != shape and other not in plugs and not thumb_clip:
                 builder.add_shape_collision_filter_pair(shape, other)
+
+
+def _one_way_cable_collision_pipeline(model: newton.Model) -> newton.CollisionPipeline:
+    """Allocate only contacts that can affect the cable after proxy transfer."""
+    import newton
+
+    # Match Newton's runtime filter once, before sizing narrow-phase buffers.
+    # In this view rigid proxies are kinematic; source contacts remain unchanged.
+    shape_bodies = model.shape_body.numpy()
+    body_flags = model.body_flags.numpy()
+    immovable = shape_bodies < 0
+    attached = np.flatnonzero(~immovable)
+    immovable[attached] = (body_flags[shape_bodies[attached]] & int(newton.BodyFlags.KINEMATIC)) != 0
+    pairs = model.shape_contact_pairs.numpy().reshape(-1, 2)
+    pairs = pairs[~np.all(immovable[pairs], axis=1)]
+    return newton.CollisionPipeline(
+        model,
+        shape_pairs_filtered=wp.array(pairs, dtype=wp.vec2i, device=model.device),
+        contact_matching="sticky",
+        include_static_kinematic_pairs=False,
+    )
