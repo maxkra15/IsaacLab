@@ -144,6 +144,67 @@ we can use the ``--agent`` argument to specify the configuration instance to use
 The ``--run_name`` argument is used to specify the name of the run. This is used to
 create a directory for the run in the ``logs/rsl_rl/cartpole`` directory.
 
+Comparing PPO learners on G1
+----------------------------
+
+The registered ``Isaac-Velocity-Flat-G1`` task supports RoboLearn's Warp-NN PPO through
+the same native training entrypoint:
+
+.. code-block:: bash
+
+   uv sync --extra robolearn
+   uv run --no-sync isaaclab train --task Isaac-Velocity-Flat-G1 \
+     --rl_library robolearn --algorithm warp_ppo physics=newton_mjwarp
+
+The comparison workflow uses the existing Torch MDP frontend for both learners and
+Newton's MuJoCo Warp physics backend. Both use the backend's existing physics CUDA graph;
+Warp PPO additionally captures its neural learning update. Observation, reward, command,
+reset and rollout assembly remain in the existing Isaac Lab workflow.
+
+``scripts/benchmarks/compare_g1.py`` matches separate 256/128/128 Tanh actor and critic networks,
+a fixed learning rate of ``3e-4``, five full-batch epochs, a 24-step rollout horizon and action
+clipping to ``[-1, 1]``. Its RSL-RL run overrides the stock G1 agent's ELU activation, adaptive
+learning rate and four minibatches. The stock agent configuration remains available unchanged.
+Network initialization, timeout bootstrapping and gradient clipping still differ between learners.
+
+For a paired comparison, use identical iteration and environment counts. The defaults collect
+36,864,000 transitions per learner: 1024 environments times 24 steps times 1500 iterations.
+With two GPUs, run each seed's two commands in separate terminals, then swap GPUs for the next seed:
+
+.. code-block:: bash
+
+   uv run --no-sync python scripts/benchmarks/compare_g1.py train \
+     --algorithm warp_ppo --seed 0 --device cuda:0 --output logs/g1-warp-seed0
+   uv run --no-sync python scripts/benchmarks/compare_g1.py train \
+     --algorithm rsl_rl_ppo --seed 0 --device cuda:1 --output logs/g1-rsl-seed0
+   uv run --no-sync python scripts/benchmarks/compare_g1.py train \
+     --algorithm warp_ppo --seed 1 --device cuda:1 --output logs/g1-warp-seed1
+   uv run --no-sync python scripts/benchmarks/compare_g1.py train \
+     --algorithm rsl_rl_ppo --seed 1 --device cuda:0 --output logs/g1-rsl-seed1
+
+After training finishes, evaluate the saved checkpoints using deterministic actions and common
+reset seeds. Evaluation disables observation corruption and random pushes for both learners and
+measures both the native command distribution and a fixed 0.5 m/s forward-walking scenario:
+
+.. code-block:: bash
+
+   for g1_run_dir in logs/g1-warp-seed0 logs/g1-rsl-seed0 logs/g1-warp-seed1 logs/g1-rsl-seed1; do
+     uv run --no-sync python scripts/benchmarks/compare_g1.py evaluate \
+       --output "$g1_run_dir" --device cuda:0 --checkpoint_iterations 500 1000 1500
+   done
+   uv run --no-sync python scripts/benchmarks/compare_g1.py merge \
+     --output logs/g1-comparison \
+     --inputs logs/g1-warp-seed0 logs/g1-rsl-seed0 logs/g1-warp-seed1 logs/g1-rsl-seed1
+   uv run --no-sync python scripts/benchmarks/render_g1_comparison.py \
+     logs/g1-comparison/comparison.json logs/g1-comparison/comparison.html
+
+The merge phase requires paired seeds, matching MDP fingerprints, source revisions, dependency
+versions and actual collection budgets. The offline HTML report separates rollout and learning
+time, shows return against time or samples, and includes survival, velocity tracking and forward
+walking metrics. Select algorithms, seeds, GPUs, evaluation scenarios and checkpoints interactively.
+Use the measured quality results to interpret speed differences; two seeds provide an exploratory
+comparison rather than a general algorithm ranking.
+
 .. _Stable-Baselines3: https://stable-baselines3.readthedocs.io/en/master/
 .. _RL-Games: https://github.com/Denys88/rl_games
 .. _RSL-RL: https://github.com/leggedrobotics/rsl_rl
