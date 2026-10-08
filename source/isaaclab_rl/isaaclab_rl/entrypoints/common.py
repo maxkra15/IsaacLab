@@ -284,6 +284,7 @@ def add_common_play_args(parser: argparse.ArgumentParser, *, agent_default: str 
     parser.add_argument("--agent", type=str, default=agent_default, help=agent_help)
     parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
     parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+    parser.add_argument("--max_steps", type=int, default=None, help="Stop playback after this many environment steps.")
     parser.add_argument(
         "--train_env_cfg",
         action="store_true",
@@ -1017,16 +1018,21 @@ Playback.
 
 
 def run_playback(step: Callable[[], None], *, dt: float, args_cli: argparse.Namespace, env_cfg: Any) -> None:
-    """Step a policy until interrupted, or until the requested video clip is complete.
+    """Step a policy until interrupted, a step budget is reached, or the video clip is complete.
 
     Args:
         step: Callable that infers one action and steps the environment. Runs under
             :func:`torch.inference_mode`.
         dt: Environment step duration [s], used to pace real-time playback.
-        args_cli: Parsed command-line arguments providing ``video``, ``video_length`` and ``real_time``.
+        args_cli: Parsed arguments providing ``video``, ``video_length``, ``max_steps`` and ``real_time``.
         env_cfg: Environment config whose first video recorder bounds the clip when ``--video_length`` is omitted.
     """
     max_steps = video_playback_steps(args_cli, env_cfg)
+    requested_steps = getattr(args_cli, "max_steps", None)
+    if requested_steps is not None:
+        if requested_steps <= 0:
+            raise ValueError("--max_steps must be positive.")
+        max_steps = requested_steps if max_steps is None else min(max_steps, requested_steps)
     logger.info("Policy playback is running, press Ctrl+C to exit...")
     step_count = 0
     with contextlib.suppress(KeyboardInterrupt):

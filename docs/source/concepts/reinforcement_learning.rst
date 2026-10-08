@@ -85,6 +85,11 @@ features your experiment needs, not on a single throughput result.
      - PPO reference runner on a ``torchrl.envs.EnvBase`` wrapper that keeps observation groups and
        terminal observations, with unified training and playback
      - ``--extra torchrl``
+   * - **RoboLearn** (experimental)
+     - Lean FlashSAC or CUDA graph captured Warp-NN PPO experiments
+     - State-based policies, replay with terminal observations, full-batch Warp PPO,
+       and unified training and playback; single GPU
+     - ``--extra robolearn``
 
 Install optional dependencies by selecting the corresponding ``uv`` extra when running a command:
 
@@ -95,6 +100,42 @@ Install optional dependencies by selecting the corresponding ``uv`` extra when r
    uv run --extra sb3 isaaclab train --rl_library sb3 --task Isaac-Cartpole
    uv run --extra torchrl isaaclab train --rl_library torchrl --task Isaac-Cartpole
    uv run --extra torchrl isaaclab play --rl_library torchrl --task Isaac-Cartpole --checkpoint latest
+
+
+RoboLearn
+~~~~~~~~~
+
+The optional `RoboLearn <https://github.com/maxkra15/RoboLearn>`_ package is installed from a pinned
+GitHub revision. The state-based Cartpole environments register both supported algorithms:
+
+.. code-block:: bash
+
+   uv run --extra robolearn isaaclab train --rl_library robolearn --task Isaac-Cartpole \
+       --algorithm flashsac --num_envs 1024 --max_iterations 150
+   uv run --extra robolearn isaaclab train --rl_library robolearn --task Isaac-Cartpole \
+       --algorithm warp_ppo --num_envs 1024 --max_iterations 150
+   uv run --extra robolearn isaaclab play --rl_library robolearn --task Isaac-Cartpole \
+       --algorithm warp_ppo --checkpoint latest --num_envs 16 --viz newton --max_steps 600
+
+Each iteration collects ``agent.num_steps_per_env`` transitions per environment. FlashSAC then performs
+``agent.updates_per_step`` replay updates per vector step after warmup; Warp PPO performs one full-batch
+update with the configured epochs after each rollout. Equal iteration budgets therefore match collected
+transitions. The algorithms can perform different amounts of optimizer work within that budget.
+Metrics and checkpoint metadata are written under ``logs/robolearn/<experiment>/``. Explicit checkpoint paths restore the algorithm configuration and action
+contract before policy construction. FlashSAC resume restores model and optimizer state and starts a fresh
+replay buffer; it does not reproduce an interrupted run exactly.
+
+The current adapter requires flat observation groups and normalized actions clipped to ``[-1, 1]``;
+the environment retains its existing action scaling. Terminal observations are enabled for correct timeout
+bootstrapping.
+
+Use the Torch environment frontend (``--frontend torch``) with either learning algorithm. The experimental
+Warp environment frontend and ``--capture_env_sensors`` currently require further adapter support.
+Visualizer video recording is available through ``--video``.
+
+Warp PPO captures its learning update only: the general Isaac Lab environment step runs through its usual
+lifecycle. RoboLearn includes a separate direct MuJoCo Warp example of joint physics and learning capture.
+Compare speed using measurements of the same workload.
 
 
 Typical training workflow

@@ -89,7 +89,7 @@ def load_cfg_from_registry(task_name: str, entry_point_key: str) -> dict | objec
     cfg_entry_point = spec.kwargs.get(entry_point_key)
     # check if entry point exists
     if cfg_entry_point is None:
-        rl_libraries = ("rl_games", "rlinf", "rsl_rl", "sb3", "skrl", "torchrl")
+        rl_libraries = ("rl_games", "rlinf", "robolearn", "rsl_rl", "sb3", "skrl", "torchrl")
         supported_libraries = [
             library for library in rl_libraries if spec.kwargs.get(f"{library}_cfg_entry_point") is not None
         ]
