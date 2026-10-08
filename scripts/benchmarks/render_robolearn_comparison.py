@@ -15,6 +15,7 @@ are displayed as unavailable. The renderer does not run or import a simulator.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 import math
@@ -51,6 +52,7 @@ def render_report(data: dict[str, Any]) -> str:
         final = evaluations[-1] if evaluations else {}
         values = [
             name,
+            _format(run.get("parameter_count"), 0),
             _format(final.get("return_mean")),
             _format(final.get("normalized_score"), 1, "%"),
             _format(final.get("episode_length_mean"), 1),
@@ -141,11 +143,13 @@ main{padding:25px 16px}h1{font-size:30px}.panel{padding:18px}.thresholds li{disp
 <p class="muted">__HARDWARE__</p><span class="badge">One seed · quick comparison</span>
 <span class="badge">Same Cartpole MDP</span><span class="badge">Offline report</span></header>
 <section class="panel"><h2>Outcome and training speed</h2><div class="scroll"><table><thead><tr>
-<th>Learner</th><th>Final return</th><th>Score</th><th>Episode steps</th><th>Survival</th><th>Upright</th>
+<th>Learner</th><th>Parameters</th><th>Final return</th><th>Score</th>
+<th>Episode steps</th><th>Survival</th><th>Upright</th>
 <th>Training</th><th>Transitions/s</th>
 <th>Process wall</th><th>Warmup</th></tr></thead><tbody>__ROWS__</tbody></table></div>
 <p class="small muted">Final values come from recorded deterministic evaluation. Score = 100 × return / 5:
 five seconds of perfect reward is the theoretical upper bound for this manager MDP. Negative scores remain visible.
+Parameters count the trainable actor and critic; FlashSAC uses a much larger model than either PPO in this run.
 Survival is the fraction reaching the episode timeout; upright is the fraction of episode steps with
 |pole angle| &lt; 0.2 rad. This normalization differs from the FlashSAC paper's asymptotic reference.
 Process wall time covers the training subprocess, including startup, logging, checkpointing, and shutdown.
@@ -265,7 +269,16 @@ def main() -> None:
     parser.add_argument("output", type=Path, help="Destination HTML file.")
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render_report(json.loads(args.input.read_text())), encoding="utf-8")
+    data = json.loads(args.input.read_text())
+    for run in data.get("runs", []):
+        picture = run.get("playback_image")
+        if picture and not picture.startswith("data:"):
+            image_path = args.input.parent / picture
+            if image_path.suffix.lower() == ".png" and image_path.is_file():
+                run["playback_image"] = "data:image/png;base64," + base64.b64encode(image_path.read_bytes()).decode(
+                    "ascii"
+                )
+    args.output.write_text(render_report(data), encoding="utf-8")
     print(args.output.resolve())
 
 
