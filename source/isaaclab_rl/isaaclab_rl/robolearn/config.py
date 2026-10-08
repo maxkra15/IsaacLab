@@ -32,5 +32,11 @@ class RoboLearnRunnerCfg:
     """FlashSAC gradient updates per vector step once replay warmup is complete."""
     capture_updates: bool = True
     """Capture the complete Warp PPO learning update in a reusable CUDA graph."""
+    capture_rollout: bool = False
+    """Capture G1 Newton physics, Warp MDP, rollout collection, and PPO in one graph.
+
+    This experimental path currently supports only the unmodified flat G1 task,
+    headless Newton MJWarp physics, and Warp PPO. Other tasks use the usual runner.
+    """
     algorithm_cfg: dict[str, Any] = {}
     """Keyword arguments for RoboLearn's FlashSACConfig or PPOConfig."""

@@ -123,7 +123,14 @@ def run(argv: list[str]) -> None:
             screen.stage("Creating environment")
             env = create_isaaclab_env(args_cli.task, env_cfg, args_cli, convert_marl_to_single_agent=False)
             cleanup.callback(lambda: close_env(env))
-            runner = RoboLearnRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+            runner_type = RoboLearnRunner
+            if agent_cfg.capture_rollout:
+                if args_cli.task != "Isaac-Velocity-Flat-G1" or args_cli.video:
+                    raise ValueError("capture_rollout currently supports headless Isaac-Velocity-Flat-G1 training.")
+                from ...robolearn.captured_runner import CapturedG1Runner
+
+                runner_type = CapturedG1Runner
+            runner = runner_type(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
             if checkpoint_path is not None:
                 runner.load(checkpoint_path)
             if args_cli.deterministic:

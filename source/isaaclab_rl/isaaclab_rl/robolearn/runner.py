@@ -174,6 +174,7 @@ class RoboLearnRunner:
             self.current_learning_iteration = iteration
             total_return, total_length, episodes = episode_totals.tolist()
             metrics = {
+                "timestamp_unix": time.time(),
                 "iteration": iteration,
                 "algorithm": self.cfg["algorithm"],
                 "total_steps": self.total_steps,

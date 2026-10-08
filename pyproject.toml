@@ -167,7 +167,7 @@ torchrl = ["torchrl>=0.13"]
 
 # GitHub-only learning package; pin the source revision for reproducible installs.
 robolearn = [
-    "robolearn-rl[flashsac,warp] @ git+https://github.com/maxkra15/RoboLearn.git@6a33600f993e7f96062c46a37246cace771a4686",
+    "robolearn-rl[flashsac,warp] @ git+https://github.com/maxkra15/RoboLearn.git@ccb27baf7eb2136c68de92bcfac26c69e383b31a",
 ]
 
 viser = ["viser>=1.0.16"]

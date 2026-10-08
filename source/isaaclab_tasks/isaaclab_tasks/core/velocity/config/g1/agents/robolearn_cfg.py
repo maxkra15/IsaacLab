@@ -32,4 +32,5 @@ class G1FlatWarpPPORunnerCfg(RoboLearnRunnerCfg):
         "initial_std": 1.0,
         "normalize_advantages": True,
         "clip_value": True,
+        "optimized_linear_backward": False,
     }

@@ -161,6 +161,27 @@ Newton's MuJoCo Warp physics backend. Both use the backend's existing physics CU
 Warp PPO additionally captures its neural learning update. Observation, reward, command,
 reset and rollout assembly remain in the existing Isaac Lab workflow.
 
+To use the experimental combined G1 graph, enable the task-specific captured runner and optional
+tiled network gradients:
+
+.. code-block:: bash
+
+   uv run --no-sync isaaclab train --task Isaac-Velocity-Flat-G1 \
+     --rl_library robolearn --algorithm warp_ppo physics=newton_mjwarp \
+     agent.capture_rollout=true agent.algorithm_cfg.optimized_linear_backward=true
+
+The existing Isaac Lab scene and startup randomization are retained. Commands, events, observations,
+rewards, terminations, masked resets, Newton physics, rollout collection and PPO updates execute in
+one CUDA graph with fixed device arrays. The adapter preserves the constructed native environment's
+physics decimation, joint-acceleration and lazy contact-update cadence. Random-number streams differ
+from Torch; equal seeds do not produce identical trajectories. Rendering, logging and serialization
+run outside capture. The option currently supports only the unmodified flat G1 MDP and CUDA MJWarp.
+
+The benchmark accepts ``--optimized_linear_backward`` and ``--capture_rollout`` independently. Compare
+the original learner, optimized learner and complete graph with the same environment/iteration budget
+to distinguish kernel changes from capture. Common deterministic evaluations use the original Torch
+MDP for every saved policy. Report both elapsed time and policy quality.
+
 ``scripts/benchmarks/compare_g1.py`` matches separate 256/128/128 Tanh actor and critic networks,
 a fixed learning rate of ``3e-4``, five full-batch epochs, a 24-step rollout horizon and action
 clipping to ``[-1, 1]``. Its RSL-RL run overrides the stock G1 agent's ELU activation, adaptive

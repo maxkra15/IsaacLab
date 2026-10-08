@@ -130,6 +130,9 @@ def metadata(args: argparse.Namespace) -> dict:
         "scripts/benchmarks/profile_rsl_ppo.py",
         "source/isaaclab_tasks/isaaclab_tasks/core/velocity/config/g1/agents/robolearn_cfg.py",
         "source/isaaclab_rl/isaaclab_rl/robolearn/runner.py",
+        "source/isaaclab_rl/isaaclab_rl/robolearn/captured_runner.py",
+        "source/isaaclab_rl/isaaclab_rl/robolearn/captured_g1.py",
+        "source/isaaclab_rl/isaaclab_rl/robolearn/captured_g1_mdp.py",
         "source/isaaclab_rl/isaaclab_rl/entrypoints/backends/train_robolearn.py",
         "source/isaaclab_rl/isaaclab_rl/entrypoints/backends/train_rsl_rl.py",
     ]
@@ -173,6 +176,10 @@ def metadata(args: argparse.Namespace) -> dict:
         "task": TASK,
         "physics": "newton_mjwarp",
         "frontend": "torch",
+        "mdp_execution": "warp_captured" if args.capture_rollout else "torch_eager",
+        "capture_scope": "physics_mdp_rollout_ppo" if args.capture_rollout else "separate_physics_and_learner",
+        "inner_physics_graph": not args.capture_rollout,
+        "optimized_linear_backward": args.optimized_linear_backward,
         "seed": args.seed,
         "device": args.device,
         "hardware": selected["name"] if selected else inventory_text.strip(),
@@ -202,7 +209,9 @@ def metadata(args: argparse.Namespace) -> dict:
             "Executed actions are clipped to [-1,1], unlike the stock unclipped G1 PPO configuration.",
             "PPO: separate 256/128/128 Tanh MLPs, log std, fixed lr=.0003, "
             "five full-batch epochs, gamma=.99, lambda=.95.",
-            "Warp captures the learning update; Isaac Lab rollout assembly remains eager.",
+            "Warp captures physics, MDP, rollout and learner together; Python constructs the original Isaac Lab scene."
+            if args.capture_rollout
+            else "Warp captures the learning update; Isaac Lab rollout assembly remains eager.",
             "Implementations differ in initialization, timeout bootstrap, gradient clipping and numeric precision.",
             "GPU-synchronized phase timings exclude checkpoint I/O and logging; process wall time includes them.",
             "Steady throughput excludes the first five iterations; capture preparation is reported separately.",
@@ -277,9 +286,25 @@ def train(args: argparse.Namespace) -> None:
     else:
         command = [str(Path(sys.executable).with_name("isaaclab")), "train", "--rl_library", library]
         command += ["--algorithm", "warp_ppo", *common]
+        command += [f"agent.capture_rollout={str(args.capture_rollout).lower()}"]
+        if args.optimized_linear_backward:
+            command += ["agent.algorithm_cfg.optimized_linear_backward=true"]
+    variant = "rsl_rl_ppo" if is_rsl else "warp_ppo"
+    if args.optimized_linear_backward:
+        variant = "warp_ppo_tiled"
+    if args.capture_rollout:
+        variant = "warp_ppo_captured"
+    names = {
+        "rsl_rl_ppo": "RSL-RL PPO",
+        "warp_ppo": "Warp PPO · original backward",
+        "warp_ppo_tiled": "Warp PPO · tiled backward",
+        "warp_ppo_captured": "Warp PPO · complete graph",
+    }
     run = {
-        "name": "RSL-RL PPO" if is_rsl else "Warp PPO",
+        "name": names[variant],
         "algorithm": args.algorithm,
+        "variant": variant,
+        "capture_scope": results["metadata"]["capture_scope"],
         "seed": args.seed,
         "device": args.device,
         "command": command,
@@ -296,6 +321,8 @@ def train(args: argparse.Namespace) -> None:
         flush=True,
     )
     started = time.perf_counter()
+    started_unix = time.time()
+    run["process_started_unix"] = started_unix
     with (args.output / f"{args.algorithm}.log").open("w") as log:
         with subprocess.Popen(command, cwd=root, stdout=log, stderr=subprocess.STDOUT) as process:
             while process.poll() is None:
@@ -329,6 +356,7 @@ def train(args: argparse.Namespace) -> None:
                     "iteration": row["iteration"],
                     "transitions": row["total_steps"],
                     "time_seconds": elapsed,
+                    "wall_time_seconds": row["timestamp_unix"] - started_unix if "timestamp_unix" in row else None,
                     "return_mean": row["mean_episode_return"],
                 }
             )
@@ -563,6 +591,9 @@ def evaluate(args: argparse.Namespace) -> None:
                             iteration=iteration,
                             transitions=iteration * run["num_envs"] * run["horizon"],
                             time_seconds=sum(row["iteration_seconds"] for row in rows[:iteration]),
+                            wall_time_seconds=rows[iteration - 1]["timestamp_unix"] - run["process_started_unix"]
+                            if "timestamp_unix" in rows[iteration - 1] and "process_started_unix" in run
+                            else None,
                         )
                         run["evaluations"].append(evaluation)
                         write_results(manifest, results)
@@ -616,7 +647,7 @@ def merge(args: argparse.Namespace) -> None:
             raise ValueError(f"Incompatible benchmark source fingerprint in {manifest}.")
         for original in source["runs"]:
             run = dict(original)
-            identity = (run["algorithm"], run["seed"])
+            identity = (run.get("variant", run["algorithm"]), run["seed"])
             if identity in identities:
                 raise ValueError(f"Duplicate algorithm and seed: {identity}.")
             if run["status"] != "completed":
@@ -642,8 +673,10 @@ def merge(args: argparse.Namespace) -> None:
     seeds = sorted({seed for _, seed in identities})
     for seed in seeds:
         algorithms = {algorithm for algorithm, run_seed in identities if run_seed == seed}
-        if algorithms != {"warp_ppo", "rsl_rl_ppo"}:
-            raise ValueError(f"Seed {seed} requires both Warp PPO and RSL-RL PPO; found {sorted(algorithms)}.")
+        if "rsl_rl_ppo" not in algorithms or not any(name.startswith("warp_ppo") for name in algorithms):
+            raise ValueError(f"Seed {seed} requires Warp PPO and RSL-RL PPO; found {sorted(algorithms)}.")
+        if algorithms != {algorithm for algorithm, _ in identities}:
+            raise ValueError(f"Seed {seed} is missing a comparison variant: {sorted(algorithms)}.")
     if not seeds:
         raise ValueError("No completed paired runs were supplied.")
     evaluation_counts = {point["evaluation_envs"] for run in runs for point in run["evaluations"]}
@@ -686,6 +719,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--inputs", nargs="+", type=Path, help="Merge phase: run directories or comparison JSON files.")
     parser.add_argument("--algorithm", choices=["warp_ppo", "rsl_rl_ppo"], default="warp_ppo")
+    parser.add_argument(
+        "--capture_rollout", action="store_true", help="Warp PPO: capture physics, Warp MDP and learner."
+    )
+    parser.add_argument(
+        "--optimized_linear_backward", action="store_true", help="Warp PPO: use explicit tiled network gradients."
+    )
     parser.add_argument("--device", choices=["cuda:0", "cuda:1"], default="cuda:0")
     parser.add_argument("--iterations", type=int, default=1500)
     parser.add_argument("--num_envs", type=int, default=1024)
@@ -698,6 +737,8 @@ def main() -> None:
         parser.error("Iteration and environment counts must be positive.")
     if args.seed < 0:
         parser.error("Use a nonnegative explicit seed for reproducible comparisons.")
+    if args.algorithm == "rsl_rl_ppo" and (args.capture_rollout or args.optimized_linear_backward):
+        parser.error("The capture and backward flags apply to Warp PPO.")
     {"train": train, "evaluate": evaluate, "merge": merge}[args.phase](args)
 
 

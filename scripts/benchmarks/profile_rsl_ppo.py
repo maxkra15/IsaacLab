@@ -100,6 +100,7 @@ class TimedOnPolicyRunner(OnPolicyRunner):
         updates = self.alg.num_learning_epochs * self.alg.num_mini_batches
         seconds = self._profile_rollout_seconds + self._profile_update_seconds
         metrics = {
+            "timestamp_unix": time.time(),
             "iteration": iteration,
             "algorithm": "rsl_rl_ppo",
             "total_steps": steps * iteration,

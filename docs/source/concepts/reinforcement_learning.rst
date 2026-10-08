@@ -137,6 +137,18 @@ Warp PPO captures its learning update only: the general Isaac Lab environment st
 lifecycle. RoboLearn includes a separate direct MuJoCo Warp example of joint physics and learning capture.
 Compare speed using measurements of the same workload.
 
+For ``Isaac-Velocity-Flat-G1`` with ``physics=newton_mjwarp``, the experimental
+``agent.capture_rollout=true`` option captures a complete rollout and PPO update together.
+The ordinary Isaac Lab environment constructs the existing scene and applies startup randomization.
+Its steady-state physics, observations, rewards, commands, masked resets, random pushes, rollout storage,
+and learning then use fixed Warp buffers in one CUDA graph. Logging and checkpoint writes remain outside
+the graph. This task-specific path requires headless operation and the stock G1 MDP; it is not a generic
+capture option for arbitrary Isaac Lab tasks.
+
+``agent.algorithm_cfg.optimized_linear_backward=true`` independently selects RoboLearn's tiled network
+gradients. It preserves the model architecture, PPO objective, and checkpoint format. Capture and kernel
+optimization should be measured separately; neither guarantees a speed advantage over RSL-RL.
+
 
 Typical training workflow
 -------------------------
