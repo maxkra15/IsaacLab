@@ -50,6 +50,8 @@ def render_report(data: dict[str, Any]) -> str:
             point.setdefault("yaw_velocity_error_mean", point.get("yaw_rate_error_mean"))
     title = html.escape(str(metadata.get("artifact_label", "G1 walking · PPO comparison")))
     hardware = html.escape(str(metadata.get("hardware", "Hardware details unavailable")))
+    outcome = metadata.get("outcome_summary")
+    outcome = f'<p class="outcome">{html.escape(str(outcome))}</p>' if outcome else ""
     details, pictures = [], []
     for run in runs:
         name = html.escape(str(run.get("name", run.get("algorithm", "Unnamed run"))))
@@ -85,6 +87,9 @@ main{max-width:1420px;padding:42px 30px;margin:auto}h1{font-size:40px;letter-spa
 margin:10px 0 12px}h2{font-size:20px;margin:0 0 14px}p{margin:9px 0 16px}.eyebrow{color:var(--warp);
 font-size:12px;letter-spacing:2px;font-weight:650}.muted,figcaption{color:var(--muted)}.small{font-size:12px}
 .badge{display:inline-block;background:#e5eef5;padding:5px 10px;border-radius:20px;font-size:12px;margin:4px 6px 0 0}
+.outcome{background:#eaf4f2;border-left:4px solid var(--warp);border-radius:8px;padding:14px 18px;
+font-size:16px;margin:20px 0 0}.architecture{margin:16px 0}.architecture caption{text-align:left;font-weight:650;
+padding-bottom:8px}.architecture td:first-child{width:160px}
 .panel{border:1px solid var(--line);background:#fff;border-radius:16px;padding:24px;margin-top:22px;
 box-shadow:0 5px 18px #17395404}.controls{display:flex;flex-wrap:wrap;gap:15px;align-items:center}
 .controls label,.control-label{font-size:13px;color:var(--muted)}
@@ -121,7 +126,7 @@ footer{font-size:12px;color:var(--muted);margin-top:25px}@media(max-width:1100px
 </style></head><body><main>
 <header><div class="eyebrow">ISAAC LAB × ROBOLEARN × RSL-RL</div><h1>__TITLE__</h1>
 <p class="muted">__HARDWARE__</p><span class="badge" id="budget"></span><span class="badge" id="replicas"></span>
-<span class="badge">Recorded measurements · offline report</span></header>
+<span class="badge">Recorded measurements · offline report</span>__OUTCOME__</header>
 <section class="panel"><div class="controls control-row">
 <div class="legend" id="algorithms" aria-label="Learner visibility"></div>
 <label>Seed<select id="seed"><option value="all">All seeds</option></select></label>
@@ -181,7 +186,16 @@ Two seeds cannot establish a stable algorithm ranking.</p></section>
 Planar velocity error is the mean Euclidean error in the yaw frame (m/s), and yaw-rate error is the mean absolute
 world-z error (rad/s). Survival is the fraction of evaluation episodes reaching timeout without a failure termination.
 Low tracking error should be considered together with survival and return.</p>
+<div class="scroll"><table class="architecture" aria-label="Shared simulation and learner execution paths">
+<caption>Execution path</caption><thead><tr><th>Stage</th><th>RSL-RL PPO</th><th>RoboLearn Warp PPO</th></tr></thead>
+<tbody><tr><td>Physics</td><td colspan="2">Shared Newton/MuJoCo Warp physics graph</td></tr>
+<tr><td>Isaac Lab MDP</td><td colspan="2">
+Shared eager Torch observations, rewards, resets, and action processing</td></tr>
+<tr><td>PPO update</td><td>Torch learner</td><td>Warp-NN learner captured in a CUDA graph</td></tr>
+</tbody></table></div>
 <p>Warp PPO captures the learner update in a CUDA graph. The Isaac Lab rollout remains eager.
+The learner graph is separate from physics stepping; this run does not capture the complete rollout and learning cycle
+in one graph.
 Speed ratios compare measured implementations and configurations; quality cards can favor either learner.
 Checkpoint evaluation uses deterministic actions and the recorded reset seeds and command scenarios.
 Unavailable measurements are shown as —.</p><ul class="notes">__NOTES__</ul>
@@ -365,6 +379,7 @@ if(!document.querySelector('.pictures img'))$('playback').remove();redraw();
     replacements = {
         "TITLE": title,
         "HARDWARE": hardware,
+        "OUTCOME": outcome,
         "NOTES": notes,
         "DETAILS": "".join(details),
         "METADATA": html.escape(json.dumps(metadata, indent=2, ensure_ascii=False)),
