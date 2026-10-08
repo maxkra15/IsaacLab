@@ -4,6 +4,6 @@
   video recording. The scripted preset combined a one-way VBD cable boundary
   with physical spring-clip retention and hydroelastic three-finger grasping;
   optional visual-only USD scenery referenced the original GB300 assets.
-  The hydroelastic example required a corrected Newton checkout and the robot
-  asset required authorized Fabrics-Sim access. Repeatable full-cycle extraction
-  remained under validation.
+  The calibrated robot bundle and two Newton contact-coupling corrections
+  remained external dependencies. Public robot sources were documented;
+  their contact behavior remained under validation.

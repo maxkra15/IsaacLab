@@ -243,9 +243,11 @@ def _one_way_cable_collision_pipeline(model: newton.Model) -> newton.CollisionPi
     immovable[attached] = (body_flags[shape_bodies[attached]] & int(newton.BodyFlags.KINEMATIC)) != 0
     pairs = model.shape_contact_pairs.numpy().reshape(-1, 2)
     pairs = pairs[~np.all(immovable[pairs], axis=1)]
+    # Override the destination view so optional fields are sized from its usable pairs.
+    model.shape_contact_pairs = wp.array(pairs, dtype=wp.vec2i, device=model.device)
     return newton.CollisionPipeline(
         model,
-        shape_pairs_filtered=wp.array(pairs, dtype=wp.vec2i, device=model.device),
+        shape_pairs_filtered=model.shape_contact_pairs,
         contact_matching="sticky",
         include_static_kinematic_pairs=False,
     )

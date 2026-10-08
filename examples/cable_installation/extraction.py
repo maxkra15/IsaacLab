@@ -302,7 +302,7 @@ class CableRemovalStateMachine:
         elif not released:
             # Full keyframe closure can overload the clip's compliant stop.
             target = _smooth(self.elapsed / 2.0) if self.phase == "PRESS" else 1.0
-            rate = 0.3 if self.phase in ("PRESS", "WITHDRAW") else 0.15
+            rate = 0.3
             thumb_blend = max(thumb_blend, min(target, thumb_blend + rate * self.dt))
         self.hand_blends = (1.0, thumb_blend)
 

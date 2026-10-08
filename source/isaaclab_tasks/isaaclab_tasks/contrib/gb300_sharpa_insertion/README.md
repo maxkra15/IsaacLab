@@ -128,8 +128,17 @@ on the CPU. Rendering and optional contact diagnostics are outside capture.
 
 ## Assets and Newton dependency
 
-Licensed payloads are not committed or downloaded automatically. Asset
-resolution validates pinned local files and reports missing dependencies.
+Asset payloads are not committed or downloaded automatically. Asset resolution
+validates pinned local files and reports missing dependencies.
+
+The manufacturers publish the [Rizon arm sources](https://github.com/flexivrobotics/flexiv_description)
+and [Sharpa hand sources](https://github.com/sharpa-robotics/sharpa-urdf-usd-xml)
+under Apache-2.0. The Rizon arm also has an existing Isaac Lab asset configuration,
+`FLEXIV_RIZON4S_CFG`. These public components are not a drop-in replacement for
+the validated combined assembly below: the hand's USD palm mass and pad meshes
+differ, and its palm lacks `r_palm_ctrl`. A public composition can preserve the
+mount and TCP using a fixed joint and the existing Newton IK body-offset fields;
+its grasp and contact behavior still need validation before replacing the default.
 
 - **Robot:** the access-controlled [Fabrics-Sim repository](https://gitlab-master.nvidia.com/dex/fabrics-sim.git),
   revision `d0dbd1ddaefc4996db546949a7dfb37e39afcbeb`, at
@@ -149,14 +158,24 @@ resolution validates pinned local files and reports missing dependencies.
   `ISAACLAB_RJ45_PLUG_USD` can supply the canonical file when example assets are
   absent from the installed Newton package.
 
-The full hydroelastic example requires four corrections absent from the Newton
-dependency pinned by upstream Isaac Lab: effective-mass conversion of MJWarp
-hydroelastic gains, graph-safe SDF contact counters, publishing filtered contacts
-after mapping invalidation, and subset-aware hydroelastic buffer allocation.
-Prefix example commands with `PYTHONPATH=/path/to/corrected-newton`. The task
-does not patch installed packages or change the dependency pin. Native training
-does not need hydroelastic-specific corrections; contact-generation correctness
-also affects coupled solvers generally.
+Two contact-coupling defects remain in the pinned public Newton dependency:
+MJWarp hydroelastic gains omit effective-mass conversion, and filtered contacts
+can publish a generation before invalidating its cached mapping. Focused
+regressions fail on the public dependency and pass with these corrections. The
+mapping race is scheduling-dependent; it was reproduced on CPU, not in the
+current L40 fixture. Prefix example commands with
+`PYTHONPATH=/path/to/corrected-newton`; the task does not patch installed packages
+or change the dependency pin. Native training does not use hydroelastic gains,
+but mapping correctness affects coupled solvers generally.
+
+Subset-aware hydroelastic allocation is not an external prerequisite: the cable
+pipeline uses Newton's public solver-view pair override. A graph-safe SDF warning
+poll is a separate, conditional capture issue, not an established cause of the
+current extraction timeout. IK and implicit-actuator capture are opt-in
+performance additions. The Kit camera fix supports headless moving-camera
+recording, and the launcher fix enables sibling imports through the public CLI;
+neither changes insertion contacts. These framework changes should be reviewed
+separately from the task, not described as physics prerequisites.
 
 ## Validation and public PR status
 
@@ -167,10 +186,12 @@ diagnostic sampling. It had 79 active colliders, 925 rigid candidate pairs, and
 reported overflow. The largest sampled cable-joint gap/socket overlap was
 0.090/0.174 mm. This is not real-time performance or a robustness claim.
 
-A repeat and an unpruned baseline both inserted and retained the plug but timed
-out during the extraction pinch. Housing support and thumb–clip contact were
-present; repeatable clip-clearance control remains unresolved. Public asset
-access, upstream Newton corrections, and repeated full-cycle validation are
-prerequisites for a self-contained public example. Captured-actuator, IK, Kit
-camera, and launcher fixes have separate framework ownership and should be
-reviewed as prerequisite changes rather than hidden in the task implementation.
+Two subsequent cycles completed insertion, hands-off retention, regrasp,
+physical clip depression, extraction, and final hold after making thumb feedback
+during the housing pinch as responsive as during pressing and withdrawal.
+Measured withdrawal was 59.80/59.74 mm, with maximum sampled cable-joint gaps
+of 0.050/0.055 mm and no non-finite state or fixed-tail drift. Grasp targets,
+physical clip stops, and release guards were unchanged. Two passes are not a
+broad robustness or public-asset validation claim. A dynamically validated public
+robot composition and upstream contact corrections remain outstanding for a
+self-contained public example.
