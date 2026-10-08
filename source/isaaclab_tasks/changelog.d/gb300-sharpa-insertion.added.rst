@@ -7,3 +7,5 @@
   The calibrated robot bundle and two Newton contact-coupling corrections
   remained external dependencies. Public robot sources were documented;
   their contact behavior remained under validation.
+  The latest-stack branch used native curve metadata from the pinned public
+  Newton development revision.

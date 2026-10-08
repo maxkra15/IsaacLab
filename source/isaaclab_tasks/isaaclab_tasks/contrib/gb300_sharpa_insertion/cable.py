@@ -394,13 +394,13 @@ def add_connectors(
     # Hooks run before source labels are rewritten to the destination environment.
     groups = [
         i
-        for i, (label, world) in enumerate(zip(builder._cable_label, builder._cable_world, strict=True))
+        for i, (label, world) in enumerate(zip(builder.curve_label, builder.curve_world, strict=True))
         if int(world) == world_idx and str(label).endswith("/Cable/geometry/mesh")
     ]
     if len(groups) != 1:
         raise ValueError(f"Expected one native cable in world {world_idx}, found {len(groups)}.")
     group = groups[0]
-    root = str(builder._cable_label[group]).removesuffix("/geometry/mesh")
+    root = str(builder.curve_label[group]).removesuffix("/geometry/mesh")
     # Give the fixed workcell one owner and mirror it into VBD like the robot.
     # A shape cannot belong to two coupled entries, even when it is static.
     env_root = root.rsplit("/", 1)[0]
@@ -409,7 +409,7 @@ def add_connectors(
     builder.add_articulation([joint], label=f"{env_root}/Fixtures/articulation")
     _assign_fixed_fixtures(builder, world_idx, env_root, fixtures)
     add_rack_colliders(builder, fixtures, env_position, env_rotation)
-    start, end = int(builder._cable_body_start[group]), int(builder._cable_body_end[group])
+    start, end = int(builder._curve_body_start[group]), int(builder._curve_body_end[group])
     head_body = start
     if rigid_connector:
         matches = [
@@ -588,7 +588,9 @@ def add_connectors(
         for other, label in enumerate(builder.shape_label):
             if str(label).startswith(f"{env_root}/Fixtures/GB300/"):
                 builder.add_shape_collision_filter_pair(grip, other)
-    for joint in range(int(builder._cable_joint_start[group]), int(builder._cable_joint_end[group])):
+    for joint in range(int(builder._curve_joint_start[group]), int(builder._curve_joint_end[group])):
+        if builder.joint_type[joint] != newton.JointType.ROD:
+            continue
         dof = int(builder.joint_qd_start[joint])
         builder.joint_target_kd[dof : dof + 4] = [0.01, 0.01, 0.02, 0.02]
     # The far plug is already latched; the loose connector and spans are dynamic.

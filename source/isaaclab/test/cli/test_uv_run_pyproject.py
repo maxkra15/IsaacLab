@@ -158,8 +158,9 @@ def test_version_single_source_matches_literal_pins(source_checkout_root: Path):
     for package in ("torch", "torchvision", "torchaudio"):
         assert f"{package}=={versions[package]}" in dependencies
 
-    # Newton uses the same exact PyPI release for source and wheel installations.
-    newton_spec = f"newton[sim]=={versions['newton']}"
+    # Newton uses the same pinned release or development revision in both installation paths.
+    newton_pin = versions["newton"]
+    newton_spec = f"newton[sim] @ {newton_pin}" if newton_pin.startswith("git+") else f"newton[sim]=={newton_pin}"
     assert newton_spec in dependencies
     assert newton_spec in overrides
 

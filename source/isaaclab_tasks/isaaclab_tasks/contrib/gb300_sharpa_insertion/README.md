@@ -128,6 +128,15 @@ on the CPU. Rendering and optional contact diagnostics are outside capture.
 
 ## Assets and Newton dependency
 
+The latest-stack branch pins public Newton development revision
+`62b1dc5cd739f028c47421ce71cda80569025db6` (`1.8.0.dev0`), Warp `1.18.0`,
+and MuJoCo/MuJoCo-Warp `3.15.0`. This is a development stack, not Newton's
+published `1.6.1` release. The cloner and task use its native surface, volume,
+and curve metadata; older Newton releases are not supported on this branch.
+Newton declares MuJoCo `3.14`; this branch deliberately overrides it to `3.15`.
+The focused contact and demo checks do not establish compatibility for every
+other solver or Isaac Lab task.
+
 Asset payloads are not committed or downloaded automatically. Asset resolution
 validates pinned local files and reports missing dependencies.
 
@@ -158,14 +167,14 @@ its grasp and contact behavior still need validation before replacing the defaul
   `ISAACLAB_RJ45_PLUG_USD` can supply the canonical file when example assets are
   absent from the installed Newton package.
 
-Two contact-coupling defects remain in the pinned public Newton dependency:
+Two contact-coupling defects remain even in this pinned public Newton revision:
 MJWarp hydroelastic gains omit effective-mass conversion, and filtered contacts
 can publish a generation before invalidating its cached mapping. Focused
 regressions fail on the public dependency and pass with these corrections. The
 mapping race is scheduling-dependent; it was reproduced on CPU, not in the
 current L40 fixture. Prefix example commands with
-`PYTHONPATH=/path/to/corrected-newton`; the task does not patch installed packages
-or change the dependency pin. Native training does not use hydroelastic gains,
+`PYTHONPATH=/path/to/corrected-newton`; the task does not patch installed packages.
+Native training does not use hydroelastic gains,
 but mapping correctness affects coupled solvers generally.
 
 Subset-aware hydroelastic allocation is not an external prerequisite: the cable
@@ -195,3 +204,9 @@ physical clip stops, and release guards were unchanged. Two passes are not a
 broad robustness or public-asset validation claim. A dynamically validated public
 robot composition and upstream contact corrections remain outstanding for a
 self-contained public example.
+
+The latest development stack also completed a continuous cycle on an A40 with
+only the two contact corrections, withdrawing 59.90 mm. All 200 sampled states
+were finite, physics and IK graphs remained active, and resets, reported
+overflow, and fixed-tail drift were zero. The final cable-joint gap was 0.034 mm.
+No grasp targets or release guards were changed for this stack migration.

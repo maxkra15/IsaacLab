@@ -48,7 +48,7 @@ dependencies = [
     "pyglet>=2.1.6,<3",
     "transformers==5.10.4",
     "einops",
-    "warp-lang==1.17.0",
+    "warp-lang==1.18.0",
     "matplotlib>=3.10.3",
     # pillow: floor, not exact — an exact pin below Isaac Sim's prebundled version forces a
     # downgrade that deletes the prebundled copy other extensions symlink into (nvbugs 6410989).
@@ -84,8 +84,8 @@ dependencies = [
     "rsl-rl-lib==5.5.1",  # default RL framework
     "gitpython>=3.1.59",  # used by RL training and experiment logging
     # ----- newton (default physics engine) -----
-    # Pin the Newton release used by both workspace and wheel installs.
-    "newton[sim]==1.6.1",
+    # Pin the public development revision used by this latest-stack branch.
+    "newton[sim] @ git+https://github.com/newton-physics/newton.git@62b1dc5cd739f028c47421ce71cda80569025db6",
     # Import and mesh-processing packages used by Newton, including the ones that honoring
     # USD-authored ``physics:approximation`` requires. Keep these explicit instead of selecting
     # newton[importers], whose standalone USD dependency would overlap with usd-exchange.
@@ -226,8 +226,8 @@ torchaudio = "2.11.0"
 ovphysx = "0.6.3"
 ovrtx = "0.5.0.377615"
 ovstage = "0.2.0.377349"
-newton = "1.6.1"
-warp = "1.17.0"
+newton = "git+https://github.com/newton-physics/newton.git@62b1dc5cd739f028c47421ce71cda80569025db6"
+warp = "1.18.0"
 
 [tool.ruff]
 line-length = 120
@@ -406,9 +406,9 @@ environments = [
 # Direct torch-stack pins also apply to published wheels; overrides reconcile Isaac Sim's older pins.
 override-dependencies = [
     "numpy>=2",
-    "mujoco~=3.12.0",
-    "mujoco-warp~=3.12.0",
-    "newton[sim]==1.6.1",
+    "mujoco~=3.15.0",
+    "mujoco-warp~=3.15.0",
+    "newton[sim] @ git+https://github.com/newton-physics/newton.git@62b1dc5cd739f028c47421ce71cda80569025db6",
     # Force the Newton-matched schemas over isaacsim's ==0.2.0 pin.
     "newton-usd-schemas>=0.5.0",
     # isaacsim-asset-isolated and isaacsim-robot-schema 6.1 pin usd-exchange ==2.3.0.
