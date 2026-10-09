@@ -63,6 +63,7 @@ class G1FlatFlashSACRunnerCfg(RoboLearnRunnerCfg):
     max_iterations = 2050
     updates_per_step = 2
     flash_updates_during_rollout = True
+    init_at_random_ep_len = True
     algorithm_cfg = {
         "buffer_max_length": 10_000_000,
         "buffer_min_length": 100_000,
