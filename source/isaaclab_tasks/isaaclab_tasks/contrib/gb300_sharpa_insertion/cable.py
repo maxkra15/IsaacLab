@@ -427,9 +427,7 @@ def add_connectors(
             builder.body_inv_mass[start] = 0.0
             builder.body_inv_inertia[start] = wp.mat33(0.0)
         else:
-            # An unconstrained root lets MJWarp import the terminal rod as an ADMM proximal body.
-            joint = builder.add_joint_free(child=start, label=f"{root}/geometry/terminal_free")
-            builder.add_articulation([joint], label=f"{root}/geometry/terminal_articulation")
+            # Reuse the native rod's free root for the ADMM proximal attachment.
             builder.add_joint_fixed(
                 parent=start,
                 child=head_body,
