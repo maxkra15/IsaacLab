@@ -138,9 +138,7 @@ def _expected_cable_points_world(cable, env_id: int = 0) -> torch.Tensor:
     body_q = wp.to_torch(NewtonManager.get_state_0().body_q).cpu()
     shape_transform = wp.to_torch(model.shape_transform).cpu()
     shape_scale = wp.to_torch(model.shape_scale).cpu()
-    root_id = int(cable.data._sim_bind_root_body_ids.numpy()[env_id])
-    link_ids = [int(value) for value in cable.data._sim_bind_link_body_ids.numpy()[env_id]]
-    body_ids = [root_id, *link_ids]
+    body_ids = cable.root_view.get_attribute("joint_child", model).numpy()[env_id, 0].tolist()
 
     negative_endpoints = []
     positive_endpoints = []

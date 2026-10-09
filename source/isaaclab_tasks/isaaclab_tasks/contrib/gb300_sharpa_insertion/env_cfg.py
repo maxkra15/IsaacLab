@@ -38,7 +38,7 @@ from .assets import (
     RIZON_SHARPA_RIGHT_HAND_LIMITS_RAD,
 )
 from .cable import CONNECTOR_SPAN_M, PATCH_CABLE_COLOR, PatchCableCfg, hanging_cable_positions
-from .presentation import InstallationPresentationCfg, update_switchboard_lights
+from .presentation import InstallationPresentationCfg, SwitchboardActivity
 from .robot_cfg import ROBOT_BASE_POSITION_E, rizon_sharpa_articulation_cfg
 from .workcell import SOCKET_POSITION_E, UPPER_SOCKET_POSITION_E
 
@@ -104,6 +104,11 @@ class GB300SharpaSceneCfg(InteractiveSceneCfg):
     )
     activity_b = VisualMaterialCfg(
         prim_path="{ENV_REGEX_NS}/RackPresentation/Looks/ActivityB", spawn=None, channels=("color", "emissive_color")
+    )
+    activity_target = VisualMaterialCfg(
+        prim_path="{ENV_REGEX_NS}/RackPresentation/Looks/ActivityTarget",
+        spawn=None,
+        channels=("color", "emissive_color"),
     )
 
 
@@ -172,7 +177,7 @@ class ObservationsCfg:
 @configclass
 class EventsCfg:
     reset_scene = EventTermCfg(func=base_mdp.reset_scene_to_default, mode="reset", params={"reset_joint_targets": True})
-    activity = EventTermCfg(func=update_switchboard_lights, mode="interval", interval_range_s=(0.1, 0.1))
+    activity = EventTermCfg(func=SwitchboardActivity, mode="interval", interval_range_s=(0.1, 0.1))
 
 
 @configclass
@@ -231,7 +236,10 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
             raise ValueError("one_way_cable requires hydroelastic_contacts.")
         if not self.presentation_enabled:
             self.scene.presentation = self.scene.activity_a = self.scene.activity_b = None
+            self.scene.activity_target = None
             self.events.activity = None
+        else:
+            self.scene.presentation.spawn.target_socket_position_e = self.target_socket_position_e
         if self.hydroelastic_contacts:
             self.scene.cable.spawn.rigid_connector = True
             self.scene.latch = None

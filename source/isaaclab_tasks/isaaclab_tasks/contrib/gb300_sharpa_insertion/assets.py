@@ -29,7 +29,6 @@ RIZON_SHARPA_BUNDLE_SHA256 = "ae5d22792b44fb6d29a7691d4276bc061a5529132f01e7a0eb
 RIZON_SHARPA_BUNDLE_SIZE_BYTES = 379_258_308
 RIZON_SHARPA_ASSET_ROOT_ENV = "ISAACLAB_FABRICS_SIM_RIZON_SHARPA_ROOT"
 
-RIZON_SHARPA_BASE_LINK_NAME = "base_link"
 # Fabrics-Sim authors this fixed child from measured knuckle geometry. Its
 # canonical axes are X toward the knuckles and Z out of the palm. The native
 # Sharpa palm swaps X/Z and must never be used directly as a pose objective.

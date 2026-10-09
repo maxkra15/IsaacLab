@@ -8,17 +8,18 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
+from isaaclab.managers import ManagerTermBase
 from isaaclab.sim.utils import clone
 from isaaclab.utils import configclass
 from isaaclab.utils.version import has_kit
 
+from . import mdp
 from .assets import configured_gb300_external_usd
 from .workcell import (
     FLOOR_OFFSET_M,
@@ -35,18 +36,15 @@ if TYPE_CHECKING:
     from pxr import Usd, UsdShade
 
     from isaaclab.envs import ManagerBasedRLEnv
+    from isaaclab.managers import EventTermCfg
 
 # Measured centers of the unused, right-hand eight-port bank in the pinned CAD.
 # The working pair lies at X=0.377/0.523 m; these leads do not cross its approach.
 POPULATED_PORT_X_M = (0.64100519, 0.68294519, 0.71089519)
+POPULATED_PORT_LED_X_M = (0.6461701880, 0.6881101915, 0.7160701905)
 PATCH_COLORS = ((0.018, 0.26, 0.85), (0.95, 0.65, 0.015), (0.72, 0.78, 0.83))
 RACK_HEIGHT_M = GB300_SIMREADY_COMPOSED_BOUNDS_MAX_M[2] - GB300_SIMREADY_COMPOSED_BOUNDS_MIN_M[2]
 CEILING_HEIGHT_M = RACK_HEIGHT_M + 0.55
-
-
-def rack_visual_usd() -> Path:
-    """Return the verified native CAD, preserving its geometry, normals and materials."""
-    return configured_gb300_external_usd(required=True)
 
 
 @clone
@@ -65,7 +63,7 @@ def spawn_installation_presentation(
     root.AddTranslateOp().Set(Gf.Vec3d(*(translation or (0, 0, 0))))
     x, y, z, w = orientation or (0, 0, 0, 1)
     root.AddOrientOp().Set(Gf.Quatf(w, Gf.Vec3f(x, y, z)))
-    asset_path = rack_visual_usd()
+    asset_path = configured_gb300_external_usd(required=True)
     defer_racks = has_kit()
     for index, (position, rotation) in enumerate(
         zip(GB300_PRESENTATION_RACK_TRANSLATIONS_E, GB300_PRESENTATION_RACK_ROTATIONS_XYZW, strict=True)
@@ -85,7 +83,7 @@ def spawn_installation_presentation(
         asset.SetInstanceable(True)
 
     _author_patch_leads(stage, prim_path)
-    _author_switchboard_lights(stage, prim_path)
+    _author_switchboard_lights(stage, prim_path, cfg.target_socket_position_e)
     if not cfg.include_architecture:
         return root.GetPrim()
     metal = _material(stage, f"{prim_path}/Looks/Structure", (0.12, 0.15, 0.19), metallic=0.65)
@@ -137,7 +135,34 @@ def spawn_installation_presentation(
     return root.GetPrim()
 
 
-def update_switchboard_lights(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> None:
+class SwitchboardActivity(ManagerTermBase):
+    """Activate the target indicator on capture and retain its link until withdrawal."""
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._connected = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._env_ids = torch.arange(env.num_envs, device=env.device)
+
+    @property
+    def connected(self) -> torch.Tensor:
+        """Measured target link state for each environment, shape [N]."""
+        return self._connected
+
+    def __call__(self, env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> None:
+        ids = slice(None) if env_ids is None else env_ids
+        # Depressing the clip does not disconnect a plug that is still seated.
+        self._connected[ids] = mdp.head_seated(env)[ids] & (self._connected[ids] | mdp.latch_captured(env)[ids])
+        update_switchboard_lights(env, env_ids, self._connected)
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        ids = self._env_ids if env_ids is None else self._env_ids[env_ids]
+        self._connected[ids] = False
+        update_switchboard_lights(self._env, ids, self._connected)
+
+
+def update_switchboard_lights(
+    env: ManagerBasedRLEnv, env_ids: torch.Tensor | None, connected: torch.Tensor | None = None
+) -> None:
     """Animate status colors at simulation time without changing observations or physics."""
     from isaaclab.assets import VisualMaterial
 
@@ -148,6 +173,10 @@ def update_switchboard_lights(env: ManagerBasedRLEnv, env_ids: torch.Tensor | No
     levels = (1.0 if tick % 7 < 4 else 0.06, 1.0 if (tick + 3) % 11 < 7 else 0.06)
     colors = torch.tensor([(0.06 * level, 0.82 * level, 0.035 * level) for level in levels], device=env.device)
     colors = colors[:, None, :].expand(-1, count, -1)
+    if connected is not None:
+        materials.append(env.scene["activity_target"])
+        linked = connected if env_ids is None else connected[env_ids]
+        colors = torch.cat((colors, colors[:1] * linked[None, :, None]), dim=0)
     VisualMaterial.write_channels(materials, {"color": colors, "emissive_color": colors * 3.0}, env_ids)
 
 
@@ -158,6 +187,8 @@ class InstallationPresentationCfg(sim_utils.SpawnerCfg):
     func = spawn_installation_presentation
     include_architecture: bool = True
     """Author the shared ceiling and lights; disable when composing an external facility."""
+    target_socket_position_e: tuple[float, float, float] = SOCKET_POSITION_E
+    """Target socket origin in environment coordinates [m], used to register its indicator."""
 
 
 def _material(
@@ -275,18 +306,40 @@ def _tube_mesh(
     return points, np.asarray(faces)
 
 
-def _author_switchboard_lights(stage: Usd.Stage, root: str) -> None:
+def _author_switchboard_lights(
+    stage: Usd.Stage, root: str, target_socket_position_e: tuple[float, float, float]
+) -> None:
+    from pxr import Gf, UsdGeom, UsdShade
+
+    def indicator(path, center, material):
+        # Actual SN2201 light-pipe face, offset outward 20 micrometers to avoid z-fighting.
+        x, y, z = center
+        mesh = UsdGeom.Mesh.Define(stage, path)
+        mesh.CreatePointsAttr(
+            [
+                Gf.Vec3f(x + dx, y - 0.00002, z + dz)
+                for dx, dz in ((-0.00155, -0.00095), (0.00155, -0.00095), (0.00155, 0.00095), (-0.00155, 0.00095))
+            ]
+        )
+        mesh.CreateFaceVertexCountsAttr([4])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+
+    def led_center(socket):
+        return (socket[0] + 0.0049949875, socket[1] - 0.0127475909, socket[2] + 0.003740)
+
     materials = [
         _material(stage, f"{root}/Looks/Activity{name}", (0.06, 0.82, 0.035), emission=(0.18, 2.46, 0.105))
         for name in ("A", "B")
     ]
     for level, socket in enumerate((SOCKET_POSITION_E, UPPER_SOCKET_POSITION_E)):
-        for column, x in enumerate(POPULATED_PORT_X_M):
-            # Small link indicators on the bezel immediately above populated ports.
-            _box(
-                stage,
+        for column, x in enumerate(POPULATED_PORT_LED_X_M):
+            indicator(
                 f"{root}/Status/Level{level}/Port{column}",
-                (x + 0.0045, socket[1] - 0.0130, socket[2] + 0.0075),
-                (0.0018, 0.0007, 0.0012),
+                (x, socket[1] - 0.0127475909, socket[2] + 0.003740),
                 materials[(level + column) % 2],
             )
+    indicator(f"{root}/Status/Source", led_center(UPPER_SOCKET_POSITION_E), materials[1])
+    target = _material(stage, f"{root}/Looks/ActivityTarget", (0.0, 0.0, 0.0))
+    indicator(f"{root}/Status/Target", led_center(target_socket_position_e), target)

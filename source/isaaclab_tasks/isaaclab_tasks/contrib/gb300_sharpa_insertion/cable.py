@@ -486,15 +486,9 @@ def add_connectors(
         for part in parts:
             if (name == "head" and part.name == "latch") or (name == "latch" and part.name != "latch"):
                 continue
-            triangles = []
-            normal_corners = []
-            offset = 0
-            for count in part.face_vertex_counts:
-                corners = part.face_vertex_indices[offset : offset + count]
-                triangles.extend((corners[0], corners[j], corners[j + 1]) for j in range(1, count - 1))
-                normal_corners.extend((offset, offset + j, offset + j + 1) for j in range(1, count - 1))
-                offset += count
-            mesh = newton.Mesh(_gb300_connector_points(part.points), np.asarray(triangles).reshape(-1))
+            counts = np.asarray(part.face_vertex_counts)
+            triangles = convert_faces_to_triangles(np.asarray(part.face_vertex_indices), counts)
+            mesh = newton.Mesh(_gb300_connector_points(part.points), triangles.reshape(-1))
             if name == "latch" or (rigid_connector and name == "head"):
                 contact_stiffness = rigid_connector_contact_stiffness if name == "head" else 1.0e5
                 if rigid_connector and name == "latch":
@@ -538,10 +532,12 @@ def add_connectors(
             normals = _gb300_connector_normals(part)
             if len(normals):
                 # Newton consumes vertex normals; split render corners to preserve the CAD's sharp edges.
-                indices = np.asarray(triangles).reshape(-1)
-                normal_indices = np.asarray(
-                    normal_corners if part.normals_interpolation == "faceVarying" else triangles
-                ).reshape(-1)
+                indices = triangles.reshape(-1)
+                normal_indices = (
+                    convert_faces_to_triangles(np.arange(len(part.face_vertex_indices)), counts).reshape(-1)
+                    if part.normals_interpolation == "faceVarying"
+                    else indices
+                )
                 visual_mesh = newton.Mesh(
                     mesh.vertices[indices],
                     np.arange(len(indices), dtype=np.int32),

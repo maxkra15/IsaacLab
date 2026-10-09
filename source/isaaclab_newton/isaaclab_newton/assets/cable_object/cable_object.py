@@ -244,7 +244,7 @@ class CableObject(BaseCableObject):
             wp.launch(
                 kernel,
                 dim=(selector.shape[0], self.num_segments),
-                inputs=[value, selector, self.data._sim_bind_root_body_ids, self.data._sim_bind_link_body_ids],
+                inputs=[value, selector, self.data._sim_bind_segment_body_ids],
                 outputs=[getattr(state, state_attribute)],
                 device=self.device,
             )

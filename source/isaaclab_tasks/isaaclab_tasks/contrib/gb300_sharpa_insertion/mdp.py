@@ -109,6 +109,15 @@ def latch_metrics(env: GB300SharpaInsertionEnv) -> tuple[torch.Tensor, torch.Ten
     return captured, margins, release, exit_margin
 
 
+def head_seated(env: GB300SharpaInsertionEnv) -> torch.Tensor:
+    """Return whether the physical head is within 3 [mm] and 0.08 [rad] of its seated pose."""
+    head = head_state(env)
+    target = goal_state(env)
+    position_error = torch.linalg.vector_norm(head[:, :3] - target[:, :3], dim=-1)
+    angle_error = quat_error_magnitude(head[:, 3:], target[:, 3:])
+    return (position_error < 0.003) & (angle_error < 0.08)
+
+
 def insertion_success(
     env: GB300SharpaInsertionEnv, require_release: bool = True, release_clearance: float = 0.19
 ) -> torch.Tensor:
@@ -122,11 +131,7 @@ def insertion_success(
     Returns:
         Boolean insertion success for each environment. No scripted finger pose is required.
     """
-    head = head_state(env)
-    target = goal_state(env)
-    position_error = torch.linalg.vector_norm(head[:, :3] - target[:, :3], dim=-1)
-    angle_error = quat_error_magnitude(head[:, 3:], target[:, 3:])
-    seated = (position_error < 0.003) & (angle_error < 0.08) & latch_captured(env)
+    seated = head_seated(env) & latch_captured(env)
     if not require_release:
         return seated
     distance = torch.linalg.vector_norm(tcp_pose(env)[:, :3] - head_pose(env)[:, :3], dim=-1)

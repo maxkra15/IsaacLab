@@ -75,17 +75,6 @@ def _seated_env(hydroelastic_contacts=False):
     )
 
 
-def test_seating_reward_is_frame_invariant_and_measures_the_connector():
-    """Equal seating is rewarded in independent frames; moving the plug lowers reward."""
-    env = _seated_env()
-    torch.testing.assert_close(mdp.head_goal_position(env), torch.ones(2))
-    torch.testing.assert_close(mdp.head_goal_orientation(env), torch.ones(2))
-    env.scene["cable"].data.segment_pose_w.torch[:, 0, 0] += 0.04
-    torch.testing.assert_close(mdp.head_goal_position(env), torch.full((2,), 1.0 - math.tanh(0.04 / 0.05)))
-    env.scene["cable"].data.segment_pose_w.torch[0, 0, 0] = float("nan")
-    assert mdp.head_goal_position(env)[0] == 0.0
-
-
 def test_success_requires_captured_seating_and_measured_hand_clearance():
     """Release is a geometric outcome, not a prescribed hand-joint keyframe."""
     env = _seated_env()
@@ -121,6 +110,7 @@ def test_connector_observations_follow_physical_bodies_with_stale_root_coordinat
     """Maximal-coordinate motion must change rewards and relative clip state."""
     env = _seated_env(hydroelastic_contacts)
     torch.testing.assert_close(mdp.head_goal_position(env), torch.ones(2))
+    torch.testing.assert_close(mdp.head_goal_orientation(env), torch.ones(2))
     torch.testing.assert_close(mdp.latch_state(env), torch.zeros(2, 2))
     assert mdp.insertion_success(env).all()
     if hydroelastic_contacts:
@@ -149,6 +139,8 @@ def test_connector_observations_follow_physical_bodies_with_stale_root_coordinat
     # The clip is compressed 0.12 rad and opens at 0.7 rad/s about world -Y.
     torch.testing.assert_close(mdp.latch_state(env), torch.tensor(((-0.12, 0.7), (-0.12, 0.7))))
     assert not mdp.insertion_success(env, require_release=False).any()
+    head[0, 0] = float("nan")
+    assert mdp.head_goal_position(env)[0] == 0.0
 
 
 class _Scene(dict):
@@ -188,30 +180,63 @@ def test_registered_presets_pair_normalized_and_absolute_action_contracts():
 
 
 def test_switchboard_activity_runs_through_the_event_manager(monkeypatch):
-    """Periodic activity changes material colors with manager-supplied environment indices."""
+    """Port activity follows measured capture through clip release, withdrawal and subset resets."""
     writes = []
 
     def record_channels(materials, channels, env_ids):
-        writes.append((env_ids.clone(), channels["color"].clone()))
+        writes.append((env_ids.clone(), channels["color"].clone(), channels["emissive_color"].clone()))
 
     monkeypatch.setattr(VisualMaterial, "write_channels", record_channels)
-    env = SimpleNamespace(
-        num_envs=2,
-        device="cpu",
-        sim=SimpleNamespace(is_playing=lambda: True),
-        scene={"activity_a": object(), "activity_b": object()},
-        common_step_counter=6,
-        step_dt=1.0 / 60.0,
-    )
+    env = _seated_env(True)
+    env.device = "cpu"
+    env.sim = SimpleNamespace(is_playing=lambda: True)
+    env.common_step_counter = 6
+    env.step_dt = 1.0 / 60.0
+    env.scene.update(activity_a=object(), activity_b=object(), activity_target=object())
+    latch = env.scene["connector"].data.body_link_pose_w.torch[:, env.latch_body_id]
+    resting = latch.clone()
+    # Independent CAD hinge and rotation: depress the clip without translating the head.
+    hinge = np.array((0.0, 0.004677868448, -0.030711488256))
+    head_rotation = Rotation.from_euler("x", np.pi / 2)
+    compression = Rotation.from_euler("x", 0.225)
+    pressed = resting.clone()
+    pressed[:, :3] += torch.tensor(head_rotation.apply(hinge - compression.apply(hinge)), dtype=pressed.dtype)
+    pressed[:, 3:] = torch.tensor((head_rotation * compression).as_quat(), dtype=pressed.dtype)
+    latch[:] = pressed
+    assert not mdp.latch_captured(env).any()
     cfg = parse_env_cfg("IsaacContrib-Rizon-Sharpa-GB300-Cable-Install", overrides=["presets=scripted"])
     manager = EventManager({"activity": cfg.events.activity}, env)
     manager.apply("interval", dt=0.1)
+    assert writes[-1][1].shape == writes[-1][2].shape == (3, 2, 3)
+    assert not writes[-1][2][2].any(), "A seated but uncaptured plug must not activate the port."
+
+    latch[0] = resting[0]
+    manager.apply("interval", dt=0.1)
+    assert writes[-1][2][2, 0].any() and not writes[-1][2][2, 1].any()
     env.common_step_counter = 24
     manager.apply("interval", dt=0.1)
+    assert not torch.equal(writes[-1][2][:2], writes[-2][2][:2]), "Installed-port activity still blinks."
+    assert not torch.equal(writes[-1][2][2, 0], writes[-2][2][2, 0]), "The latched target must blink too."
 
-    assert len(writes) == 2
-    assert writes[0][0].tolist() == writes[1][0].tolist() == [0, 1]
-    assert not torch.equal(writes[0][1], writes[1][1])
+    latch[0] = pressed[0]
+    manager.apply("interval", dt=0.1)
+    assert writes[-1][2][2, 0].any(), "Pressing the clip alone must not turn off a seated link."
+    env.scene["connector"].data.body_link_pose_w.torch[0, :, 1] -= 0.01
+    manager.apply("interval", dt=0.1)
+    assert not writes[-1][2][2, 0].any(), "Withdrawing the plug must extinguish the target light."
+
+    latch[1] = resting[1]
+    manager.apply("interval", dt=0.1)
+    assert writes[-1][2][2, 1].any()
+    manager.apply("interval", dt=0.05)
+    manager.reset(torch.tensor([0]))
+    manager.apply("interval", dt=0.05)
+    assert writes[-1][0].tolist() == [1]
+    assert writes[-1][2][2, 0].any(), "Resetting another environment must preserve this port's link."
+    latch[1] = pressed[1]
+    manager.reset(torch.tensor([1]))
+    manager.apply("interval", dt=0.1)
+    assert not writes[-1][2][2].any(), "Reset must require a fresh latch capture."
 
 
 @pytest.mark.parametrize("validate_contacts", (True, False))

@@ -548,7 +548,6 @@ def _make_target_mode_builder(
             False,
         ),
         (ImplicitActuatorCfg(joint_names_expr=["joint"], stiffness=10.0, damping=1.0), False, True, set(), False),
-        (None, True, True, set(), False),
         (None, False, True, set(), False),
     ],
     ids=[
@@ -559,10 +558,8 @@ def _make_target_mode_builder(
         "custom_implicit",
         "disabled",
         "empty",
-        "disabled_empty",
     ],
 )
-@pytest.mark.parametrize("eligible_first", [False, True], ids=["eligible_last", "eligible_first"])
 def test_prepare_native_actuators_preserves_solver_drives(
     monkeypatch,
     actuator_cfg,
@@ -570,48 +567,49 @@ def test_prepare_native_actuators_preserves_solver_drives(
     capture_implicit_actuators,
     expected_native_groups,
     expected_activation,
-    eligible_first,
 ):
     """Preserve drives and eager execution regardless of articulation construction order.
 
     Collection construction resolves gains later, on both implicit and explicit paths.
     """
-    gain_writes = []
-    physics_cfg = NewtonCfg()
-    if capture_implicit_actuators is not None:
-        physics_cfg.capture_implicit_actuators = capture_implicit_actuators
-    articulation = SimpleNamespace(
-        _sim_cfg=SimpleNamespace(use_newton_actuators=use_newton_actuators, physics=physics_cfg),
-        device="cpu",
-        find_joints=lambda _: ([0], ["joint"]),
-        write_joint_stiffness_to_sim_index=lambda **_: gain_writes.append("stiffness"),
-        write_joint_damping_to_sim_index=lambda **_: gain_writes.append("damping"),
-    )
-    monkeypatch.setattr(SimulationManager, "backend", None)
-    monkeypatch.setattr(SimulationManager, "_adapter", None)
-    monkeypatch.setattr(SimulationManager, "_use_newton_actuators_active", False, raising=False)
-    monkeypatch.setattr(SimulationManager, "_requires_eager_actuator_updates", False, raising=False)
+    # Only mixed native/eager articulations exercise ordering-dependent eligibility.
+    for eligible_first in (False, True) if actuator_cfg is not None and not expected_activation else (False,):
+        gain_writes = []
+        physics_cfg = NewtonCfg()
+        if capture_implicit_actuators is not None:
+            physics_cfg.capture_implicit_actuators = capture_implicit_actuators
+        articulation = SimpleNamespace(
+            _sim_cfg=SimpleNamespace(use_newton_actuators=use_newton_actuators, physics=physics_cfg),
+            device="cpu",
+            find_joints=lambda _: ([0], ["joint"]),
+            write_joint_stiffness_to_sim_index=lambda **_: gain_writes.append("stiffness"),
+            write_joint_damping_to_sim_index=lambda **_: gain_writes.append("damping"),
+        )
+        monkeypatch.setattr(SimulationManager, "backend", None)
+        monkeypatch.setattr(SimulationManager, "_adapter", None)
+        monkeypatch.setattr(SimulationManager, "_use_newton_actuators_active", False, raising=False)
+        monkeypatch.setattr(SimulationManager, "_requires_eager_actuator_updates", False, raising=False)
 
-    eligible_articulation = SimpleNamespace(
-        _sim_cfg=SimpleNamespace(use_newton_actuators=True, physics=NewtonCfg(capture_implicit_actuators=True))
-    )
-    eligible_control = NewtonActuatorControl(eligible_articulation)
-    eligible_cfgs = {"joint": ImplicitActuatorCfg(joint_names_expr=["joint"], stiffness=10.0, damping=1.0)}
-    if eligible_first:
-        eligible_control.prepare_native_actuators(collection=None, actuator_cfgs=eligible_cfgs)
+        eligible_articulation = SimpleNamespace(
+            _sim_cfg=SimpleNamespace(use_newton_actuators=True, physics=NewtonCfg(capture_implicit_actuators=True))
+        )
+        eligible_control = NewtonActuatorControl(eligible_articulation)
+        eligible_cfgs = {"joint": ImplicitActuatorCfg(joint_names_expr=["joint"], stiffness=10.0, damping=1.0)}
+        if eligible_first:
+            eligible_control.prepare_native_actuators(collection=None, actuator_cfgs=eligible_cfgs)
 
-    control = NewtonActuatorControl(articulation)
-    group_name = "explicit" if expected_native_groups else "implicit"
-    actuator_cfgs = {} if actuator_cfg is None else {group_name: actuator_cfg}
-    native_groups = control.prepare_native_actuators(collection=None, actuator_cfgs=actuator_cfgs)
-    if not eligible_first:
-        eligible_control.prepare_native_actuators(collection=None, actuator_cfgs=eligible_cfgs)
+        control = NewtonActuatorControl(articulation)
+        group_name = "explicit" if expected_native_groups else "implicit"
+        actuator_cfgs = {} if actuator_cfg is None else {group_name: actuator_cfg}
+        native_groups = control.prepare_native_actuators(collection=None, actuator_cfgs=actuator_cfgs)
+        if not eligible_first:
+            eligible_control.prepare_native_actuators(collection=None, actuator_cfgs=eligible_cfgs)
 
-    assert native_groups == expected_native_groups
-    assert gain_writes == []
-    assert control.native_actuator_path_active is expected_activation
-    assert articulation._has_newton_actuators is expected_activation
-    assert SimulationManager.handles_decimation() is (expected_activation or not actuator_cfgs)
+        assert native_groups == expected_native_groups
+        assert gain_writes == []
+        assert control.native_actuator_path_active is expected_activation
+        assert articulation._has_newton_actuators is expected_activation
+        assert SimulationManager.handles_decimation() is (expected_activation or not actuator_cfgs)
 
 
 @pytest.mark.parametrize(

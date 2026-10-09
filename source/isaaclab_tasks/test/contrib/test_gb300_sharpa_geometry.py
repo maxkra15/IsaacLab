@@ -30,8 +30,7 @@ from isaaclab_tasks.contrib.gb300_sharpa_insertion.hydroelastic import (
     configure_hydroelastic_shapes,
 )
 from isaaclab_tasks.contrib.gb300_sharpa_insertion.socket_geometry import (
-    latch_engagement_margins,
-    latch_release_margin,
+    latch_geometry_margins,
     local_socket_mesh,
 )
 from isaaclab_tasks.contrib.gb300_sharpa_insertion.workcell import (
@@ -361,9 +360,10 @@ def test_socket_field_clears_cad_entry_and_retains_only_the_unpressed_clip(devic
     poses = torch.tensor(np.tile(np.r_[seat, head_rotation.as_quat()], (2, 1)), dtype=torch.float64)
     poses[1, :3] += torch.from_numpy(head_rotation.apply(hinge - compression.apply(hinge)))
     poses[1, 3:] = torch.from_numpy((head_rotation * compression).as_quat())
-    assert torch.all(latch_engagement_margins(poses)[0] > 0)
-    assert latch_release_margin(poses)[0] > 0
-    assert latch_release_margin(poses)[1] < 0
+    capture_margins, release_margin, _ = latch_geometry_margins(poses)
+    assert torch.all(capture_margins[0] > 0)
+    assert release_margin[0] > 0
+    assert release_margin[1] < 0
     # The native barb vertices independently prove physical shoulder clearance.
     vertices = meshes["latch"].vertices
     barbs = vertices[np.isclose(vertices[:, 2], -0.026459, atol=1e-6)]

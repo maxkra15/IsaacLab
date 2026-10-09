@@ -91,19 +91,6 @@ def latch_engagement_margins(latch_pose_in_socket: torch.Tensor) -> torch.Tensor
     return _latch_barb_engagement_margins(latch_pose_in_socket).amin(dim=-2)
 
 
-def latch_release_margin(latch_pose_in_socket: torch.Tensor) -> torch.Tensor:
-    """Return the greatest vertical keeper overlap across both barbs [m].
-
-    Args:
-        latch_pose_in_socket: Measured latch-body pose [m, XYZW], shape (..., 7).
-
-    Returns:
-        Maximum vertical overlap [m], shape (...). A negative value proves both
-        barbs are below their keepers; a negative capture minimum proves only one.
-    """
-    return _latch_barb_engagement_margins(latch_pose_in_socket)[..., 2].amax(dim=-1)
-
-
 def latch_keeper_exit_margin(latch_pose_in_socket: torch.Tensor) -> torch.Tensor:
     """Return conservative axial clip overlap with the keeper front plane [m].
 
@@ -128,7 +115,8 @@ def latch_geometry_margins(latch_pose_in_socket: torch.Tensor) -> tuple[torch.Te
 
     Returns:
         Capture margins [m], shape (..., 3), release margin [m], shape (...), and
-        keeper-exit margin [m], shape (...), with the individual functions' semantics.
+        keeper-exit margin [m], shape (...). Release is the greatest vertical overlap
+        across both barbs; a negative value proves both are below their keepers.
     """
     barb_margins = _latch_barb_engagement_margins(latch_pose_in_socket)
     return (

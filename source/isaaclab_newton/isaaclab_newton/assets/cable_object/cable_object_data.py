@@ -72,9 +72,7 @@ class CableObjectData(BaseCableObjectData):
         state = SimulationManager.get_state_0()
         self._num_instances = self._root_view.count
         self._num_segments = self._root_view.link_count
-        # The free root joint owns segment 0; rod joints own the remaining segments.
-        self._sim_bind_root_body_ids = self._root_view.get_attribute("joint_child", model)[:, 0, 0].contiguous()
-        self._sim_bind_link_body_ids = self._root_view.get_attribute("joint_child", model)[:, 0, 1:].contiguous()
+        self._sim_bind_segment_body_ids = self._root_view.get_attribute("joint_child", model)[:, 0].contiguous()
         self._sim_bind_link_pose_w = self._root_view.get_link_transforms(state)[:, 0]
         self._sim_bind_link_velocity_w = self._root_view.get_link_velocities(state)[:, 0]
 
