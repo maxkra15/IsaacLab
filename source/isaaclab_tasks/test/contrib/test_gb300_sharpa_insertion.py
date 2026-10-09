@@ -261,7 +261,13 @@ def test_insertion_opens_smoothly_through_retreat_after_measured_release(validat
             latch_engaged = False
             uncaptured_steps += 1
         previous = tcp.copy()
-        tcp, width = machine.update(tcp, head, contacts if validate_contacts else None, latch_engaged=latch_engaged)
+        tcp, width = machine.update(
+            tcp,
+            head,
+            contacts if validate_contacts else None,
+            latch_engaged=latch_engaged,
+            hand_open=machine.width >= 0.03,
+        )
         if not latch_engaged:
             assert machine.phase == "INSERT", "An unmeasured grasp must not bypass actual clip capture."
         if machine.phase in ("RELEASE", "RETREAT"):
@@ -278,6 +284,37 @@ def test_insertion_opens_smoothly_through_retreat_after_measured_release(validat
     assert np.all(increments >= -1e-12)
     assert increments.max() <= 0.01 * machine.dt + 1e-12
     assert opening[-1] == pytest.approx(0.04)
+
+
+@pytest.mark.parametrize("measure_hand", (False, True))
+def test_cycle_requires_measured_hand_opening_before_regrasp(measure_hand):
+    """Opening targets alone must not establish release beside a seated connector."""
+    from isaaclab_tasks.contrib.gb300_sharpa_insertion.robot_cfg import CLOSE_HAND_RAD
+
+    from examples.cable_installation.config import RemovalPostures
+    from examples.cable_installation.cycle import CableCycleStateMachine
+    from examples.cable_installation.insertion import CableInstallStateMachine
+
+    goal = np.array((0.5, 0.3, 2.1, 0.0, 0.0, 0.0, 1.0))
+    insertion = CableInstallStateMachine(goal, goal, 1 / 60, retreat_offset_w=(0.0, 0.0, 0.0))
+    insertion.phase = "RELEASE"
+    machine = CableCycleStateMachine(insertion, RemovalPostures(), CLOSE_HAND_RAD)
+    for _ in range(1000):
+        machine.update(
+            goal,
+            goal,
+            latch_engaged=True,
+            latch_angle_rad=0.0,
+            capture_margins_m=np.array((0.0002, 0.001, 0.0008)),
+            keeper_release_margin_m=0.0008,
+            keeper_exit_margin_m=0.006,
+            hand_joint_pos=np.asarray(CLOSE_HAND_RAD) if measure_hand else None,
+        )
+        if machine.phase == "FAILED":
+            break
+    assert machine.removal is None, "Targets without measured release must not start extraction."
+    assert machine.phase == "FAILED"
+    assert machine.failure == "RELEASE timed out"
 
 
 def test_cycle_regrasps_without_retreat_or_finger_jump():
@@ -312,6 +349,7 @@ def test_cycle_regrasps_without_retreat_or_finger_jump():
             capture_margins_m=np.array((0.0002, 0.001, 0.0008)),
             keeper_release_margin_m=0.0008,
             keeper_exit_margin_m=0.006,
+            hand_joint_pos=previous_fingers,
         )
         if prior_phase in ("RAISE", "ORIENT", "ALIGN", "INSERT"):
             head[:3] += tcp[:3] - previous_tcp[:3]

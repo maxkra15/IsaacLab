@@ -118,9 +118,11 @@ def _run(args: argparse.Namespace) -> int:
             observations, _ = env.reset(seed=args.seed)
             if env.action_manager.total_action_dim != 29:
                 raise RuntimeError("The scripted preset must provide absolute TCP and 22 finger targets.")
+            robot = env.scene["robot"]
+            hand_ids, _ = robot.find_joints(RIZON_SHARPA_RIGHT_HAND_JOINT_NAMES, preserve_order=True)
 
             def controller_state(status: torch.Tensor) -> np.ndarray:
-                # One small readback: TCP, head, hinge, capture/keeper geometry, finite/reset status.
+                # One readback: measured poses, clip geometry, finger opening and finite/reset status.
                 captured, capture_margins, release_margin, exit_margin = mdp.latch_metrics(env)
                 return (
                     torch.cat(
@@ -132,6 +134,7 @@ def _run(args: argparse.Namespace) -> int:
                             capture_margins[0],
                             release_margin[0, None],
                             exit_margin[0, None],
+                            robot.data.joint_pos.torch[0, hand_ids],
                             status,
                         )
                     )
@@ -169,8 +172,6 @@ def _run(args: argparse.Namespace) -> int:
                 from cable_installation.contacts import GraspContactReader
 
                 reader = GraspContactReader()
-            robot = env.scene["robot"]
-            hand_ids, _ = robot.find_joints(RIZON_SHARPA_RIGHT_HAND_JOINT_NAMES, preserve_order=True)
             initial_hand = robot.data.joint_pos.torch[:, hand_ids].clone()
             closed_hand = initial_hand.new_tensor(CLOSE_HAND_RAD)[None]
             step = reset_count = 0
@@ -193,6 +194,7 @@ def _run(args: argparse.Namespace) -> int:
                             capture_margins_m=state[16:19],
                             keeper_release_margin_m=float(state[19]),
                             keeper_exit_margin_m=float(state[20]),
+                            hand_joint_pos=state[21:43],
                         )
                     if machine.phase != prior_phase:
                         logger.info("[GB300 cycle] step=%d phase=%s", step, machine.phase)

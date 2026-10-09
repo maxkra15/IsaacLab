@@ -71,10 +71,12 @@ class CableInstallStateMachine:
         contacts: GraspContacts | None = None,
         *,
         latch_engaged: bool,
+        hand_open: bool = False,
     ) -> tuple[np.ndarray, float]:
         """Return TCP pose [m, XYZW] and release opening [m], from 0 to 0.04.
 
-        ``contacts=None`` skips contact diagnostics, not measured pose or latch checks.
+        Without contact diagnostics, ``hand_open`` must confirm measured finger opening
+        before release. Commanded opening alone is not sufficient.
         """
         if self.phase in ("DONE", "FAILED"):
             return self.command.copy(), self.width
@@ -146,7 +148,7 @@ class CableInstallStateMachine:
         if self.phase in ("RELEASE", "RETREAT"):
             self.width = min(0.04, self.width + 0.01 * self.dt)
         if self.phase == "RELEASE":
-            released = contacts is None or (not contacts.left and not contacts.right)
+            released = hand_open if contacts is None else not contacts.left and not contacts.right
             if self.width >= 0.025 and released:
                 self.target = tcp.copy()
                 self.target[:3] += self.retreat_offset_w

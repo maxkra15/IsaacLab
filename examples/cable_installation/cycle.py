@@ -111,8 +111,14 @@ class CableCycleStateMachine:
         capture_margins_m: np.ndarray,
         keeper_release_margin_m: float,
         keeper_exit_margin_m: float,
+        hand_joint_pos: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return normal TCP [m, XYZW] and finger action targets [rad]."""
+        """Return normal TCP [m, XYZW] and finger action targets [rad].
+
+        Without contact diagnostics, canonical hand joint positions [rad] must
+        confirm the thumb, index and middle reached the calibrated open posture.
+        This checks actual opening, not zero contact force.
+        """
         self.elapsed += self.insertion.dt
         if self.elapsed < self.settle_duration_s:
             if contacts is not None:
@@ -122,7 +128,12 @@ class CableCycleStateMachine:
                     self._fail(failure)
             return self.insertion.command.copy(), self.closed_hand.copy()
         if self.removal is None:
-            command, width = self.insertion.update(tcp_pose_w, head_pose_w, contacts, latch_engaged=latch_engaged)
+            hand_open = hand_joint_pos is not None and np.all(
+                np.abs(hand_joint_pos[:13] - self.released_hand[:13]) < 0.03
+            )
+            command, width = self.insertion.update(
+                tcp_pose_w, head_pose_w, contacts, latch_engaged=latch_engaged, hand_open=hand_open
+            )
             fingers = self.closed_hand + (width / 0.04) * (self.released_hand - self.closed_hand)
             if self.insertion.phase == "DONE":
                 self._begin_removal(tcp_pose_w, head_pose_w)

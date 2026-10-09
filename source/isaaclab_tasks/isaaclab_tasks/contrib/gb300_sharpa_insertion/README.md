@@ -25,7 +25,9 @@ adds an initial grasp hold. `--failure_tail_s 8` continues recording for eight
 seconds after a controller fault while holding the last targets. It does not
 bypass guards or report success; non-finite state or a reset ends the run.
 Measured seating, slip, clip clearance, retention, and withdrawal guards are
-always active. `--validate_contacts` adds slower CPU contact diagnostics.
+always active. The default handoff checks actual thumb/index/middle joint
+opening within 0.03 rad of the calibrated open posture; this is not a zero-force
+contact test. `--validate_contacts` adds slower CPU contact diagnostics.
 The final JSON reports completion, failure, reset count, and withdrawal.
 
 ## Task and example
@@ -52,8 +54,9 @@ and GPU memory before scaling. Camera observations, randomization, and
 extraction rewards are not included. The example selects `presets=scripted`:
 29 absolute actions (palm position, XYZW quaternion, 22 finger targets),
 hydroelastic contacts, and a one-way cable boundary. Training and scripted
-checkpoints are not interchangeable. Bidirectional ADMM remains available via
-`GB300SharpaScriptedEnvCfg(one_way_cable=False)`.
+checkpoints are not interchangeable. The experimental bidirectional ADMM
+configuration, `GB300SharpaScriptedEnvCfg(one_way_cable=False)`, has not been
+validated on the current dependency stack.
 
 ## Physics and presentation
 
@@ -74,7 +77,8 @@ The scripted configuration uses 120 Hz physics, 30 Hz control, four outer
 substeps, two inner MJWarp steps, and two VBD subdivisions with eight iterations.
 Bending/torsion moduli are 1e8/6e7 Pa; these and the contact/actuator settings are
 numerical tuning, not calibrated measurements. Physics and IK are CUDA-captured;
-the state machine, managers, and one compact feedback readback run on the CPU.
+the state machine and managers run on the CPU, with one compact GPU feedback
+readback per control step.
 
 Optional `presentation.py` adds eight instanced GB300 racks, the surrounding
 data center, installed colored cables, and status lights, without background
