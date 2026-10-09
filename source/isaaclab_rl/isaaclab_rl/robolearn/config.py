@@ -26,10 +26,14 @@ class RoboLearnRunnerCfg:
     observation_group: str = "policy"
     critic_group: str | None = None
     """Optional privileged observations for FlashSAC; Warp PPO uses the policy group."""
-    clip_actions: float = 1.0
-    """Normalized action limit. The current RoboLearn adapter requires a value of one."""
+    clip_actions: float | None = 1.0
+    """Action clipping limit, or ``None`` to preserve native Gaussian policy actions."""
+    init_at_random_ep_len: bool = False
+    """Randomize initial episode counters, matching the native RSL-RL option."""
     updates_per_step: int = 1
     """FlashSAC gradient updates per vector step once replay warmup is complete."""
+    flash_updates_during_rollout: bool = False
+    """Interleave FlashSAC replay updates with collection, as in the authors' runner."""
     capture_updates: bool = True
     """Capture the complete Warp PPO learning update in a reusable CUDA graph."""
     capture_rollout: bool = False

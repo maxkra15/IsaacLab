@@ -27,8 +27,9 @@ class RoboLearnRunner:
     """Run FlashSAC or WarpNN PPO against the same Isaac Lab environment contract.
 
     Every iteration collects ``num_steps_per_env`` steps from every environment.
-    FlashSAC then performs that many replay updates times ``updates_per_step``;
-    WarpNN PPO performs one full-batch PPO update. The latter captures the learning
+    FlashSAC performs replay updates times ``updates_per_step`` after each vector
+    step when ``flash_updates_during_rollout`` is enabled, or after collection.
+    WarpNN PPO performs one PPO update with configured epochs and minibatches. It captures the learning
     update only, while Isaac Lab stepping and observation assembly remain eager.
 
     Checkpoints consist of a JSON file and an adjacent directory of algorithm
@@ -58,14 +59,15 @@ class RoboLearnRunner:
         env_device = _resolve_device(env.unwrapped.device)
         if self.device.type != env_device.type or self.device.index != env_device.index:
             raise ValueError("RoboLearn requires the learner and environment on the same device.")
-        if cfg["clip_actions"] != 1.0:
-            raise ValueError("RoboLearn uses normalized actions clipped to [-1, 1]; clip_actions must be 1.0.")
+        if cfg["clip_actions"] is not None and cfg["clip_actions"] <= 0:
+            raise ValueError("clip_actions must be positive or None.")
         if min(cfg["num_steps_per_env"], cfg["save_interval"], cfg["updates_per_step"]) < 1:
             raise ValueError("Rollout horizon, save interval, and updates per step must be positive.")
         self.env = IsaacLabEnv(
             env,
             observation_group=cfg["observation_group"],
             critic_group=cfg["critic_group"],
+            clip_actions=cfg["clip_actions"],
         )
         self.log_dir = Path(log_dir) if log_dir is not None else None
         self.current_learning_iteration = 0
@@ -94,6 +96,20 @@ class RoboLearnRunner:
                 cfg=flash_cfg,
                 critic_observation_dim=self.env.critic_observation_dim,
             )
+            self._flash_interleaved = cfg.get("flash_updates_during_rollout", False)
+            self._flash_metric_totals: dict[str, torch.Tensor] = {}
+            self._flash_metric_counts: dict[str, int] = {}
+            self._flash_iteration_updates = 0
+            self._flash_iteration_actor_updates = 0
+            self._flash_events = (
+                [
+                    (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                    for _ in range(cfg["num_steps_per_env"])
+                ]
+                if self._flash_interleaved and self.device.type == "cuda"
+                else []
+            )
+            self._flash_cpu_update_seconds = 0.0
         elif cfg["algorithm"] == "warp_ppo":
             import warp as wp
             from robolearn.warp import PPOConfig, WarpPPO
@@ -134,6 +150,8 @@ class RoboLearnRunner:
             raise ValueError("The number of learning iterations must be positive.")
         if self.log_dir is not None:
             self.log_dir.mkdir(parents=True, exist_ok=True)
+            if self.current_learning_iteration == 0 and not (self.log_dir / "initial.json").exists():
+                self.save(str(self.log_dir / "initial.json"))
         observations = self.env.reset(seed=self.cfg["seed"])
         if init_at_random_ep_len:
             self.env.env.episode_length_buf[:] = torch.randint_like(
@@ -147,6 +165,15 @@ class RoboLearnRunner:
         end_iteration = self.current_learning_iteration + num_learning_iterations
 
         for iteration in range(first_iteration, end_iteration + 1):
+            if self.cfg["algorithm"] == "flashsac" and self._flash_interleaved:
+                self._flash_iteration_updates = 0
+                self._flash_iteration_actor_updates = 0
+                self._flash_cpu_update_seconds = 0.0
+                self._flash_active_events = []
+                for total in self._flash_metric_totals.values():
+                    total.zero_()
+                for key in self._flash_metric_counts:
+                    self._flash_metric_counts[key] = 0
             episode_totals = torch.zeros(3, device=self.device)
             self._synchronize()
             rollout_start = time.perf_counter()
@@ -166,6 +193,14 @@ class RoboLearnRunner:
             losses, updates, actor_updates = self._update()
             self._synchronize()
             update_seconds = time.perf_counter() - update_start
+            if self.cfg["algorithm"] == "flashsac" and self._flash_interleaved:
+                interleaved_update_seconds = (
+                    sum(start.elapsed_time(stop) / 1000 for start, stop in self._flash_active_events)
+                    if self._flash_events
+                    else self._flash_cpu_update_seconds
+                )
+                rollout_seconds -= interleaved_update_seconds
+                update_seconds += interleaved_update_seconds
             steps = self.env.num_envs * self.cfg["num_steps_per_env"]
             self.total_steps += steps
             self.gradient_updates += updates
@@ -192,6 +227,13 @@ class RoboLearnRunner:
                 "mean_episode_length": total_length / episodes if episodes else None,
                 "losses": losses,
             }
+            if self.cfg["algorithm"] == "warp_ppo":
+                metrics["health"] = self.agent.health_metrics()
+            elif self._flash_interleaved:
+                metrics["timing"] = (
+                    "Synchronized iteration wall; interleaved update CUDA events; "
+                    "rollout remainder includes host launch overhead."
+                )
             if self.log_dir is not None:
                 with (self.log_dir / "metrics.jsonl").open("a") as stream:
                     stream.write(json.dumps(metrics, allow_nan=False) + "\n")
@@ -263,7 +305,7 @@ class RoboLearnRunner:
     def get_inference_policy(self, device: str | None = None) -> Callable:
         """Return a deterministic policy accepting an observation mapping or tensor.
 
-        The returned action is clipped to [-1, 1] on the environment device. The
+        The returned action respects the configured clipping limit on the environment device. The
         policy does not change the learner device or its fixed environment count.
         """
         if device is not None and _resolve_device(device) != self.device:
@@ -274,7 +316,9 @@ class RoboLearnRunner:
                 observations = self.env._observations(observations)
             with torch.no_grad():
                 if self.cfg["algorithm"] == "flashsac":
-                    return self.agent.act(observations, training=False).clamp(-1, 1)
+                    result = self.agent.act(observations, training=False)
+                    limit = self.cfg["clip_actions"]
+                    return result.clamp(-limit, limit) if limit is not None else result
                 import warp as wp
 
                 environment_stream = torch.cuda.current_stream(self.device)
@@ -283,7 +327,10 @@ class RoboLearnRunner:
                 with torch.cuda.stream(self._torch_warp_stream), wp.ScopedStream(self._warp_stream, sync_enter=False):
                     wp.copy(self._warp_obs, wp.from_torch(observations, dtype=wp.float32))
                     actions = self.agent.act(self._warp_obs, deterministic=True)
-                    result = wp.to_torch(actions).clamp(-1, 1)
+                    result = wp.to_torch(actions)
+                    limit = self.cfg["clip_actions"]
+                    if limit is not None:
+                        result = result.clamp(-limit, limit)
                 environment_stream.wait_stream(self._torch_warp_stream)
                 result.record_stream(environment_stream)
                 return result
@@ -308,8 +355,8 @@ class RoboLearnRunner:
         self._prepared = True
 
     def _collect_step(self, observations: torch.Tensor, step: int) -> tuple[torch.Tensor, dict]:
-        with torch.no_grad():
-            if self.cfg["algorithm"] == "flashsac":
+        if self.cfg["algorithm"] == "flashsac":
+            with torch.no_grad():
                 actions = (
                     self.agent.act(observations)
                     if self.agent.ready
@@ -317,7 +364,10 @@ class RoboLearnRunner:
                 )
                 observations, transition = self.env.step(actions)
                 self.agent.process_transition(transition)
-                return observations, transition
+            if self._flash_interleaved and self.agent.ready:
+                self._flash_update_group(step)
+            return observations, transition
+        with torch.no_grad():
             import warp as wp
 
             environment_stream = torch.cuda.current_stream(self.device)
@@ -327,7 +377,7 @@ class RoboLearnRunner:
                 wp.copy(self._warp_obs, wp.from_torch(observations, dtype=wp.float32))
                 actions = wp.to_torch(self.agent.act(self._warp_obs))
             environment_stream.wait_stream(self._torch_warp_stream)
-            # Keep physics on its existing streams. The adapter clips out of
+            # Keep physics on its existing streams. Optional clipping is out of
             # place, preserving Gaussian samples and their PPO log probabilities.
             observations, transition = self.env.step(actions)
             self._warp_terminated.copy_(transition["terminated"])
@@ -351,6 +401,20 @@ class RoboLearnRunner:
 
     def _update(self) -> tuple[dict[str, float], int, int]:
         if self.cfg["algorithm"] == "flashsac":
+            if self._flash_interleaved:
+                count = self._flash_iteration_updates
+                if not count:
+                    return {}, 0, 0
+                keys = list(self._flash_metric_totals)
+                keys = [key for key in keys if self._flash_metric_counts[key]]
+                averages = (
+                    torch.stack(
+                        [(self._flash_metric_totals[key] / self._flash_metric_counts[key]).reshape(()) for key in keys]
+                    )
+                    .cpu()
+                    .tolist()
+                )
+                return dict(zip(keys, averages, strict=True)), count, self._flash_iteration_actor_updates
             if not self.agent.ready:
                 return {}, 0, 0
             count = self.cfg["num_steps_per_env"] * self.cfg["updates_per_step"]
@@ -373,9 +437,31 @@ class RoboLearnRunner:
                 "value_loss": value_loss,
                 "entropy": entropy,
             },
-            self.agent.config.epochs,
-            self.agent.config.epochs,
+            self.agent.config.epochs * self.agent.config.num_mini_batches,
+            self.agent.config.epochs * self.agent.config.num_mini_batches,
         )
+
+    def _flash_update_group(self, step: int) -> None:
+        """Run one eligible vector step's replay updates without scalar host reads."""
+        started = time.perf_counter()
+        if self._flash_events:
+            start, stop = self._flash_events[step]
+            start.record()
+        for _ in range(self.cfg["updates_per_step"]):
+            update_index = self.gradient_updates + self._flash_iteration_updates
+            information = self.agent.update(tensor_metrics=True)
+            for key, value in information.items():
+                if key not in self._flash_metric_totals:
+                    self._flash_metric_totals[key] = torch.zeros_like(value)
+                    self._flash_metric_counts[key] = 0
+                self._flash_metric_totals[key].add_(value)
+                self._flash_metric_counts[key] += 1
+            self._flash_iteration_updates += 1
+            self._flash_iteration_actor_updates += int(update_index % self._actor_update_period == 0)
+        if self._flash_events:
+            stop.record()
+            self._flash_active_events.append((start, stop))
+        self._flash_cpu_update_seconds += time.perf_counter() - started
 
     def _synchronize(self) -> None:
         if self.device.type == "cuda":

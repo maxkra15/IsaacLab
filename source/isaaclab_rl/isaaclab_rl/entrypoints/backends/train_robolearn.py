@@ -139,7 +139,10 @@ def run(argv: list[str]) -> None:
             screen.close()
             start_time = time.perf_counter()
             try:
-                runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
+                runner.learn(
+                    num_learning_iterations=agent_cfg.max_iterations,
+                    init_at_random_ep_len=agent_cfg.init_at_random_ep_len,
+                )
             except KeyboardInterrupt:
                 logger.info("RoboLearn training interrupted.")
             finally:

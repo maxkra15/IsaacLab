@@ -24,11 +24,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
 import subprocess
 import sys
 import time
 import uuid
+from importlib.metadata import distribution
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from compare_g1 import HORIZON, SCENARIOS, TASK, json_value, metadata, write_results
 
@@ -88,13 +92,63 @@ def profile_rsl(argv: list[str]) -> None:
 
 def learning_evidence(checkpoint: Path, *, algorithm: str) -> dict:
     """Audit saved policy changes and optimizer state without changing weights."""
-    if algorithm != "rsl_rl_ppo":
-        if algorithm == "warp_ppo":
-            from compare_g1 import warp_learning_evidence
+    if algorithm == "warp_ppo":
+        import numpy as np
 
-            return warp_learning_evidence(checkpoint)
-        return {"checkpoint": str(checkpoint), "audit": "FlashSAC state audit pending"}
+        saved = json.loads(checkpoint.read_text())
+        network_parameters = 2 * (len(saved["config"]["algorithm_cfg"]["hidden_dims"]) + 1)
+        changes = {}
+        with np.load(checkpoint.with_suffix("") / "policy.npz", allow_pickle=False) as current:
+            with np.load(checkpoint.parent / "initial/policy.npz", allow_pickle=False) as initial:
+                if not all(np.isfinite(current[key]).all() for key in current.files):
+                    raise ValueError("The Warp policy or optimizer has nonfinite saved values.")
+                for name, start in (("actor", 0), ("critic", network_parameters)):
+                    changes[f"{name}_maximum_weight_change"] = max(
+                        float(np.abs(current[f"parameter_{index}"] - initial[f"parameter_{index}"]).max())
+                        for index in range(start, start + network_parameters)
+                    )
+                changes["optimizer_steps"] = float(current["adam_timestep"][0])
+                changes["parameter_count"] = sum(
+                    current[key].size for key in current.files if key.startswith("parameter_")
+                )
+        changes["weights_and_optimizer_finite"] = True
+        changes["weights_updated"] = all(changes[f"{name}_maximum_weight_change"] > 0 for name in ("actor", "critic"))
+        return changes
     import torch
+
+    if algorithm == "flashsac":
+        changes = {"parameter_count": 0}
+        # These names are buffers declared by the upstream normalization and
+        # categorical value layers. Their movement is not a learned-weight proof.
+        buffers = {"running_mean", "running_var", "bin_values"}
+        for name in ("actor", "critic", "target_critic", "temperature"):
+            current = torch.load(checkpoint.with_suffix("") / f"{name}.pt", map_location="cpu", weights_only=True)
+            initial = torch.load(checkpoint.parent / "initial" / f"{name}.pt", map_location="cpu", weights_only=True)
+            state = current["network_state_dict"]
+            if not all(torch.isfinite(value).all() for value in state.values()):
+                raise ValueError(f"The saved FlashSAC {name} has nonfinite weights or buffers.")
+            parameter_keys = [key for key in state if key.rsplit(".", 1)[-1] not in buffers]
+            changes[f"{name}_maximum_weight_change"] = max(
+                float((state[key] - initial["network_state_dict"][key]).abs().max()) for key in parameter_keys
+            )
+            if name in ("actor", "critic"):
+                changes["parameter_count"] += sum(state[key].numel() for key in parameter_keys)
+            optimizer = current["optimizer_state_dict"]
+            if optimizer is not None:
+                states = optimizer["state"]
+                if not states:
+                    raise ValueError(f"The saved FlashSAC {name} optimizer has no update state.")
+                if not all(torch.isfinite(value).all() for item in states.values() for value in item.values()):
+                    raise ValueError(f"The saved FlashSAC {name} optimizer has nonfinite state.")
+                counts = [float(item["step"]) for item in states.values()]
+                changes[f"{name}_optimizer_steps_min"] = min(counts)
+                changes[f"{name}_optimizer_steps_max"] = max(counts)
+        agent_state = torch.load(checkpoint.with_suffix("") / "agent_state.pt", map_location="cpu", weights_only=True)
+        changes["replay_update_calls"] = agent_state["update_step"]
+        changes["amp_scaler_state"] = agent_state["grad_scaler_state_dict"]
+        changes["weights_and_optimizer_finite"] = True
+        changes["weights_updated"] = all(changes[f"{name}_maximum_weight_change"] > 0 for name in ("actor", "critic"))
+        return changes
 
     current = torch.load(checkpoint, map_location="cpu", weights_only=True)
     initial = torch.load(checkpoint.parent / "initial.pt", map_location="cpu", weights_only=True)
@@ -127,10 +181,29 @@ def train(args: argparse.Namespace) -> None:
     if manifest.exists():
         raise FileExistsError(f"Use a fresh run directory; a manifest already exists at {manifest}.")
     information = metadata(args)
+    direct_url = distribution("robolearn-rl").read_text("direct_url.json")
+    if direct_url:
+        installed = json.loads(direct_url)
+        parsed = urlparse(installed["url"])
+        if parsed.scheme == "file" and installed.get("dir_info", {}).get("editable"):
+            robolearn_root = Path(unquote(parsed.path))
+            information["robolearn_revision"] = subprocess.check_output(
+                ["git", "-C", str(robolearn_root), "rev-parse", "HEAD"], text=True
+            ).strip()
+            information["robolearn_diff_sha256"] = hashlib.sha256(
+                subprocess.check_output(["git", "-C", str(robolearn_root), "diff", "HEAD"])
+            ).hexdigest()
+            sources = ["src/robolearn/warp/ppo.py", "src/robolearn/flashsac/agent.py", "src/robolearn/isaaclab.py"]
+            information["robolearn_source_files"] = {
+                relative: hashlib.sha256((robolearn_root / relative).read_bytes()).hexdigest() for relative in sources
+            }
     harness_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     information.update(
         protocol="g1_native_learning_baselines_v1",
         harness_source_sha256=harness_sha,
+        gpu_isolation=os.environ.get("G1_GPU_ISOLATION", "unknown"),
+        osmo_workflow_id=os.environ.get("WORKFLOW_ID"),
+        allocation_cpus=os.environ.get("ALLOCATION_CPUS"),
         walking_gate={
             "scenario": "forward_0_5",
             "walking_success_rate_min": 0.8,
@@ -141,8 +214,7 @@ def train(args: argparse.Namespace) -> None:
         capture_scope="separate_physics_and_learner",
         notes=[
             "The unmodified registered G1 flat MDP and native Newton MJWarp physics are used.",
-            "Stock RSL-RL G1 PPO configuration is retained, including clip_actions=None.",
-            "RSL-RL and Warp PPO use unclipped Gaussian actions; FlashSAC uses its configured bounded policy support.",
+            "The saved agent_config and algorithm_config identify this run's actual learner recipe and policy support.",
             "The collection budget is matched; algorithms may perform different numbers and sizes of replay updates.",
             "CUDA-synchronized phase timings exclude logging and checkpoint I/O; process wall time includes them.",
             "Common deterministic full native episodes measure learning quality independently of training log windows.",
@@ -190,6 +262,7 @@ def train(args: argparse.Namespace) -> None:
             args.algorithm,
             *common,
         ]
+        command.append(f"agent.save_interval={math.gcd(50, args.iterations, *args.checkpoint_iterations)}")
     command += args.train_override
     names = {"rsl_rl_ppo": "RSL-RL PPO · stock G1", "warp_ppo": "Warp PPO · stock G1 recipe", "flashsac": "FlashSAC"}
     run = {
@@ -304,14 +377,57 @@ def train(args: argparse.Namespace) -> None:
         final_checkpoint=str(final_checkpoint),
         learning_evidence=learning_evidence(final_checkpoint, algorithm=args.algorithm),
     )
+    if not run["learning_evidence"]["weights_updated"]:
+        run["status"] = "invalid_learning"
+        write_results(manifest, results)
+        raise RuntimeError("Actor or critic weights did not change; refusing to report this as successful training.")
+    if is_rsl:
+        run["algorithm_config"] = cfg["algorithm"]
+        run["policy_support"] = {"distribution": "Gaussian", "wrapper_clip_actions": cfg["clip_actions"]}
+        if run["learning_evidence"]["optimizer_steps"] != run["actor_gradient_updates"]:
+            raise ValueError("RSL saved optimizer work does not match the metric update count.")
+    else:
+        run["algorithm_config"] = cfg["algorithm_cfg"]
+        run["parameter_count"] = run["learning_evidence"]["parameter_count"]
+        run["policy_support"] = {
+            "distribution": "Gaussian" if args.algorithm == "warp_ppo" else "Tanh Gaussian",
+            "wrapper_clip_actions": cfg["clip_actions"],
+        }
+        saved = json.loads(final_checkpoint.read_text())
+        if saved["actor_gradient_updates"] != run["actor_gradient_updates"]:
+            raise ValueError("The saved actor update counter does not match the training metrics.")
+        if saved["critic_gradient_updates"] != run["critic_gradient_updates"]:
+            raise ValueError("The saved critic update counter does not match the training metrics.")
+        if args.algorithm == "warp_ppo":
+            if run["learning_evidence"]["optimizer_steps"] != run["actor_gradient_updates"]:
+                raise ValueError("Warp saved optimizer work does not match the metric update count.")
+        elif run["learning_evidence"]["replay_update_calls"] != run["critic_gradient_updates"]:
+            raise ValueError("FlashSAC replay update calls do not match the saved critic update counter.")
+        if args.algorithm == "flashsac":
+            information["notes"].append(
+                "AMP optimizer step counts are audited separately from attempted replay update calls; "
+                "overflow can skip an optimizer step. Interleaved phase timing uses CUDA events."
+            )
     health_path = log_dir / "health_metrics.jsonl"
     if health_path.exists():
         run["health_curve"] = [json.loads(line) for line in health_path.read_text().splitlines()]
+    elif args.algorithm == "warp_ppo":
+        run["health_curve"] = [{"iteration": row["iteration"], **row["health"]} for row in rows]
+    else:
+        run["health_curve"] = [
+            {
+                "iteration": row["iteration"],
+                "actor_gradient_updates": row["actor_gradient_updates"],
+                "critic_gradient_updates": row["critic_gradient_updates"],
+                **row["losses"],
+            }
+            for row in rows
+        ]
     write_results(manifest, results)
     print(f"Finished {run['name']}: loop={elapsed:.2f}s, process={run['process_wall_seconds']:.2f}s", flush=True)
 
 
-def evaluate_policy(env, policy, *, tensor_dict: bool, seed: int, scenario: str) -> dict:
+def evaluate_policy(env, policy, *, tensor_dict: bool, seed: int, scenario: str, foot_contacts: bool = False) -> dict:
     """Score deterministic native actions for one full episode per world."""
     import torch
     from tensordict import TensorDict
@@ -337,7 +453,20 @@ def evaluate_policy(env, policy, *, tensor_dict: bool, seed: int, scenario: str)
     survived = torch.zeros_like(active)
     action_abs_max = torch.zeros((), device=env.device)
     robot = env.scene["robot"]
-    for _ in range(env.max_episode_length):
+    if foot_contacts:
+        sensor = env.scene["contact_forces"]
+        foot_ids, foot_names = sensor.find_sensors(".*_ankle_roll_link", preserve_order=True)
+        if len(foot_ids) != 2:
+            raise ValueError(f"Expected two G1 feet, found {foot_names}.")
+        contact_sums = torch.zeros((env.num_envs, 2), device=env.device)
+        touchdowns = torch.zeros_like(contact_sums)
+        previous_contact = torch.zeros_like(contact_sums, dtype=torch.bool)
+        last_touchdown_side = torch.full((env.num_envs,), -1, device=env.device, dtype=torch.int64)
+        alternations = torch.zeros(env.num_envs, device=env.device)
+        comparisons = torch.zeros_like(alternations)
+        support_sums = torch.zeros((env.num_envs, 3), device=env.device)
+        contact_trace = []
+    for step in range(env.max_episode_length):
         velocity = quat_apply_inverse(yaw_quat(robot.data.root_quat_w.torch), robot.data.root_lin_vel_w.torch)
         command = env.command_manager.get_command("base_velocity")
         linear_error = torch.linalg.norm(command[:, :2] - velocity[:, :2], dim=-1)
@@ -349,6 +478,30 @@ def evaluate_policy(env, policy, *, tensor_dict: bool, seed: int, scenario: str)
         sums["forward_velocity"] += velocity[:, 0] * active
         sums["forward_command"] += command[:, 0] * active
         sums["upright"] += (robot.data.projected_gravity_b.torch[:, 2] < -0.9) * active
+        if foot_contacts:
+            contact = torch.linalg.norm(sensor.data.net_forces_w.torch[:, foot_ids], dim=-1) > 1.0
+            touchdown = contact & ~previous_contact & active[:, None]
+            touchdowns += touchdown
+            contact_sums += contact * active[:, None]
+            support_count = contact.sum(dim=-1)
+            for count in range(3):
+                support_sums[:, count] += (support_count == count) * active
+            side = torch.where(
+                touchdown[:, 0] & ~touchdown[:, 1], 0, torch.where(touchdown[:, 1] & ~touchdown[:, 0], 1, -1)
+            )
+            comparable = (side >= 0) & (last_touchdown_side >= 0)
+            comparisons += comparable
+            alternations += comparable & (side != last_touchdown_side)
+            last_touchdown_side = torch.where(side >= 0, side, last_touchdown_side)
+            previous_contact.copy_(contact)
+            if step % 5 == 0:
+                contact_trace.append(
+                    {
+                        "seconds": step * env.step_dt,
+                        "contact": contact[:4].cpu().tolist(),
+                        "active": active[:4].cpu().tolist(),
+                    }
+                )
         inputs = TensorDict(observations, batch_size=[env.num_envs]) if tensor_dict else observations
         actions = policy(inputs)
         if not torch.isfinite(actions).all():
@@ -390,8 +543,23 @@ def evaluate_policy(env, policy, *, tensor_dict: bool, seed: int, scenario: str)
         "action_rms": float((sums["action_squared"] / lengths).mean().sqrt()),
         "action_abs_max": float(action_abs_max),
         "action_outside_unit_fraction": float((sums["action_outside_unit"] / lengths).mean()),
-        "wrapper_clip_actions": None,
+        "evaluation_extra_action_clip": None,
     }
+    if foot_contacts:
+        result["foot_contacts"] = {
+            "body_names": foot_names,
+            "force_threshold_newtons": 1.0,
+            "contact_fraction": (contact_sums / lengths[:, None]).mean(dim=0).cpu().tolist(),
+            "touchdowns_per_episode_mean": touchdowns.mean(dim=0).cpu().tolist(),
+            "flight_fraction": float((support_sums[:, 0] / lengths).mean()),
+            "single_support_fraction": float((support_sums[:, 1] / lengths).mean()),
+            "double_support_fraction": float((support_sums[:, 2] / lengths).mean()),
+            "alternating_touchdown_fraction": float(alternations.sum() / comparisons.sum().clamp_min(1)),
+            "touchdown_comparisons": int(comparisons.sum()),
+            "trace": contact_trace,
+            "trace_note": "Pre-step contacts for the first four worlds, sampled every five control steps; "
+            "inactive worlds have finished their scored episode.",
+        }
     if scenario == "forward_0_5":
         result["walking_success_rate"] = float(
             (survived & (linear < 0.25) & (yaw < 0.4) & (forward > 0.25)).float().mean()
@@ -491,6 +659,7 @@ def evaluate(args: argparse.Namespace) -> None:
                                 tensor_dict=is_rsl,
                                 seed=seed,
                                 scenario=scenario,
+                                foot_contacts=args.foot_contacts,
                             )
                         measurement.update(
                             checkpoint=str(checkpoint),
@@ -533,6 +702,9 @@ def main() -> None:
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument(
         "--train_override", action="append", default=[], help="Explicit Hydra override recorded in the run command."
+    )
+    parser.add_argument(
+        "--foot_contacts", action="store_true", help="Record native foot-contact diagnostics during evaluation."
     )
     args = parser.parse_args()
     if min(args.num_envs, args.iterations, args.eval_envs, *args.checkpoint_iterations) < 1:
