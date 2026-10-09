@@ -42,7 +42,7 @@ class G1FlatWarpPPORunnerCfg(RoboLearnRunnerCfg):
         "timeout_bootstrap": "current",
         "separate_grad_clipping": True,
         "clip_value": True,
-        "optimized_linear_backward": False,
+        "optimized_linear_backward": True,
     }
 
 
