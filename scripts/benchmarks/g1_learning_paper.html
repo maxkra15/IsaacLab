@@ -1,0 +1,115 @@
+<!-- Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause -->
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>G1 locomotion: sample efficiency and training speed</title>
+<style>
+:root{--ink:#192333;--muted:#536174;--line:#dce1e7;--paper:#fff;--wash:#f4f6f8;--blue:#2563eb;--violet:#7c3aed;--amber:#d97706}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.65 system-ui,-apple-system,sans-serif}
+main{max-width:1016px;margin:auto;padding:56px 40px 36px}header{border-bottom:2px solid var(--ink);padding-bottom:30px}
+.eyebrow{font:600 11px/1.4 system-ui,sans-serif;letter-spacing:.15em;text-transform:uppercase;color:var(--muted)}
+h1{font:500 clamp(34px,5vw,52px)/1.13 Georgia,serif;letter-spacing:-.035em;max-width:800px;margin:17px 0}
+.subtitle{font-size:19px;line-height:1.5;color:var(--muted);max-width:730px}.byline{font-size:12px;color:var(--muted);margin-top:22px}
+nav{display:flex;gap:24px;flex-wrap:wrap;font-size:12px;padding:16px 0;border-bottom:1px solid var(--line)}a{color:#244a80;text-decoration:underline;text-underline-offset:3px}nav a{text-decoration:none}
+section{margin:42px 0;scroll-margin-top:24px}h2{font:500 27px/1.3 Georgia,serif;margin:0 0 17px}h2 .n{font:500 12px system-ui,sans-serif;color:var(--muted);margin-right:10px}
+h3{font:650 16px/1.5 system-ui,sans-serif;margin:22px 0 8px}p{max-width:850px;margin:10px 0 17px}.abstract{font:18px/1.65 Georgia,serif;max-width:850px}
+.findings{display:grid;grid-template-columns:repeat(3,1fr);gap:26px;margin-top:25px}.finding{border-top:3px solid var(--line);padding-top:12px}.finding:first-child{border-color:var(--amber)}.finding:nth-child(2){border-color:var(--violet)}.finding:nth-child(3){border-color:var(--blue)}.finding b{font:500 29px/1.3 Georgia,serif;display:block}.finding p{font-size:13px;line-height:1.55;color:var(--muted);margin:8px 0}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:20px 0 10px}.controls span{font-size:12px;color:var(--muted);margin-right:6px}button{font:600 12px system-ui,sans-serif;padding:8px 13px;background:white;border:1px solid var(--line);border-radius:4px;color:var(--ink);cursor:pointer}button[aria-pressed=true]{background:var(--ink);color:white;border-color:var(--ink)}button:focus-visible,a:focus-visible{outline:3px solid #94b9ff;outline-offset:3px}
+figure{margin:22px 0 32px}figure img{display:block;width:100%;height:auto;min-height:160px}figcaption{font-size:13px;line-height:1.6;margin:12px 4px 0;color:var(--muted)}figcaption strong{color:var(--ink)}.exports{font-size:11px;margin:8px 4px;display:flex;gap:14px}.exports a{color:var(--muted)}
+.note{padding:15px 19px;background:var(--wash);font-size:13px;line-height:1.6;border-left:3px solid #8793a3}.note p{margin:0}
+.table-scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px;line-height:1.45;margin:15px 0 10px;font-variant-numeric:tabular-nums}th,td{padding:12px 10px;border-bottom:1px solid var(--line);text-align:right;vertical-align:middle}thead th{color:var(--muted);font-size:11px;font-weight:600;border-top:1px solid var(--ink);border-bottom:1px solid var(--ink)}th:first-child{text-align:left}tbody th{font-weight:600}small{display:block;font-size:10px;color:var(--muted);margin-top:4px}th i{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:8px}.table-note{font-size:12px;color:var(--muted)}
+.methods{display:grid;grid-template-columns:1fr 1fr;gap:14px 30px}.methods p{font-size:14px;margin:0}.methods strong{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}.diagram{display:grid;grid-template-columns:1fr 30px 1fr 30px 1fr;align-items:center;margin:25px 0;gap:10px;text-align:center}.diagram div{border:1px solid var(--line);padding:14px 10px;font-size:13px}.diagram span{color:var(--muted);font-size:20px}.diagram small{font-size:11px}
+details{border-top:1px solid var(--line);padding:14px 0;margin-top:13px}summary{cursor:pointer;font-weight:600;font-size:13px}details p{font-size:13px}code{font:11px/1.5 ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}pre{padding:16px;background:var(--wash);overflow:auto}pre code{font-size:12px;overflow-wrap:normal}
+.limits li,.references li{margin:10px 0;font-size:13px;line-height:1.65}.references a{word-break:break-word}.provenance td{text-align:left}.provenance code{font-size:9px}footer{margin-top:45px;padding:20px 0;border-top:1px solid var(--line);font-size:11px;color:var(--muted)}
+@media(max-width:680px){main{padding:30px 18px}.findings,.methods{grid-template-columns:1fr}.findings{gap:14px}.finding b{font-size:25px}.diagram{grid-template-columns:1fr}.diagram span{transform:rotate(90deg)}nav{gap:15px}th,td{padding:10px 7px}figure img{min-height:100px}}
+@media print{main{max-width:none;padding:0}body{font-size:11px}.controls,nav,.exports,.no-print{display:none}section{margin:24px 0}figure,.findings,table{break-inside:avoid}h1{font-size:34px}h2{font-size:22px}a{color:inherit;text-decoration:none}details{break-inside:avoid}}
+</style></head><body><main>
+<header><div class="eyebrow">RoboLearn · Isaac Lab · Locomotion benchmark</div>
+<h1>Sample efficiency and training speed for G1 locomotion</h1>
+<p class="subtitle">A controlled comparison of RSL PPO, Warp PPO, and the authors’ FlashSAC implementation on the same Isaac Lab task.</p>
+<div class="byline">9 October 2026 · Three independent learner seeds · One isolated NVIDIA L40 per run · 50.38 million transitions per run</div></header>
+<nav aria-label="Report sections"><a href="#findings">Findings</a><a href="#learning">Learning curves</a><a href="#runtime">Runtime</a><a href="#quality">Policy quality</a><a href="#methods">Methods</a><a href="#limitations">Limits</a><a href="#evidence">Evidence</a></nav>
+<section id="findings"><h2>Abstract</h2>
+<p class="abstract">FlashSAC reached the measured walking criterion with fewer collected transitions and achieved lower final velocity error in this cohort. Warp PPO reduced PPO’s learning-phase cost by 18.6%, but rollout dominated runtime, limiting its training-loop gain to 2.5%. All nine final policies passed the forward-walking criterion. Preparation and evaluation costs make the complete command-pipeline comparison less favorable to Warp and FlashSAC than the training-loop numbers alone suggest.</p>
+<div class="findings"><div class="finding"><b>2 of 3 seeds</b><p>FlashSAC passed at 12.29M transitions. Neither PPO had a passing seed at that checkpoint. This is evidence of better observed sample efficiency.</p></div>
+<div class="finding"><b>1.23× faster updates</b><p>Warp PPO: 125.5 seconds of learning versus RSL PPO’s 154.2 seconds. The complete production training loop was only 1.025× faster.</p></div>
+<div class="finding"><b>100% forward survival</b><p>All learners survived every final forward evaluation. Native-command survival was 87.5% for RSL, 99.5% for Warp, and 100% for FlashSAC.</p></div></div>
+</section>
+<section id="learning"><h2><span class="n">01</span>How much experience was needed?</h2>
+<p>At 24.58M transitions, all three FlashSAC seeds passed the walking gate, versus two seeds for each PPO. The first passing checkpoints were 500 / 500 / 1000 iterations for FlashSAC, 1000 / 1500 / 1000 for Warp PPO, and 1000 / 1000 / 2050 for RSL PPO. One RSL seed later failed at iteration 1500 before recovering.</p>
+<div class="controls" aria-label="Evaluation scenario"><span>Evaluation scenario</span><button type="button" data-scenario="forward_0_5" aria-pressed="true">Forward at 0.5 m/s</button><button type="button" data-scenario="native_commands" aria-pressed="false">Native commands</button></div>
+<figure id="learning-figure"><img alt="Three-seed learning curves showing success and planar velocity error versus collected transitions"><figcaption><strong>Figure 1.</strong> <span class="caption"></span></figcaption><div class="exports"><a class="svg-download" download>Download SVG</a><a class="pdf-download" download>Download PDF</a></div></figure>
+<div class="note"><p><strong>Reading the curves.</strong> Thin lines show individual training seeds; the thick line is their mean and the band is their minimum–maximum range. The band is not a confidence interval. Each point comes from 64 evaluation worlds. Lines connect sampled checkpoints; behavior between them was not measured.</p></div>
+<details><summary>Per-seed passing checkpoints and observed regressions</summary><p>The interval starts at the preceding observed failure and ends at the first observed passing checkpoint. It does not establish the exact first crossing. Process time is the retrospective time at which the checkpoint was produced; common evaluations were performed afterward, and preparation-smoke time is excluded.</p>
+<div class="table-scroll"><table><thead><tr><th>Learner</th><th>Seed</th><th>First passing iteration</th><th>Sample interval (M)</th><th>Process time (min)</th><th>Later failing iterations</th></tr></thead><tbody>@GATE_ROWS@</tbody></table></div></details>
+</section>
+<section id="runtime"><h2><span class="n">02</span>Where did the time go?</h2>
+<p>PPO spent approximately 82–85% of its training loop collecting rollouts. Accelerating its remaining learning phase therefore produced a small overall gain. FlashSAC performed more, smaller replay update calls and used larger networks; its higher full-budget runtime coexists with earlier measured learning success.</p>
+<figure id="runtime-figure"><img alt="Runtime breakdown separating the production loop from preparation smoke, training process, and common evaluation"><figcaption><strong>Figure 2.</strong> <span class="caption"></span></figcaption><div class="exports"><a class="svg-download" download>Download SVG</a><a class="pdf-download" download>Download PDF</a></div></figure>
+<div class="table-scroll"><table><thead><tr><th>Learner</th><th>Training loop<br>min ↓</th><th>Learning phase<br>min ↓</th><th>Preceding smoke<br>min ↓</th><th>Smoke + train + evaluate<br>min ↓</th></tr></thead><tbody>@RUNTIME_ROWS@</tbody></table></div>
+<p class="table-note">Three-seed means. The complete measured command pipeline took 18.29 / 18.51 / 32.43 minutes for RSL / Warp / FlashSAC. It excludes OSMO queueing, container bootstrap, and artifact retrieval. This is not a cache-cleared machine-start benchmark.</p>
+<div class="note"><p><strong>What “faster” means here.</strong> Warp’s production loop is faster; the measured command pipeline, including its mandatory preparation smoke and evaluations, is slightly slower than RSL’s. Flash compilation also enters its early production iterations. Flash’s rollout/update split uses CUDA-event attribution, whereas PPO phases use synchronized wall timing; these phase totals do not compare identical gradient work.</p></div>
+</section>
+<section id="quality"><h2><span class="n">03</span>What did the final policies achieve?</h2>
+<p>At the matched final budget, FlashSAC had the lowest mean planar velocity error in both evaluation scenarios. Every forward evaluation passed walking and survival. Native commands are broader: they include varying planar and yaw commands as well as standing, so native tracking success is a different metric from forward walking.</p>
+<figure id="quality-figure"><img alt="Final planar tracking error and survival for native and forward command scenarios, showing all three learner seeds"><figcaption><strong>Figure 3.</strong> <span class="caption"></span></figcaption><div class="exports"><a class="svg-download" download>Download SVG</a><a class="pdf-download" download>Download PDF</a></div></figure>
+<h3 id="quality-title">Final forward evaluation at 0.5 m/s</h3><div class="table-scroll"><table><thead><tr><th>Learner</th><th>Mean planar error<br>m/s ↓</th><th>Survival ↑</th><th id="success-heading">Walking success ↑</th></tr></thead><tbody id="quality-rows">@FORWARD_ROWS@</tbody></table></div>
+<p class="table-note">Small numbers below the error mean give the three-seed range. Survival and success percentages average seeds, each with 64 worlds and a maximum episode length of 20 seconds.</p>
+<p>Recorded contact traces show repeated foot contacts, but FlashSAC’s left/right support duty is strongly asymmetric. These metrics establish commanded movement and survival; video or an additional gait analysis is needed to judge whether the motion is natural, balanced, or suitable for hardware.</p>
+</section>
+<section id="methods"><h2><span class="n">04</span>Experimental setup</h2>
+<div class="methods"><p><strong>Environment</strong><code>Isaac-Velocity-Flat-G1</code>, Isaac Lab 3 on Newton MJWarp. Shared rewards, observations, commands, action scale, resets, terminations, and initial episode-counter randomization. All nine runs have the same recorded MDP hash.</p>
+<p><strong>Training budget and hardware</strong>1,024 parallel environments × 24 steps × 2,050 iterations = 50,380,800 collected transitions. Fresh policy and optimizer for seeds 0, 1, 2. Each run had one isolated L40, 15 CPUs, and 64 GiB RAM.</p>
+<p><strong>Common evaluation</strong>64 worlds, 20-second native episodes, deterministic policy actions, noise and pushes disabled. Evaluation seed = 10000 + learner seed. Checkpoints: 250, 500, 1000, 1500, 2050. Two scenarios produce 90 evaluations total.</p>
+<p><strong>Walking gate</strong>At least 80% of worlds satisfy walking, mean planar error ≤ 0.2 m/s, and survival ≥ 90%. A walking world survives with planar error &lt; 0.25 m/s, yaw-rate error &lt; 0.4 rad/s, and forward speed &gt; 0.25 m/s.</p></div>
+<h3>Capture scope</h3><div class="diagram"><div>RoboLearn learner<small>Warp PPO graph / Torch FlashSAC</small></div><span>↔</span><div>Isaac Lab task<small>Torch observations, rewards, resets</small></div><span>↔</span><div>Newton MJWarp physics<small>Physics graph</small></div></div>
+<p class="table-note">The MDP runs in Torch. Physics and learning use separate graphs; this experiment does not capture a complete physics–MDP–learning iteration in one Warp graph.</p>
+<details><summary>Algorithm settings and learning work</summary>
+<p><strong>Matched PPO:</strong> ELU MLPs with widths 256/128/128, directly learned state-independent Gaussian standard deviation per action, unclipped policy actions, unnormalized observations, five epochs × four shuffled minibatches, γ = 0.99, λ = 0.95, initial adaptive learning rate 0.001 at target KL 0.01, entropy 0.008, full-MSE clipped value loss, and separate gradient norm limits of 1. Warp uses the tiled Linear backward path. Both have 167,243 parameters and 41,000 actor/critic Adam updates. A fixed-rollout diagnostic compared parameters and optimizer moments to Torch, with errors below 10⁻⁶.</p>
+<p><strong>FlashSAC:</strong> authors’ implementation with bounded tanh-Gaussian actions, 10M replay capacity, 100K-transition warmup, batch 2,048, three-step returns, two critic updates per vector step and one actor update per two critic updates, AMP, and Torch compilation. Actor width 128 and critic width 256, two blocks each; twin distributional critics with 101 atoms. The model has 2,532,746 parameters. Each run attempted 98,202 critic and 49,101 actor updates. Actual actor updates were 49,042 / 49,038 / 49,039, reflecting AMP skips; all critic updates completed.</p></details>
+<details><summary>Use the current integration or reproduce the frozen experiment</summary><p>The commands below use the current integration and RoboLearn 0.2. Install the supported Isaac Lab environment first, then install RoboLearn without replacing simulator-owned dependencies. For the exact measured stack, use the pinned checkout and frozen lock in the <a href="https://github.com/maxkra15/RoboLearn/blob/main/docs/g1.md">G1 reproduction guide</a>, which also contains the production overrides and common evaluation commands.</p>
+<pre><code>git clone --branch experiment/g1-learning-baselines https://github.com/maxkra15/IsaacLab.git
+git clone https://github.com/maxkra15/RoboLearn.git
+# From the configured Isaac Lab environment:
+uv pip install --no-deps -e /path/to/RoboLearn
+uv run --no-sync isaaclab train --rl_library robolearn \
+    --algorithm warp_ppo --task Isaac-Velocity-Flat-G1 --num_envs 1024 \
+    --max_iterations 2050 --seed 0 physics=newton_mjwarp \
+    agent.algorithm_cfg.optimized_linear_backward=true</code></pre>
+<p>The registered Warp PPO recipe supplies the matched numerical settings; the explicit override selects the tested tiled gradients. Select <code>--algorithm flashsac</code> for the corrected Flash registration. Use the benchmark harness in the guide for matched timing and common evaluations.</p></details>
+</section>
+<section id="limitations"><h2><span class="n">05</span>Interpretation and limits</h2><ul class="limits">
+<li><strong>A useful result, with a narrow scope.</strong> Three learner seeds on one flat G1 task support the observed sample-efficiency and runtime conclusions. They do not establish universal speed or quality advantages. Matching seed numbers does not match every implementation’s random draw.</li>
+<li><strong>Shared MDP, algorithm-specific work.</strong> Flash uses bounded actions, a larger model, distributional critics, replay, and AMP. PPO uses unclipped Gaussian actions and FP32 updates. Matching collected transitions does not match optimizer work or policy support.</li>
+<li><strong>Sampled success is not an exact convergence time.</strong> Evaluations were performed at five checkpoints after training. First-passing times are retrospective checkpoint production times; regressions and unseen behavior between checkpoints matter.</li>
+<li><strong>Integration benchmark, not a paper replication.</strong> The FlashSAC paper used Isaac Lab 2.1 with PhysX and a different PPO budget. This benchmark uses Isaac Lab 3/Newton, the authors’ code recipe, and an equal collected-transition budget. The paper’s separate real-robot experiment is also a different setup.</li>
+<li><strong>Current graphs leave rollout costs.</strong> A captured learner does not remove Torch MDP work or guarantee faster matrix operations. A fully captured Warp MDP and physics–learning graph would require a separate implementation and comparison.</li>
+</ul></section>
+<section id="evidence"><h2><span class="n">06</span>Evidence and reproducibility</h2>
+<p>All nine bundles passed SHA256 verification, checkpoint and optimizer audits, budget checks, and common-evaluation checks. Weights changed and remained finite. Native checkpoints are preserved; raw measurement JSON is unchanged. The three earlier Flash runs with different initial episode counters are retained as diagnostics and excluded here.</p>
+<p>Measurements refer to the source revisions below. RoboLearn 0.2 preserves those learner kernels and math, and fixes the adapter’s unclipped-action storage with one device conversion/copy. That fix was made after these runs; no new timing measurement is claimed for it.</p>
+<p><a href="@CSV@" download="g1-common-evaluations.csv">Download all 90 evaluation rows (CSV)</a> · <a href="comparison-audit.html">Open the detailed local audit dashboard</a></p>
+<details><summary>Source revisions and immutable measurement hashes</summary>
+<p>Measured RoboLearn: <a href="https://github.com/maxkra15/RoboLearn/tree/@ROBO_PIN@"><code>@ROBO_PIN@</code></a><br>
+Isaac Lab PPO harness: <a href="https://github.com/maxkra15/IsaacLab/tree/@PPO_PIN@"><code>@PPO_PIN@</code></a><br>
+Isaac Lab Flash initialization correction: <a href="https://github.com/maxkra15/IsaacLab/tree/@FLASH_PIN@"><code>@FLASH_PIN@</code></a></p>
+<p>Resolved MDP SHA256: <code>@MDP_HASH@</code><br>Derived summary SHA256: <code>@SUMMARY_HASH@</code></p>
+<div class="table-scroll"><table class="provenance"><thead><tr><th>Run</th><th>Local evidence</th><th>Raw JSON SHA256</th></tr></thead><tbody>@EVIDENCE_ROWS@</tbody></table></div></details>
+</section>
+<section id="references"><h2>References and attribution</h2><ol class="references">
+<li>Donghu Kim, Youngdo Lee, and coauthors. <a href="https://arxiv.org/abs/2604.04539">FlashSAC</a>, 2026. <a href="https://github.com/Holiday-Robot/FlashSAC/tree/87edc9061150ae9e962dd84e6544e27a1554b3ab">Official implementation at the adapted revision</a>. RoboLearn retains the authors’ copyright and MIT license.</li>
+<li>John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. <a href="https://arxiv.org/abs/1707.06347">Proximal Policy Optimization Algorithms</a>, 2017.</li>
+<li><a href="https://github.com/leggedrobotics/rsl_rl">RSL-RL</a>, <a href="https://github.com/isaac-sim/IsaacLab">Isaac Lab</a>, <a href="https://github.com/newton-physics/newton">Newton</a>, and <a href="https://github.com/google-deepmind/mujoco_warp">MuJoCo Warp</a>: their respective authors and contributors.</li>
+<li>NVIDIA and contributors. <a href="https://nvidia.github.io/warp-nn/">Warp-NN</a> and <a href="https://github.com/NVIDIA/warp">Warp</a>. RoboLearn’s Warp PPO is an independent implementation of the published PPO objective.</li>
+<li><a href="https://github.com/maxkra15/RoboLearn">RoboLearn</a>. <a href="https://github.com/maxkra15/RoboLearn/blob/main/ATTRIBUTION.md">Full attribution</a> and <a href="https://github.com/maxkra15/RoboLearn/blob/main/CITATIONS.bib">BibTeX citations</a>.</li>
+</ol></section>
+<footer>Offline report · SVG and PDF figures are embedded · Shaded ranges describe three seeds · Raw evidence remains separate · Browser print produces a paper-style copy</footer>
+</main><script>
+const figures=@FIGURE_DATA@;
+const qualityRows={forward_0_5:`@FORWARD_ROWS@`,native_commands:`@NATIVE_ROWS@`};
+function showFigure(elementId,figureId){const el=document.getElementById(elementId),f=figures[figureId];el.querySelector('img').src=f.svg;el.querySelector('.caption').textContent=f.caption;for(const ext of ['svg','pdf']){const a=el.querySelector('.'+ext+'-download');a.href=f[ext];a.download=figureId+'.'+ext}}
+function selectScenario(scenario){for(const b of document.querySelectorAll('[data-scenario]'))b.setAttribute('aria-pressed',String(b.dataset.scenario===scenario));showFigure('learning-figure',scenario==='forward_0_5'?'sample-efficiency-forward':'sample-efficiency-native');document.getElementById('quality-rows').innerHTML=qualityRows[scenario];document.getElementById('quality-title').textContent=scenario==='forward_0_5'?'Final forward evaluation at 0.5 m/s':'Final native-command evaluation';document.getElementById('success-heading').textContent=scenario==='forward_0_5'?'Walking success ↑':'Tracking success ↑'}
+for(const b of document.querySelectorAll('[data-scenario]'))b.addEventListener('click',()=>selectScenario(b.dataset.scenario));
+selectScenario('forward_0_5');showFigure('runtime-figure','runtime-costs');showFigure('quality-figure','final-quality');
+</script></body></html>
