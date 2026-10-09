@@ -75,3 +75,20 @@ class G1FlatFlashSACRunnerCfg(RoboLearnRunnerCfg):
         "use_amp": True,
         "learning_rate_decay_step": 98_400,
     }
+
+
+@configclass
+class G1FlatWarpFlashSACRunnerCfg(G1FlatFlashSACRunnerCfg):
+    """Experimental FP32 Warp-NN port of the same FlashSAC architecture and losses.
+
+    Collection, replay, update ratio and task settings follow the Torch recipe.
+    FP32 replaces its AMP precision; capture replaces Torch compilation. This
+    recipe does not imply a measured speed or walking-quality advantage.
+    """
+
+    algorithm = "warp_flashsac"
+    algorithm_cfg = {
+        **G1FlatFlashSACRunnerCfg.algorithm_cfg,
+        "use_compile": False,
+        "use_amp": False,
+    }

@@ -23,6 +23,7 @@ gym.register(
         "robolearn_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:G1FlatWarpPPORunnerCfg",
         "robolearn_warp_ppo_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:G1FlatWarpPPORunnerCfg",
         "robolearn_flashsac_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:G1FlatFlashSACRunnerCfg",
+        "robolearn_warp_flashsac_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:G1FlatWarpFlashSACRunnerCfg",
         "default_agent": "rsl_rl",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
     },

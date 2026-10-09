@@ -44,7 +44,7 @@ with contextlib.suppress(ImportError):
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse RoboLearn playback arguments."""
-    parser = argparse.ArgumentParser(description="Play a FlashSAC or Warp-NN PPO checkpoint with RoboLearn.")
+    parser = argparse.ArgumentParser(description="Play a Torch or Warp-NN checkpoint with RoboLearn.")
     add_common_play_args(
         parser, agent_default=None, agent_help="Name of the RoboLearn agent configuration entry point."
     )

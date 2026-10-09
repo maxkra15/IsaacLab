@@ -29,6 +29,7 @@ gym.register(
         "torchrl_cfg_entry_point": f"{agents.__name__}.torchrl_ppo_cfg:CartpoleDirectPPOCfg",
         "robolearn_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:CartpoleDirectFlashSACCfg",
         "robolearn_flashsac_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:CartpoleDirectFlashSACCfg",
+        "robolearn_warp_flashsac_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:CartpoleDirectWarpFlashSACCfg",
         "robolearn_warp_ppo_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:CartpoleDirectWarpPPOCfg",
         "default_agent": "rsl_rl",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_direct_ppo_cfg.yaml",
@@ -65,6 +66,7 @@ gym.register(
         "torchrl_cfg_entry_point": f"{agents.__name__}.torchrl_ppo_cfg:CartpolePPOCfg",
         "robolearn_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:CartpoleFlashSACCfg",
         "robolearn_flashsac_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:CartpoleFlashSACCfg",
+        "robolearn_warp_flashsac_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:CartpoleWarpFlashSACCfg",
         "robolearn_warp_ppo_cfg_entry_point": f"{agents.__name__}.robolearn_cfg:CartpoleWarpPPOCfg",
         "default_agent": "rsl_rl",
         "rsl_rl_with_symmetry_cfg_entry_point": (

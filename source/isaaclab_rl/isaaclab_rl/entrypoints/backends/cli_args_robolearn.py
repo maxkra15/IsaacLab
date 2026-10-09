@@ -23,7 +23,7 @@ CHECKPOINT_PATTERN = r"model_\d+\.json"
 
 def add_robolearn_args(parser: argparse.ArgumentParser) -> None:
     """Add learning algorithm and checkpoint selectors."""
-    parser.add_argument("--algorithm", choices=["flashsac", "warp_ppo"], default=None)
+    parser.add_argument("--algorithm", choices=["flashsac", "warp_flashsac", "warp_ppo"], default=None)
     parser.add_argument(
         "--checkpoint", type=str, default=None, help="Checkpoint JSON path, run directory, latest, or best."
     )

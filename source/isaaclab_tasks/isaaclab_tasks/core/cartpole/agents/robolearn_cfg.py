@@ -41,3 +41,15 @@ class CartpoleDirectFlashSACCfg(CartpoleFlashSACCfg):
 @configclass
 class CartpoleDirectWarpPPOCfg(CartpoleWarpPPOCfg):
     experiment_name = "cartpole_direct"
+
+
+@configclass
+class CartpoleWarpFlashSACCfg(CartpoleFlashSACCfg):
+    """Experimental FP32 FlashSAC with captured Warp-NN updates."""
+
+    algorithm = "warp_flashsac"
+
+
+@configclass
+class CartpoleDirectWarpFlashSACCfg(CartpoleWarpFlashSACCfg):
+    experiment_name = "cartpole_direct"

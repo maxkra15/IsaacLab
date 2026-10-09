@@ -12,9 +12,9 @@ from isaaclab.utils.configclass import configclass
 
 @configclass
 class RoboLearnRunnerCfg:
-    """Configure FlashSAC or Warp-NN PPO without importing either learning dependency."""
+    """Configure FlashSAC and Warp-NN learners without importing learning dependencies."""
 
-    algorithm: Literal["flashsac", "warp_ppo"] = "flashsac"
+    algorithm: Literal["flashsac", "warp_flashsac", "warp_ppo"] = "flashsac"
     seed: int = 0
     device: str = "cuda:0"
     num_steps_per_env: int = 16
@@ -35,7 +35,7 @@ class RoboLearnRunnerCfg:
     flash_updates_during_rollout: bool = False
     """Interleave FlashSAC replay updates with collection, as in the authors' runner."""
     capture_updates: bool = True
-    """Capture the complete Warp PPO learning update in a reusable CUDA graph."""
+    """Capture Warp PPO or Warp FlashSAC learning updates in reusable CUDA graphs."""
     capture_rollout: bool = False
     """Capture G1 Newton physics, Warp MDP, rollout collection, and PPO in one graph.
 

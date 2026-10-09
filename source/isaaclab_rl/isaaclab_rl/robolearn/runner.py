@@ -24,13 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 class RoboLearnRunner:
-    """Run FlashSAC or WarpNN PPO against the same Isaac Lab environment contract.
+    """Run Torch FlashSAC, WarpNN FlashSAC, or PPO against the same environment contract.
 
     Every iteration collects ``num_steps_per_env`` steps from every environment.
     FlashSAC performs replay updates times ``updates_per_step`` after each vector
     step when ``flash_updates_during_rollout`` is enabled, or after collection.
-    WarpNN PPO performs one PPO update with configured epochs and minibatches. It captures the learning
-    update only, while Isaac Lab stepping and observation assembly remain eager.
+    WarpNN PPO performs one PPO update with configured epochs and minibatches. Warp learners capture
+    their learning updates; Isaac Lab stepping and observation assembly remain eager.
 
     Checkpoints consist of a JSON file and an adjacent directory of algorithm
     state. FlashSAC checkpoints restore networks and optimizers; replay is rebuilt
@@ -55,6 +55,8 @@ class RoboLearnRunner:
         from robolearn.isaaclab import IsaacLabEnv
 
         self.cfg = deepcopy(cfg)
+        self._is_flash = cfg["algorithm"] in ("flashsac", "warp_flashsac")
+        self._is_warp_flash = cfg["algorithm"] == "warp_flashsac"
         self.device = _resolve_device(device)
         env_device = _resolve_device(env.unwrapped.device)
         if self.device.type != env_device.type or self.device.index != env_device.index:
@@ -83,8 +85,13 @@ class RoboLearnRunner:
         algorithm_cfg["seed"] = cfg["seed"]
         torch.manual_seed(cfg["seed"])
 
-        if cfg["algorithm"] == "flashsac":
-            from robolearn.flashsac import FlashSAC, FlashSACConfig
+        if self._is_flash:
+            from robolearn.flashsac import FlashSACConfig
+
+            if self._is_warp_flash:
+                from robolearn.warp import WarpFlashSAC as FlashSAC
+            else:
+                from robolearn.flashsac import FlashSAC
 
             algorithm_cfg["device"] = str(self.device)
             flash_cfg = FlashSACConfig(**algorithm_cfg)
@@ -124,19 +131,27 @@ class RoboLearnRunner:
                 config=PPOConfig(**algorithm_cfg),
                 device=str(self.device),
             )
+        else:
+            raise ValueError(f"Unknown RoboLearn algorithm: {cfg['algorithm']!r}.")
+
+        if cfg["algorithm"].startswith("warp_"):
+            import warp as wp
+
+            if self.device.type != "cuda":
+                raise ValueError("The Isaac Lab Warp learner adapter requires a CUDA device.")
             # Warp 1.17 cannot capture an imported Torch default stream. Own a
             # Warp stream and use its Torch mirror for device-side dependencies.
             self._warp_stream = wp.Stream(self.agent.device)
             self._torch_warp_stream = wp.stream_to_torch(self._warp_stream)
             self._warp_stream.wait_stream(wp.get_stream(self.agent.device))
             self._warp_obs = wp.zeros(
-                (self.env.num_envs, self.env.observation_dim), dtype=wp.float32, device=self.agent.device
+                (self.env.num_envs, self.env.critic_observation_dim or self.env.observation_dim),
+                dtype=wp.float32,
+                device=self.agent.device,
             )
             self._warp_next_obs = wp.zeros_like(self._warp_obs)
             self._warp_terminated = torch.zeros(self.env.num_envs, dtype=torch.int32, device=self.device)
             self._warp_truncated = torch.zeros_like(self._warp_terminated)
-        else:
-            raise ValueError(f"Unknown RoboLearn algorithm: {cfg['algorithm']!r}.")
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Collect rollouts, train, and write synchronized per-iteration metrics.
@@ -165,7 +180,7 @@ class RoboLearnRunner:
         end_iteration = self.current_learning_iteration + num_learning_iterations
 
         for iteration in range(first_iteration, end_iteration + 1):
-            if self.cfg["algorithm"] == "flashsac" and self._flash_interleaved:
+            if self._is_flash and self._flash_interleaved:
                 self._flash_iteration_updates = 0
                 self._flash_iteration_actor_updates = 0
                 self._flash_cpu_update_seconds = 0.0
@@ -193,7 +208,7 @@ class RoboLearnRunner:
             losses, updates, actor_updates = self._update()
             self._synchronize()
             update_seconds = time.perf_counter() - update_start
-            if self.cfg["algorithm"] == "flashsac" and self._flash_interleaved:
+            if self._is_flash and self._flash_interleaved:
                 interleaved_update_seconds = (
                     sum(start.elapsed_time(stop) / 1000 for start, stop in self._flash_active_events)
                     if self._flash_events
@@ -254,7 +269,12 @@ class RoboLearnRunner:
             raise ValueError("RoboLearn checkpoint metadata must use the .json extension.")
         state_dir = checkpoint.with_suffix("")
         state_dir.mkdir(parents=True, exist_ok=True)
-        if self.cfg["algorithm"] == "flashsac":
+        if self._is_warp_flash:
+            import warp as wp
+
+            with wp.ScopedStream(self._warp_stream, sync_enter=False):
+                self.agent.save(str(state_dir))
+        elif self._is_flash:
             self.agent.save(str(state_dir))
         else:
             self.agent.save(state_dir / "policy.npz")
@@ -292,7 +312,12 @@ class RoboLearnRunner:
         if any(metadata[key] != value for key, value in dimensions.items()):
             raise ValueError("Checkpoint observation or action dimensions do not match the environment.")
         state_dir = checkpoint.with_suffix("")
-        if self.cfg["algorithm"] == "flashsac":
+        if self._is_warp_flash:
+            import warp as wp
+
+            with wp.ScopedStream(self._warp_stream, sync_enter=False):
+                self.agent.load(str(state_dir))
+        elif self._is_flash:
             self.agent.load(str(state_dir))
         else:
             self.agent.load(state_dir / "policy.npz")
@@ -326,7 +351,11 @@ class RoboLearnRunner:
                 observations.record_stream(self._torch_warp_stream)
                 with torch.cuda.stream(self._torch_warp_stream), wp.ScopedStream(self._warp_stream, sync_enter=False):
                     wp.copy(self._warp_obs, wp.from_torch(observations, dtype=wp.float32))
-                    actions = self.agent.act(self._warp_obs, deterministic=True)
+                    actions = (
+                        self.agent.act(self._warp_obs, training=False)
+                        if self._is_warp_flash
+                        else self.agent.act(self._warp_obs, deterministic=True)
+                    )
                     result = wp.to_torch(actions)
                     limit = self.cfg["clip_actions"]
                     if limit is not None:
@@ -338,18 +367,21 @@ class RoboLearnRunner:
         return policy
 
     def _prepare_learning(self) -> None:
-        if self._prepared or self.cfg["algorithm"] != "warp_ppo":
+        if self._prepared or not self.cfg["algorithm"].startswith("warp_"):
             return
         import warp as wp
 
         self._synchronize()
         start = time.perf_counter()
         with wp.ScopedStream(self._warp_stream, sync_enter=False):
-            # The first update compiles and captures against persistent arrays.
-            # Restore all parameters, Adam state, and RNG before collecting data.
-            state = self.agent.state_dict()
-            self.agent.update(capture=self.cfg["capture_updates"])
-            self.agent.load_state_dict(state)
+            if self._is_warp_flash:
+                self.agent.prepare(capture=self.cfg["capture_updates"])
+            else:
+                # The first update compiles and captures against persistent arrays.
+                # Restore all parameters, Adam state, and RNG before collecting data.
+                state = self.agent.state_dict()
+                self.agent.update(capture=self.cfg["capture_updates"])
+                self.agent.load_state_dict(state)
         self._synchronize()
         self._warmup_seconds = time.perf_counter() - start
         self._prepared = True
@@ -367,6 +399,8 @@ class RoboLearnRunner:
             if self._flash_interleaved and self.agent.ready:
                 self._flash_update_group(step)
             return observations, transition
+        if self._is_warp_flash:
+            return self._collect_warp_flash_step(observations, step)
         with torch.no_grad():
             import warp as wp
 
@@ -399,14 +433,51 @@ class RoboLearnRunner:
                 )
                 return observations, transition
 
+    def _collect_warp_flash_step(self, observations: torch.Tensor, step: int) -> tuple[torch.Tensor, dict]:
+        """Collect a transition with explicit dependencies across environment and learner streams."""
+        import warp as wp
+
+        with torch.no_grad():
+            environment_stream = torch.cuda.current_stream(self.device)
+            self._torch_warp_stream.wait_stream(environment_stream)
+            observations.record_stream(self._torch_warp_stream)
+            with torch.cuda.stream(self._torch_warp_stream), wp.ScopedStream(self._warp_stream, sync_enter=False):
+                wp.copy(self._warp_obs, wp.from_torch(observations, dtype=wp.float32))
+                actions = (
+                    wp.to_torch(self.agent.act(self._warp_obs))
+                    if self.agent.ready
+                    else torch.empty((self.env.num_envs, self.env.action_dim), device=self.device).uniform_(-1, 1)
+                )
+            environment_stream.wait_stream(self._torch_warp_stream)
+            observations, transition = self.env.step(actions)
+            self._warp_terminated.copy_(transition["terminated"])
+            self._warp_truncated.copy_(transition["truncated"])
+            self._torch_warp_stream.wait_stream(environment_stream)
+            for value in transition.values():
+                value.record_stream(self._torch_warp_stream)
+            with torch.cuda.stream(self._torch_warp_stream), wp.ScopedStream(self._warp_stream, sync_enter=False):
+                warp_transition = {
+                    key: wp.from_torch(value, dtype=wp.float32)
+                    for key, value in transition.items()
+                    if key not in ("terminated", "truncated")
+                }
+                warp_transition["terminated"] = wp.from_torch(self._warp_terminated, dtype=wp.int32)
+                warp_transition["truncated"] = wp.from_torch(self._warp_truncated, dtype=wp.int32)
+                self.agent.process_transition(warp_transition)
+                if self._flash_interleaved and self.agent.ready:
+                    self._flash_update_group(step)
+            return observations, transition
+
     def _update(self) -> tuple[dict[str, float], int, int]:
-        if self.cfg["algorithm"] == "flashsac":
+        if self._is_flash:
             if self._flash_interleaved:
                 count = self._flash_iteration_updates
                 if not count:
                     return {}, 0, 0
                 keys = list(self._flash_metric_totals)
                 keys = [key for key in keys if self._flash_metric_counts[key]]
+                if self._is_warp_flash:
+                    torch.cuda.current_stream(self.device).wait_stream(self._torch_warp_stream)
                 averages = (
                     torch.stack(
                         [(self._flash_metric_totals[key] / self._flash_metric_counts[key]).reshape(()) for key in keys]
@@ -419,13 +490,22 @@ class RoboLearnRunner:
                 return {}, 0, 0
             count = self.cfg["num_steps_per_env"] * self.cfg["updates_per_step"]
             totals: dict[str, float] = {}
+            metric_counts: dict[str, int] = {}
             for _ in range(count):
-                for key, value in self.agent.update().items():
+                if self._is_warp_flash:
+                    import warp as wp
+
+                    with wp.ScopedStream(self._warp_stream, sync_enter=False):
+                        information = self.agent.update(tensor_metrics=False, capture=self.cfg["capture_updates"])
+                else:
+                    information = self.agent.update()
+                for key, value in information.items():
                     totals[key] = totals.get(key, 0.0) + value
+                    metric_counts[key] = metric_counts.get(key, 0) + 1
             actor_updates = sum(
                 (self.gradient_updates + index) % self._actor_update_period == 0 for index in range(count)
             )
-            return {key: value / count for key, value in totals.items()}, count, actor_updates
+            return {key: value / metric_counts[key] for key, value in totals.items()}, count, actor_updates
         import warp as wp
 
         with wp.ScopedStream(self._warp_stream, sync_enter=False):
@@ -449,7 +529,17 @@ class RoboLearnRunner:
             start.record()
         for _ in range(self.cfg["updates_per_step"]):
             update_index = self.gradient_updates + self._flash_iteration_updates
-            information = self.agent.update(tensor_metrics=True)
+            if self._is_warp_flash:
+                import warp as wp
+
+                information = {
+                    key: wp.to_torch(value)
+                    for key, value in self.agent.update(
+                        tensor_metrics=True, capture=self.cfg["capture_updates"]
+                    ).items()
+                }
+            else:
+                information = self.agent.update(tensor_metrics=True)
             for key, value in information.items():
                 if key not in self._flash_metric_totals:
                     self._flash_metric_totals[key] = torch.zeros_like(value)

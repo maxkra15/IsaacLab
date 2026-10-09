@@ -2032,7 +2032,7 @@ requires-dist = [
     { name = "rich" },
     { name = "rich", marker = "extra == 'sb3'" },
     { name = "rl-games", marker = "extra == 'rl-games'", git = "https://github.com/isaac-sim/rl_games.git?rev=5cf4f9ff07e9a01bbefd167cf19b6804b294b51c" },
-    { name = "robolearn-rl", extras = ["flashsac", "warp"], marker = "extra == 'robolearn'", git = "https://github.com/maxkra15/RoboLearn.git?rev=acad3a36cb96a29871de9ed575ce117a94bbc0bd" },
+    { name = "robolearn-rl", extras = ["flashsac", "warp"], marker = "extra == 'robolearn'", git = "https://github.com/maxkra15/RoboLearn.git?rev=7e872dbda8a0385a7fae227dbc6e61c608aa1696" },
     { name = "robomimic", marker = "sys_platform == 'linux' and extra == 'mimic'", git = "https://github.com/ARISE-Initiative/robomimic.git?rev=v0.4.0" },
     { name = "rsl-rl-lib", specifier = "==5.5.1" },
     { name = "rsl-rl-lib", marker = "extra == 'rsl-rl'", specifier = "==5.5.1" },
@@ -4786,8 +4786,8 @@ dependencies = [
 
 [[package]]
 name = "robolearn-rl"
-version = "0.2.0"
-source = { git = "https://github.com/maxkra15/RoboLearn.git?rev=acad3a36cb96a29871de9ed575ce117a94bbc0bd#acad3a36cb96a29871de9ed575ce117a94bbc0bd" }
+version = "0.3.0"
+source = { git = "https://github.com/maxkra15/RoboLearn.git?rev=7e872dbda8a0385a7fae227dbc6e61c608aa1696#7e872dbda8a0385a7fae227dbc6e61c608aa1696" }
 dependencies = [
     { name = "numpy" },
 ]

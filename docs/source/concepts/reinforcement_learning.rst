@@ -106,7 +106,8 @@ RoboLearn
 ~~~~~~~~~
 
 The optional `RoboLearn <https://github.com/maxkra15/RoboLearn>`_ package is installed from a pinned
-GitHub revision. The state-based Cartpole environments register both supported algorithms:
+GitHub revision. The state-based Cartpole environments register Torch FlashSAC, Warp-NN PPO,
+and experimental FP32 Warp-NN FlashSAC:
 
 .. code-block:: bash
 
@@ -114,6 +115,8 @@ GitHub revision. The state-based Cartpole environments register both supported a
        --algorithm flashsac --num_envs 1024 --max_iterations 150
    uv run --extra robolearn isaaclab train --rl_library robolearn --task Isaac-Cartpole \
        --algorithm warp_ppo --num_envs 1024 --max_iterations 150
+   uv run --extra robolearn isaaclab train --rl_library robolearn --task Isaac-Cartpole \
+       --algorithm warp_flashsac --num_envs 1024 --max_iterations 150
    uv run --extra robolearn isaaclab play --rl_library robolearn --task Isaac-Cartpole \
        --algorithm warp_ppo --checkpoint latest --num_envs 16 --viz newton --max_steps 600
 
@@ -129,7 +132,12 @@ The current adapter requires flat observation groups and normalized actions clip
 the environment retains its existing action scaling. Terminal observations are enabled for correct timeout
 bootstrapping.
 
-Use the Torch environment frontend (``--frontend torch``) with either learning algorithm. The experimental
+Warp-NN FlashSAC retains the authors' architecture and losses in FP32, with captured learning updates.
+Mixed precision is not supported in this backend. Its G1 speed and policy quality have not been
+established; the existing Torch FlashSAC results do not validate this port. Both FlashSAC backends use
+the same environment contract, and collection includes policy inference and replay insertion.
+
+Use the Torch environment frontend (``--frontend torch``) with these learning algorithms. The experimental
 Warp environment frontend and ``--capture_env_sensors`` currently require further adapter support.
 Visualizer video recording is available through ``--video``.
 

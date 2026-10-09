@@ -47,7 +47,7 @@ with contextlib.suppress(ImportError):
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse RoboLearn training arguments."""
-    parser = argparse.ArgumentParser(description="Train a FlashSAC or Warp-NN PPO policy with RoboLearn.")
+    parser = argparse.ArgumentParser(description="Train a Torch or Warp-NN policy with RoboLearn.")
     add_common_train_args(
         parser,
         agent_default=None,
