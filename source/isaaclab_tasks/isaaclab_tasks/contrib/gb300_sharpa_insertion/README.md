@@ -85,11 +85,9 @@ Pressing the clip while the plug remains seated does not extinguish the link.
 
 ## Dependencies and public availability
 
-This branch pins public Newton `62b1dc5cd739f028c47421ce71cda80569025db6`
-(`1.8.0.dev0`), Warp 1.18, and MuJoCo/MuJoCo-Warp 3.15. Newton declares 3.14;
-the deliberate 3.15 override and native surface/volume/curve metadata migration
-need separate framework review. Older Newton versions are unsupported here.
-Focused checks do not establish compatibility for every Isaac Lab task.
+The task uses the dependency versions selected by upstream `develop` in the
+repository's `pyproject.toml` and `uv.lock`; it does not override the shared
+Newton, Warp, or MuJoCo pins. Run `uv sync` after switching branches.
 
 Assets are not committed or downloaded automatically. Local resolution validates
 their pinned digests and reports missing dependencies:
@@ -122,8 +120,9 @@ the current GPU fixture. Training does not use hydroelastic gains but still
 depends on correct coupling maps. No private allocation or SDF-warning patch
 is required by the validated run.
 
-Two full insertion/extraction cycles passed on an A40 with this stack and the
-two corrections, without changing grasp targets or relaxing guards. This is
-limited validation, not a real-time or broad robustness claim. Public robot
-validation and upstream Newton corrections remain prerequisites for a
-self-contained public example.
+Two full insertion/extraction cycles passed on an A40 with an earlier corrected
+Newton stack, without changing grasp targets or relaxing guards. Those runs do
+not validate the current upstream dependency stack or establish real-time
+performance or broad robustness. Public robot validation, upstream Newton
+corrections, and a full-cycle rerun on the declared dependencies remain
+prerequisites for a self-contained public example.

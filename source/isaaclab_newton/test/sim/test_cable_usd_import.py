@@ -28,9 +28,8 @@ def _import_cable_joint_stiffness(**material_kwargs) -> list[float]:
 
     builder = newton.ModelBuilder()
     builder.add_usd(stage, root_path="/World/Cable")
-    cable_joint = builder.joint_type.index(newton.JointType.ROD)
-    dof0 = builder.joint_qd_start[cable_joint]
-    return [builder.joint_target_ke[dof0 + offset] for offset in range(4)]
+    dof0 = builder.joint_qd_start[builder.joint_type.index(newton.JointType.ROD)]
+    return builder.joint_target_ke[dof0 : dof0 + 4]
 
 
 def test_newton_cable_authored_shear_and_twist_override_fallbacks():
@@ -82,7 +81,6 @@ def test_newton_imports_cable_without_registry():
     cable_attrs = import_result["path_cable_attrs"][cable_path]
 
     assert builder.body_count == 2
-    assert builder.joint_count == 2
     assert builder.joint_type == [newton.JointType.FREE, newton.JointType.ROD]
     assert builder.shape_count == 2
     assert import_result["path_cable_map"][cable_path] == ([0, 1], [1])

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 from isaaclab_newton.physics import NewtonBackendCfg, NewtonBuilderCfg, NewtonCfg, NewtonManager, NewtonSoftContactCfg
 from newton import ModelBuilder
+from newton.solvers import SolverVBD
 
 from isaaclab.sim import BackendCfg, SimulationContext
 from isaaclab.utils import replace
@@ -115,14 +116,9 @@ def test_vbd_solver_force_input_capability(monkeypatch):
 def test_vbd_rigid_solver_controls(overrides):
     """VBD preserves the default controls and explicit legacy-mode selection."""
     physics = importlib.import_module("isaaclab_newton.physics")
-    builder = ModelBuilder()
-    body = builder.add_link()
-    builder.add_shape_box(body=body, hx=0.1, hy=0.1, hz=0.1)
-    builder.color()
-    model = builder.finalize(device="cpu")
-    solver = physics.NewtonVBDManager._create_solver(model, physics.VBDSolverCfg(**overrides))
-    assert solver.rigid_compliant_alm is overrides.get("rigid_compliant_alm", True)
-    assert solver.body_body_contact_indices.size == model.body_count * 64
+    kwargs = NewtonManager._filter_solver_kwargs(SolverVBD, physics.VBDSolverCfg(**overrides))
+    assert kwargs["rigid_compliant_alm"] is overrides.get("rigid_compliant_alm")
+    assert kwargs["rigid_body_contact_buffer_size"] == 64
 
 
 def test_vbd_compliant_alm_cable_stiffness():

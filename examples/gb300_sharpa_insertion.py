@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> int:
@@ -192,7 +195,7 @@ def _run(args: argparse.Namespace) -> int:
                             keeper_exit_margin_m=float(state[20]),
                         )
                     if machine.phase != prior_phase:
-                        print(f"[GB300 cycle] step={step} phase={machine.phase}", flush=True)
+                        logger.info("[GB300 cycle] step=%d phase=%s", step, machine.phase)
                         prior_phase = machine.phase
                     if machine.phase == "DONE":
                         reason = machine.failure
@@ -201,9 +204,8 @@ def _run(args: argparse.Namespace) -> int:
                         if failure_step is None:
                             failure_step = step
                             reason = machine.failure
-                            print(
-                                f"[GB300 cycle] fault={reason}; holding targets for {args.failure_tail_s:g} s",
-                                flush=True,
+                            logger.warning(
+                                "[GB300 cycle] fault=%s; holding targets for %g s", reason, args.failure_tail_s
                             )
                         if step - failure_step >= failure_tail_steps:
                             break
