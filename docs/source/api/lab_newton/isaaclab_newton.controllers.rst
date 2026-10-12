@@ -75,11 +75,6 @@ Inverse Kinematics
 
 .. currentmodule:: isaaclab_newton.controllers.ik
 
-Set ``NewtonIKSolverCfg(use_cuda_graph=True)`` to reduce CUDA launch overhead for analytic LM
-with sampling disabled. The first solve warms up and captures the fixed iteration sequence;
-subsequent solves use live seeds and objective target values. Keep the model, objective buffers,
-and solver configuration fixed after capture. CPU solves remain eager.
-
 .. autosummary::
    :nosignatures:
 

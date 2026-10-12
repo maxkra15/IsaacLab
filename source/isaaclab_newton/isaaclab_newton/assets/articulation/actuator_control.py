@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import warp as wp
 
-from isaaclab.actuators import ActuatorCollection, ImplicitActuator
+from isaaclab.actuators import ActuatorCollection
 from isaaclab.actuators.actuator_base_cfg import _is_implicit_actuator_cfg
 from isaaclab.actuators.actuator_control import ArticulationActuatorControl
 from isaaclab.actuators.newton import build_implicit_dof_mask
@@ -21,7 +21,6 @@ from isaaclab.actuators.newton import kernels as actuator_kernels
 from isaaclab.actuators.newton.adapter import NewtonActuatorSelection
 from isaaclab.assets.articulation import ordering_kernels
 from isaaclab.sim.schemas.schemas_actuators import validate_newton_native_actuator_cfgs
-from isaaclab.utils.string import string_to_callable
 
 from isaaclab_newton.assets.articulation.joint_coordinates import scatter_joint_coordinates
 from isaaclab_newton.physics import NewtonManager as SimulationManager
@@ -49,10 +48,7 @@ class NewtonActuatorControl(ArticulationActuatorControl):
         articulation._implicit_dof_mask = None
         articulation.newton_actuator_adapter = None
 
-        if not actuator_cfgs:
-            return set()
         if not getattr(articulation._sim_cfg, "use_newton_actuators", False):
-            SimulationManager._require_eager_actuator_updates()
             return set()
 
         validate_newton_native_actuator_cfgs(actuator_cfgs)
@@ -60,17 +56,7 @@ class NewtonActuatorControl(ArticulationActuatorControl):
             name for name, actuator_cfg in actuator_cfgs.items() if not _is_implicit_actuator_cfg(actuator_cfg)
         }
         if not native_group_names:
-            if not articulation._sim_cfg.physics.capture_implicit_actuators:
-                SimulationManager._require_eager_actuator_updates()
-                return set()
-            for actuator_cfg in actuator_cfgs.values():
-                actuator_class = actuator_cfg.class_type
-                if isinstance(actuator_class, str):
-                    actuator_class = string_to_callable(actuator_class)
-                # Subclasses may override compute and must keep their Lab execution path.
-                if actuator_class is not ImplicitActuator:
-                    SimulationManager._require_eager_actuator_updates()
-                    return set()
+            return set()
 
         self._native_actuator_path_active = True
         articulation._has_newton_actuators = True
@@ -83,18 +69,6 @@ class NewtonActuatorControl(ArticulationActuatorControl):
             return None
 
         articulation = self._articulation
-        if not collection._native_group_names:
-
-            def _post_implicit_actuator() -> None:
-                articulation._data._gather_joint_coordinates()
-                articulation._data._refresh_user_order_joint_state()
-                # The collection builds its executor after this callback is registered.
-                assert collection._implicit_executor is not None
-                collection._implicit_executor.launch(collection)
-
-            SimulationManager.register_post_actuator_callback(_post_implicit_actuator)
-            return None
-
         adapter = SimulationManager._adapter
         if adapter is not None:
             arti_start = self._joint_dof_offset()

@@ -140,7 +140,6 @@ def test_demo_catalog_lists_packaged_demos(capsys):
     output = capsys.readouterr().out
     assert "zoo" in output
     assert "teapot-fill" in output
-    assert "rizon-sharpa-rj45" in output
     assert "newton-dominoes" not in output
     assert "bin-packing" not in output
 
@@ -153,7 +152,6 @@ def test_example_catalog_lists_packaged_examples(capsys):
     assert "bin-packing" in output
     assert "newton-dominoes" in output
     assert "mpm-two-way-coupling" in output
-    assert "gb300-sharpa-insertion" in output
     assert "uvx --from 'isaaclab[isaacsim]' isaaclab example camera" in output
     assert "teapot-fill" not in output
 
@@ -234,10 +232,12 @@ def test_newton_gl_selector_switches_programs_after_script_returns(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("catalog", [programs.DEMOS, programs.EXAMPLES])
-def test_program_catalog_resolves_paths(catalog):
+@pytest.mark.parametrize(
+    ("catalog", "directory"), [(programs.DEMOS, "examples/demos"), (programs.EXAMPLES, "examples")]
+)
+def test_program_catalog_resolves_paths(catalog, directory):
     """Both catalogs must resolve inside the single examples tree."""
-    assert all(program.relative_path.startswith("examples/") for program in catalog)
+    assert all(program.relative_path.startswith(f"{directory}/") for program in catalog)
     assert all(program.path.is_file() for program in catalog)
 
 
@@ -249,21 +249,16 @@ def test_program_catalog_names_are_unique(catalog):
 
 
 @pytest.mark.parametrize(
-    ("command", "command_name", "program_name", "relative_path"),
-    [
-        (cli.demo, "demo", "zoo", "examples/demos/zoo.py"),
-        (cli.example, "example", "cables", "examples/cables.py"),
-        (cli.demo, "demo", "rizon-sharpa-rj45", "examples/gb300_sharpa_insertion.py"),
-    ],
+    ("command", "command_name", "program_name"),
+    [(cli.demo, "demo", "zoo"), (cli.example, "example", "cables")],
 )
-def test_program_command_dispatches_to_packaged_script(command, command_name, program_name, relative_path):
+def test_program_command_dispatches_to_packaged_script(command, command_name, program_name):
     """Program commands must forward all remaining arguments to the selected script."""
     with mock.patch.object(programs, "run_program") as run_program:
         command([program_name, "--physics", "newton_mjwarp"])
 
     catalog = programs.DEMOS if command_name == "demo" else programs.EXAMPLES
     selected = next(program for program in catalog if program.name == program_name)
-    assert selected.relative_path == relative_path
     run_program.assert_called_once_with(command_name, selected, ["--physics", "newton_mjwarp"])
 
 
@@ -275,35 +270,17 @@ def test_program_command_forwards_help_to_selected_module():
     run_program.assert_called_once_with("demo", programs.DEMOS[0], ["--help"])
 
 
-@pytest.mark.parametrize("fails", [False, True])
-def test_program_runner_preserves_command_name_and_restores_process_arguments(tmp_path, monkeypatch, fails):
-    """Sibling imports work without leaking process state, even when a script fails."""
+def test_program_runner_preserves_command_name_and_restores_process_arguments(tmp_path):
+    """Running a program must not leak its arguments to the caller."""
     original_argv = sys.argv
-    original_path = sys.path.copy()
     script = tmp_path / "demos" / "example.py"
     script.parent.mkdir()
-    sibling = "_isaaclab_program_sibling"
-    monkeypatch.delitem(sys.modules, sibling, raising=False)
-    (script.parent / f"{sibling}.py").write_text("value = 42\n", encoding="utf-8")
-    script.write_text(
-        f"import sys\nfrom {sibling} import value\n"
-        "assert value == 42\nassert sys.argv[0] == 'isaaclab demo temporary'\n"
-        + ("raise RuntimeError('script failure')\n" if fails else ""),
-        encoding="utf-8",
-    )
+    script.write_text("import sys\nassert sys.argv[0] == 'isaaclab demo temporary'\n", encoding="utf-8")
     program = programs.ProgramSpec("temporary", f"examples/demos/{script.name}", "Temporary test program.")
-    try:
-        with mock.patch.object(programs, "_program_root", return_value=tmp_path):
-            if fails:
-                with pytest.raises(RuntimeError, match="script failure"):
-                    programs.run_program("demo", program, ["--physics", "newton_mjwarp"])
-            else:
-                programs.run_program("demo", program, ["--physics", "newton_mjwarp"])
-    finally:
-        sys.modules.pop(sibling, None)
+    with mock.patch.object(programs, "_program_root", return_value=tmp_path):
+        programs.run_program("demo", program, ["--physics", "newton_mjwarp"])
 
     assert sys.argv is original_argv
-    assert sys.path == original_path
 
 
 @pytest.mark.parametrize("command", [cli.demo, cli.example])

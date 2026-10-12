@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 from isaaclab_newton.physics import HydroelasticSDFCfg, NewtonCfg, NewtonCollisionPipelineCfg
 
-from isaaclab_contrib.coupling import CouplerAdmmCfg, CouplerProxyCfg, CouplerProxyMappingCfg
+from isaaclab_contrib.coupling import CouplerProxyCfg, CouplerProxyMappingCfg
 
 if TYPE_CHECKING:
     import newton
@@ -22,13 +22,11 @@ if TYPE_CHECKING:
 _MJWARP_SOLREF_MODE_FORCE_SPACE = 0
 
 
-def configure_hydroelastic_physics(physics: NewtonCfg, *, one_way_cable: bool = False) -> None:
+def configure_hydroelastic_physics(physics: NewtonCfg) -> None:
     """Keep hydroelastic grasp contacts in MJWarp and the flexible cable in VBD.
 
     Args:
         physics: Newton configuration whose entries own the rigid scene and cable.
-        one_way_cable: Transfer plug motion to a kinematic cable endpoint without cable feedback.
-            Otherwise, exchange physical attachment loads through ADMM.
     """
     rigid, cable = physics.solver_cfg.entries
     rigid.bodies.extend((r"/World/envs/env_.*/Cable/head", r"/World/envs/env_.*/Cable/latch"))
@@ -38,42 +36,25 @@ def configure_hydroelastic_physics(physics: NewtonCfg, *, one_way_cable: bool = 
     # Up to six rows per frictional contact, plus articulation joint limits.
     rigid.solver_cfg.njmax = 6 * rigid.solver_cfg.nconmax + 128
     cable.solver_cfg.rigid_contact_history = False
-    if one_way_cable:
-        # The fixture proxy includes the pedestal and rack; only the ground needs static ownership.
-        cable.include_static_shapes = False
-        cable.shape_label_patterns = [r"/World/GroundPlane/.*"]
-        cable.solver_cfg.class_type = "isaaclab_tasks.contrib.gb300_sharpa_insertion.endpoint:NewtonEndpointVBDManager"
-        physics.solver_cfg = CouplerProxyCfg(
-            class_type="isaaclab_tasks.contrib.gb300_sharpa_insertion.endpoint:NewtonEndpointCouplerManager",
-            entries=[rigid, cable],
-            iterations=1,
-            proxies=[
-                CouplerProxyMappingCfg(
-                    source="rigid",
-                    destination="cable",
-                    bodies=rigid.bodies.copy(),
-                    mode="staggered",
-                    collision_pipeline=_one_way_cable_collision_pipeline,
-                )
-            ],
-        )
-        physics.class_type = physics.solver_cfg.class_type
-    else:
-        physics.solver_cfg = CouplerAdmmCfg(
-            entries=[rigid, cable],
-            iterations=5,
-            rho=50.0,
-            # MJWarp cannot refresh proximal inertia for changing contact candidates.
-            # Keeping this optional term off avoids enormous artificial robot masses.
-            gamma=0.0,
-            baumgarte=0.01,
-            joint_stiffness=1.0e4,
-            joint_angular_stiffness=1.0e4,
-            joint_proximal_destination_entries=["rigid"],
-            rigid_contact_matching="sticky",
-        )
-        # Validated at 1/120 s: 16 substeps kept the free-swing attachment gap below 1 mm.
-        physics.num_substeps = max(physics.num_substeps, 16)
+    # The fixture proxy includes the pedestal and rack; only the ground needs static ownership.
+    cable.include_static_shapes = False
+    cable.shape_label_patterns = [r"/World/GroundPlane/.*"]
+    cable.solver_cfg.class_type = "isaaclab_tasks.contrib.gb300_sharpa_insertion.endpoint:NewtonEndpointVBDManager"
+    physics.solver_cfg = CouplerProxyCfg(
+        class_type="isaaclab_tasks.contrib.gb300_sharpa_insertion.endpoint:NewtonEndpointCouplerManager",
+        entries=[rigid, cable],
+        iterations=1,
+        proxies=[
+            CouplerProxyMappingCfg(
+                source="rigid",
+                destination="cable",
+                bodies=rigid.bodies.copy(),
+                mode="staggered",
+                collision_pipeline=_one_way_cable_collision_pipeline,
+            )
+        ],
+    )
+    physics.class_type = physics.solver_cfg.class_type
     physics.collision_cfg = NewtonCollisionPipelineCfg(
         sdf_hydroelastic_config=HydroelasticSDFCfg(
             output_contact_surface=True,
@@ -90,23 +71,16 @@ def configure_hydroelastic_shapes(
     builder: newton.ModelBuilder,
     grasp_body_patterns: tuple[str, ...],
     *,
-    thumb_latch_force_space: bool = False,
-    thumb_latch_hydroelastic: bool = False,
     pad_pressure_gradient: float = 5.0e8,
 ) -> None:
     """Cook fingertip/plug SDFs while retaining ordinary contacts for every other pair.
 
-    Massless fingertip copies collide only with the loose plug. The original
-    colliders retain finger self-contact and contact with the socket and latch.
+    Massless fingertip copies contact the housing; the thumb also contacts the clip.
+    Original colliders retain finger self-contact and contact with the socket.
     Both copies occupy the same surface in the body's local frame [m].
     Ordinary connector/rack contacts use force-space stiffness [N/m] and
     damping [N s/m], without changing the hydroelastic pad response.
 
-    ``thumb_latch_force_space`` additionally opts the native thumb pad into that
-    material convention for clip depression. MJWarp requires both endpoints;
-    the hydroelastic duplicate remains plug-only and unchanged.
-    ``thumb_latch_hydroelastic`` additionally routes thumb/clip contact through
-    the existing massless thumb copy. Other pads retain ordinary clip contact.
     ``pad_pressure_gradient`` controls the compliant covering [N/m^3], without
     changing the rigid connector material or adding mass to the pad copies.
     """
@@ -146,13 +120,9 @@ def configure_hydroelastic_shapes(
         soft_pad = any(component.endswith("_elastomer") for component in components) and any(
             pattern in str(label) for pattern in grasp_body_patterns
         )
-        if (
-            thumb_latch_force_space
-            and soft_pad
-            and any(component.endswith("thumb_elastomer") for component in components)
-        ):
+        if soft_pad and any(component.endswith("thumb_elastomer") for component in components):
             solref_mode.values[shape] = _MJWARP_SOLREF_MODE_FORCE_SPACE
-        if not (soft_pad or shape in plugs or (thumb_latch_hydroelastic and shape in latches)):
+        if not (soft_pad or shape in plugs or shape in latches):
             continue
         if soft_pad:
             original = shape
@@ -197,7 +167,7 @@ def configure_hydroelastic_shapes(
             grasp_shapes.append(shape)
             for plug in plugs:
                 builder.add_shape_collision_filter_pair(original, plug)
-            if thumb_latch_hydroelastic and any(component.endswith("thumb_elastomer") for component in components):
+            if any(component.endswith("thumb_elastomer") for component in components):
                 thumb_grasp_shapes.add(shape)
                 for latch in latches:
                     builder.add_shape_collision_filter_pair(original, latch)

@@ -19,7 +19,7 @@ from isaaclab_newton.sim.schemas import NewtonCollisionCfg
 import isaaclab.envs.mdp as base_mdp
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg, CableObjectCfg, RigidObjectCfg, VisualMaterialCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, CableObjectCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg, ObservationGroupCfg, ObservationTermCfg, RewardTermCfg, TerminationTermCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -28,6 +28,7 @@ from isaaclab.visualizers import VisualizerCfg
 
 from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 
+from isaaclab_tasks.core.lift.mdp.observations import cable_segment_positions_in_robot_root_frame
 from isaaclab_tasks.utils import PresetCfg
 
 from . import mdp
@@ -38,7 +39,6 @@ from .assets import (
     RIZON_SHARPA_RIGHT_HAND_LIMITS_RAD,
 )
 from .cable import CONNECTOR_SPAN_M, PATCH_CABLE_COLOR, PatchCableCfg, hanging_cable_positions
-from .presentation import InstallationPresentationCfg, SwitchboardActivity
 from .robot_cfg import ROBOT_BASE_POSITION_E, rizon_sharpa_articulation_cfg
 from .workcell import SOCKET_POSITION_E, UPPER_SOCKET_POSITION_E
 
@@ -98,18 +98,6 @@ class GB300SharpaSceneCfg(InteractiveSceneCfg):
         spawn=None,
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.52, 0.24, 2.04), rot=(math.sqrt(0.5), 0, 0, math.sqrt(0.5))),
     )
-    presentation = AssetBaseCfg(prim_path="{ENV_REGEX_NS}/RackPresentation", spawn=InstallationPresentationCfg())
-    activity_a = VisualMaterialCfg(
-        prim_path="{ENV_REGEX_NS}/RackPresentation/Looks/ActivityA", spawn=None, channels=("color", "emissive_color")
-    )
-    activity_b = VisualMaterialCfg(
-        prim_path="{ENV_REGEX_NS}/RackPresentation/Looks/ActivityB", spawn=None, channels=("color", "emissive_color")
-    )
-    activity_target = VisualMaterialCfg(
-        prim_path="{ENV_REGEX_NS}/RackPresentation/Looks/ActivityTarget",
-        spawn=None,
-        channels=("color", "emissive_color"),
-    )
 
 
 @configclass
@@ -123,7 +111,7 @@ class ActionsCfg:
     right_palm = NewtonInverseKinematicsActionCfg(
         asset_name="robot",
         joint_names=list(RIZON_SHARPA_ARM_JOINT_NAMES),
-        controller=NewtonIKSolverCfg(iterations=4, use_cuda_graph=True),
+        controller=NewtonIKSolverCfg(iterations=4),
         objectives=[
             NewtonIKPoseObjectiveCfg(
                 name="right_palm",
@@ -167,7 +155,7 @@ class ObservationsCfg:
         head = ObservationTermCfg(func=mdp.head_state)
         latch = ObservationTermCfg(func=mdp.latch_state)
         goal = ObservationTermCfg(func=mdp.goal_state)
-        cable = ObservationTermCfg(func=mdp.cable_state)
+        cable = ObservationTermCfg(func=cable_segment_positions_in_robot_root_frame)
         actions = ObservationTermCfg(func=base_mdp.last_action)
         enable_corruption = False
 
@@ -177,7 +165,6 @@ class ObservationsCfg:
 @configclass
 class EventsCfg:
     reset_scene = EventTermCfg(func=base_mdp.reset_scene_to_default, mode="reset", params={"reset_joint_targets": True})
-    activity = EventTermCfg(func=SwitchboardActivity, mode="interval", interval_range_s=(0.1, 0.1))
 
 
 @configclass
@@ -209,8 +196,6 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
     curriculum = None
     decimation = 2
     episode_length_s = 60.0
-    presentation_enabled: bool = False
-    """Include render-only GB300 racks, architecture, installed leads and status lights."""
     hydroelastic_contacts: bool = False
     """Use hydroelastic hand/plug/clip contacts."""
     one_way_cable: bool = False
@@ -232,14 +217,8 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
     )
 
     def __post_init__(self) -> None:
-        if self.one_way_cable and not self.hydroelastic_contacts:
-            raise ValueError("one_way_cable requires hydroelastic_contacts.")
-        if not self.presentation_enabled:
-            self.scene.presentation = self.scene.activity_a = self.scene.activity_b = None
-            self.scene.activity_target = None
-            self.events.activity = None
-        else:
-            self.scene.presentation.spawn.target_socket_position_e = self.target_socket_position_e
+        if self.one_way_cable != self.hydroelastic_contacts:
+            raise ValueError("Hydroelastic contact requires the one-way cable boundary.")
         if self.hydroelastic_contacts:
             self.scene.cable.spawn.rigid_connector = True
             self.scene.latch = None
@@ -283,7 +262,7 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
                         solver_cfg=_ContactHistoryVBDSolverCfg(
                             iterations=12,
                             rigid_compliant_alm=True,
-                            rigid_body_contact_buffer_size=512,
+                            rigid_body_contact_buffer_size=1024,
                         ),
                     ),
                 ],
@@ -302,7 +281,7 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
         if self.hydroelastic_contacts:
             from .hydroelastic import configure_hydroelastic_physics
 
-            configure_hydroelastic_physics(self.sim.physics, one_way_cable=self.one_way_cable)
+            configure_hydroelastic_physics(self.sim.physics)
 
 
 @configclass
@@ -311,7 +290,6 @@ class GB300SharpaScriptedEnvCfg(GB300SharpaInsertionEnvCfg):
 
     actions = AbsoluteActionsCfg()
     decimation = 4
-    presentation_enabled: bool = True
     hydroelastic_contacts: bool = True
     one_way_cable: bool = True
     grasp_body_patterns: tuple[str, ...] = (
@@ -323,7 +301,6 @@ class GB300SharpaScriptedEnvCfg(GB300SharpaInsertionEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.sim.physics.capture_implicit_actuators = True
         # Millimeter-scale grasps do not need the default 10 mm search halo.
         self.scene.robot.spawn.collision_props = {
             "/.*": [NewtonCollisionCfg(contact_gap=0.001)],
@@ -331,30 +308,23 @@ class GB300SharpaScriptedEnvCfg(GB300SharpaInsertionEnvCfg):
             "/right_(?:ring|pinky)_.*/.*": [sim_utils.UsdPhysicsCollisionCfg(collision_enabled=False)],
         }
         rigid, cable = self.sim.physics.solver_cfg.entries
-        if self.one_way_cable:
-            # Refresh tight socket contacts without increasing rigid integration frequency.
-            self.sim.physics.num_substeps = 4
-            self.sim.physics.collision_cfg.contact_matching = "latest"
-            rigid.substeps = 2
-            rigid.solver_cfg.update_data_interval = 4
-            cable.substeps = 2
-            cable.solver_cfg.iterations = 8
-            self.scene.cable.spawn.physics_material.bend_stiffness *= 2.0
-            self.scene.cable.spawn.physics_material.twist_stiffness *= 2.0
-            self.scene.cable.spawn.latch_damping_scale = 3.0
-        else:
-            self.sim.physics.num_substeps = 32
-            # Preserve clip integration resolution while reducing coupling passes.
-            self.sim.physics.solver_cfg.iterations = 2
-            self.sim.physics.solver_cfg.rho = 200.0
+        # Refresh tight socket contacts without increasing rigid integration frequency.
+        self.sim.physics.num_substeps = 4
+        self.sim.physics.collision_cfg.contact_matching = "latest"
+        rigid.substeps = 2
+        rigid.solver_cfg.update_data_interval = 4
+        cable.substeps = 2
+        cable.solver_cfg.iterations = 8
+        self.scene.cable.spawn.physics_material.bend_stiffness *= 2.0
+        self.scene.cable.spawn.physics_material.twist_stiffness *= 2.0
+        self.scene.cable.spawn.latch_damping_scale = 3.0
         for name in ("right_thumb", "right_fingers"):
             actuator = self.scene.robot.actuators[name]
             actuator.stiffness = 96.0
             actuator.damping = 2.4
-            if self.one_way_cable:
-                # Honor the authored per-joint limits; regularize tiny finger inertias.
-                actuator.joint_effort_limit = None
-                actuator.armature = 2.0e-4
+            # Honor the authored per-joint limits; regularize tiny finger inertias.
+            actuator.joint_effort_limit = None
+            actuator.armature = 2.0e-4
         rigid.solver_cfg.nconmax = 2048
         rigid.solver_cfg.njmax = 2048
 

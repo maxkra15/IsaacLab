@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 from isaaclab_newton.cloner import newton_builder_world_hook
 
 from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.utils.version import has_kit
 
 from .assets import configured_rizon_sharpa_usd
 
@@ -34,7 +33,7 @@ class GB300SharpaInsertionEnv(ManagerBasedRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
     def _init_sim(self) -> None:
-        from .cable import add_connectors, configure_patch_cable_rendering
+        from .cable import add_connectors
 
         def build_connectors(
             builder: newton.ModelBuilder, world_idx: int, env_position: np.ndarray, env_rotation: np.ndarray
@@ -55,19 +54,11 @@ class GB300SharpaInsertionEnv(ManagerBasedRLEnv):
                 configure_hydroelastic_shapes(
                     builder,
                     self.cfg.grasp_body_patterns,
-                    thumb_latch_force_space=True,
-                    thumb_latch_hydroelastic=True,
                     pad_pressure_gradient=self.cfg.hydroelastic_pad_pressure_gradient,
                 )
 
         with newton_builder_world_hook(build_connectors):
             super()._init_sim()
-        if has_kit():
-            for env_path in self.scene.env_prim_paths:
-                configure_patch_cable_rendering(self.sim.stage, f"{env_path}/Cable")
-                if self.cfg.presentation_enabled:
-                    # Native rack CAD is visual-only and loads after model finalization.
-                    self.sim.stage.Load(f"{env_path}/RackPresentation/Racks")
 
     def load_managers(self) -> None:
         self.tcp_body_id = self.scene["robot"].find_bodies(self.cfg.tcp_body_name)[0][0]

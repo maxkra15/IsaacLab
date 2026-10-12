@@ -306,20 +306,6 @@ class PatchCableCfg(sim_utils.CableCfg):
     """Scale the imported rigid connector's inertia-derived spring-clip damping."""
 
 
-def configure_patch_cable_rendering(stage: Usd.Stage, cable_path: str) -> None:
-    """Display a round cable after Newton has imported its physical cross-section frames.
-
-    USD normals turn a BasisCurves tube into a flat ribbon. Hide those normals
-    only in the session layer, retaining the authored source frames and all
-    finalized Newton physics. Call after simulation initialization.
-    """
-    from pxr import Usd, UsdGeom
-
-    curve = UsdGeom.BasisCurves(stage.GetPrimAtPath(f"{cable_path}/geometry/mesh"))
-    with Usd.EditContext(stage, stage.GetSessionLayer()):
-        curve.GetNormalsAttr().Block()
-
-
 def _pin_seated_tail(builder: newton.ModelBuilder, tail: int) -> None:
     """Prescribe the seated cable boundary without redundant plug contacts."""
     import newton
@@ -426,16 +412,6 @@ def add_connectors(
             builder.body_flags[start] = int(newton.BodyFlags.KINEMATIC)
             builder.body_inv_mass[start] = 0.0
             builder.body_inv_inertia[start] = wp.mat33(0.0)
-        else:
-            # Reuse the native rod's free root for the ADMM proximal attachment.
-            builder.add_joint_fixed(
-                parent=start,
-                child=head_body,
-                parent_xform=wp.transform_multiply(
-                    wp.transform_inverse(builder.body_q[start]), builder.body_q[head_body]
-                ),
-                label=f"{root}/head/strain_relief",
-            )
         _filter_terminal_rod_contacts(builder, start, grasp_body_patterns)
     latch_bodies = [
         body

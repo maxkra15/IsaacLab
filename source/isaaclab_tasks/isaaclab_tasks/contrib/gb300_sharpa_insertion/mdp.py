@@ -57,15 +57,6 @@ def goal_state(env: GB300SharpaInsertionEnv) -> torch.Tensor:
     return torch.cat((position, rotation), dim=-1)
 
 
-def cable_state(env: GB300SharpaInsertionEnv) -> torch.Tensor:
-    """Return flattened cable segment positions in the robot base frame [m]."""
-    robot = env.scene["robot"].data.root_pose_w.torch
-    poses = env.scene["cable"].data.segment_pose_w.torch
-    roots = robot[:, None].expand_as(poses)
-    position, _ = subtract_frame_transforms(roots[..., :3], roots[..., 3:], poses[..., :3], poses[..., 3:])
-    return position.flatten(1)
-
-
 def latch_state(env: GB300SharpaInsertionEnv) -> torch.Tensor:
     """Return clip deflection [rad] and hinge angular velocity [rad/s], shape [N, 2].
 

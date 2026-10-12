@@ -61,6 +61,16 @@ def _sample_shape_distances(
     distances[index] = texture_sample_sdf(sdfs[sdf_indices[shape]], local_point)
 
 
+def _contact_pairs(contacts):
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    return {
+        tuple(sorted(pair))
+        for pair in zip(
+            contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count], strict=True
+        )
+    }
+
+
 @pytest.mark.parametrize("device", test_devices(DeviceScope.CUDA))
 def test_native_pad_field_preserves_scaled_surface_mass_and_material(device):
     """Cooking grasp copies also accelerates the unchanged ordinary collision surface."""
@@ -129,13 +139,7 @@ def test_native_pad_field_preserves_scaled_surface_mass_and_material(device):
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
-    count = int(contacts.rigid_contact_count.numpy()[0])
-    pairs = {
-        tuple(sorted(pair))
-        for pair in zip(
-            contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count], strict=True
-        )
-    }
+    pairs = _contact_pairs(contacts)
     assert tuple(sorted((pad, proximal_shape))) not in pairs
     assert tuple(sorted((pad, other_shape))) in pairs, "Cross-finger collisions must remain active."
 
@@ -160,7 +164,6 @@ def test_cable_collision_scope_preserves_source_hydroelastic_and_dynamic_contact
         source_pairs = model.shape_contact_pairs.numpy().copy()
         source = newton.CollisionPipeline(model)
         source_contacts = source.contacts()
-        source.collide(model.state(), source_contacts)
 
         view = ModelView(model, "cable")
         flags = model.body_flags.numpy()
@@ -171,13 +174,7 @@ def test_cable_collision_scope_preserves_source_hydroelastic_and_dynamic_contact
         contacts = destination.contacts()
         destination.collide(model.state(), contacts)
 
-    count = int(contacts.rigid_contact_count.numpy()[0])
-    pairs = {
-        tuple(sorted(pair))
-        for pair in zip(
-            contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count], strict=True
-        )
-    }
+    pairs = _contact_pairs(contacts)
     assert (hand_shape, cable_shape) in pairs
     assert (cable_shape, rack_shape) in pairs
     assert (cable_shape, ground_shape) in pairs
@@ -185,15 +182,7 @@ def test_cable_collision_scope_preserves_source_hydroelastic_and_dynamic_contact
     assert destination.hydroelastic_sdf is None, "Prescribed rigid contacts must not allocate a second pressure field."
     np.testing.assert_array_equal(model.shape_contact_pairs.numpy(), source_pairs)
     source.collide(model.state(), source_contacts)
-    count = int(source_contacts.rigid_contact_count.numpy()[0])
-    pairs = {
-        tuple(sorted(pair))
-        for pair in zip(
-            source_contacts.rigid_contact_shape0.numpy()[:count],
-            source_contacts.rigid_contact_shape1.numpy()[:count],
-            strict=True,
-        )
-    }
+    pairs = _contact_pairs(source_contacts)
     assert (hand_shape, plug_shape) in pairs, "The source must retain real hydroelastic grasp contacts."
 
 
@@ -243,36 +232,35 @@ def test_cable_endpoint_follows_measured_plug_twist_through_captured_step_and_re
         with wp.ScopedCapture(device=device) as capture:
             advance()
 
-        poses, velocities = model.body_q.numpy(), model.body_qd.numpy()
-        poses[plug] = (1, 2, 3, 0, 0, quarter_turn, quarter_turn)
-        velocities[plug] = (1, 2, 3, 0, 0, 4)
-        state_in.body_q.assign(poses)
-        state_in.body_qd.assign(velocities)
-        wp.capture_launch(capture.graph)
-        np.testing.assert_allclose(state_out.body_q.numpy()[endpoint], (1, 2.04, 3, 0.5, 0.5, 0.5, 0.5), atol=1e-6)
-        # Endpoint COM minus plug COM is (0, 0.03, 0.02); omega cross offset is (-0.12, 0, 0).
-        for state in (state_in, state_out):
-            np.testing.assert_allclose(state.body_q.numpy()[plug], poses[plug], atol=1e-6)
-            np.testing.assert_allclose(state.body_qd.numpy()[plug], velocities[plug], atol=1e-6)
-            np.testing.assert_allclose(state.body_qd.numpy()[endpoint], (0.88, 2, 3, 0, 0, 4), atol=1e-6)
-            np.testing.assert_allclose(state.body_q.numpy()[tail], (0, 0.25, 0.5, 0, 0, 0, 1), atol=1e-6)
-            np.testing.assert_allclose(state.body_qd.numpy()[tail], 0, atol=1e-6)
         assert not model.shape_flags.numpy()[tail_shape] & int(newton.ShapeFlags.COLLIDE_SHAPES)
-
-        poses[plug] = (-2, 0.5, 1, 0, 0, 0, 1)
-        velocities.fill(0)
-        state_in.body_q.assign(poses)
-        state_in.body_qd.assign(velocities)
-        solver.reset(state_in, flags=0)
-        wp.capture_launch(capture.graph)
-        np.testing.assert_allclose(
-            state_out.body_q.numpy()[endpoint], (-1.96, 0.5, 1, quarter_turn, 0, 0, quarter_turn), atol=1e-6
+        poses, velocities = model.body_q.numpy(), model.body_qd.numpy()
+        cases = (
+            (
+                (1, 2, 3, 0, 0, quarter_turn, quarter_turn),
+                (1, 2, 3, 0, 0, 4),
+                (1, 2.04, 3, 0.5, 0.5, 0.5, 0.5),
+                (0.88, 2, 3, 0, 0, 4),
+            ),
+            ((-2, 0.5, 1, 0, 0, 0, 1), (0,) * 6, (-1.96, 0.5, 1, quarter_turn, 0, 0, quarter_turn), (0,) * 6),
         )
-        for state in (state_in, state_out):
-            np.testing.assert_allclose(state.body_q.numpy()[plug], poses[plug], atol=1e-6)
-            np.testing.assert_allclose(state.body_qd.numpy()[plug], 0, atol=1e-6)
-            np.testing.assert_allclose(state.body_qd.numpy()[endpoint], 0, atol=1e-6)
-            np.testing.assert_allclose(state.body_q.numpy()[tail], (0, 0.25, 0.5, 0, 0, 0, 1), atol=1e-6)
+        # The first COM offset is (0, 0.03, 0.02); omega cross offset is (-0.12, 0, 0).
+        for index, case in enumerate(cases):
+            plug_pose, plug_twist, endpoint_pose, endpoint_twist = case
+            poses[plug], velocities[plug] = plug_pose, plug_twist
+            state_in.body_q.assign(poses)
+            state_in.body_qd.assign(velocities)
+            if index:
+                solver.reset(state_in, flags=0)
+            wp.capture_launch(capture.graph)
+            for state in (state_in, state_out):
+                np.testing.assert_allclose(
+                    state.body_q.numpy()[[plug, endpoint, tail]],
+                    (plug_pose, endpoint_pose, (0, 0.25, 0.5, 0, 0, 0, 1)),
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    state.body_qd.numpy()[[plug, endpoint, tail]], (plug_twist, endpoint_twist, (0,) * 6), atol=1e-6
+                )
         np.testing.assert_array_equal(model.body_flags.numpy(), original_flags)
 
 

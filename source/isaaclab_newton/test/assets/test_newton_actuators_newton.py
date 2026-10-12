@@ -528,88 +528,42 @@ def _make_target_mode_builder(
 
 
 @pytest.mark.parametrize(
-    (
-        "actuator_cfg",
-        "use_newton_actuators",
-        "capture_implicit_actuators",
-        "expected_native_groups",
-        "expected_activation",
-    ),
+    ("actuator_cfg", "expected_native_groups"),
     [
-        (ImplicitActuatorCfg(joint_names_expr=["joint"], stiffness=10.0, damping=1.0), True, True, set(), True),
-        (ImplicitActuatorCfg(joint_names_expr=["joint"], stiffness=10.0, damping=1.0), True, None, set(), False),
-        (IdealPDActuatorCfg(joint_names_expr=["joint"], stiffness=None, damping=None), True, True, {"explicit"}, True),
-        (IdealPDActuatorCfg(joint_names_expr=["joint"], stiffness=None, damping=None), True, None, {"explicit"}, True),
-        (
-            ImplicitActuatorCfg(class_type=CustomDrive, joint_names_expr=["joint"], stiffness=10.0, damping=1.0),
-            True,
-            True,
-            set(),
-            False,
-        ),
-        (ImplicitActuatorCfg(joint_names_expr=["joint"], stiffness=10.0, damping=1.0), False, True, set(), False),
-        (None, False, True, set(), False),
+        (ImplicitActuatorCfg(joint_names_expr=["joint"], stiffness=10.0, damping=1.0), set()),
+        (IdealPDActuatorCfg(joint_names_expr=["joint"], stiffness=None, damping=None), {"explicit"}),
     ],
-    ids=[
-        "implicit_captured",
-        "implicit_default",
-        "explicit",
-        "explicit_default",
-        "custom_implicit",
-        "disabled",
-        "empty",
-    ],
+    ids=["implicit", "explicit"],
 )
-def test_prepare_native_actuators_preserves_solver_drives(
-    monkeypatch,
-    actuator_cfg,
-    use_newton_actuators,
-    capture_implicit_actuators,
-    expected_native_groups,
-    expected_activation,
-):
-    """Preserve drives and eager execution regardless of articulation construction order.
+def test_prepare_native_actuators_activates_only_explicit_groups(monkeypatch, actuator_cfg, expected_native_groups):
+    """Keep implicit-only articulations on the solver-drive path and leave solver gains untouched.
 
-    Collection construction resolves gains later, on both implicit and explicit paths.
+    Explicit groups activate the Newton-actuator path without writing gains; collection construction resolves
+    the actuator defaults later.
     """
-    # Only mixed native/eager articulations exercise ordering-dependent eligibility.
-    for eligible_first in (False, True) if actuator_cfg is not None and not expected_activation else (False,):
-        gain_writes = []
-        physics_cfg = NewtonCfg()
-        if capture_implicit_actuators is not None:
-            physics_cfg.capture_implicit_actuators = capture_implicit_actuators
-        articulation = SimpleNamespace(
-            _sim_cfg=SimpleNamespace(use_newton_actuators=use_newton_actuators, physics=physics_cfg),
-            device="cpu",
-            find_joints=lambda _: ([0], ["joint"]),
-            write_joint_stiffness_to_sim_index=lambda **_: gain_writes.append("stiffness"),
-            write_joint_damping_to_sim_index=lambda **_: gain_writes.append("damping"),
-        )
-        monkeypatch.setattr(SimulationManager, "backend", None)
-        monkeypatch.setattr(SimulationManager, "_adapter", None)
-        monkeypatch.setattr(SimulationManager, "_use_newton_actuators_active", False, raising=False)
-        monkeypatch.setattr(SimulationManager, "_requires_eager_actuator_updates", False, raising=False)
+    activation_calls = []
+    gain_writes = []
+    articulation = SimpleNamespace(
+        _sim_cfg=SimpleNamespace(use_newton_actuators=True),
+        device="cpu",
+        find_joints=lambda _: ([0], ["joint"]),
+        write_joint_stiffness_to_sim_index=lambda **_: gain_writes.append("stiffness"),
+        write_joint_damping_to_sim_index=lambda **_: gain_writes.append("damping"),
+    )
+    monkeypatch.setattr(SimulationManager, "activate_newton_actuator_path", lambda: activation_calls.append(True))
 
-        eligible_articulation = SimpleNamespace(
-            _sim_cfg=SimpleNamespace(use_newton_actuators=True, physics=NewtonCfg(capture_implicit_actuators=True))
-        )
-        eligible_control = NewtonActuatorControl(eligible_articulation)
-        eligible_cfgs = {"joint": ImplicitActuatorCfg(joint_names_expr=["joint"], stiffness=10.0, damping=1.0)}
-        if eligible_first:
-            eligible_control.prepare_native_actuators(collection=None, actuator_cfgs=eligible_cfgs)
+    control = NewtonActuatorControl(articulation)
+    group_name = "explicit" if expected_native_groups else "implicit"
+    native_groups = control.prepare_native_actuators(collection=None, actuator_cfgs={group_name: actuator_cfg})
 
-        control = NewtonActuatorControl(articulation)
-        group_name = "explicit" if expected_native_groups else "implicit"
-        actuator_cfgs = {} if actuator_cfg is None else {group_name: actuator_cfg}
-        native_groups = control.prepare_native_actuators(collection=None, actuator_cfgs=actuator_cfgs)
-        if not eligible_first:
-            eligible_control.prepare_native_actuators(collection=None, actuator_cfgs=eligible_cfgs)
-
-        assert native_groups == expected_native_groups
-        assert gain_writes == []
-        assert control.native_actuator_path_active is expected_activation
-        assert articulation._has_newton_actuators is expected_activation
-        assert SimulationManager.handles_decimation() is (expected_activation or not actuator_cfgs)
+    assert native_groups == expected_native_groups
+    assert gain_writes == []
+    if expected_native_groups:
+        assert activation_calls == [True]
+    else:
+        assert not control.native_actuator_path_active
+        assert not articulation._has_newton_actuators
+        assert activation_calls == []
 
 
 @pytest.mark.parametrize(
@@ -825,44 +779,6 @@ def test_newton_actuators_match_lab_actuators(lab_run: dict, newton_run: _Run, i
 def test_decimated_remotized_pd_matches_lab_actuators(decimated_runs: dict) -> None:
     """RemotizedPD with decimation 2 and CUDA-graph capture: Lab vs Newton."""
     _assert_equivalent(decimated_runs["lab"], decimated_runs["newton"])
-
-
-def test_decimated_implicit_only_actuators_preserve_trajectory_and_telemetry(device: str) -> None:
-    """Capture implicit-only control while preserving live targets, ordering, and saturated telemetry."""
-    actuators = {
-        "hips": ImplicitActuatorCfg(
-            joint_names_expr=[".*HAA", ".*HFE"], stiffness=40.0, damping=5.0, joint_effort_limit=2.0
-        ),
-        "knees": ImplicitActuatorCfg(joint_names_expr=[".*KFE"], stiffness=60.0, damping=1.5, joint_effort_limit=2.0),
-    }
-    islands = {
-        "implicit": _Island(
-            actuators,
-            joint_ordering=_LEG_REORDERED_JOINT_NAMES,
-            feedforward=4.0,
-            ramp_targets=True,
-        )
-    }
-    results = {}
-    for use_newton_actuators in (False, True):
-        sim_cfg = newton_sim_cfg(
-            device,
-            use_newton_actuators=use_newton_actuators,
-            solver_cfg=_solver_cfg(),
-            num_substeps=2,
-            use_cuda_graph=True,
-            capture_implicit_actuators=True,
-        )
-        with build_simulation_context(sim_cfg=sim_cfg) as sim:
-            run = _run(sim, islands, use_newton_actuators, num_steps=5, decimation=2)
-            assert sim.physics_manager.handles_decimation() is use_newton_actuators
-            results[use_newton_actuators] = run.results["implicit"]
-    _assert_equivalent(results[False], results[True])
-    for result in results.values():
-        assert any(
-            not torch.allclose(applied, computed)
-            for applied, computed in zip(result["applied_effort"], result["computed_effort"])
-        ), "implicit effort saturation must bind for this telemetry regression"
 
 
 def test_dc_motor_clamp_binds(lab_run: dict, newton_run: _Run) -> None:

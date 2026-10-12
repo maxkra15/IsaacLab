@@ -29,15 +29,6 @@ class NewtonIKSolverCfg:
     objectives=..., link_resolver=...)``.
     """
 
-    use_cuda_graph: bool = False
-    """Capture and replay CUDA solves instead of launching each iteration eagerly.
-
-    Supports analytic LM with ``sampler="none"``. CPU solves remain eager.
-    The first solve warms up the kernels and captures subsequent solves. Targets
-    and input seeds may change, but the model, objectives, and solver configuration
-    must remain unchanged after capture. Capture errors are propagated.
-    """
-
     optimizer: str = "lm"
     """Newton IK optimizer backend. Supported values are ``"lm"`` and ``"lbfgs"``."""
 

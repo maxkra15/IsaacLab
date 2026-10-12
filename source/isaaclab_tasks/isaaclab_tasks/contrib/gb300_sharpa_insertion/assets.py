@@ -6,7 +6,7 @@
 """External asset provenance, validation, and immutable connector CAD geometry.
 
 Licensed USD payloads are not redistributed with the task. The robot needs its
-complete texture bundle; GB300 presentation is optional for physics and training.
+complete texture bundle.
 """
 
 from __future__ import annotations
@@ -28,6 +28,9 @@ RIZON_SHARPA_USD_NAME = "rizon4s_sharpa_no_spheres_generated.usd"
 RIZON_SHARPA_BUNDLE_SHA256 = "ae5d22792b44fb6d29a7691d4276bc061a5529132f01e7a0eb5795a482595d63"
 RIZON_SHARPA_BUNDLE_SIZE_BYTES = 379_258_308
 RIZON_SHARPA_ASSET_ROOT_ENV = "ISAACLAB_FABRICS_SIM_RIZON_SHARPA_ROOT"
+
+# The measured socket geometry uses this CAD revision as its SDF cache key.
+GB300_SIMREADY_EXTERNAL_USD_SHA256 = "5e0b7b3b58d005b24909b8d2e735c49997f8dbea72352b51911326343ef1e7bb"
 
 # Fabrics-Sim authors this fixed child from measured knuckle geometry. Its
 # canonical axes are X toward the knuckles and Z out of the palm. The native
@@ -157,68 +160,6 @@ def configured_rizon_sharpa_usd(*, required: bool) -> Path | None:
             )
         return None
     return verify_rizon_sharpa_bundle(candidate)
-
-
-GB300_SIMREADY_REVISION = "5938869019f0d2afb6b9b808ed1ab1bc6e0e0961"
-GB300_SIMREADY_RELATIVE_PATH = "GB300/simready_usd/payloads/external.usd"
-GB300_SIMREADY_EXTERNAL_USD_SHA256 = "5e0b7b3b58d005b24909b8d2e735c49997f8dbea72352b51911326343ef1e7bb"
-GB300_SIMREADY_EXTERNAL_USD_SIZE = 473_434_496
-GB300_SIMREADY_ASSET_ROOT_ENV = "ISAACLAB_SIMREADY_DSX_GB300_ROOT"
-GB300_SIMREADY_DOWNLOAD_URL = (
-    "https://huggingface.co/datasets/nvidia/simready-dsx/resolve/"
-    f"{GB300_SIMREADY_REVISION}/{GB300_SIMREADY_RELATIVE_PATH}?download=true"
-)
-
-
-def default_gb300_external_usd_path() -> Path:
-    """Return the content-addressed default cache path for the external rack USD."""
-    return (
-        Path.home()
-        / ".cache"
-        / "isaaclab"
-        / "simready-dsx"
-        / "sha256"
-        / GB300_SIMREADY_EXTERNAL_USD_SHA256
-        / "external.usd"
-    )
-
-
-@lru_cache(maxsize=4)
-def verify_gb300_external_usd(path: str | Path) -> Path:
-    """Verify and return one exact local GB300 external payload."""
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"Pinned GB300 external USD is missing: {resolved}")
-    size = resolved.stat().st_size
-    if size != GB300_SIMREADY_EXTERNAL_USD_SIZE:
-        raise RuntimeError(
-            f"GB300 external USD size mismatch: expected {GB300_SIMREADY_EXTERNAL_USD_SIZE}, got {size}."
-        )
-    with resolved.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    if digest != GB300_SIMREADY_EXTERNAL_USD_SHA256:
-        raise RuntimeError(
-            f"GB300 external USD SHA-256 mismatch: expected {GB300_SIMREADY_EXTERNAL_USD_SHA256}, got {digest}."
-        )
-    return resolved
-
-
-def configured_gb300_external_usd(*, required: bool) -> Path | None:
-    """Resolve the configured payload, optionally failing when it is absent."""
-    configured_root = os.environ.get(GB300_SIMREADY_ASSET_ROOT_ENV)
-    if configured_root:
-        root = Path(configured_root).expanduser()
-        candidate = root if root.suffix.lower() in (".usd", ".usda", ".usdc") else root / "external.usd"
-    else:
-        candidate = default_gb300_external_usd_path()
-    if not candidate.is_file():
-        if required:
-            raise FileNotFoundError(
-                "The GB300 Kit presentation needs the pinned SimReady payload. Download "
-                f"{GB300_SIMREADY_DOWNLOAD_URL} to {candidate}, or set {GB300_SIMREADY_ASSET_ROOT_ENV}."
-            )
-        return None
-    return verify_gb300_external_usd(candidate)
 
 
 RJ45_PLUG_SHA256 = "50c95bcfb63544777f9148d548aac6f16b62f65cacbaaa9316453d579de4b4fa"

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import gc
 from collections.abc import Callable, Sequence
 
 import newton.ik as ik
@@ -28,7 +27,8 @@ class NewtonIKSolver:
     concrete Newton objectives are appended to the underlying
     :class:`newton.ik.IKSolver`. The built objectives are exposed via
     :attr:`objectives` / :attr:`objectives_by_name`; callers update a pose
-    objective's targets through its Newton position and rotation objectives.
+    objective's target by calling :meth:`~..newton_ik_objectives.NewtonIKPoseObjective.set_target_pose`
+    on it directly.
 
     The solver solves ``num_envs`` independent problems and is agnostic to how
     targets are produced -- the prototype-broadcast policy used by the Newton IK
@@ -68,12 +68,6 @@ class NewtonIKSolver:
             solver_objectives.extend(objective.solver_objectives)
 
         self.joint_q_out = wp.zeros((num_envs, model.joint_coord_count), dtype=wp.float32, device=device)
-        self._graph: wp.Graph | None = None
-        self._seed: wp.array | None = None
-        if cfg.use_cuda_graph and self.joint_q_out.device.is_cuda:
-            if (cfg.optimizer, cfg.jacobian_mode, cfg.sampler) != ("lm", "analytic", "none"):
-                raise ValueError("Newton IK CUDA graph capture requires analytic LM with sampler='none'.")
-            self._seed = wp.empty_like(self.joint_q_out)
         self.solver = ik.IKSolver(
             model=model,
             n_problems=num_envs,
@@ -98,52 +92,15 @@ class NewtonIKSolver:
         return self.solver.joint_q
 
     def solve(self, joint_pos: wp.array) -> wp.array:
-        """Solve IK from joint coordinates without modifying the input seed.
+        """Solve IK from the Warp seed ``joint_pos``, shape ``[num_envs, joint_coord_count]``.
 
-        With CUDA graph capture enabled, input seeds are copied into stable solver-owned
-        storage on each call. Update objective targets through their existing setters or
-        target arrays; replacing objective buffers after capture is not supported.
-
-        Args:
-            joint_pos: Joint coordinates [m or rad, depending on joint type], shape
-                ``[num_envs, joint_coord_count]``, on the solver device.
-
-        Returns:
-            Joint coordinates [m or rad, depending on joint type], with the same shape.
-            This solver-owned buffer is overwritten on the next solve.
+        Returns the solver's output buffer, overwritten on the next solve -- consume
+        or copy it before solving again.
         """
-        if self._seed is None:
-            self._solve(joint_pos)
-            return self.joint_q_out
-
-        if (
-            joint_pos.shape != self._seed.shape
-            or joint_pos.dtype != self._seed.dtype
-            or joint_pos.device != self._seed.device
-        ):
-            raise ValueError("Newton IK seed must match the output buffer's shape, dtype, and device.")
-        wp.copy(self._seed, joint_pos)
-        if self._graph is None:
-            # Compile every iteration before capture; this warmup is also the first solve.
-            self._solve(self._seed)
-            wp.synchronize_device(self._seed.device)
-            collection_enabled = gc.isenabled()
-            gc.disable()
-            try:
-                with wp.ScopedCapture(device=self._seed.device) as capture:
-                    self._solve(self._seed)
-                self._graph = capture.graph
-            finally:
-                if collection_enabled:
-                    gc.enable()
-        else:
-            wp.capture_launch(self._graph)
-        return self.joint_q_out
-
-    def _solve(self, joint_pos: wp.array) -> None:
         self.solver.step(
             joint_pos,
             self.joint_q_out,
             iterations=self.cfg.iterations,
             step_size=self.cfg.step_size,
         )
+        return self.joint_q_out

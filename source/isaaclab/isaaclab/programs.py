@@ -62,13 +62,10 @@ def _run_script(path: Path) -> None:
     module.__package__ = None
     module.__spec__ = None
     original_main = sys.modules.get("__main__")
-    original_path = sys.path
     try:
         sys.modules["__main__"] = module
-        sys.path = [str(path.parent), *original_path]
         exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     finally:
-        sys.path = original_path
         if original_main is None:
             sys.modules.pop("__main__", None)
         else:

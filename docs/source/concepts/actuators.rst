@@ -647,24 +647,9 @@ model through the shared host adapter during
 :meth:`~isaaclab.assets.Articulation.write_data_to_sim`.
 
 On Newton, native actuators run in the CUDA-graph-captured region. Implicit actuators are unchanged:
-the solver still applies their PD gains. To include collections containing only ordinary implicit
-actuators in Newton's physics-owned decimation loop, opt in with
-:attr:`~isaaclab_newton.physics.NewtonCfg.capture_implicit_actuators` while
-``SimulationCfg.use_newton_actuators=True``. The default keeps their per-physics-step Isaac Lab
-execution. Custom implicit models that override ``compute()`` keep their eager execution path.
-
-.. note::
-
-    When all actuator collections support physics-owned decimation, manager-based environments
-    apply actions once per control step and hold their targets through the physics steps. Enabling
-    implicit-only capture therefore changes the cadence of state-dependent actions, such as
-    inverse kinematics or operational-space control. Solver drive gains, effort limits, and
-    per-physics-step torque telemetry are preserved. Native explicit actuator routing is unaffected
-    by this opt-in.
-
-On CUDA, the host adapter captures actuator staging, model execution, and telemetry publication
-when possible; otherwise it uses eager execution. Stateful native actuators cannot run in a
-caller-owned CUDA graph, so the host adapter manages them.
+the solver still applies their PD gains. On CUDA, the host adapter captures actuator staging, model
+execution, and telemetry publication when possible; otherwise it uses eager execution. Stateful
+native actuators cannot run in a caller-owned CUDA graph, so the host adapter manages them.
 
 Newton executes native actuators in its controller, and the collection exposes that ownership
 directly: ``robot.actuators[name]`` returns the Newton ``Actuator`` object driving the group's
