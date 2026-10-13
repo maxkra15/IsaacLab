@@ -300,7 +300,7 @@ class PatchCableCfg(sim_utils.CableCfg):
     func = spawn_patch_cable
 
     rigid_connector: bool = False
-    """Whether the loose plug is a separate rigid body physically joined to the rod."""
+    """Use a separate rigid loose plug with a measured one-way VBD cable endpoint."""
 
     latch_damping_scale: float = 1.0
     """Scale the imported rigid connector's inertia-derived spring-clip damping."""
@@ -338,14 +338,10 @@ def _filter_terminal_rod_contacts(
                 builder.add_shape_collision_filter_pair(rod_shape, other)
 
 
-def _filter_embedded_rods(
-    builder: newton.ModelBuilder, head: int, latch: int, start: int, *, one_way_cable: bool
-) -> None:
+def _filter_embedded_rods(builder: newton.ModelBuilder, head: int, latch: int, start: int) -> None:
     """Exclude the rods inside the housing, hinge, and strain relief."""
-    pairs = [(latch, start), (head, start + 1)]
-    if one_way_cable:
-        # The prescribed terminal replaces the fixed joint's parent filtering.
-        pairs.append((head, start))
+    # The prescribed terminal replaces the fixed joint's parent filtering.
+    pairs = [(latch, start), (head, start + 1), (head, start)]
     for body, rod in pairs:
         for shape in builder.body_shapes[body]:
             for rod_shape in builder.body_shapes[rod]:
@@ -360,7 +356,6 @@ def add_connectors(
     *,
     grasp_body_patterns: tuple[str, ...] = (),
     rigid_connector: bool = False,
-    one_way_cable: bool = False,
     rigid_connector_contact_stiffness: float = 1.0e5,
 ) -> None:
     """Add physical connector shapes to native end bodies before model finalization.
@@ -406,12 +401,11 @@ def add_connectors(
         if len(matches) != 1:
             raise ValueError(f"Expected one imported rigid connector at {root}/head, found {len(matches)}.")
         head_body = matches[0]
-        if one_way_cable:
-            # Only the root terminal is prescribed; the remaining rod stays dynamic.
-            builder.body_label[start] = f"{root}/geometry/plug_endpoint"
-            builder.body_flags[start] = int(newton.BodyFlags.KINEMATIC)
-            builder.body_inv_mass[start] = 0.0
-            builder.body_inv_inertia[start] = wp.mat33(0.0)
+        # Only the root terminal is prescribed; the remaining rod stays dynamic.
+        builder.body_label[start] = f"{root}/geometry/plug_endpoint"
+        builder.body_flags[start] = int(newton.BodyFlags.KINEMATIC)
+        builder.body_inv_mass[start] = 0.0
+        builder.body_inv_inertia[start] = wp.mat33(0.0)
         _filter_terminal_rod_contacts(builder, start, grasp_body_patterns)
     latch_bodies = [
         body
@@ -551,7 +545,7 @@ def add_connectors(
             )
         )
     if rigid_connector:
-        _filter_embedded_rods(builder, head_body, latch_body, start, one_way_cable=one_way_cable)
+        _filter_embedded_rods(builder, head_body, latch_body, start)
     # The exact connector owns rack contact. The wider rectangular grip
     # exists only to provide a clean finger contact surface.
     for grip in grip_shapes:

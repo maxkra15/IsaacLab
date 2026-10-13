@@ -198,8 +198,6 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
     episode_length_s = 60.0
     hydroelastic_contacts: bool = False
     """Use hydroelastic hand/plug/clip contacts."""
-    one_way_cable: bool = False
-    """Anchor the VBD cable to the MJWarp plug without feeding cable loads back to the plug."""
     hydroelastic_pad_pressure_gradient: float = 5.0e8
     """Compliant finger-cover pressure gradient [N/m^3]."""
     rigid_connector_contact_stiffness: float = 1.0e5
@@ -217,8 +215,6 @@ class GB300SharpaInsertionEnvCfg(ManagerBasedRLEnvCfg):
     )
 
     def __post_init__(self) -> None:
-        if self.one_way_cable != self.hydroelastic_contacts:
-            raise ValueError("Hydroelastic contact requires the one-way cable boundary.")
         if self.hydroelastic_contacts:
             self.scene.cable.spawn.rigid_connector = True
             self.scene.latch = None
@@ -291,7 +287,6 @@ class GB300SharpaScriptedEnvCfg(GB300SharpaInsertionEnvCfg):
     actions = AbsoluteActionsCfg()
     decimation = 4
     hydroelastic_contacts: bool = True
-    one_way_cable: bool = True
     grasp_body_patterns: tuple[str, ...] = (
         "right_hand_C_MC",
         "right_thumb_",

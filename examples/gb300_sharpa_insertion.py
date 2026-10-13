@@ -7,8 +7,7 @@
 
 The manager-based task owns physics and reset. This example returns ordinary TCP
 and finger targets. Measured poses, finger opening and latch clearance gate the
-sequence. Hydroelastic clip contact requires the corrected Newton checkout
-documented in the task README; select it explicitly with PYTHONPATH.
+sequence. The managed dependencies include the Newton hydroelastic contact correction.
 
 .. code-block:: bash
 

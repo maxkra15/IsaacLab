@@ -45,7 +45,6 @@ class GB300SharpaInsertionEnv(ManagerBasedRLEnv):
                 env_rotation,
                 grasp_body_patterns=self.cfg.grasp_body_patterns,
                 rigid_connector=self.cfg.hydroelastic_contacts,
-                one_way_cable=self.cfg.one_way_cable,
                 rigid_connector_contact_stiffness=self.cfg.rigid_connector_contact_stiffness,
             )
             if self.cfg.hydroelastic_contacts:

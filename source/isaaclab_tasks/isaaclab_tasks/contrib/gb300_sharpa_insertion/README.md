@@ -23,8 +23,8 @@ The PPO configuration is a baseline, not a validated trained policy.
   This access-controlled default must be replaced/validated before public release.
 - Connector: Newton's canonical `rj45_plug.usd`; set `ISAACLAB_RJ45_PLUG_USD`
   if it is absent from the installation. The resolver reports its pinned download URL.
-- Scripted hydroelastic contact currently needs [Newton #4649](https://github.com/newton-physics/newton/pull/4649).
-  Use `PYTHONPATH=/path/to/corrected-newton` until available in the selected dependency.
+- Managed dependencies include the merged [Newton contact-gain fix](https://github.com/newton-physics/newton/pull/4649)
+  and MuJoCo/MJWarp 3.15. No patched checkout or `PYTHONPATH` override is needed.
 
 `--video` uses the standard recorder. `--failure_tail_s 8` keeps recording after
 a controller fault without bypassing its guards. No robot/plug teleport, grasp
