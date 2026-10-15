@@ -50,10 +50,13 @@ def publish(source: Path, output: Path) -> str:
     ]:
         content = re.sub(r"([?&](?:rev|v)=)[\w-]+", rf"\g<1>{revision}", path.read_text())
         content = re.sub(r"(const revision = ')[\w-]+(';)", rf"\g<1>{revision}\2", content)
-        content = content.replace(
+        for source_url in (
             "https://github.com/maxkra15/isaaclab-browser-demos/tree/pages/exporters",
             "https://github.com/isaac-sim/IsaacLab/tree/interactive-releases/exporters",
-        )
+        ):
+            content = content.replace(
+                source_url, "https://github.com/isaac-sim/IsaacLab/releases/tag/interactive-demos"
+            )
         content = content.replace("Experimental preview · ", "")
         path.write_text(content)
 
@@ -102,19 +105,32 @@ def publish(source: Path, output: Path) -> str:
         "Static browser simulations and exporter source published from the reusable\n"
         "`interactive-releases` branch. Physics and policy inference run locally in the browser.\n\n"
         "- [Hosted gallery](https://isaac-sim.github.io/IsaacLab/demos/interactive/)\n"
+        "- [Published archives and source](https://github.com/isaac-sim/IsaacLab/releases/tag/interactive-demos)\n"
         "- [Scene details and rebuilding](site/interactive/README.md)\n"
         "- [Exporters and toolchain](exporters/README.md)\n\n"
         f"Generated from source commit `{revision}`. The internal Newton Web compiler is\n"
         "required for new physics captures; it is not included here. Serving reviewed output\n"
         "requires only static files.\n\n"
-        "## Update\n\n"
+        "## Publish\n\n"
         "In the source project, commit the reviewed changes and run:\n\n"
         "```bash\npython tools/publish.py --output /path/to/interactive-releases-checkout\n```\n\n"
         "Review, commit and push that checkout to the same `interactive-releases` branch.\n"
-        "Keep existing compatibility directories unchanged. No new release branch, tag or\n"
-        "numbered gallery directory is required. The docs PR pins the resulting official\n"
-        "commit archive and its SHA256; documentation serves the stable `/demos/interactive/` path.\n\n"
-        "Archive URL: `https://codeload.github.com/isaac-sim/IsaacLab/tar.gz/<publishing-commit>`.\n"
+        "The branch currently lives in `maxkra15/IsaacLab`; organization rules require an\n"
+        "administrator to create its official counterpart. Runtime hosting uses Isaac Lab.\n\n"
+        "From the committed publishing checkout, append a deterministic snapshot to the\n"
+        "single official `interactive-demos` release:\n\n"
+        "```bash\n"
+        "publishing_commit=$(git rev-parse HEAD)\n"
+        "bundle=/tmp/isaaclab-browser-demos-$publishing_commit.tar.gz\n"
+        'git archive --format=tar --prefix="IsaacLab-$publishing_commit/" "$publishing_commit" | gzip -n > "$bundle"\n'
+        'sha256sum "$bundle"\n'
+        'gh release upload interactive-demos "$bundle" --repo isaac-sim/IsaacLab\n'
+        "```\n\n"
+        "Preserve existing assets and compatibility directories. Reuse the branch, release\n"
+        "and gallery directory; each new snapshot has its publishing commit in its filename.\n"
+        "The docs PR pins the official release asset URL and SHA256. Its build extracts\n"
+        "`site/` and serves the stable `/demos/interactive/` path. The archive also includes\n"
+        "these exporter sources and rebuilding instructions.\n"
     )
     return revision
 

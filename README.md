@@ -11,14 +11,15 @@ Static browser simulations and exporter source published from the reusable
 `interactive-releases` branch. Physics and policy inference run locally in the browser.
 
 - [Hosted gallery](https://isaac-sim.github.io/IsaacLab/demos/interactive/)
+- [Published archives and source](https://github.com/isaac-sim/IsaacLab/releases/tag/interactive-demos)
 - [Scene details and rebuilding](site/interactive/README.md)
 - [Exporters and toolchain](exporters/README.md)
 
-Generated from source commit `2404de0e9dbf97b479823e409def8194cde208eb`. The internal Newton Web compiler is
+Generated from source commit `828967010c8bc6251432245f7070b6d46b8e4fa0`. The internal Newton Web compiler is
 required for new physics captures; it is not included here. Serving reviewed output
 requires only static files.
 
-## Update
+## Publish
 
 In the source project, commit the reviewed changes and run:
 
@@ -27,8 +28,22 @@ python tools/publish.py --output /path/to/interactive-releases-checkout
 ```
 
 Review, commit and push that checkout to the same `interactive-releases` branch.
-Keep existing compatibility directories unchanged. No new release branch, tag or
-numbered gallery directory is required. The docs PR pins the resulting official
-commit archive and its SHA256; documentation serves the stable `/demos/interactive/` path.
+The branch currently lives in `maxkra15/IsaacLab`; organization rules require an
+administrator to create its official counterpart. Runtime hosting uses Isaac Lab.
 
-Archive URL: `https://codeload.github.com/isaac-sim/IsaacLab/tar.gz/<publishing-commit>`.
+From the committed publishing checkout, append a deterministic snapshot to the
+single official `interactive-demos` release:
+
+```bash
+publishing_commit=$(git rev-parse HEAD)
+bundle=/tmp/isaaclab-browser-demos-$publishing_commit.tar.gz
+git archive --format=tar --prefix="IsaacLab-$publishing_commit/" "$publishing_commit" | gzip -n > "$bundle"
+sha256sum "$bundle"
+gh release upload interactive-demos "$bundle" --repo isaac-sim/IsaacLab
+```
+
+Preserve existing assets and compatibility directories. Reuse the branch, release
+and gallery directory; each new snapshot has its publishing commit in its filename.
+The docs PR pins the official release asset URL and SHA256. Its build extracts
+`site/` and serves the stable `/demos/interactive/` path. The archive also includes
+these exporter sources and rebuilding instructions.

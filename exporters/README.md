@@ -26,6 +26,9 @@ Replace current compiled outputs at their existing paths under `site/interactive
 Preserve the relative paths of policies, shared meshes, textures, and license
 files. Existing compatibility directories stay unchanged. Prepare the official
 publishing checkout with `python tools/publish.py --output /path/to/interactive-releases-checkout`.
+Follow the [publishing instructions](../README.md#publish) to append its committed
+archive to Isaac Lab's permanent `interactive-demos` release. Keep previous assets
+so documentation can pin an exact archive and checksum.
 
 ## Toolchain and scenes
 
