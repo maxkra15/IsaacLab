@@ -386,9 +386,11 @@ compares the policy observations with native Isaac Lab, and verifies native and
 captured standing/walking and the solver's elapsed time before compiling.
 
 
-For a local preview, download and verify the release archive using its `.sha256`
-file, extract it outside the checkout, and serve its complete root over HTTP.
-Open `v5/`; retain earlier version directories because current bundles reuse their assets.
+For a local preview, download the archive pinned by Isaac Lab's
+`.github/actions/_lib/stage-browser-demos.sh` and verify the checksum recorded there.
+Extract it outside the checkout, enter its top-level directory, and run
+`python -m http.server 8000 --directory site`. Open `http://localhost:8000/interactive/`.
+Retain the compatibility directories because current bundles reuse their assets.
 
 ### Warehouse interactions (version 5)
 

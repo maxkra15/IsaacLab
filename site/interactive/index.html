@@ -11,7 +11,7 @@ SPDX-License-Identifier: BSD-3-Clause
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Interactive Newton physics and pretrained policy demos for Isaac Lab, running locally in your browser.">
   <title>Isaac Lab interactive demos</title>
-  <link rel="stylesheet" href="css/browser-demo.css?rev=828967010c8bc6251432245f7070b6d46b8e4fa0">
+  <link rel="stylesheet" href="css/browser-demo.css?rev=d7a784f32b22288a7442dbe11796fe46463cc411">
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; padding: 2rem max(1rem, calc((100vw - 1120px) / 2)); background: #f4f7f8; font: 16px/1.5 system-ui, sans-serif; color: #1a3039; }
@@ -72,7 +72,7 @@ SPDX-License-Identifier: BSD-3-Clause
 </head>
 <body>
   <nav aria-label="Navigation">
-    <a id="gallery-link" href="./?v=828967010c8bc6251432245f7070b6d46b8e4fa0">Demo gallery</a>
+    <a id="gallery-link" href="./?v=d7a784f32b22288a7442dbe11796fe46463cc411">Demo gallery</a>
     <a href="https://isaac-sim.github.io/IsaacLab/">Isaac Lab documentation</a>
     <a href="https://github.com/isaac-sim/IsaacLab/releases/tag/interactive-demos">Source and rebuild instructions</a>
   </nav>
@@ -107,8 +107,8 @@ SPDX-License-Identifier: BSD-3-Clause
     </a>
   </template>
   <script type="module">
-    import { demos, activities, physics } from './demos.js?rev=828967010c8bc6251432245f7070b6d46b8e4fa0';
-    const revision = '828967010c8bc6251432245f7070b6d46b8e4fa0';
+    import { demos, activities, physics } from './demos.js?rev=d7a784f32b22288a7442dbe11796fe46463cc411';
+    const revision = 'd7a784f32b22288a7442dbe11796fe46463cc411';
     const content = document.querySelector('#content');
     const params = new URLSearchParams(location.search);
     const galleryParams = new URLSearchParams(params);
@@ -121,7 +121,7 @@ SPDX-License-Identifier: BSD-3-Clause
       document.title = `${demo.title} · Isaac Lab`;
       document.querySelector('h1').textContent = demo.title;
       document.querySelector('#description').textContent = `${demo.description} Drag to orbit, scroll to zoom, and use the controls to pause or reset.`;
-      await import('./css/browser-demo.js?rev=828967010c8bc6251432245f7070b6d46b8e4fa0');
+      await import('./css/browser-demo.js?rev=d7a784f32b22288a7442dbe11796fe46463cc411');
       const widget = document.createElement('isaaclab-browser-demo');
       widget.setAttribute('src', `${demo.assetRoot || './browser_demos'}/${demo.id}/manifest.json?rev=${revision}`);
       content.append(widget);

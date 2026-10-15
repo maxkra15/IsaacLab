@@ -15,7 +15,7 @@ Static browser simulations and exporter source published from the reusable
 - [Scene details and rebuilding](site/interactive/README.md)
 - [Exporters and toolchain](exporters/README.md)
 
-Generated from source commit `828967010c8bc6251432245f7070b6d46b8e4fa0`. The internal Newton Web compiler is
+Generated from source commit `d7a784f32b22288a7442dbe11796fe46463cc411`. The internal Newton Web compiler is
 required for new physics captures; it is not included here. Serving reviewed output
 requires only static files.
 

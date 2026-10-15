@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
-import { demos } from '../demos.js?rev=828967010c8bc6251432245f7070b6d46b8e4fa0';
+import { demos } from '../demos.js?rev=d7a784f32b22288a7442dbe11796fe46463cc411';
 
 const arrayTypes = {
   float32: [Float32Array, 'HEAPF32'], float64: [Float64Array, 'HEAPF64'],
@@ -222,7 +222,7 @@ class IsaacLabBrowserDemo extends HTMLElement {
         this.viewer = viewer;
       } else if (!['stiffness', 'cloth_bending', 'mpm'].includes(this.demo.kind)) {
         const [{ RobotViewer }, policy] = await Promise.all([
-          import('./robot-viewer.js?rev=828967010c8bc6251432245f7070b6d46b8e4fa0'), this.demo.policy ? DensePolicy.load(this.simulation.url, this.demo.policy) : null,
+          import('./robot-viewer.js?rev=d7a784f32b22288a7442dbe11796fe46463cc411'), this.demo.policy ? DensePolicy.load(this.simulation.url, this.demo.policy) : null,
         ]);
         if (this.generation !== generation) return;
         this.policy = policy;
@@ -238,7 +238,7 @@ class IsaacLabBrowserDemo extends HTMLElement {
         }
       } else {
         const Viewer = this.demo.kind === 'mpm'
-          ? (await import('./mpm-viewer.js?rev=828967010c8bc6251432245f7070b6d46b8e4fa0')).MpmViewer
+          ? (await import('./mpm-viewer.js?rev=d7a784f32b22288a7442dbe11796fe46463cc411')).MpmViewer
           : (await import('../../v1/css/stiffness-viewer.js')).StiffnessViewer;
         const viewer = await Viewer.load(this.canvas, this.simulation);
         if (this.generation !== generation) {
@@ -248,7 +248,7 @@ class IsaacLabBrowserDemo extends HTMLElement {
         this.viewer = viewer;
       }
       if (this.isManipulation) {
-        const { FrankaControl } = await import('./franka-control.js?rev=828967010c8bc6251432245f7070b6d46b8e4fa0');
+        const { FrankaControl } = await import('./franka-control.js?rev=d7a784f32b22288a7442dbe11796fe46463cc411');
         const source = new URL(demos.find((item) => item.id === this.demo.kind).manualControl, new URL('../', import.meta.url));
         const control = await FrankaControl.load(this.simulation, source);
         if (this.generation !== generation) return;
