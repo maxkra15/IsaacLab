@@ -658,6 +658,28 @@ def test_mpm_prepare_builder_converts_convex_mesh_before_solver_construction():
     assert isinstance(solver, SolverImplicitMPM)
 
 
+def test_mpm_prepare_builder_preserves_rigid_only_convex_hulls():
+    """MPM preparation must retain convex geometry used only by a coupled rigid solver."""
+    import newton
+
+    builder = newton.ModelBuilder()
+    body = builder.add_body()
+    mesh = newton.Mesh(
+        vertices=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
+        indices=[0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+    )
+    rigid_shape = builder.add_shape_mesh(body, mesh=mesh)
+    particle_shape = builder.add_shape_mesh(body, mesh=mesh)
+    builder.shape_type[rigid_shape] = newton.GeoType.CONVEX_MESH
+    builder.shape_type[particle_shape] = newton.GeoType.CONVEX_MESH
+    builder.shape_flags[rigid_shape] &= ~int(newton.ShapeFlags.COLLIDE_PARTICLES)
+
+    NewtonMPMManager._prepare_builder_for_finalize(builder)
+
+    assert builder.shape_type[rigid_shape] == newton.GeoType.CONVEX_MESH
+    assert builder.shape_type[particle_shape] == newton.GeoType.MESH
+
+
 @pytest.mark.parametrize(
     ("manager_cls", "solver_cfg", "expected_friction", "expected_damping"),
     [

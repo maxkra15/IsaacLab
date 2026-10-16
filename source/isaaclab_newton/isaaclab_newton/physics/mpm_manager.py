@@ -19,6 +19,7 @@ from newton import (
     GeoType,
     Model,
     ModelBuilder,
+    ShapeFlags,
     State,
     StateFlags,
 )
@@ -216,7 +217,8 @@ class NewtonMPMManager(NewtonManager):
         computed mass, so clear mass and inertia for kinematic bodies to match
         Newton's direct-builder MPM examples. The solver consumes mesh vertices
         and indices but only accepts the triangle-mesh geometry type, so classify
-        convex meshes as meshes without changing their geometry.
+        particle-colliding convex meshes as meshes without changing their geometry.
+        Rigid-only convex hulls retain their type for coupled rigid solvers.
         """
         kinematic_flag = int(BodyFlags.KINEMATIC)
         for body_id, flags in enumerate(builder.body_flags):
@@ -226,7 +228,9 @@ class NewtonMPMManager(NewtonManager):
                 builder.body_inertia[body_id] = wp.mat33()
                 builder.body_inv_inertia[body_id] = wp.mat33()
         for shape_id, shape_type in enumerate(builder.shape_type):
-            if shape_type == GeoType.CONVEX_MESH:
+            if shape_type == GeoType.CONVEX_MESH and int(builder.shape_flags[shape_id]) & int(
+                ShapeFlags.COLLIDE_PARTICLES
+            ):
                 builder.shape_type[shape_id] = GeoType.MESH
 
     @classmethod
