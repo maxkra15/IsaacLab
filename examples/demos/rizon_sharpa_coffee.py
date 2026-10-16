@@ -101,6 +101,10 @@ def _parse_args():
     )
     parser.add_argument("--voxel_size", type=float, default=0.004)
     parser.add_argument(
+        "--fidelity", choices=("mpm", "particles"), default="mpm", help="Continuum or approximate granular physics."
+    )
+    parser.add_argument("--particle_iterations", type=int, default=2, help="Contact iterations in particle fidelity.")
+    parser.add_argument(
         "--bowl_scale",
         type=float,
         default=0.65,
@@ -149,6 +153,12 @@ def _parse_args():
         parser.error("--keep_open requires a desktop viewer.")
     if args.render_samples < 1:
         parser.error("--render_samples must be positive.")
+    if args.particle_iterations < 1:
+        parser.error("--particle_iterations must be positive.")
+    if args.fidelity == "particles" and args.water:
+        parser.error("Particle fidelity supports the dry coffee demo; water requires MPM pressure and dissolution.")
+    if args.fidelity == "particles" and args.grains_per_particle:
+        parser.error("Particle fidelity requires --grains_per_particle 0 to render the physical particles.")
     return args, parser
 
 
@@ -168,6 +178,11 @@ def _make_env_cfg(args, video_stride):
     cfg.sim.physics.solver_cfg.entries[0].substeps = rigid_hz // args.physics_hz
     cfg.sim.physics.use_cuda_graph = not args.disable_cuda_graph
     media = cfg.sim.physics.solver_cfg.entries[1].solver_cfg
+    media.fidelity = args.fidelity
+    media.particle_iterations = args.particle_iterations
+    # Contact friction is a granular approximation, not a constitutive-law match.
+    media.particle_friction = 0.55
+    media.particle_cohesion = 0.0
     if not args.water and cfg.voxel_size == 0.002:
         # Bound padded grid work for this scripted fill. Other resolutions,
         # and water keep the conservative automatic budget.

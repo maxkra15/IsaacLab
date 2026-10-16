@@ -8,6 +8,8 @@
 Run with ``uv run isaaclab example rizon-sharpa-teapot``. This experimental
 example uses a fixed index grasp and motion.
 
+Record the native approximate particle mode with
+``uv run isaaclab example rizon-sharpa-teapot --fidelity particles --video``.
 
 The pinned robot USD and textures are downloaded and verified on first use.
 Set ``ISAACLAB_FABRICS_SIM_RIZON_SHARPA_ROOT`` to an existing bundle directory

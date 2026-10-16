@@ -30,6 +30,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import MISSING
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -67,8 +68,23 @@ def _unit_interval_float(value: str) -> float:
     return resolved
 
 
+def _positive_int(value: str) -> int:
+    """Parse a positive integer argument."""
+    resolved = int(value)
+    if resolved <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return resolved
+
+
 parser = argparse.ArgumentParser(description="Newton implicit MPM teapot-fill demo.")
 parser.add_argument("--robot", choices=["none", "rizon_sharpa"], default="none", help="Use the fixed physical grasp.")
+parser.add_argument("--fidelity", choices=["mpm", "particles"], default="mpm", help="Material simulation mode.")
+parser.add_argument(
+    "--particle_iterations", type=_positive_int, default=2, help="Approximate particle solve iterations."
+)
+parser.add_argument("--video", action="store_true", help="Record the selected visualizer to an MP4 clip.")
+parser.add_argument("--output_dir", type=Path, default=Path("logs/teapot_video"), help="Video output directory.")
+parser.add_argument("--video_fps", type=_positive_int, default=25, help="Video frame rate; must divide 800 Hz.")
 parser.add_argument(
     "--max_steps",
     type=int,
@@ -108,6 +124,12 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--fill_jitter",
+    type=_unit_interval_float,
+    default=0.2,
+    help="Initial particle jitter in [0, 0.5] times fill spacing; zero keeps the regular lattice.",
+)
+parser.add_argument(
     "--min_ray_hits",
     type=int,
     default=DEFAULT_MIN_RAY_HITS,
@@ -145,12 +167,19 @@ parser.add_argument(
 add_launcher_args(parser)
 parser.set_defaults(visualizer=["newton_gl"])
 args_cli = parser.parse_args()
+if args_cli.fill_jitter > 0.5:
+    parser.error("--fill_jitter must be in [0, 0.5]")
 ROBOT_ENABLED = args_cli.robot == "rizon_sharpa"
 
 
 # Use one 1.25 ms solver step per outer loop iteration and retain the original 400 Hz render cadence.
 SIMULATION_HZ = 800
+if args_cli.video and (SIMULATION_HZ % args_cli.video_fps or args_cli.max_steps <= 0):
+    parser.error("--video requires a finite positive --max_steps and a --video_fps that divides 800 Hz")
+if args_cli.video and not {"kit", "newton_gl", "newton_rtx"}.intersection(args_cli.visualizer or []):
+    parser.error("--video requires --visualizer kit, newton_gl, or newton_rtx")
 RENDER_INTERVAL = 2
+VIDEO_STRIDE = SIMULATION_HZ // args_cli.video_fps
 VOXEL_SIZE = args_cli.voxel_size
 FILL_SPACING = (
     args_cli.fill_spacing if args_cli.fill_spacing is not None else VOXEL_SIZE / DEFAULT_PARTICLES_PER_VOXEL_AXIS
@@ -167,7 +196,7 @@ MAX_ACTIVE_CELL_COUNT = (1 << 16) if GRID_TYPE == "sparse" else (1 << 18)
 MPM_SUBSTEPS = 1
 
 PARTICLE_DENSITY = 1000.0
-FILL_JITTER = 0.2
+FILL_JITTER = args_cli.fill_jitter
 FILL_SEED = 7
 PARTICLE_RADIUS = 0.5 * FILL_SPACING
 PARTICLE_MASS = FILL_SPACING**3 * PARTICLE_DENSITY
@@ -234,6 +263,10 @@ def create_visualizer_cfgs():
             cfgs.append(NewtonGLVisualizerCfg(show_particles=SHOW_FLUID_PARTICLES, particle_color=WATER_COLOR))
         elif name == "newton_rtx":
             cfgs.append(NewtonRTXVisualizerCfg())
+    if args_cli.video:
+        for cfg in cfgs:
+            cfg.headless = True
+            cfg.window.size = (1280, 720)
     return cfgs
 
 
@@ -520,6 +553,10 @@ def create_sim_cfg():
         visualizer_cfgs=create_visualizer_cfgs(),
         physics=NewtonCfg(
             solver_cfg=MPMSolverCfg(
+                fidelity=args_cli.fidelity,
+                particle_iterations=args_cli.particle_iterations,
+                particle_friction=0.0,
+                particle_cohesion=0.0,
                 voxel_size=VOXEL_SIZE,
                 grid_type=GRID_TYPE,
                 grid_padding=GRID_PADDING,
@@ -782,22 +819,47 @@ def write_container_state(container, sim_time: float) -> None:
 
 def run_simulator(sim, scene, surface_renderer: ParticleSurfaceRenderer | None, robot_motion=None) -> None:
     """Run the scripted teapot-fill MPM loop."""
+    from isaaclab.envs.utils.video_recorder import VideoRecorder
+    from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
+
     sim_dt = sim.get_physics_dt()
     container = scene["container"]
+    recorder = (
+        VideoRecorder(
+            VideoRecorderCfg(
+                source="viz",
+                output_dir=str(args_cli.output_dir),
+                output_filename_prefix=f"teapot_{args_cli.fidelity}",
+                video_length=args_cli.max_steps,
+                frame_stride=VIDEO_STRIDE,
+                fps=args_cli.video_fps,
+            ),
+            SimpleNamespace(sim=sim, scene=scene, step_dt=sim_dt),
+        )
+        if args_cli.video
+        else None
+    )
     count = 0
-    while keep_running(sim, count):
-        if robot_motion is None:
-            write_container_state(container, count / SIMULATION_HZ)
-        else:
-            robot_motion.update(count / SIMULATION_HZ)
-        scene.write_data_to_sim()
-        sim.step(render=False)
-        scene.update(sim_dt)
-        if sim.is_rendering and count % RENDER_INTERVAL == 0:
-            if surface_renderer is not None:
-                surface_renderer.update()
-            sim.render()
-        count += 1
+    try:
+        while keep_running(sim, count):
+            if robot_motion is None:
+                write_container_state(container, count / SIMULATION_HZ)
+            else:
+                robot_motion.update(count / SIMULATION_HZ)
+            scene.write_data_to_sim()
+            sim.step(render=False)
+            scene.update(sim_dt)
+            render_step = (count + 1) % VIDEO_STRIDE == 0 if recorder else count % RENDER_INTERVAL == 0
+            if sim.is_rendering and render_step:
+                if surface_renderer is not None:
+                    surface_renderer.update()
+                sim.render()
+            if recorder is not None:
+                recorder.step()
+            count += 1
+    finally:
+        if recorder is not None:
+            recorder.close()
 
 
 def main() -> None:
@@ -867,6 +929,7 @@ def main() -> None:
 
         print(
             "[INFO]: Isaac Lab Newton teapot-fill MPM demo ready."
+            f" Fidelity {args_cli.fidelity};"
             f" Sampled {particle_count(scene)} MPM particles inside the teapot;"
             f" extracted {surface_triangle_count} surface triangles;"
             f" rendering {args_cli.fluid_render_mode};"
