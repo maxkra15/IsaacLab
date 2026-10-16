@@ -114,12 +114,16 @@ and moves the interactive viewer closer:
 ```bash
 uv run isaaclab play --rl_library rsl_rl \
   --task IsaacContrib-Franka-Pour \
-  --checkpoint /path/to/model.pt \
-  --num_envs 1 --device cuda:0 --visualizer kit
+  --checkpoint pretrained \
+  --num_envs 1 --device cuda:0 --visualizer newton_gl
 ```
 
-Use `--visualizer newton_gl` instead for the lightweight Newton viewer. No external callback or
-particle-setting override is required for either visualizer.
+This resolves the [official pretrained MPM policy](https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.2/Isaac/IsaacLab/PretrainedCheckpoints/rsl_rl/IsaacContrib-Franka-Pour_newtonmjwarpmpmproxy_none_rsl_rl.pt)
+for the task's default physics backend. On October 16, 2026, the published file contained
+iteration 7450 with SHA-256
+`52cbab93a55a8d153844ba93ad496c69838e1bf1082b4c4f4fc4bba43e3a3643`.
+Use `--checkpoint /path/to/model.pt` for a local continuation, or `--visualizer kit` for the Kit
+viewer. Neither visualizer requires an external callback or particle-setting override.
 
 ## Material fidelity and throughput experiments
 
@@ -167,6 +171,10 @@ uv run python scripts/benchmarks/benchmark_franka_pour_fidelity.py \
   --output logs/mpm_fidelity/particles2-64.json
 ```
 
+The standalone benchmark accepts a checkpoint file path. To use the official policy, pass the
+cached path printed by `isaaclab play --checkpoint pretrained`, or download the linked file above.
+The benchmark does not resolve the literal value `pretrained`.
+
 Use `--mode particles4` to test a larger particle-contact iteration budget. `--mode s2` and
 `--mode s2_cached` compare S2 MPM contacts with the same Gauss-Seidel budget
 (`--mpm_iterations 5` by default), changing only the optional spatial contact-impulse cache.
@@ -192,13 +200,83 @@ the current episodes after automatic resets; a freshly reset full source cup doe
 that earlier episodes avoided spilling. Source fingerprints and checkpoint hashes identify
 archived deployments even when their Git metadata is absent.
 
-### Measured checkpoint continuation
+### Official pretrained checkpoint: PPO continuation
+
+The October 16, 2026 measurements below resume the official iteration-7450 weights under this
+branch's current task settings. They retain 468 particles per environment, 84 actor inputs,
+86 critic inputs, eight actions, and the saved optimizer. The asset supplies weights and optimizer
+state; it does not bundle the original run's complete material configuration.
+
+Each fresh process used seed 42, one CPU thread, 16 warmup policy steps, and 96 timed inference
+steps before collecting five PPO iterations of 96 transitions per environment. Four minibatches
+and five epochs give 20 Adam updates per iteration. The PPO rate includes collection, returns,
+optimization, logging, and checkpoint saving. The preceding inference window is timed separately.
+The reset sampler remained adaptive. Warp 1.18.0, PyTorch 2.11.0+cu130, and the Newton/Isaac Lab
+Python runtime sources matched across the two hosts.
+
+A matched 512-environment comparison on one NVIDIA L40 gave:
+
+| Mode | Inference transitions/s | PPO transitions/s | GPU peak, MiB | Pre-PPO terminal success |
+| --- | ---: | ---: | ---: | ---: |
+| MPM, `pic27`, Jacobi budget 24 | 1,797 | 1,753 | 7,517 | 95.9% |
+| Particles, 2 iterations | 5,650 | 5,272 | 2,665 | 74.4% |
+
+Particle training was 3.01x faster at the same environment count. The inference window recorded
+263 spill terminations with particles and four with MPM. Its success rates describe the frozen
+input policy before PPO and divide successful episodes by completed episodes within that window.
+Evaluate the continued checkpoints separately to assess learned quality.
+Both continuations saved changed actor weights, finite actor/critic/optimizer tensors, five finite
+loss records per tag, and 100 additional Adam updates in every optimizer state.
+
+The same particle mode and PPO protocol scaled as follows. Peaks are sampled whole-GPU usage at
+one-second intervals, including the scene, rollout storage, policy, and optimizer allocations.
+
+| GPU | Environments | PPO transitions/s | GPU peak, MiB |
+| --- | ---: | ---: | ---: |
+| L40, 48 GB | 4,096 | 12,093 | 10,565 |
+| L40, 48 GB | 8,192 | 10,501 | 19,339 |
+| L40, 48 GB | 21,504 | 6,825 | 47,915 |
+| RTX PRO 6000 Blackwell, 96 GB | 4,096 | 20,616 | 11,108 |
+| RTX PRO 6000 Blackwell, 96 GB | 8,192 | 19,155 | 19,884 |
+| RTX PRO 6000 Blackwell, 96 GB | 16,384 | 16,653 | 37,402 |
+
+Among these completed primary cases, 4,096 environments gave the highest throughput on both
+hosts. The L40 also completed five PPO iterations with 21,504 environments, or 10,063,872 particles.
+Its next tested full-protocol batch, 22,528 environments, exhausted CUDA memory while collecting
+after the first PPO iteration (20 Adam updates). A shorter 16-step inference/one-PPO-iteration probe
+at 22,528 had passed, while a 24,576-environment probe failed during optimization of its first PPO
+iteration. The full-protocol
+L40 bracket therefore has 1,024-environment resolution; a short capacity probe alone does not confirm
+later training capacity. The host-memory guard retained an 8 GiB reserve and did not trigger in
+these GPU-memory failures.
+
+The RTX PRO 6000's largest completed batch in this record is 16,384 environments. Its local
+capacity ceiling has not been established.
+
+Only completed, isolated five-iteration cases enter the throughput table. Startup and cold
+compilation are excluded, and the hosts have different CPUs as well as GPUs. Changing the number
+of environments also changes PPO minibatch size and the reset populations. Measure time to the
+desired task performance separately from these collection and optimization rates.
+
+For example, run the same training protocol using a cached official checkpoint:
+
+```bash
+uv run python scripts/benchmarks/benchmark_franka_pour_fidelity.py \
+  --mode particles2 --num_envs 8192 \
+  --checkpoint /path/to/cached-official-pour.pt \
+  --warmup_steps 16 --steps 96 --train_iterations 5 \
+  --seed 42 --cpu_threads 1 \
+  --output logs/mpm_fidelity/particles2-8192-ppo5.json
+```
+
+### Historical cached-checkpoint measurements
 
 On October 16, 2026, a single NVIDIA L40 with Warp 1.18.0 and PyTorch 2.11.0 ran the saved
 iteration-6997 policy with seed 42 and 468 particles per environment. Each rollout used 16
 warmup policy steps followed by 96 timed steps, or 3.2 simulated seconds at the task's 30 Hz
 policy rate. Timing includes the robot, coupling, inference, observations, rewards, and resets.
-Both modes used the same corrected convex-mesh adapter and control/substep settings.
+Both modes used the same corrected convex-mesh adapter and control/substep settings. This was
+an earlier locally cached checkpoint; the official published default is iteration 7450 above.
 
 | Environments | MPM transitions/s | Particles, 2 iterations | Speedup | Terminal success, MPM / particles |
 | --- | ---: | ---: | ---: | ---: |
@@ -307,7 +385,7 @@ the default bound is not a general guarantee for a changed grid or denser packin
 The 16-world continuation experiment also exercised these APIs inside PPO. A 50% success gate
 did not trigger within five iterations. A separate, explicitly forced zero-threshold mechanism
 trial switched from particles to MPM at policy step 265 during training steps 20 through 500.
-Two complete PPO updates used particles before the handoff, and two complete updates used MPM
+Two complete PPO iterations used particles before the handoff, and two complete iterations used MPM
 afterward; the intervening rollout included both modes. The handoff changed 15 mm voxels to
 12 mm and reduced the radius by 2%, retaining all 7,488 particles and their 2.204999 kg total mass.
 The radius change increased density by approximately 6.25% at fixed mass.
@@ -343,7 +421,7 @@ Each row retains its exact 50 most recent local-progress outcomes. Adaptive prio
 `sqrt(p * (1 - p)) + epsilon`, so uncertain rows near 50% progress are emphasized without starving
 rows at 0% or 100%. A shuffled cyclic stream receives 50% of assignments throughout training,
 which keeps persistently difficult reaching and grasp-acquisition rows represented alongside the
-adaptive competence frontier. There are no runtime stages or region probabilities.
+adaptive competence frontier. The reset sampler has no runtime stages or region probabilities.
 
 The sampler reports its effective pool size, concentration, and cyclic-replay fraction. Offline
 reset regions remain in the artifact as generation provenance, but runtime does not maintain a
