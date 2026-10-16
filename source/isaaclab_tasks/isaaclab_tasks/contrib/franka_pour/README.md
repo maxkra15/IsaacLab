@@ -155,7 +155,7 @@ Both compared modes retain this existing limitation. These experiments establish
 policy-interface compatibility; they do not calibrate absolute robot reaction forces.
 
 The standalone workflow applies these settings to the existing `media` entry, keeping default
-MPM's `pic27` contacts and 24 Jacobi sweeps as its baseline. Run each case in a fresh process:
+MPM's `pic27` contacts and a 24-sweep Jacobi budget as its baseline. Run each case in a fresh process:
 
 ```bash
 uv run python scripts/benchmarks/benchmark_franka_pour_fidelity.py \
@@ -181,11 +181,82 @@ larger environment counts in separate processes until memory or latency becomes 
 successful short run does not establish long-horizon task quality. Initial particle mode avoids
 allocating the MPM grid until full MPM is first requested.
 
+For a handoff inside one run, choose an environment count that also fits full MPM. Lazy particle
+allocation does not guarantee that the later MPM grid will fit. A larger particle-only training
+batch can instead save the policy and optimizer, then resume with fewer MPM environments; each
+environment retains the same 84 actor inputs, 86 critic inputs, and eight actions.
+
 The reports include terminal success and spill counts, finite-state and movement checks, and the
 final mean particle fractions in each cup and the spill region. These final fractions describe
 the current episodes after automatic resets; a freshly reset full source cup does not establish
 that earlier episodes avoided spilling. Source fingerprints and checkpoint hashes identify
 archived deployments even when their Git metadata is absent.
+
+### Measured checkpoint continuation
+
+On October 16, 2026, a single NVIDIA L40 with Warp 1.18.0 and PyTorch 2.11.0 ran the saved
+iteration-6997 policy with seed 42 and 468 particles per environment. Each rollout used 16
+warmup policy steps followed by 96 timed steps, or 3.2 simulated seconds at the task's 30 Hz
+policy rate. Timing includes the robot, coupling, inference, observations, rewards, and resets.
+Both modes used the same corrected convex-mesh adapter and control/substep settings.
+
+| Environments | MPM transitions/s | Particles, 2 iterations | Speedup | Terminal success, MPM / particles |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 156 | 431 | 2.77x | 77.5% / 54.5% |
+| 64 | 502 | 1,229 | 2.45x | 68.9% / 38.0% |
+| 256 | 1,309 | 3,477 | 2.66x | 59.1% / 43.4% |
+| 512 | 1,813 | 5,873 | 3.24x | 53.1% / 44.9% |
+
+Terminal success divides successful episodes by completed episodes within each short window.
+The particle mode produced more spill terminations, so the speedup does not establish physical
+equivalence or equal policy quality. These are single-seed measurements. They also do not establish
+the maximum supported environment count. At 512 environments, sampled whole-GPU peak memory
+was 7,269 MiB for MPM and 2,417 MiB for particles, including shared scene and policy allocations.
+
+Five actual PPO continuation iterations from the same checkpoint gave the following rates,
+including optimization, logging, and final checkpoint saving. Each iteration collected 96
+transitions per environment; the policy dimensions and optimizer were retained.
+
+| Environments | MPM training transitions/s | Particle training transitions/s | Speedup |
+| --- | ---: | ---: | ---: |
+| 128 | 820 | 1,983 | 2.42x |
+| 512 | 1,794 | 5,134 | 2.86x |
+
+The rollout matrix used Newton `c4ff41bf`; PPO used `d183ffaa`. The latter adds a fix for
+positive-cohesion pair friction; all these runs used zero particle cohesion. Each comparison
+used identical source fingerprints within its group. Five PPO iterations demonstrate executable
+continuation and throughput, not training convergence or recovered transfer success.
+
+The separate S2 experiment kept the same 64 worlds and used Gauss-Seidel with the following
+upper iteration budgets. Its purpose was to test retaining contact impulses across grid rebuilds.
+
+| S2 contact cache | Iteration budget | Transitions/s | Terminal success |
+| --- | ---: | ---: | ---: |
+| Disabled | 20 | 355 | 65.0% |
+| Enabled | 5 | 410 | 62.1% |
+| Disabled | 5 | 401 | 31.3% |
+
+The cache restored much of the low-budget task behavior in this short run. The cached five-iteration
+budget was about 15% faster than the 20-iteration cold budget. This does not make S2 faster than the
+task's default `pic27`/Jacobi configuration, or establish equivalent material behavior.
+
+Separate 48-step capacity probes, after eight warmup policy steps, completed at the following
+sampled whole-GPU peaks:
+
+| Environments | Full MPM peak, MiB | Particle peak, MiB |
+| --- | ---: | ---: |
+| 1,024 | 12,771 | 3,275 |
+| 2,048 | 24,277 | 5,021 |
+| 4,096 | 47,089 | 8,507 |
+| 8,192 | Allocation failed | 15,375 |
+
+At 8,192 worlds, MPM exhausted GPU memory during initial sparse-volume allocation and exited
+after reaching 48,467 MiB. Particle mode completed with 3,833,856 particles. These are tested
+allocation and finite-motion outcomes, not exact capacity limits or training-quality guarantees.
+MPM's environment-workspace guard activated frequently at the larger counts; its root cause was
+not established. Reset-row coverage and grid phase also change across environment counts.
+Capacity timing is excluded because some probes overlapped video or functional work on the
+other GPU. All primary rollout and PPO timing comparisons above ran without that overlap.
 
 Record the same checkpoint and seed in separate one-world runs with `--video --num_envs 1
 --steps 360 --freeze_reset_sampler`. Clips are written alongside each JSON result. Rendering is
@@ -232,6 +303,20 @@ Use an S2 contact basis for voxel curricula (`--collider_basis S2` in the workfl
 the grid can exceed the fixed 27-particles-per-cell bound of the default `pic27` contact basis;
 the default bound is not a general guarantee for a changed grid or denser packing. Add
 `--warmstart_contact_impulses` to enable the S2 contact cache in an initially particle-based run.
+
+The 16-world continuation experiment also exercised these APIs inside PPO. A 50% success gate
+did not trigger within five iterations. A separate, explicitly forced zero-threshold mechanism
+trial switched from particles to MPM at policy step 265 during training steps 20 through 500.
+Two complete PPO updates used particles before the handoff, and two complete updates used MPM
+afterward; the intervening rollout included both modes. The handoff changed 15 mm voxels to
+12 mm and reduced the radius by 2%, retaining all 7,488 particles and their 2.204999 kg total mass.
+The radius change increased density by approximately 6.25% at fixed mass.
+
+A second experiment started in full cached-S2 MPM and rebuilt its already-active grid from
+15 mm to 12 mm at policy step 355 during PPO. It retained particle radius, count, and total mass.
+Both final checkpoints contained changed actor weights and 100 additional Adam updates from
+the saved iteration-6997 checkpoint, with no optimizer restart. These short mechanism trials
+demonstrate executable handoffs and grid rebuilding; they do not establish a learned curriculum.
 
 ## Learning contract
 
