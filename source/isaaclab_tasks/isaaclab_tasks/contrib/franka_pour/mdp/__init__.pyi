@@ -9,6 +9,8 @@ __all__ = [
     "CurriculumGripperPositionActionCfg",
     "EMARelativeJointPositionAction",
     "EMARelativeJointPositionActionCfg",
+    # media fidelity
+    "PourMediaFidelityCurriculum",
     # events
     "reset_pour_scene",
     # observations
@@ -58,6 +60,7 @@ from .actions_cfg import (
     EMARelativeJointPositionActionCfg,
 )
 from .events import reset_pour_scene
+from .media_fidelity import PourMediaFidelityCurriculum
 from .observations import (
     cup_pose_obs,
     finger_position_obs,

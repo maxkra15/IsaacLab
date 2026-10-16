@@ -121,6 +121,118 @@ uv run isaaclab play --rl_library rsl_rl \
 Use `--visualizer newton_gl` instead for the lightweight Newton viewer. No external callback or
 particle-setting override is required for either visualizer.
 
+## Material fidelity and throughput experiments
+
+This feature branch pins Newton fork commit `d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b`
+and Warp 1.18.0 in `pyproject.toml` and `uv.lock`. Normal `uv run` commands resolve these
+dependencies; no source-path overlay is required.
+
+An experimental Newton build with `SolverImplicitMPM.Fidelity` supports an approximate
+position-based particle stage through `MPMSolverCfg(fidelity="particles", particle_iterations=2)`.
+The full material remains `fidelity="mpm"`. Both modes use the same scene particles, ordering,
+masses, policy observations (84 actor / 86 critic), eight actions, task reward, and reset dataset.
+The robot and cups continue to use the same MuJoCo entry and proxy-coupling settings. Particle
+contacts return approximate reaction wrenches through the existing proxy interface; they do not
+reproduce MPM's continuum constitutive forces. Match the modes with task measurements before
+treating them as interchangeable training distributions.
+
+The default fill creates 468 particles with approximately 2.906 mm radius and 137.8 g total mass.
+Finite-radius particle contact places their centers approximately 6.756 mm from the cup mesh,
+compared with MPM's 3.85 mm signed contact offset. This reduces the source's available center
+width from 34.3 mm to 28.488 mm, so packing and outflow differ even with identical particle arrays.
+The approximate pair friction defaults to 0.5, while this task's MPM internal friction is 0.7;
+these describe different contact and constitutive models. Use `--particle_friction 0.7` to test
+an explicit fit, and compare two versus four contact iterations before adjusting attraction.
+
+The MPM adapter converts convex meshes to particle-compatible triangle meshes only when their
+collision flags include particles. Robot hulls that collide only with other rigid shapes retain
+their authored convex representation. Both material modes use this adapter correction; its
+effect on shared-scene collision work is separate from the material-solver optimization.
+
+The current proxy-coupling implementation harvests feedback from the final media substep. With
+the task's two media substeps, it does not accumulate every impact impulse across that interval.
+Both compared modes retain this existing limitation. These experiments establish throughput and
+policy-interface compatibility; they do not calibrate absolute robot reaction forces.
+
+The standalone workflow applies these settings to the existing `media` entry, keeping default
+MPM's `pic27` contacts and 24 Jacobi sweeps as its baseline. Run each case in a fresh process:
+
+```bash
+uv run python scripts/benchmarks/benchmark_franka_pour_fidelity.py \
+  --mode mpm --num_envs 64 --checkpoint /path/to/model.pt \
+  --output logs/mpm_fidelity/mpm-64.json
+
+uv run python scripts/benchmarks/benchmark_franka_pour_fidelity.py \
+  --mode particles2 --num_envs 64 --checkpoint /path/to/model.pt \
+  --output logs/mpm_fidelity/particles2-64.json
+```
+
+Use `--mode particles4` to test a larger particle-contact iteration budget. `--mode s2` and
+`--mode s2_cached` compare S2 MPM contacts with the same Gauss-Seidel budget
+(`--mpm_iterations 5` by default), changing only the optional spatial contact-impulse cache.
+The task's existing `pic27` basis already retains particle contact history. The new S2 cache is
+therefore a separate numerical experiment, not an automatic change to the checkpoint baseline.
+
+The JSON records environment transitions per second and policy batches per second separately.
+Rollout timing includes policy inference, physics, observations, rewards, resets, and curriculum
+work after warmup. `--train_iterations 5` also continues PPO from the checkpoint and reports total
+training throughput including optimization, logging, and final checkpoint saving. Run progressively
+larger environment counts in separate processes until memory or latency becomes limiting; a
+successful short run does not establish long-horizon task quality. Initial particle mode avoids
+allocating the MPM grid until full MPM is first requested.
+
+The reports include terminal success and spill counts, finite-state and movement checks, and the
+final mean particle fractions in each cup and the spill region. These final fractions describe
+the current episodes after automatic resets; a freshly reset full source cup does not establish
+that earlier episodes avoided spilling. Source fingerprints and checkpoint hashes identify
+archived deployments even when their Git metadata is absent.
+
+Record the same checkpoint and seed in separate one-world runs with `--video --num_envs 1
+--steps 360 --freeze_reset_sampler`. Clips are written alongside each JSON result. Rendering is
+included in that run's timing, so use non-video runs for throughput comparisons.
+
+For an existing environment, the public manager exposes transitions between physics steps:
+
+```python
+from isaaclab_newton.physics import NewtonMPMManager
+
+NewtonMPMManager.set_fidelity("particles", entry_name="media")
+NewtonMPMManager.set_voxel_size(0.012, entry_name="media")
+NewtonMPMManager.set_particle_radius(0.003, entry_name="media")
+NewtonMPMManager.set_fidelity("mpm", entry_name="media")
+```
+
+The manager resolves the current entry-local state and schedules CUDA graph capture again.
+Voxel changes preserve material history; fidelity handoffs reset stress and deformation history
+while preserving positions and velocities. A uniform radius change preserves particle mass and
+count, so MPM density changes as `1 / radius**3`. It does not split or merge particles. Radius
+changes currently require the selected MPM entry to own all scene particles.
+
+An optional success-gated curriculum can perform these transitions inside one training run:
+
+```python
+from isaaclab_tasks.contrib.franka_pour.pour_env_cfg import PourMediaFidelityStageCfg, _resolve_pour_solver_tree
+
+cfg.media_fidelity_min_episodes = 128
+_resolve_pour_solver_tree(cfg).media_solver.collider_basis = "S2"
+cfg.media_fidelity_stages = (
+    PourMediaFidelityStageCfg(success_rate=0.70, fidelity="mpm", voxel_size=0.020),
+    PourMediaFidelityStageCfg(success_rate=0.80, voxel_size=0.015),
+)
+```
+
+Each stage checks a cohort of completed episodes against actual terminal particle-transfer
+success. It is independent of the reset sampler's local-progress signal. A transition applies to
+all worlds at a reset boundary and retains the policy and optimizer. Empty stages disable the
+curriculum, and frozen playback does not advance it. Distributed ranks currently evaluate their
+own cohorts. The workflow offers a one-stage CLI variant with `--switch_success_rate 0.70
+--switch_voxel_size 0.015`; `--switch_particle_radius` is available for explicitly mass-fixed radius
+experiments. Changing solver voxel spacing does not change the configured particle spawn lattice.
+Use an S2 contact basis for voxel curricula (`--collider_basis S2` in the workflow). Coarsening
+the grid can exceed the fixed 27-particles-per-cell bound of the default `pic27` contact basis;
+the default bound is not a general guarantee for a changed grid or denser packing. Add
+`--warmstart_contact_impulses` to enable the S2 contact cache in an initially particle-based run.
+
 ## Learning contract
 
 The actor reward contains only:

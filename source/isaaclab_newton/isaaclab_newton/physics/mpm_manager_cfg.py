@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from dataclasses import field
 from typing import TYPE_CHECKING, Literal
 
 from isaaclab.utils import configclass
@@ -31,6 +32,30 @@ class MPMSolverCfg(NewtonSolverCfg):
     solver_type: str = "implicit_mpm"
     """Solver type. Can be "implicit_mpm"."""
 
+    fidelity: Literal["mpm", "particles"] = field(default="mpm", kw_only=True)
+    """Material fidelity: continuum MPM or approximate position-based particles.
+
+    Both modes retain the same particle arrays, ordering, masses, and rigid-collider
+    coupling interface. ``"particles"`` skips the continuum stress solve and uses
+    particle contact constraints; its contact reactions approximate MPM forces.
+    """
+
+    particle_iterations: int = field(default=2, kw_only=True)
+    """Contact constraint iterations per substep in ``"particles"`` fidelity."""
+
+    particle_cohesion: float | None = field(default=None, kw_only=True)
+    """Particle attraction distance in the approximate mode [m].
+
+    ``None`` uses Newton's model-level particle cohesion distance. This does not
+    convert MPM tensile or shear yield stress to a particle material.
+    """
+
+    particle_friction: float | None = field(default=None, kw_only=True)
+    """Dimensionless particle friction in the approximate mode.
+
+    ``None`` uses Newton's model-level particle friction coefficient.
+    """
+
     # numerics
     max_iterations: int = 250
     """Maximum number of iterations for the rheology solver."""
@@ -48,6 +73,13 @@ class MPMSolverCfg(NewtonSolverCfg):
 
     warmstart_mode: Literal["none", "auto", "particles", "grid", "smoothed"] = "auto"
     """Warm-start mode for the rheology solver."""
+
+    warmstart_contact_impulses: bool = field(default=False, kw_only=True)
+    """Whether to retain spatial contact impulses across sparse-grid rebuilds.
+
+    This experimental cache improves low-iteration S2 contact solves without
+    changing the particle material or enabling the approximate particle mode.
+    """
 
     collider_velocity_mode: Literal["forward", "backward", "instantaneous", "finite_difference"] = "forward"
     """Collider velocity computation mode.

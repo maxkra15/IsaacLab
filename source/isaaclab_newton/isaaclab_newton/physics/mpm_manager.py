@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import warp as wp
 from newton import (
@@ -19,11 +19,13 @@ from newton import (
     GeoType,
     Model,
     ModelBuilder,
+    ModelFlags,
     ShapeFlags,
     State,
     StateFlags,
 )
 from newton.solvers import SolverImplicitMPM
+from newton.solvers.experimental.coupled import SolverCoupled
 from warp.fem import TemporaryStore
 
 from isaaclab.physics import PhysicsManager
@@ -58,10 +60,15 @@ def _make_solver_config(solver_cfg: MPMSolverCfg, scene_prim: Usd.Prim | None = 
     """Build Newton's implicit MPM config, consuming authored USD when available."""
     collider_velocity_mode = _canonical_collider_velocity_mode(solver_cfg)
     values = {
+        "fidelity": solver_cfg.fidelity,
+        "particle_iterations": solver_cfg.particle_iterations,
+        "particle_cohesion": solver_cfg.particle_cohesion,
+        "particle_friction": solver_cfg.particle_friction,
         "max_iterations": solver_cfg.max_iterations,
         "tolerance": solver_cfg.tolerance,
         "solver": solver_cfg.solver,
         "warmstart_mode": solver_cfg.warmstart_mode,
+        "warmstart_contact_impulses": solver_cfg.warmstart_contact_impulses,
         "collider_velocity_mode": collider_velocity_mode,
         "voxel_size": solver_cfg.voxel_size,
         "grid_type": solver_cfg.grid_type,
@@ -185,6 +192,101 @@ class NewtonMPMManager(NewtonManager):
     """
     _implicit_mpm_solver_root: object | None = None
     _implicit_mpm_solver_cache: tuple[SolverImplicitMPM, ...] = ()
+
+    @classmethod
+    def get_fidelity(cls, *, entry_name: str | None = None) -> Literal["mpm", "particles"]:
+        """Return the material mode currently used by a direct or coupled MPM solver.
+
+        Args:
+            entry_name: Coupled MPM entry to query. Omit when there is only one.
+        """
+        solver, _, _ = cls._runtime_mpm_target(entry_name)
+        return solver.fidelity.value
+
+    @classmethod
+    def set_fidelity(cls, fidelity: Literal["mpm", "particles"], *, entry_name: str | None = None) -> None:
+        """Change material fidelity between simulation steps without changing particle IDs.
+
+        Positions, velocities, masses, and observation ordering are preserved. MPM
+        stress and deformation history are reset at a fidelity handoff. The next
+        physics step captures a new CUDA graph when capture is enabled.
+
+        Args:
+            fidelity: Continuum MPM or approximate position-based particle mode.
+            entry_name: Coupled MPM entry to update. Omit for a direct MPM solver
+                or a coupled solver containing exactly one MPM entry.
+        """
+        solver, state, solver_cfg = cls._runtime_mpm_target(entry_name)
+        solver.set_fidelity(fidelity, state=state)
+        solver_cfg.fidelity = fidelity
+        PhysicsManager._sim.physics_manager._invalidate_graph()
+
+    @classmethod
+    def set_voxel_size(cls, voxel_size: float, *, entry_name: str | None = None) -> None:
+        """Rebuild an MPM grid around the current particles between simulation steps.
+
+        Particle state and material history are retained. Resolution changes
+        allocate solver resources and invalidate CUDA graphs, so call this at
+        curriculum transitions rather than on every policy step.
+
+        Args:
+            voxel_size: New uniform grid spacing [m].
+            entry_name: Coupled MPM entry to update. Omit when there is only one.
+        """
+        solver, state, solver_cfg = cls._runtime_mpm_target(entry_name)
+        solver.set_voxel_size(voxel_size, state=state)
+        solver_cfg.voxel_size = voxel_size
+        PhysicsManager._sim.physics_manager._invalidate_graph()
+
+    @classmethod
+    def set_particle_radius(cls, radius: float, *, entry_name: str | None = None) -> None:
+        """Change a uniform particle radius between simulation steps, preserving masses.
+
+        MPM support volume is ``8 * radius**3``; changing radius at fixed mass
+        changes material density. Particle count and observation ordering stay
+        fixed. This is not particle splitting or merging.
+
+        Args:
+            radius: New uniform particle radius [m].
+            entry_name: Coupled MPM entry to update. It must own all model particles.
+
+        Raises:
+            ValueError: If a coupled entry contains only a subset of model particles.
+        """
+        solver, _, _ = cls._runtime_mpm_target(entry_name)
+        parent = NewtonManager.backend.model
+        if solver.model.particle_count != parent.particle_count:
+            raise ValueError("Runtime particle radius changes require an MPM entry owning all model particles.")
+        solver.set_particle_radius(radius)
+        if solver.model is not parent:
+            parent.particle_radius.fill_(radius)
+            parent.particle_max_radius = radius
+            NewtonManager._solver.notify_model_changed(ModelFlags.MODEL_PROPERTIES)
+        PhysicsManager._sim.physics_manager._invalidate_graph()
+
+    @classmethod
+    def _runtime_mpm_target(cls, entry_name: str | None) -> tuple[SolverImplicitMPM, State, MPMSolverCfg]:
+        """Resolve a direct or named coupled MPM solver and its current local state."""
+        root = NewtonManager._solver
+        if NewtonManager.backend is None or PhysicsManager._sim is None:
+            raise RuntimeError("Newton physics must be initialized before changing MPM settings.")
+        if isinstance(root, SolverImplicitMPM):
+            if entry_name is not None:
+                raise ValueError("entry_name is only valid for coupled solvers.")
+            return root, NewtonManager.backend.state_0, PhysicsManager._cfg.solver_cfg
+        if not isinstance(root, SolverCoupled):
+            raise RuntimeError("The active physics solver does not contain an MPM entry.")
+        names = tuple(name for name in root.entry_names() if isinstance(root.solver(name), SolverImplicitMPM))
+        if entry_name is None:
+            if len(names) != 1:
+                raise ValueError(f"Select entry_name from the active MPM entries: {names}.")
+            entry_name = names[0]
+        elif entry_name not in names:
+            raise ValueError(f"{entry_name!r} is not an MPM entry; select from {names}.")
+        solver_cfg = next(
+            entry.solver_cfg for entry in PhysicsManager._cfg.solver_cfg.entries if entry.name == entry_name
+        )
+        return root.solver(entry_name), root.entry_state(entry_name), solver_cfg
 
     @classmethod
     def initialize(cls, sim_context: SimulationContext) -> None:

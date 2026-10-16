@@ -374,6 +374,19 @@ def test_mpm_solver_cfg_maps_only_newton_solver_fields():
     assert not hasattr(newton_cfg, "project_outside_colliders")
 
 
+def test_mpm_solver_cfg_preserves_legacy_positional_arguments():
+    """Optional fidelity fields cannot reinterpret legacy numerical settings."""
+    cfg = MPMSolverCfg(None, "implicit_mpm", 13, 5.0e-5, "gauss-seidel", "particles", "backward", 0.0375)
+
+    assert cfg.max_iterations == 13
+    assert cfg.tolerance == 5.0e-5
+    assert cfg.solver == "gauss-seidel"
+    assert cfg.warmstart_mode == "particles"
+    assert cfg.collider_velocity_mode == "backward"
+    assert cfg.voxel_size == 0.0375
+    assert cfg.fidelity == "mpm"
+
+
 @pytest.mark.parametrize(
     "mode, expected, deprecated",
     [
@@ -400,10 +413,15 @@ def test_mpm_solver_cfg_translates_deprecated_collider_velocity_modes(mode, expe
 # SolverImplicitMPM.Config construction so a Newton field rename or accidental
 # drop is caught here instead of silently producing wrong-physics runs.
 _MPM_FIELD_VALUES = [
+    ("fidelity", "particles"),
+    ("particle_iterations", 4),
+    ("particle_cohesion", 0.002),
+    ("particle_friction", 0.4),
     ("max_iterations", 13),
     ("tolerance", 5.0e-5),
     ("solver", "gauss-seidel"),
     ("warmstart_mode", "particles"),
+    ("warmstart_contact_impulses", True),
     ("collider_velocity_mode", "backward"),
     ("voxel_size", 0.0375),
     ("grid_type", "dense"),

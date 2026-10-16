@@ -20,7 +20,7 @@ overrides = [
     { name = "fsspec", specifier = ">=2026.6.0" },
     { name = "mujoco", specifier = "~=3.15.0" },
     { name = "mujoco-warp", specifier = "~=3.15.0" },
-    { name = "newton", extras = ["sim"], git = "https://github.com/newton-physics/newton.git?rev=71eeba16a717d4dcf0b9dd7056a7b6f863054dc3" },
+    { name = "newton", extras = ["sim"], git = "https://github.com/maxkra15/newton.git?rev=d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b" },
     { name = "newton-usd-schemas", specifier = ">=0.5.0" },
     { name = "numpy", specifier = ">=2" },
     { name = "packaging", specifier = ">=20,<27" },
@@ -2045,7 +2045,7 @@ requires-dist = [
     { name = "meshio", specifier = ">=5.3.5" },
     { name = "moviepy", marker = "extra == 'video'", specifier = ">=1.0.3,<2.0.0.dev0" },
     { name = "myst-parser", marker = "extra == 'dev'" },
-    { name = "newton", extras = ["sim"], git = "https://github.com/newton-physics/newton.git?rev=71eeba16a717d4dcf0b9dd7056a7b6f863054dc3" },
+    { name = "newton", extras = ["sim"], git = "https://github.com/maxkra15/newton.git?rev=d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b" },
     { name = "newton-usd-schemas", specifier = ">=0.5.0" },
     { name = "numba", specifier = ">=0.63.1" },
     { name = "numpy", specifier = ">=2" },
@@ -2120,7 +2120,7 @@ requires-dist = [
     { name = "virtualenv", marker = "extra == 'rlinf'", specifier = ">=21.7.13" },
     { name = "viser", marker = "extra == 'viser'", specifier = ">=1.0.16" },
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.13.11" },
-    { name = "warp-lang", specifier = "==1.17.0" },
+    { name = "warp-lang", specifier = "==1.18.0" },
 ]
 provides-extras = ["tetrahedralization", "video", "importers", "test", "dev", "sb3", "skrl", "skrl-jax", "rl-games", "wandb", "rsl-rl", "torchrl", "viser", "rerun", "isaacsim", "ov", "ovphysx", "ovrtx", "mimic", "teleop", "rlinf", "leapp", "all"]
 
@@ -3455,7 +3455,7 @@ wheels = [
 [[package]]
 name = "newton"
 version = "1.8.0.dev0"
-source = { git = "https://github.com/newton-physics/newton.git?rev=71eeba16a717d4dcf0b9dd7056a7b6f863054dc3#71eeba16a717d4dcf0b9dd7056a7b6f863054dc3" }
+source = { git = "https://github.com/maxkra15/newton.git?rev=d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b#d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b" }
 dependencies = [
     { name = "warp-lang" },
 ]
@@ -6118,15 +6118,15 @@ wheels = [
 
 [[package]]
 name = "warp-lang"
-version = "1.17.0"
+version = "1.18.0"
 source = { registry = "https://pypi.nvidia.com/" }
 dependencies = [
     { name = "numpy" },
 ]
 wheels = [
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.17.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:47cd93636828dd16e55eeb4e77a0e3547b5fb0f383000a3d228629df68f28fd8" },
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.17.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:5051271048da956a8b94e2db9771ce60ce9591a3ac5bb49037f3d6812d1eea00" },
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.17.0-py3-none-win_amd64.whl", hash = "sha256:ca35c82242a7553046f09023bbe56750b5c3d9af72625bd1a905a56d3189771d" },
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.18.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:090962bfae7dd22ade0d8e0258f41635e0e58980f15bcc9e7a7d312819dfe440" },
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.18.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:d76ab8c7d4f4897405fa0a744d38812fc44cfc8162c40e658dc9ca7790b6a645" },
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.18.0-py3-none-win_amd64.whl", hash = "sha256:1769e55746739f2e244a2b412123003c462ec3d977dfb5f420f924a8553d30aa" },
 ]
 
 [[package]]

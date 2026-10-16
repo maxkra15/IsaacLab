@@ -515,10 +515,38 @@ class EventsCfg:
 
 
 @configclass
+class PourMediaFidelityStageCfg:
+    """One optional success-gated transition of the pouring media."""
+
+    success_rate: float = 0.70
+    """Required terminal particle-transfer success fraction in a completed-episode cohort."""
+
+    fidelity: Literal["mpm", "particles"] | None = None
+    """New material fidelity, or ``None`` to retain the current mode."""
+
+    voxel_size: float | None = None
+    """New uniform MPM grid spacing [m], or ``None`` to retain it."""
+
+    particle_radius: float | None = None
+    """New uniform particle radius [m], preserving particle masses and count."""
+
+    def validate_config(self) -> None:
+        """Reject invalid curriculum values before physics initialization."""
+        if not math.isfinite(self.success_rate) or not 0.0 <= self.success_rate <= 1.0:
+            raise ValueError("Media curriculum success_rate must lie in [0, 1].")
+        if self.fidelity not in (None, "mpm", "particles"):
+            raise ValueError("Media curriculum fidelity must be 'mpm', 'particles', or None.")
+        for name, value in (("voxel_size", self.voxel_size), ("particle_radius", self.particle_radius)):
+            if value is not None and (not math.isfinite(value) or value <= 0.0):
+                raise ValueError(f"Media curriculum {name} must be finite and positive or None.")
+
+
+@configclass
 class ResetDatasetCurriculumCfg:
     """Adaptive replay over the validated external reset dataset."""
 
     reset_dataset = CurrTerm(func=mdp.PourResetDatasetCurriculum)
+    media_fidelity = CurrTerm(func=mdp.PourMediaFidelityCurriculum)
 
 
 @configclass
@@ -579,6 +607,17 @@ class FrankaPourResetDatasetEnvCfg(ManagerBasedRLEnvCfg):
         uniform_fraction=0.50,
     )
     curriculum_freeze: bool = False
+
+    media_fidelity_stages: tuple[PourMediaFidelityStageCfg, ...] = ()
+    """Optional success-gated media transitions; an empty sequence disables them.
+
+    Transitions apply to every environment at a reset boundary while preserving
+    observations, actions, rewards, and particle count. In distributed training,
+    each rank evaluates its own completed-episode cohort.
+    """
+
+    media_fidelity_min_episodes: int = 128
+    """Minimum completed episodes per success-rate cohort and curriculum stage."""
 
     def __post_init__(self):
         """Set the canonical control rate, horizon, viewer, and coupled Newton solver."""
@@ -674,6 +713,14 @@ class FrankaPourResetDatasetEnvCfg(ManagerBasedRLEnvCfg):
 
     def _validate_runtime_values(self) -> None:
         """Validate allocation and observation bounds consumed directly at runtime."""
+        if (
+            isinstance(self.media_fidelity_min_episodes, bool)
+            or not isinstance(self.media_fidelity_min_episodes, int)
+            or self.media_fidelity_min_episodes <= 0
+        ):
+            raise ValueError("media_fidelity_min_episodes must be a positive integer.")
+        for stage in self.media_fidelity_stages:
+            stage.validate_config()
         for name, value in (
             ("source_fill_level", self.source_fill_level),
             ("pour_target_frac", self.pour_target_frac),
