@@ -141,8 +141,6 @@ def main() -> None:
             NewtonGLVisualizerCfg(
                 eye=(0.9, 0.65, 0.5),
                 lookat=(0.5, 0.0, 0.1),
-                origin_type="env",
-                origin_env_index=0,
                 show_particles=True,
                 particle_color=(0.85, 0.72, 0.45),
             )
