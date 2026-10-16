@@ -239,6 +239,8 @@ one-second intervals, including the scene, rollout storage, policy, and optimize
 | RTX PRO 6000 Blackwell, 96 GB | 4,096 | 20,616 | 11,108 |
 | RTX PRO 6000 Blackwell, 96 GB | 8,192 | 19,155 | 19,884 |
 | RTX PRO 6000 Blackwell, 96 GB | 16,384 | 16,653 | 37,402 |
+| RTX PRO 6000 Blackwell, 96 GB | 40,960 | 11,646 | 90,841 |
+| RTX PRO 6000 Blackwell, 96 GB | 45,056 | 10,858 | 96,466 |
 
 Among these completed primary cases, 4,096 environments gave the highest throughput on both
 hosts. The L40 also completed five PPO iterations with 21,504 environments, or 10,063,872 particles.
@@ -250,8 +252,18 @@ L40 bracket therefore has 1,024-environment resolution; a short capacity probe a
 later training capacity. The host-memory guard retained an 8 GiB reserve and did not trigger in
 these GPU-memory failures.
 
-The RTX PRO 6000's largest completed batch in this record is 16,384 environments. Its local
-capacity ceiling has not been established.
+The RTX PRO 6000 completed five PPO iterations with 45,056 environments, or 21,086,208 particles.
+The next tested count, 49,152, completed its first PPO rollout and exhausted CUDA memory in
+`loss.backward()` during optimization, requesting another 288 MiB with 254.75 MiB free. No complete
+PPO iteration was logged, and its internal minibatch index was not instrumented. Its sampled peak
+was 97,064 MiB. This is a tested 4,096-environment bracket: the successful lower point uses the
+full protocol, while the failing upper point uses the shorter one-iteration capacity protocol.
+No host-memory guard, timeout, or foreign GPU computation caused that failure. Earlier interrupted
+attempts remain excluded from capacity and throughput conclusions.
+
+The largest completed batch is 47.3% slower than the 4,096-environment batch on the RTX system.
+These counts bound the measured scene and fixed PPO configuration; they do not establish an
+exact particle-solver or hardware maximum.
 
 Only completed, isolated five-iteration cases enter the throughput table. Startup and cold
 compilation are excluded, and the hosts have different CPUs as well as GPUs. Changing the number
