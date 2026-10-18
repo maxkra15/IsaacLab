@@ -62,6 +62,7 @@ def _make_solver_config(solver_cfg: MPMSolverCfg, scene_prim: Usd.Prim | None = 
     values = {
         "fidelity": solver_cfg.fidelity,
         "particle_iterations": solver_cfg.particle_iterations,
+        "particle_relaxation": solver_cfg.particle_relaxation,
         "particle_cohesion": solver_cfg.particle_cohesion,
         "particle_friction": solver_cfg.particle_friction,
         "max_iterations": solver_cfg.max_iterations,

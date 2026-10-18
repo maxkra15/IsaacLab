@@ -82,6 +82,18 @@ parser.add_argument("--fidelity", choices=["mpm", "particles"], default="mpm", h
 parser.add_argument(
     "--particle_iterations", type=_positive_int, default=2, help="Approximate particle solve iterations."
 )
+parser.add_argument(
+    "--particle_relaxation",
+    type=_positive_finite_float,
+    default=0.9,
+    help="Approximate particle pair relaxation in (0, 1]; lower values soften dense packing.",
+)
+parser.add_argument(
+    "--fluid_substeps",
+    type=_positive_int,
+    default=None,
+    help="Fluid steps per 800 Hz robot step; Rizon defaults to 2 for particles and 1 for MPM.",
+)
 parser.add_argument("--video", action="store_true", help="Record the selected visualizer to an MP4 clip.")
 parser.add_argument("--output_dir", type=Path, default=Path("logs/teapot_video"), help="Video output directory.")
 parser.add_argument("--video_fps", type=_positive_int, default=25, help="Video frame rate; must divide 800 Hz.")
@@ -170,6 +182,13 @@ args_cli = parser.parse_args()
 if args_cli.fill_jitter > 0.5:
     parser.error("--fill_jitter must be in [0, 0.5]")
 ROBOT_ENABLED = args_cli.robot == "rizon_sharpa"
+if args_cli.particle_relaxation > 1.0:
+    parser.error("--particle_relaxation must be in (0, 1]")
+FLUID_SUBSTEPS = args_cli.fluid_substeps
+if FLUID_SUBSTEPS is None:
+    FLUID_SUBSTEPS = 2 if ROBOT_ENABLED and args_cli.fidelity == "particles" else 1
+if not ROBOT_ENABLED and FLUID_SUBSTEPS != 1:
+    parser.error("--fluid_substeps greater than 1 requires --robot rizon_sharpa")
 
 
 # Use one 1.25 ms solver step per outer loop iteration and retain the original 400 Hz render cadence.
@@ -238,8 +257,8 @@ if ROBOT_ENABLED:
 
     BOWL_WORLD_TOP_Z = BOWL_BASE_POS[2] + BOWL_SCALE * BOWL_LOCAL_Z_MAX
 
-    CAMERA_EYE = (0.55, -1.5, 1.72)
-    CAMERA_TARGET = (-0.28, 0.0, 1.22)
+    CAMERA_EYE = (0.0, -0.65, 1.4)
+    CAMERA_TARGET = (-0.26, 0.0, 1.1)
 
 # Use tighter kernels than the open-tank dam-break preset so the reconstructed
 # surface stays inside narrow features such as the teapot spout.
@@ -555,6 +574,7 @@ def create_sim_cfg():
             solver_cfg=MPMSolverCfg(
                 fidelity=args_cli.fidelity,
                 particle_iterations=args_cli.particle_iterations,
+                particle_relaxation=args_cli.particle_relaxation,
                 particle_friction=0.0,
                 particle_cohesion=0.0,
                 voxel_size=VOXEL_SIZE,
@@ -591,7 +611,7 @@ def create_sim_cfg():
         # Cover dense cells during bowl impact; pic27 can omit wall contacts.
         solver_cfg.collider_basis = "pic512"
         cfg.physics = NewtonCfg(
-            solver_cfg=make_solver_cfg(solver_cfg),
+            solver_cfg=make_solver_cfg(solver_cfg, fluid_substeps=FLUID_SUBSTEPS),
             num_substeps=MPM_SUBSTEPS,
             use_cuda_graph=not args_cli.disable_cuda_graph,
         )
@@ -919,6 +939,7 @@ def main() -> None:
             )
             robot.write_joint_position_to_sim_index(position=robot_motion.initial_joint_positions)
             sim.forward()
+        sim.initialize_visualizers()
         sim.set_camera_view(eye=CAMERA_EYE, target=CAMERA_TARGET)
         surface_renderer = (
             create_surface_renderer(sim)
@@ -930,6 +951,8 @@ def main() -> None:
         print(
             "[INFO]: Isaac Lab Newton teapot-fill MPM demo ready."
             f" Fidelity {args_cli.fidelity};"
+            f" fluid substeps {FLUID_SUBSTEPS}; particle iterations {args_cli.particle_iterations};"
+            f" particle relaxation {args_cli.particle_relaxation:g};"
             f" Sampled {particle_count(scene)} MPM particles inside the teapot;"
             f" extracted {surface_triangle_count} surface triangles;"
             f" rendering {args_cli.fluid_render_mode};"

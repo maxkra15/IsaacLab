@@ -56,6 +56,57 @@ Franka Pour task all use this pattern. See :ref:`newton-coupled-solvers` for
 proxy and ADMM coupling, exchange modes, and tuning.
 
 
+Approximate particle contacts
+-----------------------------
+
+Experimental particle fidelity preserves the particle state layout while
+skipping MPM grid allocation, transfers, and the stress solve:
+
+.. code-block:: python
+
+    from isaaclab_newton.physics import MPMSolverCfg
+
+    solver_cfg = MPMSolverCfg(
+        fidelity="particles",
+        particle_iterations=2,
+        particle_relaxation=0.9,
+        particle_friction=0.5,
+        particle_cohesion=0.0,
+        separate_worlds=True,
+        grid_type="sparse",
+    )
+
+These are runtime solver controls. They are independent of the USD material's
+constitutive parameters. Particle contacts approximate granular behavior;
+they do not reproduce an incompressible liquid or MPM stress history.
+
+Dense fills can require more contact iterations or smaller substeps. Summed
+pair corrections can add energy and eject particles even when swept mesh
+contacts prevent individual wall crossings. Reducing ``particle_relaxation``
+can reduce this overshoot at the same iteration budget, but permits more
+overlap and weaker pressure support. Its default remains ``0.9``.
+
+The Rizon teapot example defaults to two fluid substeps in particle fidelity,
+with two iterations per substep. The robot remains at 800 Hz and the fluid
+runs at 1600 Hz. The coupler interpolates the measured pot COM and shortest
+rotation through the fluid substeps, so it advances each boundary segment
+once. Record the full scripted sequence with:
+
+.. code-block:: bash
+
+    uv run --extra video isaaclab example rizon-sharpa-teapot \
+        --fidelity particles --fluid_render_mode particles \
+        --fluid_substeps 2 --particle_iterations 2 --particle_relaxation 0.9 \
+        --max_steps 14400 --video --output_dir logs/teapot_particles
+
+The cheaper combination ``--fluid_substeps 1 --particle_relaxation 0.5`` also
+completed the tested 18-second sequence without the startup blow-up, with
+greater packing compression and different delivery. These tests used 135,314
+particles of radius 0.75 mm and fixed seed 7; stability in another fill or
+motion requires validation. A few particles spilled during the later pour,
+so these runs establish stable bulk motion rather than zero spillage.
+
+
 Data model
 ----------
 
@@ -154,6 +205,11 @@ source of truth for fields and defaults. The fields group as follows:
      - ``voxel_size``, and ``particles_per_cell`` on the spawner
      - Background-grid and particle resolution, which set accuracy, active
        cells, and memory use.
+   * - Approximate particles
+     - ``fidelity``, ``particle_iterations``, ``particle_relaxation``,
+       ``particle_friction``, and ``particle_cohesion``
+     - Selects local particle contacts and their convergence, friction, and
+       attraction range. These controls do not change the MPM material.
    * - Grid storage
      - ``grid_type``, ``grid_padding``, ``max_active_cell_count``, the
        ``max_*_node_count`` limits, and ``separate_worlds``

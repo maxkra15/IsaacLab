@@ -574,6 +574,9 @@ class _TeapotColliderSyncSolver(SolverCoupled):
         pot = model.body_label.index("/World/envs/env_0/PourContainer")
         self._source_pot = int(self._entries["robot"].body_global_to_local.numpy()[pot])
         self._fluid_pot = int(self._entries["fluid"].body_global_to_local.numpy()[pot])
+        # Reuse the standard entry stepping path for each prescribed boundary segment.
+        # The configured entry retains its public substep count; both share in-place state.
+        self._fluid_microstep_entry = replace(self._entries["fluid"], substeps=1)
 
     def _apply_entry_shape_visibility(self, view, cfg, proxy_body_keep):
         visible = self._entry_visible_shapes(cfg, set(cfg.bodies) | proxy_body_keep)
@@ -611,24 +614,28 @@ class _TeapotColliderSyncSolver(SolverCoupled):
     def _step_coupled(self, state_in, state_out, control, contacts, dt):
         rigid, fluid = self._entries["robot"], self._entries["fluid"]
         self._step_entry(rigid, control, contacts, dt)
-        # COM velocity and angular velocity carry the measured root from start to end.
-        wp.launch(
-            _sync_teapot_collider,
-            dim=1,
-            inputs=[
-                rigid.state_0.body_q,
-                rigid.state_1.body_q,
-                rigid.view.body_com,
-                self._source_pot,
-                dt,
-                fluid.state_0.body_q,
-                fluid.state_0.body_qd,
-                self._fluid_pot,
-            ],
-            device=self.model.device,
-        )
-        self._notify_input_state_update(fluid, StateFlags.BODY_Q | StateFlags.BODY_QD, dt=dt)
-        self._step_entry(fluid, control, contacts, dt)
+        substep_dt = dt / fluid.substeps
+        for substep in range(fluid.substeps):
+            # Newton predicts a collider's end pose from its start pose and twist.
+            # Advance that start between fluid steps without advancing the robot again.
+            wp.launch(
+                _sync_teapot_collider,
+                dim=1,
+                inputs=[
+                    rigid.state_0.body_q,
+                    rigid.state_1.body_q,
+                    rigid.view.body_com,
+                    self._source_pot,
+                    dt,
+                    substep / fluid.substeps,
+                    fluid.state_0.body_q,
+                    fluid.state_0.body_qd,
+                    self._fluid_pot,
+                ],
+                device=self.model.device,
+            )
+            self._notify_input_state_update(fluid, StateFlags.BODY_Q | StateFlags.BODY_QD, dt=substep_dt)
+            self._step_entry(self._fluid_microstep_entry, control, contacts, substep_dt)
 
 
 class NewtonTeapotCouplerManager(NewtonCouplerManager):
@@ -1011,16 +1018,24 @@ def _sync_teapot_collider(
     source_com: wp.array[wp.vec3],
     source: int,
     dt: float,
+    alpha: float,
     fluid_pose: wp.array[wp.transform],
     fluid_velocity: wp.array[wp.spatial_vector],
     destination: int,
 ):
     start = source_start[source]
     end = source_end[source]
-    linear = (wp.transform_point(end, source_com[source]) - wp.transform_point(start, source_com[source])) / dt
+    center_start = wp.transform_point(start, source_com[source])
+    center_end = wp.transform_point(end, source_com[source])
+    linear = (center_end - center_start) / dt
     rotation = wp.normalize(wp.transform_get_rotation(end) * wp.quat_inverse(wp.transform_get_rotation(start)))
     axis, angle = wp.quat_to_axis_angle(rotation)
-    fluid_pose[destination] = start
+    pose = start
+    if alpha > 0.0:
+        orientation = wp.normalize(wp.quat_from_axis_angle(axis, angle * alpha) * wp.transform_get_rotation(start))
+        center = center_start + alpha * (center_end - center_start)
+        pose = wp.transform(center - wp.quat_rotate(orientation, source_com[source]), orientation)
+    fluid_pose[destination] = pose
     fluid_velocity[destination] = wp.spatial_vector(linear, axis * (angle / dt))
 
 
@@ -1066,7 +1081,7 @@ class TeapotSolverCfg(CouplerProxyCfg):
     class_type: type[NewtonTeapotCouplerManager] | str = "rizon_sharpa_teapot:NewtonTeapotCouplerManager"
 
 
-def make_solver_cfg(mpm_cfg: MPMSolverCfg) -> TeapotSolverCfg:
+def make_solver_cfg(mpm_cfg: MPMSolverCfg, *, fluid_substeps: int = 1) -> TeapotSolverCfg:
     """Resolve rigid hand--pot contacts and synchronize the measured fluid boundary."""
     return TeapotSolverCfg(
         entries=[
@@ -1096,6 +1111,7 @@ def make_solver_cfg(mpm_cfg: MPMSolverCfg) -> TeapotSolverCfg:
                 all_particles=True,
                 include_static_shapes=True,
                 in_place=True,
+                substeps=fluid_substeps,
             ),
         ],
     )

@@ -43,6 +43,13 @@ class MPMSolverCfg(NewtonSolverCfg):
     particle_iterations: int = field(default=2, kw_only=True)
     """Contact constraint iterations per substep in ``"particles"`` fidelity."""
 
+    particle_relaxation: float = field(default=0.9, kw_only=True)
+    """Dimensionless pair-constraint relaxation in ``(0, 1]`` for approximate particles.
+
+    Reducing this factor can stabilize dense particle fills, with a softer packing response.
+    It does not change MPM material parameters.
+    """
+
     particle_cohesion: float | None = field(default=None, kw_only=True)
     """Particle attraction distance in the approximate mode [m].
 

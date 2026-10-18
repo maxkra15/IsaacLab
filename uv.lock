@@ -20,7 +20,7 @@ overrides = [
     { name = "fsspec", specifier = ">=2026.6.0" },
     { name = "mujoco", specifier = "~=3.15.0" },
     { name = "mujoco-warp", specifier = "~=3.15.0" },
-    { name = "newton", extras = ["sim"], git = "https://github.com/maxkra15/newton.git?rev=d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b" },
+    { name = "newton", extras = ["sim"], git = "https://github.com/maxkra15/newton.git?rev=f70e7d2edbd981909afebf3e24daba62ff2b45e6" },
     { name = "newton-usd-schemas", specifier = ">=0.5.0" },
     { name = "numpy", specifier = ">=2" },
     { name = "packaging", specifier = ">=20,<27" },
@@ -2045,7 +2045,7 @@ requires-dist = [
     { name = "meshio", specifier = ">=5.3.5" },
     { name = "moviepy", marker = "extra == 'video'", specifier = ">=1.0.3,<2.0.0.dev0" },
     { name = "myst-parser", marker = "extra == 'dev'" },
-    { name = "newton", extras = ["sim"], git = "https://github.com/maxkra15/newton.git?rev=d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b" },
+    { name = "newton", extras = ["sim"], git = "https://github.com/maxkra15/newton.git?rev=f70e7d2edbd981909afebf3e24daba62ff2b45e6" },
     { name = "newton-usd-schemas", specifier = ">=0.5.0" },
     { name = "numba", specifier = ">=0.63.1" },
     { name = "numpy", specifier = ">=2" },
@@ -3455,7 +3455,7 @@ wheels = [
 [[package]]
 name = "newton"
 version = "1.8.0.dev0"
-source = { git = "https://github.com/maxkra15/newton.git?rev=d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b#d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b" }
+source = { git = "https://github.com/maxkra15/newton.git?rev=f70e7d2edbd981909afebf3e24daba62ff2b45e6#f70e7d2edbd981909afebf3e24daba62ff2b45e6" }
 dependencies = [
     { name = "warp-lang" },
 ]

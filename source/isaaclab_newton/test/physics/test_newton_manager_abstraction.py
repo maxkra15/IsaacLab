@@ -415,6 +415,7 @@ def test_mpm_solver_cfg_translates_deprecated_collider_velocity_modes(mode, expe
 _MPM_FIELD_VALUES = [
     ("fidelity", "particles"),
     ("particle_iterations", 4),
+    ("particle_relaxation", 0.5),
     ("particle_cohesion", 0.002),
     ("particle_friction", 0.4),
     ("max_iterations", 13),
