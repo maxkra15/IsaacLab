@@ -88,7 +88,7 @@ class G1FlatWarpFlashSACRunnerCfg(G1FlatFlashSACRunnerCfg):
 
     algorithm = "warp_flashsac"
     algorithm_cfg = {
-        **G1FlatFlashSACRunnerCfg.algorithm_cfg,
+        **G1FlatFlashSACRunnerCfg().algorithm_cfg,
         "use_compile": False,
         "use_amp": False,
     }
