@@ -86,6 +86,11 @@ Choose a library for the algorithms and configuration tools your experiment need
      - PPO reference runner on a ``torchrl.envs.EnvBase`` wrapper that keeps observation groups and
        terminal observations, with unified training and playback
      - ``--extra torchrl``
+   * - **RoboLearn**
+     - FlashSAC and experimental Warp-NN learners on flat G1 locomotion
+     - Torch FlashSAC, captured Warp PPO, and experimental FP32 Warp FlashSAC;
+       environment observations and rewards use the task's existing Torch workflow
+     - ``--extra robolearn``
 
 Install optional dependencies by selecting the corresponding ``uv`` extra when running a command:
 
@@ -97,6 +102,15 @@ Install optional dependencies by selecting the corresponding ``uv`` extra when r
    uv run --extra sb3 isaaclab train --rl_library sb3 --task Isaac-Cartpole
    uv run --extra torchrl isaaclab train --rl_library torchrl --task Isaac-Cartpole
    uv run --extra torchrl isaaclab play --rl_library torchrl --task Isaac-Cartpole --checkpoint latest
+   uv run --extra robolearn isaaclab train --rl_library robolearn --algorithm warp_ppo --task Isaac-Velocity-Flat-G1
+   uv run --extra robolearn isaaclab train --rl_library robolearn --algorithm flashsac --task Isaac-Velocity-Flat-G1
+
+The optional `RoboLearn <https://github.com/maxkra15/RoboLearn>`_ package is pinned to
+a Git revision and installed from GitHub. Its FlashSAC implementation credits the
+`FlashSAC authors and paper <https://arxiv.org/abs/2604.04539>`_. Warp-NN FlashSAC
+is experimental; graph capture does not by itself imply faster learning or better
+policy quality. These runners retain the task's physics, observations, rewards,
+and termination logic; only the learner changes.
 
 
 Typical training workflow
