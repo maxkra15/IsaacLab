@@ -127,9 +127,14 @@ viewer. Neither visualizer requires an external callback or particle-setting ove
 
 ## Material fidelity and throughput experiments
 
-This feature branch pins Newton fork commit `d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b`
+This feature branch pins Newton fork commit `c322601673c1a84a523329861d465ee951501591`
 and Warp 1.18.0 in `pyproject.toml` and `uv.lock`. Normal `uv run` commands resolve these
 dependencies; no source-path overlay is required.
+
+This revision rebuilds particle neighbor lists during every contact iteration and adds directional
+weighting for dense normal and friction contacts. The October 16 throughput tables below used Newton
+fork commit `d183ffaad4d49a74f75a0bdc70e6c31d86d3f58b`, before these changes. Updated PPO throughput
+for the current pin is pending; the historical rates do not measure the pinned solver.
 
 An experimental Newton build with `SolverImplicitMPM.Fidelity` supports an approximate
 position-based particle stage through `MPMSolverCfg(fidelity="particles", particle_iterations=2)`.
@@ -202,8 +207,8 @@ archived deployments even when their Git metadata is absent.
 
 ### Official pretrained checkpoint: PPO continuation
 
-The October 16, 2026 measurements below resume the official iteration-7450 weights under this
-branch's current task settings. They retain 468 particles per environment, 84 actor inputs,
+The October 16, 2026 measurements below resume the official iteration-7450 weights under the task
+settings and Newton revision used at that date. They retain 468 particles per environment, 84 actor inputs,
 86 critic inputs, eight actions, and the saved optimizer. The asset supplies weights and optimizer
 state; it does not bundle the original run's complete material configuration.
 
