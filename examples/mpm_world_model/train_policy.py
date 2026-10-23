@@ -28,6 +28,24 @@ from .models import load_checkpoint
 from .recording import atomic_json
 
 
+class ActionBoundedPolicy(torch.nn.Module):
+    """Export the executed actuator limit around an ordinary RSL JIT policy.
+
+    The native RSL checkpoint retains the raw actor distribution and optimizer
+    interface. This wrapper affects deterministic TorchScript deployment only.
+    """
+
+    def __init__(self, policy: torch.nn.Module, action_limit: float = 1.0):
+        super().__init__()
+        if not 0.0 < action_limit <= 1.0:
+            raise ValueError("Action limit must lie in (0, 1]")
+        self.policy = policy
+        self.action_limit = float(action_limit)
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        return self.policy(observation).clamp(-self.action_limit, self.action_limit)
+
+
 def default_runner_config():
     """Give new tasks a small policy while keeping Franka's exported config exact."""
     return {
@@ -36,7 +54,7 @@ def default_runner_config():
             "class_name": "MLPModel",
             "hidden_dims": [128, 128],
             "activation": "elu",
-            "obs_normalization": False,
+            "obs_normalization": True,
             "distribution_cfg": {
                 "class_name": "GaussianDistribution",
                 "init_std": 0.3,
@@ -47,7 +65,7 @@ def default_runner_config():
             "class_name": "MLPModel",
             "hidden_dims": [128, 128],
             "activation": "elu",
-            "obs_normalization": False,
+            "obs_normalization": True,
             "distribution_cfg": None,
         },
         "algorithm": {
@@ -70,6 +88,8 @@ def default_runner_config():
 
 def train(args):
     """Fit a policy without reference futures and save native RSL and JIT actors."""
+    if args.task == "franka_pour" and args.action_limit != 1.0:
+        raise ValueError("Franka native RSL checkpoint consumers require the original action limit of 1")
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     output = Path(args.output)
@@ -78,7 +98,11 @@ def train(args):
         raise FileExistsError(f"Refusing to overwrite policy run: {output}")
     models, model_checkpoint = load_checkpoint(args.model, device=args.device)
     episodes = []
+    declared_manifests = {entry["manifest_sha256"] for entry in model_checkpoint.get("run", {}).get("data", [])}
     for directory in args.data:
+        digest = hashlib.sha256((Path(directory) / "manifest.json").read_bytes()).hexdigest()
+        if digest not in declared_manifests:
+            raise ValueError("PPO replay manifests must match the dynamics model's recorded training datasets")
         episodes.extend(load_episodes(directory))
     declared_groups = model_checkpoint.get("run", {}).get("split_groups", {}).get(args.task)
     if declared_groups is None:
@@ -96,6 +120,7 @@ def train(args):
         uncertainty_limit=args.uncertainty_limit,
         uncertainty_penalty=args.uncertainty_penalty,
         mass_tolerance=args.mass_tolerance,
+        action_limit=args.action_limit,
         device=args.device,
         seed=args.seed,
     )
@@ -128,6 +153,17 @@ def train(args):
         "reward_bounds": [env.reward_min, env.reward_max],
         "reset_split": "train",
         "seed_bank_size": args.seed_bank_size,
+        "mass_admissibility_check_enabled": bool(env.mass_indices),
+        "physical_decoder": getattr(models[0].config, "physical_decoder", "none"),
+        "action_limit": env.action_limit,
+        "action_semantics": (
+            "Imagined environment and policy.pt clip executed actions to this limit; "
+            "the RSL checkpoint retains its raw actor distribution"
+        ),
+        "native_checkpoint_action_limit_requirement": (
+            "Native RSL checkpoint consumers must separately enforce this action_limit; "
+            "only policy.pt embeds the clipping wrapper. Franka accepts action_limit=1 only."
+        ),
         "algorithm": "RSL-RL PPO; no analytical policy gradient",
         "interpretation": "Model rewards are diagnostic; accept only real-MPM task results.",
     }
@@ -176,7 +212,7 @@ def train(args):
             "truncations": truncations,
             "model_terminations": terminations,
             "nonfinite": nonfinite,
-            "inadmissible_mass_predictions": inadmissible,
+            "mass_admissibility_cutoffs": inadmissible,
             "mean_disagreement": uncertainty_sum / count,
             "loss": losses,
         }
@@ -187,7 +223,8 @@ def train(args):
     total_seconds = time.perf_counter() - started
     infos = {"world_model": provenance, "runner_cfg": cfg}
     torch.save({**alg.save(), "iter": initial_iteration + args.iterations, "infos": infos}, output / "model_final.pt")
-    torch.jit.script(alg.get_policy().as_jit().cpu().eval()).save(str(output / "policy.pt"))
+    policy = ActionBoundedPolicy(alg.get_policy().as_jit().cpu().eval(), args.action_limit)
+    torch.jit.script(policy).save(str(output / "policy.pt"))
     result = {
         "complete": True,
         "iterations": logs,
@@ -215,6 +252,7 @@ def main():
     parser.add_argument("--uncertainty-limit", type=float, default=2.0)
     parser.add_argument("--uncertainty-penalty", type=float, default=0.0)
     parser.add_argument("--mass-tolerance", type=float, default=0.05)
+    parser.add_argument("--action-limit", type=float, default=1.0, help="Executed and exported action bound in (0, 1]")
     parser.add_argument("--rollout-steps", type=int, default=16)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -224,6 +262,10 @@ def main():
     args = parser.parse_args()
     if min(args.iterations, args.rollout_steps, args.epochs, args.threads) < 1 or args.learning_rate <= 0:
         parser.error("Training budgets and learning rate must be positive")
+    if not 0.0 < args.action_limit <= 1.0:
+        parser.error("Action limit must lie in (0, 1]")
+    if args.task == "franka_pour" and args.action_limit != 1.0:
+        parser.error("Franka native RSL checkpoint consumers require the original action limit of 1")
     train(args)
 
 

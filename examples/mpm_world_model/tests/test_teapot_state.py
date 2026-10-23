@@ -9,9 +9,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+import warp as wp
 from scipy.spatial.transform import Rotation
 
-from examples.mpm_world_model.collect_teapot import _reset_split
+from examples.mpm_world_model.collect_teapot import _accumulate_rigid_capacity, _reset_split
 from examples.mpm_world_model.recording import EpisodeWriter
 from examples.mpm_world_model.teapot_state import (
     TeapotResidualController,
@@ -123,3 +124,38 @@ def test_prephysics_split_selection_matches_actual_recorder(tmp_path):
     writer.close()
     assert {entry["split"] for entry in writer.manifest["episodes"]} == {"train", "validation", "test"}
     assert predictions == [entry["split"] for entry in writer.manifest["episodes"]]
+
+
+def test_native_capacity_monitor_retains_transient_overflow_and_resets():
+    """One dropped-constraint microstep remains invalid after counts fall again."""
+    nefc = wp.array([180], dtype=wp.int32, device="cpu")
+    ncon = wp.array([32], dtype=wp.int32, device="cpu")
+    overflow = wp.array([1 << 9], dtype=wp.int32, device="cpu")
+    statistics = wp.zeros(7, dtype=wp.int32, device="cpu")
+
+    def sample():
+        wp.launch(
+            _accumulate_rigid_capacity, dim=1, inputs=[nefc, ncon, overflow, 128, 256, 1, statistics], device="cpu"
+        )
+
+    sample()
+    nefc.assign(np.array([20], dtype=np.int32))
+    ncon.assign(np.array([4], dtype=np.int32))
+    overflow.zero_()
+    sample()
+    values = statistics.numpy()
+    assert values.tolist() == [180, 32, 1 << 28, 1 << 9, 2, 20, 4]
+    # Native iteration limits remain visible without becoming buffer overflow.
+    statistics.zero_()
+    overflow.assign(np.array([1 << 9], dtype=np.int32))
+    sample()
+    assert statistics.numpy()[2] == 0 and statistics.numpy()[3] == 1 << 9
+    # Native capacity flags remain invalid even with small post-drop counts.
+    overflow.assign(np.array([1], dtype=np.int32))
+    sample()
+    assert statistics.numpy()[2] == 1
+    statistics.zero_()
+    overflow.zero_()
+    ncon.assign(np.array([256], dtype=np.int32))
+    sample()
+    assert statistics.numpy()[2] == 1 << 29

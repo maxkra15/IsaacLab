@@ -139,3 +139,74 @@ class EpisodeWriter:
         self.manifest["complete"] = bool(complete)
         self.manifest["transition_count"] = sum(item["transitions"] for item in self.manifest["episodes"])
         atomic_json(self.manifest_path, self.manifest)
+
+
+class EpisodeMetrics:
+    """Keep pre-reset lengths/returns, including censored initial episodes."""
+
+    def __init__(self, num_worlds: int, dt: float):
+        self.dt = dt
+        self.returns = torch.zeros(num_worlds, dtype=torch.float64)
+        self.lengths = torch.zeros(num_worlds, dtype=torch.long)
+        self.rows = torch.full((num_worlds,), -1, dtype=torch.long)
+        self.first = [
+            {
+                "world_id": i,
+                "reset_row": -1,
+                "outcome": "unfinished",
+                "episode_length_policy_steps": 0,
+                "episode_return": 0.0,
+            }
+            for i in range(num_worlds)
+        ]
+        self.completed = []
+
+    def reset(self, world_ids, rows):
+        ids = torch.as_tensor(world_ids, dtype=torch.long).cpu()
+        self.returns[ids] = 0.0
+        self.lengths[ids] = 0
+        self.rows[ids] = torch.as_tensor(rows, dtype=torch.long).cpu()
+        for index in ids.tolist():
+            if self.first[index]["reset_row"] < 0:
+                self.first[index]["reset_row"] = int(self.rows[index])
+
+    def update(self, rewards, lengths, rows, terminated, truncated, success, terms, term_names, *, warmup=False):
+        rewards, lengths, rows = rewards.detach().cpu(), lengths.detach().cpu(), rows.detach().cpu()
+        terminated, truncated, success = terminated.cpu().bool(), truncated.cpu().bool(), success.cpu().bool()
+        terms = terms.cpu().bool()
+        self.returns += rewards.double()
+        self.lengths.copy_(lengths)
+        self.rows.copy_(rows)
+        done = terminated | truncated
+        for world in range(len(self.first)):
+            record = {
+                "world_id": world,
+                "reset_row": int(rows[world]),
+                "episode_length_policy_steps": int(lengths[world]),
+                "episode_length_seconds": int(lengths[world]) * self.dt,
+                "episode_return": float(self.returns[world]),
+                "warmup": bool(warmup),
+                "terminated": bool(terminated[world]),
+                "truncated": bool(truncated[world]),
+                "outcome": "success" if success[world] else ("timeout" if truncated[world] else "failure"),
+                "termination_reasons": [name for name, active in zip(term_names, terms[world]) if active],
+            }
+            if self.first[world]["outcome"] == "unfinished":
+                self.first[world] = {**record, "outcome": record["outcome"] if done[world] else "unfinished"}
+            if done[world]:
+                self.completed.append(record)
+
+    def summary(self) -> dict:
+        completed = [record for record in self.completed if not record["warmup"]]
+        length_sum = sum(record["episode_length_policy_steps"] for record in completed)
+        return_sum = sum(record["episode_return"] for record in completed)
+        return {
+            "completed_episode_length_sum_policy_steps": length_sum,
+            "completed_episode_return_sum": return_sum,
+            "mean_completed_episode_length_policy_steps": length_sum / max(len(completed), 1),
+            "mean_completed_episode_return": return_sum / max(len(completed), 1),
+            "mean_final_episode_length_policy_steps": float(self.lengths.float().mean()),
+            "mean_final_episode_return": float(self.returns.mean()),
+            "first_cohort_records": self.first,
+            "completed_episode_records": self.completed,
+        }

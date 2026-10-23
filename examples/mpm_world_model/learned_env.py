@@ -49,25 +49,36 @@ class LearnedParticleEnv:
         uncertainty_limit: float = 2.0,
         uncertainty_penalty: float = 0.0,
         mass_tolerance: float = 0.05,
+        action_limit: float = 1.0,
         device: str = "cuda:0",
         seed: int = 42,
     ):
         if min(num_envs, horizon, seed_bank_size) < 1 or not models:
             raise ValueError("World, horizon, bank and ensemble sizes must be positive")
+        if not 0.0 < action_limit <= 1.0:
+            raise ValueError("Action limit must lie in (0, 1]")
         self.models = [model.to(device).eval().requires_grad_(False) for model in models]
         self.task_id, self.device, self.num_envs = task_id, device, num_envs
         spec = next(spec for spec in models[0].config.tasks if spec.task_id == task_id)
         self.num_actions, self.max_episode_length = spec.action_dim, horizon
         self.uncertainty_limit, self.uncertainty_penalty = uncertainty_limit, uncertainty_penalty
         self.mass_tolerance = mass_tolerance
+        self.action_limit = float(action_limit)
         self.generator = torch.Generator(device=device).manual_seed(seed)
-        self.cfg = {"task_id": task_id, "surrogate": True, "imagination_horizon": horizon}
+        self.cfg = {
+            "task_id": task_id,
+            "surrogate": True,
+            "imagination_horizon": horizon,
+            "action_limit": self.action_limit,
+        }
         self.episode_length_buf = torch.zeros(num_envs, dtype=torch.long, device=device)
         windows = EpisodeWindows(episodes, task_id=task_id, split="train", horizon=1, seed=seed)
         rewards = torch.cat(
             [
                 episode["reward"][
-                    episode["finite_mask"][:-1] & episode["finite_mask"][1:] & torch.isfinite(episode["action"]).all(-1)
+                    episode.get("valid_mask", episode["finite_mask"])[:-1]
+                    & episode.get("valid_mask", episode["finite_mask"])[1:]
+                    & torch.isfinite(episode["action"]).all(-1)
                 ]
                 for episode in windows.episodes
             ]
@@ -94,6 +105,10 @@ class LearnedParticleEnv:
         self.hidden = [value.new_empty((num_envs, value.shape[-1])) for value in self.hidden_bank]
         self.context = self.bank["context"].new_empty((num_envs, spec.context_dim))
         self.member = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.mass_indices = {
+            "franka_pour": [68, 69, 70, 83],
+            "rizon_sharpa_teapot_held_pour": [91, 92, 93, 94, 95],
+        }.get(task_id, list(getattr(spec, "mass_fraction_indices", [])))
         self._rows = torch.arange(num_envs, device=device)
         self._reset(self._rows)
 
@@ -119,7 +134,7 @@ class LearnedParticleEnv:
     @torch.no_grad()
     def step(self, actions):
         """Predict one action, expose its terminal endpoint, then reset finished worlds."""
-        actions = actions.clamp(-1.0, 1.0)
+        actions = actions.clamp(-self.action_limit, self.action_limit)
         previous = self._selected(self.observations)
         rewards, probabilities = [], []
         for index, model in enumerate(self.models):
@@ -149,20 +164,27 @@ class LearnedParticleEnv:
             # independent reward head is not allowed to invent pouring progress.
             reward = 100.0 * (selected[:, 92] - previous[:, 92])
             reward -= 200.0 * (selected[:, 93] - previous[:, 93]) + 0.001 * actions.square().sum(-1)
-            fractions = ensemble[..., 91:96]
+        if self.mass_indices:
+            fractions = ensemble[..., self.mass_indices]
             tolerance = self.mass_tolerance
             invalid = (fractions < -tolerance).any(-1) | (fractions > 1 + tolerance).any(-1)
             invalid |= (fractions.sum(-1) - 1).abs() > tolerance
             inadmissible = invalid.any(0)
-        finite = torch.isfinite(ensemble).all(dim=(0, 2)) & torch.isfinite(disagreement)
+        finite = torch.isfinite(ensemble).all(dim=(0, 2)) & torch.isfinite(disagreement) & torch.isfinite(reward)
         for values in (self.critics, self.hidden):
             finite &= torch.isfinite(torch.stack(values)).all(dim=(0, 2))
         for values in (rewards, probabilities):
             finite &= torch.isfinite(torch.stack(values)).all(dim=0)
         physical_done = self._selected(probabilities) > 0.5
         self.episode_length_buf += 1
+        native_timeout = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if self.task_id == "rizon_sharpa_teapot_held_pour":
+            # The native held-pour task ends after 16 s. This is a known task
+            # time limit, separate from the shorter imagination horizon.
+            selected = self._selected(self.observations)
+            native_timeout = finite & ((selected[:, 118] >= 16.0) | (selected[:, 119] <= 0.0))
         cutoff = (self.episode_length_buf >= self.max_episode_length) | (disagreement > self.uncertainty_limit)
-        cutoff |= inadmissible
+        cutoff |= inadmissible | native_timeout
         terminated = physical_done | ~finite
         truncated = cutoff & ~terminated
         done = terminated | truncated
@@ -179,6 +201,7 @@ class LearnedParticleEnv:
             "disagreement": disagreement,
             "nonfinite": ~finite,
             "inadmissible": inadmissible,
+            "native_timeout": native_timeout & ~terminated,
         }
         self._reset(done.nonzero().flatten())
         return self.get_observations(), reward, done, extras

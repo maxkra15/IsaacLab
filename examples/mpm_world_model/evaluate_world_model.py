@@ -20,7 +20,27 @@ from pathlib import Path
 import torch
 
 from .dataset import EpisodeWindows, load_episodes, task_specs
-from .models import load_checkpoint
+from .models import load_checkpoint, quaternion_geodesic_error
+
+
+def _quaternion_groups(task_id):
+    if task_id == "franka_pour":
+        return (19, 26, 33, 40), "xyzw"
+    if task_id == "rizon_sharpa_teapot_held_pour":
+        return (61, 74), "wxyz"
+    return (), "wxyz"
+
+
+def _ensemble_mean_observation(observations, *, task_id):
+    """Align equivalent quaternion signs before averaging, without projection."""
+    stacked = torch.stack(observations)
+    mean = stacked.mean(0)
+    starts, _ = _quaternion_groups(task_id)
+    for start in starts:
+        quaternions = stacked[..., start : start + 4]
+        sign = torch.where((quaternions * quaternions[:1]).sum(-1, keepdim=True) < 0.0, -1.0, 1.0)
+        mean[..., start : start + 4] = (quaternions * sign).mean(0)
+    return mean
 
 
 def physical_observation_errors(observation, *, task_id, action=None):
@@ -31,7 +51,7 @@ def physical_observation_errors(observation, *, task_id, action=None):
     unchanged Franka interface and the explicit held-teapot prototype interface.
     """
     finite = torch.isfinite(observation).all(-1)
-    safe = torch.nan_to_num(observation)
+    safe = torch.where(finite[..., None], observation, 0.0)
     result = {"nonfinite_observation": (~finite).float()}
     if task_id == "franka_pour":
         fractions = safe[..., [68, 69, 70, 83]]
@@ -54,11 +74,28 @@ def physical_observation_errors(observation, *, task_id, action=None):
     else:
         return result
     result["mass_fraction_out_of_bounds"] = ((fractions < -1e-5) | (fractions > 1.0 + 1e-5)).any(-1).float()
+    violation = torch.maximum((-fractions).clamp_min(0.0), (fractions - 1.0).clamp_min(0.0))
+    result["mass_fraction_bound_violation_max"] = violation.amax(-1)
+    result["mass_fraction_bound_violation_mean_square"] = violation.square().mean(-1)
     result["mass_fraction_sum_absolute_error"] = (fractions.sum(-1) - 1.0).abs()
     quaternion_error = (quaternions.norm(dim=-1) - 1.0).abs()
     result["quaternion_norm_absolute_error"] = quaternion_error.mean(-1)
     result["nonunit_quaternion"] = (quaternion_error > 0.01).any(-1).float()
     return result
+
+
+def _severity_summary(values):
+    values = torch.cat(values) if values else torch.empty(0)
+    if not len(values):
+        return {"count": 0, "minimum": None, "maximum": None, "rms": None, "p50": None, "p95": None, "p99": None}
+    quantiles = values.quantile(torch.tensor([0.5, 0.95, 0.99])).tolist()
+    return dict(
+        count=len(values),
+        minimum=float(values.min()),
+        maximum=float(values.max()),
+        rms=float(values.square().mean().sqrt()),
+        **dict(zip(("p50", "p95", "p99"), quantiles)),
+    )
 
 
 def _statistics():
@@ -69,10 +106,13 @@ def _statistics():
         "nonfinite_predictions": 0,
         "component_squared_error": None,
         "component_count": 0.0,
+        "quaternion_angular_squared_error": 0.0,
+        "quaternion_angular_count": 0,
+        "undefined_quaternion_angle_count": 0,
     }
 
 
-def _accumulate(statistics, prediction, target, scale, mask):
+def _accumulate(statistics, prediction, target, scale, mask, *, task_id=None):
     finite = torch.isfinite(prediction).all(-1)
     statistics["nonfinite_predictions"] += int((~finite & mask.bool()).sum())
     valid = mask * finite
@@ -87,6 +127,16 @@ def _accumulate(statistics, prediction, target, scale, mask):
     else:
         statistics["component_squared_error"] += component
     statistics["component_count"] += float(valid.sum())
+    starts, order = _quaternion_groups(task_id)
+    if starts:
+        predicted_quat = torch.stack([prediction[..., i : i + 4] for i in starts], -2)
+        target_quat = torch.stack([target[..., i : i + 4] for i in starts], -2)
+        angular_valid = valid.bool()[..., None] & (predicted_quat.norm(dim=-1) > 1e-12)
+        angular_valid &= target_quat.norm(dim=-1) > 1e-12
+        statistics["undefined_quaternion_angle_count"] += int((valid.bool()[..., None] & ~angular_valid).sum())
+        angle = quaternion_geodesic_error(predicted_quat[angular_valid], target_quat[angular_valid], order=order)
+        statistics["quaternion_angular_squared_error"] += float(angle.square().sum())
+        statistics["quaternion_angular_count"] += int(angular_valid.sum())
 
 
 def _finish(statistics):
@@ -101,6 +151,15 @@ def _finish(statistics):
         "error_scope": (
             "Errors are over finite predictions; nonfinite frames are counted separately and invalidate a run"
         ),
+        "quaternion_angular_rmse_rad": (
+            statistics["quaternion_angular_squared_error"] / statistics["quaternion_angular_count"]
+        )
+        ** 0.5
+        if statistics["quaternion_angular_count"]
+        else None,
+        "quaternion_angular_count": statistics["quaternion_angular_count"],
+        "undefined_quaternion_angle_count": statistics["undefined_quaternion_angle_count"],
+        "quaternion_angle_scope": "Shortest sign-invariant angle; vector norm errors are reported separately",
     }
 
 
@@ -136,6 +195,11 @@ def evaluate_task(models, episodes, *, task_id, split, horizon, batches, batch_s
     scale = models[0].observation_scale(task_id)
     statistics = {key: _statistics() for key in ("model", "shuffled_action", "persistence")}
     physics_sum, reference_physics_sum = {}, {}
+    bound_severity, reference_bound_severity = [], []
+    member_statistics = [_statistics() for _ in models]
+    member_physics_sum = [{} for _ in models]
+    member_physical_count = [0.0 for _ in models]
+    member_bound_severity = [[] for _ in models]
     physical_count = reference_physical_count = 0.0
     valid_steps = [0.0] * horizon
     endpoint_statistics = {key: _statistics() for key in statistics}
@@ -156,7 +220,7 @@ def evaluate_task(models, episodes, *, task_id, split, horizon, batches, batch_s
         for step in range(horizon):
             target, mask = batch["observation"][:, step + 1], batch["transition_mask"][:, step]
             predictions = {}
-            selected_reward = selected_probability = None
+            selected_reward = selected_probability = selected_results = None
             for branch, branch_actions in (
                 ("model", batch["action"]),
                 ("shuffled_action", batch["action"][permutation]),
@@ -169,8 +233,11 @@ def evaluate_task(models, episodes, *, task_id, split, horizon, batches, batch_s
                     )
                     states[branch][member] = (result["observation"], result["critic_observation"], result["hidden"])
                     results.append(result)
-                predictions[branch] = torch.stack([result["observation"] for result in results]).mean(0)
+                predictions[branch] = _ensemble_mean_observation(
+                    [result["observation"] for result in results], task_id=task_id
+                )
                 if branch == "model":
+                    selected_results = results
                     selected_reward = torch.stack([result["reward"] for result in results]).mean(0)
                     selected_probability = torch.stack(
                         [result["termination_logit"].sigmoid() for result in results]
@@ -184,9 +251,9 @@ def evaluate_task(models, episodes, *, task_id, split, horizon, batches, batch_s
                     disagreement_sum += float((torch.nan_to_num(disagreement) * mask).sum())
             predictions["persistence"] = batch["observation"][:, 0]
             for branch, prediction in predictions.items():
-                _accumulate(statistics[branch], prediction, target, scale, mask)
+                _accumulate(statistics[branch], prediction, target, scale, mask, task_id=task_id)
                 if step == horizon - 1:
-                    _accumulate(endpoint_statistics[branch], prediction, target, scale, mask)
+                    _accumulate(endpoint_statistics[branch], prediction, target, scale, mask, task_id=task_id)
             valid_steps[step] += float(mask.sum())
             reward_finite = torch.isfinite(selected_reward) & torch.isfinite(selected_probability)
             reward_mask = mask * reward_finite
@@ -201,6 +268,13 @@ def evaluate_task(models, episodes, *, task_id, split, horizon, batches, batch_s
             finite_prediction_mask = mask * torch.isfinite(prediction).all(-1)
             physical = physical_observation_errors(prediction, task_id=task_id, action=batch["action"][:, step])
             reference_physical = physical_observation_errors(target, task_id=task_id, action=batch["action"][:, step])
+            if "mass_fraction_bound_violation_max" in physical:
+                bound_severity.append(
+                    physical["mass_fraction_bound_violation_max"][finite_prediction_mask.bool()].cpu()
+                )
+                reference_bound_severity.append(
+                    reference_physical["mass_fraction_bound_violation_max"][mask.bool()].cpu()
+                )
             for name, values in physical.items():
                 # Keep nonfinite incidence unconditional; other checks have a
                 # meaningful interpretation only on finite state vectors.
@@ -210,6 +284,23 @@ def evaluate_task(models, episodes, *, task_id, split, horizon, batches, batch_s
                 reference_physics_sum[name] = reference_physics_sum.get(name, 0.0) + float((values * mask).sum())
             physical_count += float(finite_prediction_mask.sum())
             reference_physical_count += float(mask.sum())
+            for member, result in enumerate(selected_results):
+                observation = result["observation"]
+                _accumulate(member_statistics[member], observation, target, scale, mask, task_id=task_id)
+                member_finite = mask * torch.isfinite(observation).all(-1)
+                member_physics = physical_observation_errors(
+                    observation, task_id=task_id, action=batch["action"][:, step]
+                )
+                for name, values in member_physics.items():
+                    weight = mask if name == "nonfinite_observation" else member_finite
+                    member_physics_sum[member][name] = member_physics_sum[member].get(name, 0.0) + float(
+                        (values * weight).sum()
+                    )
+                if "mass_fraction_bound_violation_max" in member_physics:
+                    member_bound_severity[member].append(
+                        member_physics["mass_fraction_bound_violation_max"][member_finite.bool()].cpu()
+                    )
+                member_physical_count[member] += float(member_finite.sum())
     subsets = _physical_indices(task_id, len(scale))
     finished = {name: _subset_metrics(_finish(value), subsets, scale) for name, value in statistics.items()}
     endpoint = {name: _subset_metrics(_finish(value), subsets, scale) for name, value in endpoint_statistics.items()}
@@ -243,13 +334,39 @@ def evaluate_task(models, episodes, *, task_id, split, horizon, batches, batch_s
         "reward_rmse": (reward_squared_error / max(1, reward_count)) ** 0.5,
         "termination_brier_score": termination_brier_sum / max(1, reward_count),
         "mean_train_normalized_ensemble_disagreement": disagreement_sum / max(1, sum(valid_steps)),
-        "predicted_physical_observables": {
+        "ensemble_mean_physical_observables": {
             key: value / max(1, reference_physical_count if key == "nonfinite_observation" else physical_count)
             for key, value in physics_sum.items()
         },
+        "per_member_diagnostics": [
+            {
+                "member": member,
+                "rollout_average": _subset_metrics(_finish(member_statistics[member]), subsets, scale),
+                "physical_observables": {
+                    key: value
+                    / max(
+                        1, reference_physical_count if key == "nonfinite_observation" else member_physical_count[member]
+                    )
+                    for key, value in member_physics_sum[member].items()
+                },
+                "mass_fraction_bound_violation_severity": _severity_summary(member_bound_severity[member]),
+            }
+            for member in range(len(models))
+        ],
         "reference_physical_observables": {
             key: value / max(1, reference_physical_count) for key, value in reference_physics_sum.items()
         },
+        "ensemble_mean_mass_fraction_bound_violation_severity": _severity_summary(bound_severity),
+        "reference_mass_fraction_bound_violation_severity": _severity_summary(reference_bound_severity),
+        "mass_fraction_bound_severity_scope": (
+            "Dimensionless maximum violation across bins per finite frame; quantiles include zero-violation frames. "
+            "The reported mean square averages bins and frames; take its square root for RMS violation."
+        ),
+        "ensemble_aggregation": (
+            "Quaternion signs align to member0 before arithmetic averaging; no norm projection. "
+            "Ensemble-mean quaternion norms can depart from one even when each member is valid. "
+            "Grade typed constraints using per_member_diagnostics; learned_env uses a selected member per environment."
+        ),
         "physical_scope": "Fractions, moments and poses in observations; no force or full-particle validation",
     }
 

@@ -286,6 +286,7 @@ class FrankaPourState:
             "reset_row": row,
             "seed": seed,
             "dt": float(env.step_dt),
+            "max_episode_length": int(env.max_episode_length),
             "context": torch.tensor(values, dtype=torch.float32),
             "context_names": names,
             "particle_indices": self.indices.cpu(),

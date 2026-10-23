@@ -79,7 +79,26 @@ def _initialize(model, source):
     model.transition.load_state_dict(source.transition.state_dict())
     source_specs = {spec.task_id: spec for spec in source.config.tasks}
     for spec in model.config.tasks:
-        if source_specs.get(spec.task_id) == spec:
+        source_spec = source_specs.get(spec.task_id)
+        if source_spec is None or model.config.physical_decoder != source.config.physical_decoder:
+            continue
+        target_contract, source_contract = asdict(spec), asdict(source_spec)
+        if model.config.physical_decoder == "none":
+            for key in (
+                "mass_fraction_indices",
+                "quaternion_starts",
+                "quaternion_order",
+                "constant_observation_indices",
+                "zero_observation_indices",
+                "typed_action_observation_start",
+                "typed_elapsed_time_index",
+                "typed_elapsed_time_increment",
+                "typed_countdown_index",
+                "typed_countdown_decrement",
+            ):
+                target_contract.pop(key)
+                source_contract.pop(key)
+        if source_contract == target_contract:
             model.task(spec.task_id).load_state_dict(source.task(spec.task_id).state_dict())
 
 
@@ -110,7 +129,11 @@ def train(args):
         groups[key] = episode["split"]
     specs = task_specs(episodes)
     config = WorldModelConfig(
-        specs, hidden_dim=args.hidden_dim, entity_dim=args.entity_dim, material_transform=args.material_transform
+        specs,
+        hidden_dim=args.hidden_dim,
+        entity_dim=args.entity_dim,
+        material_transform=args.material_transform,
+        physical_decoder=args.physical_decoder,
     )
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -301,6 +324,12 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--entity-dim", type=int, default=64)
     parser.add_argument("--material-transform", choices=("signed_log1p", "identity"), default="signed_log1p")
+    parser.add_argument(
+        "--physical-decoder",
+        choices=("none", "typed"),
+        default="none",
+        help="Opt-in conservative mass transport and quaternion manifold integration",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threads", type=int, default=4)

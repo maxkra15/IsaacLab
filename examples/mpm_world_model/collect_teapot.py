@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import warp as wp
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -58,6 +59,132 @@ def _reset_split(reset_group: str) -> str:
     """Predict the recorder's immutable SHA-256 reset-group split before stepping."""
     bucket = int(hashlib.sha256(reset_group.encode()).hexdigest()[:8], 16) % 10
     return "train" if bucket < 8 else ("validation" if bucket == 8 else "test")
+
+
+@wp.kernel
+def _accumulate_rigid_capacity(
+    nefc: wp.array(dtype=wp.int32),
+    ncon: wp.array(dtype=wp.int32),
+    overflow: wp.array(dtype=wp.int32),
+    njmax: int,
+    nconmax: int,
+    capacity_mask: int,
+    statistics: wp.array(dtype=wp.int32),
+):
+    """Retain transient saturation/overflow between slower policy observations."""
+    constraints, contacts = nefc[0], ncon[0]
+    statistics[0] = wp.max(statistics[0], constraints)
+    statistics[1] = wp.max(statistics[1], contacts)
+    capacity_bits = overflow[0] & capacity_mask
+    # Conservatively reject saturation as well as a count strictly beyond cap;
+    # this leaves headroom for native kernels that reserve multi-row records.
+    if constraints >= njmax:
+        capacity_bits = capacity_bits | (1 << 28)
+    if contacts >= nconmax:
+        capacity_bits = capacity_bits | (1 << 29)
+    statistics[2] = statistics[2] | capacity_bits
+    statistics[3] = statistics[3] | overflow[0]
+    statistics[4] = statistics[4] + 1
+    statistics[5] = constraints
+    statistics[6] = contacts
+
+
+class RigidCapacityMonitor:
+    """Audit native rigid capacities at800Hz without a host read per microstep."""
+
+    def __init__(self, solver, device):
+        import mujoco_warp
+
+        data = solver.mjw_data
+        self.statistics = wp.zeros(7, dtype=wp.int32, device=device)
+        self.zero = wp.zeros(1, dtype=wp.int32, device=device)
+        self.device = device
+        self.nefc = getattr(data, "nefc", self.zero)
+        self.ncon = getattr(data, "nacon", getattr(data, "ncon", self.zero))
+        self.overflow = getattr(data, "overflow", self.zero)
+        self.njmax = int(getattr(data, "njmax", 0))
+        self.nconmax = int(getattr(data, "naconmax", getattr(data, "nconmax", 0)))
+        self.available = (
+            data is not None
+            and isinstance(self.nefc, wp.array)
+            and isinstance(self.ncon, wp.array)
+            and self.nefc is not self.zero
+            and self.ncon is not self.zero
+            and self.njmax > 0
+            and self.nconmax > 0
+            and int(getattr(data, "nworld", 1)) == 1
+        )
+        enum = getattr(mujoco_warp, "OverflowType", None)
+        self.bit_names = {} if enum is None else {member.name: int(member) for member in enum}
+        # Iteration-limit flags are convergence diagnostics, not buffer drops.
+        self.capacity_mask = -1 if enum is None else 0
+        for name, value in self.bit_names.items():
+            if name not in ("NONE", "ALL", "ITERATIONS", "LS_ITERATIONS"):
+                self.capacity_mask |= value
+        self.diagnostic_names = [
+            "max_nefc",
+            "max_ncon",
+            "capacity_overflow_or_saturation_bits",
+            "all_native_overflow_bits",
+            "native_steps_observed",
+            "last_nefc",
+            "last_ncon",
+        ]
+
+    def clear(self) -> None:
+        """Separate episodes even on native versions with accumulated overflow flags."""
+        self.statistics.zero_()
+        self.overflow.zero_()
+
+    def sample(self) -> None:
+        if self.available:
+            wp.launch(
+                _accumulate_rigid_capacity,
+                dim=1,
+                inputs=[
+                    self.nefc,
+                    self.ncon,
+                    self.overflow,
+                    self.njmax,
+                    self.nconmax,
+                    self.capacity_mask,
+                    self.statistics,
+                ],
+                device=self.device,
+            )
+
+    def snapshot(self) -> tuple[torch.Tensor, torch.Tensor]:
+        values = wp.to_torch(self.statistics)
+        return values, (values[2] == 0) & self.available
+
+    def metadata(self) -> dict:
+        return {
+            "available": self.available,
+            "njmax": self.njmax,
+            "nconmax": self.nconmax,
+            "native_overflow_flags_available": self.overflow is not self.zero,
+            "native_overflow_bit_names": self.bit_names,
+            "capacity_mask": self.capacity_mask,
+            "collector_saturation_bits": {"nefc_at_or_above_njmax": 1 << 28, "ncon_at_or_above_nconmax": 1 << 29},
+            "diagnostic_names": self.diagnostic_names,
+            "sample_hz": 800,
+            "semantics": "all_native_steps_including_grasp_prefix;iteration_limit_bits_reported_separately",
+        }
+
+    def outcome(self) -> dict:
+        values, valid = self.snapshot()
+        values = values.cpu().tolist()
+        return {
+            "rigid_capacity_valid": bool(valid),
+            "rigid_capacity_observable_available": self.available,
+            "max_rigid_nefc": values[0],
+            "max_rigid_ncon": values[1],
+            "rigid_capacity_overflow_or_saturation_bits": values[2],
+            "rigid_all_native_overflow_bits": values[3],
+            "rigid_native_steps_observed": values[4],
+            "rigid_njmax": self.njmax,
+            "rigid_nconmax": self.nconmax,
+        }
 
 
 class TeapotState:
@@ -93,6 +220,7 @@ class TeapotState:
         ]
         self.entry = NewtonManager._solver._entries["fluid"]
         self.solver = self.entry.solver
+        self.capacity = RigidCapacityMonitor(NewtonManager._solver.solver("robot"), self.device)
         model = NewtonManager.get_model()
         self.mass = wp.to_torch(model.particle_mass).reshape(-1)
         self.radius = wp.to_torch(model.particle_radius).reshape(-1)
@@ -291,6 +419,7 @@ class TeapotState:
             "particle_summary": summary,
             "grasp_diagnostics": self._grasp_diagnostics(sim_time),
         }
+        result["rigid_capacity_diagnostics"], result["rigid_capacity_valid"] = self.capacity.snapshot()
         finite &= torch.isfinite(boundary).all() & torch.isfinite(controller).all() & torch.isfinite(observation).all()
         finite &= torch.isfinite(result["grasp_diagnostics"]).all()
         if self.include_material:
@@ -392,7 +521,8 @@ class TeapotState:
             "residual_rotation_limit_rad": args.rotation_limit,
             "reward_definition": "100*delta_target_mass_fraction-200*delta_spill_mass_fraction-.001*sum(action^2)",
             "success_definition": (
-                "target_fraction>=requested_and_spill_fraction<=.1_and_finite_and_retained_grasp_proxy"
+                "target_fraction>=requested_and_spill_fraction<=.1_and_finite"
+                "_and_retained_grasp_proxy_and_rigid_capacity_valid"
             ),
             "grasp_diagnostic_names": self.grasp_diagnostic_names,
             "grasp_drift_threshold_m_provisional": self.grasp_drift_threshold,
@@ -404,6 +534,8 @@ class TeapotState:
             "controller_feedback_hz": 100.0,
             "native_arguments": json.loads(json.dumps(vars(demo.args_cli), default=str)),
             "resolved_fluid_solver_cfg": demo._world_model_resolved_solver_cfg,
+            "resolved_rigid_solver_cfg": demo._world_model_resolved_rigid_solver_cfg,
+            "rigid_capacity_monitor": self.capacity.metadata(),
         }
 
 
@@ -485,6 +617,7 @@ class TeapotEpisodeReset:
         motion._next_feedback_step = self.first_feedback
         motion._gain_settled = False
         adapter.residual.reset()
+        adapter.capacity.clear()
         adapter.grasp_reference = None
         adapter.max_grasp_drift = 0.0
         adapter.max_position_tracking_error = 0.0
@@ -579,6 +712,8 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--velocity-basis", help="Opt-in MPM velocity basis; preserves native default when omitted.")
     parser.add_argument("--mpm-iterations", type=int)
     parser.add_argument("--mpm-solver", help="Opt-in rheology solver token, e.g. auto or jacobi.")
+    parser.add_argument("--rigid-njmax", type=int, help="Opt-in rigid constraint capacity per world.")
+    parser.add_argument("--rigid-nconmax", type=int, help="Opt-in rigid contact capacity per world.")
     parser.add_argument("--transfer-scheme", choices=("pic", "apic"))
     parser.add_argument("--policy-checkpoint", type=Path, help="TorchScript actor121->6 for real-physics evaluation.")
     parser.add_argument("--without-material", action="store_true")
@@ -586,6 +721,39 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("native_args", nargs=argparse.REMAINDER)
     return parser
+
+
+def _configure_native_solvers(demo, args) -> None:
+    """Apply opt-in numerical/capacity changes and retain both resolved configs."""
+    native_create_sim_cfg = demo.create_sim_cfg
+
+    def configured_sim_cfg():
+        cfg = native_create_sim_cfg()
+        fluid_entries = [entry for entry in cfg.physics.solver_cfg.entries if entry.name == "fluid"]
+        rigid_entries = [entry for entry in cfg.physics.solver_cfg.entries if entry.name == "robot"]
+        if len(fluid_entries) != 1 or len(rigid_entries) != 1:
+            raise RuntimeError("Expected exactly one fluid and one robot solver entry.")
+        fluid_cfg, rigid_cfg = fluid_entries[0].solver_cfg, rigid_entries[0].solver_cfg
+        if args.rigid_njmax is not None:
+            rigid_cfg.njmax = args.rigid_njmax
+        if args.rigid_nconmax is not None:
+            rigid_cfg.nconmax = args.rigid_nconmax
+        for option, field in (
+            ("collider_basis", "collider_basis"),
+            ("strain_basis", "strain_basis"),
+            ("velocity_basis", "velocity_basis"),
+            ("mpm_iterations", "max_iterations"),
+            ("mpm_solver", "solver"),
+            ("transfer_scheme", "transfer_scheme"),
+        ):
+            value = getattr(args, option)
+            if value is not None:
+                setattr(fluid_cfg, field, value)
+        demo._world_model_resolved_solver_cfg = json.loads(json.dumps(fluid_cfg.to_dict(), default=str))
+        demo._world_model_resolved_rigid_solver_cfg = json.loads(json.dumps(rigid_cfg.to_dict(), default=str))
+        return cfg
+
+    demo.create_sim_cfg = configured_sim_cfg
 
 
 def run(args) -> dict:
@@ -631,29 +799,7 @@ def run(args) -> dict:
     if args.headless:
         demo.args_cli.visualizer = []
     demo.FILL_SEED = args.fill_seed
-    native_create_sim_cfg = demo.create_sim_cfg
-
-    def configured_sim_cfg():
-        cfg = native_create_sim_cfg()
-        fluid_entries = [entry for entry in cfg.physics.solver_cfg.entries if entry.name == "fluid"]
-        if len(fluid_entries) != 1:
-            raise RuntimeError("Expected exactly one native teapot fluid solver entry.")
-        fluid_cfg = fluid_entries[0].solver_cfg
-        for option, field in (
-            ("collider_basis", "collider_basis"),
-            ("strain_basis", "strain_basis"),
-            ("velocity_basis", "velocity_basis"),
-            ("mpm_iterations", "max_iterations"),
-            ("mpm_solver", "solver"),
-            ("transfer_scheme", "transfer_scheme"),
-        ):
-            value = getattr(args, option)
-            if value is not None:
-                setattr(fluid_cfg, field, value)
-        demo._world_model_resolved_solver_cfg = json.loads(json.dumps(fluid_cfg.to_dict(), default=str))
-        return cfg
-
-    demo.create_sim_cfg = configured_sim_cfg
+    _configure_native_solvers(demo, args)
     actor = (
         None
         if args.policy_checkpoint is None
@@ -685,6 +831,7 @@ def run(args) -> dict:
             robot_motion.update(step * dt)
             scene.write_data_to_sim()
             sim.step(render=False)
+            adapter.capacity.sample()
             scene.update(dt)
 
         reset = TeapotEpisodeReset(adapter) if args.episodes > 1 or args.split_plan else None
@@ -704,6 +851,7 @@ def run(args) -> dict:
                     Path(sys.modules["rizon_sharpa_teapot"].__file__).read_bytes()
                 ).hexdigest(),
                 "resolved_fluid_solver_cfg": demo._world_model_resolved_solver_cfg,
+                "resolved_rigid_solver_cfg": demo._world_model_resolved_rigid_solver_cfg,
                 "requested_split_plan": args.split_plan,
                 "held_out_scope": "same_geometry_material_and_topology_with_small_initial_particle_jitter",
                 "policy_checkpoint": None if args.policy_checkpoint is None else str(args.policy_checkpoint),
@@ -751,6 +899,7 @@ def run(args) -> dict:
                 rng = np.random.default_rng(args.seed + episode_index)
                 phases = rng.uniform(-np.pi, np.pi, 6)
                 frequencies = rng.uniform(0.12, 0.4, 6)
+                adapter.capacity.clear()
                 for step in range(1600):
                     native_step(step)
                 adapter.begin_held_episode()
@@ -792,7 +941,8 @@ def run(args) -> dict:
                             "success": finite
                             and bool(next_state["particle_summary"][8] >= args.target_fraction)
                             and bool(next_state["particle_summary"][9] <= 0.1)
-                            and bool(next_state["grasp_diagnostics"][-1]),
+                            and bool(next_state["grasp_diagnostics"][-1])
+                            and bool(next_state["rigid_capacity_valid"]),
                         },
                     )
                     state = next_state
@@ -814,12 +964,15 @@ def run(args) -> dict:
                     "success": bool(state["finite_mask"])
                     and float(summary[8]) >= args.target_fraction
                     and float(summary[9]) <= 0.1
-                    and bool(state["grasp_diagnostics"][-1]),
+                    and bool(state["grasp_diagnostics"][-1])
+                    and bool(state["rigid_capacity_valid"]),
+                    "physics_valid": bool(state["finite_mask"]) and bool(state["rigid_capacity_valid"]),
                     "retained_grasp_proxy": bool(state["grasp_diagnostics"][-1]),
                     "max_palm_relative_translation_drift_m": adapter.max_grasp_drift,
                     "max_pot_position_tracking_error_m": adapter.max_position_tracking_error,
                     "max_pot_rotation_tracking_error_rad": adapter.max_rotation_tracking_error,
                     "grasp_drift_threshold_m_provisional": adapter.grasp_drift_threshold,
+                    **adapter.capacity.outcome(),
                 }
                 if requested_split is not None and outcome["split"] != requested_split:
                     raise RuntimeError("Recorder split disagrees with the pre-physics reset selector.")
@@ -862,6 +1015,8 @@ def main() -> None:
         parser.error("Residual limits must be positive.")
     if args.mpm_iterations is not None and args.mpm_iterations < 1:
         parser.error("mpm-iterations must be positive.")
+    if any(value is not None and value < 1 for value in (args.rigid_njmax, args.rigid_nconmax)):
+        parser.error("Rigid capacities must be positive.")
     if args.policy_checkpoint is not None and not args.policy_checkpoint.is_file():
         parser.error(f"Missing policy: {args.policy_checkpoint}")
     print(json.dumps(run(args), indent=2))

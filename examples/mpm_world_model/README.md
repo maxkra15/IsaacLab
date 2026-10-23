@@ -33,6 +33,22 @@ previous-action and episode-clock updates are computed exactly. Large finite
 material-history aggregates use a versioned signed-log encoding for numerical
 conditioning; the original physical recordings remain unchanged.
 
+The optional `--physical-decoder typed` uses task-declared physical fields. A
+row-stochastic transport matrix updates mass fractions as `f_next = f @ P`,
+preserving their sum and nonnegativity for admissible initial fractions. Local
+rotation increments update unit quaternions, with a sign-invariant geodesic loss.
+Seeds must already contain unit quaternions and a valid mass partition. Franka's
+actor quaternion fields use XYZW; recorded entity quaternions and the teapot
+actor use WXYZ. The decoder handles these orders explicitly and copies declared
+constant, action-history and clock fields. The default `none` preserves the
+earlier unconstrained architecture and its checkpoint behavior.
+
+These constraints remove particular representation errors; they do not establish
+correct material flow, contact, forces, volume preservation or general geometric
+equivariance. Evaluation reports each ensemble member's violations separately
+from the ensemble mean, because an arithmetic mean of unit quaternions need not
+have unit norm.
+
 The teapot adapter reuses the scripted contact-acquired grasp. After two seconds,
 the policy adjusts desired translation and rotation through the original physical
 IK controller; it does not teleport the pot. This is a new residual-control task,
@@ -66,11 +82,23 @@ be training seeds or targets. Normalization uses training episodes only. PPO
 seeds must belong to the model's declared training reset groups. Validation
 selects checkpoints; final test groups are not used for selection.
 
+Teapot also monitors rigid contact/constraint capacity at every native physics
+step, including the grasp prefix. `finite_mask` records numerical validity;
+`rigid_capacity_valid` records whether capacity remained valid. Their conjunction,
+`valid_mask`, determines usable learning windows. A finite trajectory with dropped
+constraints is not accepted as valid physics. Native iteration-limit flags are
+reported separately from contact/constraint overflow.
+
 Imagination is deliberately short. Independent ensemble disagreement, nonfinite
-predictions and optional teapot mass-admissibility checks end a rollout. Artificial
+predictions and task-declared mass-admissibility checks end a rollout. Artificial
 cuts bootstrap the value at the predicted endpoint, never the unrelated replay
 snapshot used for reset. Model rewards are bounded to the observed training range.
 These safeguards limit obvious exploitation; they do not establish fidelity.
+Teapot's known 16-second control timeout also ends imagination before replay reset.
+`train_policy --action-limit` can keep a new task's executed actions within its
+collected range. The exported TorchScript `policy.pt` embeds the same clipping;
+the raw RSL checkpoint does not. Franka requires the original limit of one to
+preserve its existing native checkpoint contract.
 
 ## Run an experiment
 
@@ -107,7 +135,8 @@ Fit and independently evaluate the dynamics:
 uv run python -m examples.mpm_world_model.train_world_model \
   --data /results/franka-reference/episodes /results/franka-exploration/episodes \
   --output /results/franka-model --device cuda:0 --ensemble 2 \
-  --steps 2000 --horizon 8 --burn-in 0 --batch-size 64
+  --steps 2000 --horizon 8 --burn-in 0 --batch-size 64 \
+  --physical-decoder typed
 
 uv run python -m examples.mpm_world_model.evaluate_world_model \
   --data /results/franka-reference/episodes /results/franka-exploration/episodes \
@@ -138,9 +167,12 @@ uv run python -m examples.mpm_world_model.evaluate_franka_pour \
 ```
 
 For a native fine-tuning pilot, use `collect_franka_pour` with
-`--train-only --fine-tune-iterations 2` and the learned-policy checkpoint. This
-runs actual MPM PPO, saves `model_mpm_finetuned.pt`, and records the inherited
-optimizer rate. Evaluate that checkpoint in a fresh process with the same flags.
+`--train-only --fine-tune-iterations 20 --fine-tune-rollout-steps 16
+--fine-tune-epochs 2 --fine-tune-learning-rate 0.00001` and the learned-policy
+checkpoint. This runs actual MPM PPO and saves `model_mpm_finetuned.pt`. The
+learning-rate override is applied after loading; the resolved rate is recorded.
+Loop timing includes rollout collection and PPO updates and excludes process
+startup and the final export. Evaluate that checkpoint in a fresh process.
 Compare unchanged 7450, model-adapted, and MPM-fine-tuned policies using the same
 physics, reset distribution and full episode horizon. Report numerical failures
 separately from physical task failures.
@@ -152,12 +184,14 @@ uv run python -m examples.mpm_world_model.collect_teapot \
   --output /results/teapot-seed7 --fill-seed 7 --seed 0 \
   --episodes 6 --split-plan train train train train validation test \
   --steps 1600 --particle-samples 1024 --collider-basis pic356 \
-  --mpm-iterations 256 --headless -- --voxel_size 0.004
+  --mpm-iterations 256 --rigid-njmax 1024 --rigid-nconmax 512 \
+  --headless -- --voxel_size 0.004 --grid_type sparse
 ```
 
 Native demo arguments follow `--`. This pilot explicitly uses 4-mm voxels,
 particle-based contact with a 356-point cap and 256 iterations; it does not claim
-identical settings to the default demo. The split plan rejection-samples safe
+identical settings to the default demo. The larger rigid buffers must still pass
+the per-step capacity monitor. The split plan rejection-samples safe
 initial jitter before actions or outcomes, using the recorder's unchanged hash
 buckets. Repeated episodes restore physical, material, actuator and controller
 state without rebuilding the scene. These held-out resets share geometry,
@@ -172,6 +206,10 @@ provides a stricter adapter-only transfer control. Each task keeps its own polic
 The teapot policy task ID is `rizon_sharpa_teapot_held_pour`; `train_policy` creates
 a small new actor when no checkpoint/config is supplied and exports `policy.pt`.
 Replay it through `collect_teapot --policy-checkpoint /results/teapot-ppo/policy.pt`.
+For a narrow-action pilot, set the new actor's exploration standard deviation
+through its runner JSON and use the same action limit in imagined training and
+native replay. Reducing collection amplitude alone does not constrain a policy's
+exploration or make out-of-distribution predictions reliable.
 Measure delivery, spills, grasp retention and full-horizon finite behavior in real
 MPM before claiming the policy learned to pour. The collector reports maximum
 sampled palm drift relative to the pot; success additionally requires drift
@@ -183,8 +221,9 @@ and does not prove a particular contact force or wrench.
 This is an experimental policy-training pipeline. It has no full particle decoder
 and cannot produce physically meaningful imagined particle videos. It does not
 learn calibrated forces or implement SuperMimic's BPTT policy optimizer. A stronger
-general material model would need richer geometry, local interactions, typed
-conservation-preserving outputs and broader material/contact data. Learned
+general material model would need richer geometry, local interactions and broader
+material/contact data. The typed decoder supplies only a few necessary output
+constraints. Learned
 warm-starts inside the native solver are a separate path when retaining MPM's
 physical constraints is more important than eliminating simulation cost.
 

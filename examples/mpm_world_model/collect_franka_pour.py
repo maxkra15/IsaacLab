@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -26,7 +28,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from examples.mpm_world_model.franka_pour_state import FrankaPourState, configure_source_paths, source_digest
-from examples.mpm_world_model.recording import EpisodeWriter, atomic_json
+from examples.mpm_world_model.recording import EpisodeMetrics, EpisodeWriter, atomic_json
 
 
 def argument_parser(evaluation: bool = False) -> argparse.ArgumentParser:
@@ -58,6 +60,11 @@ def argument_parser(evaluation: bool = False) -> argparse.ArgumentParser:
     parser.add_argument("--metrics-only", action="store_true", default=evaluation)
     parser.add_argument(
         "--fine-tune-iterations", type=int, default=0, help="Actual real-MPM PPO iterations; requires --train-only."
+    )
+    parser.add_argument("--fine-tune-rollout-steps", type=int, default=96)
+    parser.add_argument("--fine-tune-epochs", type=int, help="Defaults to the task PPO configuration (5).")
+    parser.add_argument(
+        "--fine-tune-learning-rate", type=float, help="Override optimizer LR after loading; default inherits it."
     )
     parser.add_argument(
         "--train-only",
@@ -94,6 +101,12 @@ def validate_arguments(parser: argparse.ArgumentParser, args) -> None:
         parser.error("max-bytes must be positive")
     if args.fine_tune_iterations < 0:
         parser.error("fine-tune-iterations must be nonnegative")
+    if args.fine_tune_rollout_steps < 1 or (args.fine_tune_epochs is not None and args.fine_tune_epochs < 1):
+        parser.error("Fine-tune rollout steps and epochs must be positive.")
+    if args.fine_tune_learning_rate is not None and (
+        not math.isfinite(args.fine_tune_learning_rate) or args.fine_tune_learning_rate <= 0
+    ):
+        parser.error("fine-tune-learning-rate must be finite and positive")
     if bool(args.fine_tune_iterations) != args.train_only:
         parser.error(
             "Use --train-only together with positive --fine-tune-iterations; evaluate the saved checkpoint separately."
@@ -109,6 +122,75 @@ def reset_exploration_state(done, noise, selected, generator, perturb_fraction):
         selected[done] = torch.rand((int(done.sum()), 1), generator=generator, device=done.device) < perturb_fraction
         noise[done] = 0.0
     return done
+
+
+def override_loaded_learning_rate(algorithm, learning_rate: float | None) -> list[float]:
+    """Preserve the loaded optimizer rate unless an explicit override is given."""
+    if learning_rate is not None:
+        algorithm.learning_rate = learning_rate
+        for group in algorithm.optimizer.param_groups:
+            group["lr"] = learning_rate
+    return [float(group["lr"]) for group in algorithm.optimizer.param_groups]
+
+
+def fine_tune_runner(runner, args, runner_cfg: dict) -> dict:
+    """Run and time actual MPM PPO after restoring/overriding its optimizer."""
+    start_iteration = int(runner.current_learning_iteration)
+    actual_rates = override_loaded_learning_rate(runner.alg, args.fine_tune_learning_rate)
+    runner.cfg["algorithm"]["learning_rate"] = float(runner.alg.learning_rate)
+    runner_cfg["algorithm"]["learning_rate"] = float(runner.alg.learning_rate)
+    atomic_json(args.output / "runner_cfg.json", runner_cfg)
+    phases = []
+    original_log = runner.logger.log
+
+    def observed_log(*positional, **keywords):
+        phases.append(
+            {
+                "iteration": int(keywords["it"]),
+                "collection_seconds": float(keywords["collect_time"]),
+                "learning_seconds": float(keywords["learn_time"]),
+                "loss": {key: float(value) for key, value in keywords["loss_dict"].items()},
+            }
+        )
+        return original_log(*positional, **keywords)
+
+    runner.logger.log = observed_log
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize(args.device)
+    learn_started = time.perf_counter()
+    try:
+        runner.learn(num_learning_iterations=args.fine_tune_iterations, init_at_random_ep_len=False)
+        if args.device.startswith("cuda"):
+            torch.cuda.synchronize(args.device)
+    finally:
+        runner.logger.log = original_log
+    learn_seconds = time.perf_counter() - learn_started
+    checkpoint = args.output / "model_mpm_finetuned.pt"
+    runner.save(str(checkpoint))
+    transitions = args.num_envs * int(runner_cfg["num_steps_per_env"]) * args.fine_tune_iterations
+    return {
+        "requested_ppo_iterations": args.fine_tune_iterations,
+        "loaded_iteration": start_iteration,
+        "saved_iteration": int(runner.current_learning_iteration),
+        "rollout_steps_per_env_per_iteration": int(runner_cfg["num_steps_per_env"]),
+        "environment_transitions": transitions,
+        "epochs_per_iteration": int(runner.alg.num_learning_epochs),
+        "minibatches_per_epoch": int(runner.alg.num_mini_batches),
+        "actual_optimizer_learning_rates": actual_rates,
+        "learn_wall_seconds": learn_seconds,
+        "environment_steps_per_second": transitions / learn_seconds,
+        "rsl_phase_timings": phases,
+        "rsl_collection_seconds": sum(item["collection_seconds"] for item in phases),
+        "rsl_learning_seconds": sum(item["learning_seconds"] for item in phases),
+        "timing_scope": (
+            "Synchronized runner.learn wall includes rollout, PPO, logging and native automatic saves; "
+            "excludes environment/network construction and explicit final export. First-step capture/compilation, "
+            "if any, remains included. RSL phase times are its own CPU wall diagnostics."
+        ),
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        "evaluation_performed": False,
+    }
 
 
 def run(args) -> dict:
@@ -151,6 +233,12 @@ def run(args) -> dict:
     cfg.log_dir = str(args.output / "runtime")
     agent_cfg = FrankaPourResetDatasetPPORunnerCfg()
     agent_cfg.device, agent_cfg.seed = args.device, args.seed
+    if args.train_only:
+        agent_cfg.num_steps_per_env = args.fine_tune_rollout_steps
+        if args.fine_tune_epochs is not None:
+            agent_cfg.algorithm.num_learning_epochs = args.fine_tune_epochs
+        if args.fine_tune_learning_rate is not None:
+            agent_cfg.algorithm.learning_rate = args.fine_tune_learning_rate
     atomic_json(args.output / "runner_cfg.json", to_dict(agent_cfg))
     provenance = {
         "task_id": "franka_pour",
@@ -185,6 +273,7 @@ def run(args) -> dict:
     }
     state = {"adapter": None, "teacher_action": None, "perturbation": None, "complete": False, "is_warmup": False}
     first_done = torch.zeros(args.num_envs, dtype=torch.bool)
+    episode_metrics = EpisodeMetrics(args.num_envs, cfg.sim.dt * cfg.decimation)
     term_order = []
 
     class PhysicalEpisodeRecorder(RecorderTerm):
@@ -194,13 +283,15 @@ def run(args) -> dict:
             return state["adapter"]
 
         def record_post_reset(self, env_ids):
+            ids = range(self._env.num_envs) if env_ids is None else env_ids
+            if isinstance(ids, slice):
+                ids = range(self._env.num_envs)[ids]
+            ids = torch.as_tensor(list(ids), dtype=torch.long, device=self._env.device)
+            episode_metrics.reset(ids.cpu(), self._env.reset_dataset_row_id[ids].cpu())
             if writer is None:
                 return None, None
             adapter = self._adapter()
             captured = adapter.capture()
-            ids = range(self._env.num_envs) if env_ids is None else env_ids
-            if isinstance(ids, slice):
-                ids = range(self._env.num_envs)[ids]
             for index in ids:
                 index = int(index)
                 writer.start_episode(
@@ -229,6 +320,17 @@ def run(args) -> dict:
             if not term_order:
                 term_order.extend(env.termination_manager.active_terms)
             terms = torch.stack([env.termination_manager.get_term(name) for name in term_order], dim=-1)
+            episode_metrics.update(
+                env.reward_buf,
+                env.episode_length_buf,
+                env.reset_dataset_row_id,
+                terminated,
+                truncated,
+                success,
+                terms,
+                term_order,
+                warmup=state["is_warmup"],
+            )
             if not state["is_warmup"]:
                 for column, name in enumerate(term_order):
                     counters["terminations"][name] = counters["terminations"].get(name, 0) + int(terms[:, column].sum())
@@ -257,11 +359,9 @@ def run(args) -> dict:
 
     recorder_cfg = RecorderManagerBaseCfg(dataset_export_mode=0)
     recorder_cfg.physical_episode = RecorderTermCfg(class_type=PhysicalEpisodeRecorder)
-    cfg.recorders = recorder_cfg
-    if args.train_only:
-        # PPO owns the rollout and episode counters in this phase. A subsequent
-        # evaluator starts fresh so training transitions cannot pollute metrics.
-        cfg.recorders = {}
+    # PPO owns rollout counters while training. A fresh evaluator keeps training
+    # transitions out of reported policy metrics.
+    cfg.recorders = {} if args.train_only else recorder_cfg
     original_init = None
     if args.mode == "xpbd":
         from newton._src.solvers.implicit_mpm.particle_solver_xpbd import _XPBDParticleSolver
@@ -313,22 +413,7 @@ def run(args) -> dict:
                     flush=True,
                 )
                 if args.train_only:
-                    start_iteration = int(runner.current_learning_iteration)
-                    runner.learn(num_learning_iterations=args.fine_tune_iterations, init_at_random_ep_len=False)
-                    checkpoint = args.output / "model_mpm_finetuned.pt"
-                    runner.save(str(checkpoint))
-                    counters["fine_tune"] = {
-                        "requested_ppo_iterations": args.fine_tune_iterations,
-                        "loaded_iteration": start_iteration,
-                        "saved_iteration": int(runner.current_learning_iteration),
-                        "rollout_steps_per_env_per_iteration": agent_cfg.num_steps_per_env,
-                        "environment_transitions": args.num_envs
-                        * agent_cfg.num_steps_per_env
-                        * args.fine_tune_iterations,
-                        "checkpoint": str(checkpoint.resolve()),
-                        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
-                        "evaluation_performed": False,
-                    }
+                    counters["fine_tune"] = fine_tune_runner(runner, args, to_dict(agent_cfg))
                     state["complete"] = True
                     return counters
                 policy = runner.get_inference_policy(device=args.device)
@@ -378,6 +463,8 @@ def run(args) -> dict:
             newton.solvers.SolverImplicitMPM.__init__ = original_init
         if writer is not None:
             writer.close(complete=state["complete"])
+        if not args.train_only:
+            counters.update(episode_metrics.summary())
         counters.update(
             {
                 "complete": state["complete"],

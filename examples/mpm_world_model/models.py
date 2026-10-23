@@ -12,7 +12,7 @@ future reference particle or rigid states never enter an imagined rollout.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
@@ -34,6 +34,16 @@ class TaskSpec:
     last_action_scale: float = 1.0
     time_remaining_index: int = -1
     time_remaining_decrement: float = 0.0
+    mass_fraction_indices: list[int] = field(default_factory=list)
+    quaternion_starts: list[int] = field(default_factory=list)
+    quaternion_order: str = "wxyz"
+    constant_observation_indices: list[int] = field(default_factory=list)
+    zero_observation_indices: list[int] = field(default_factory=list)
+    typed_action_observation_start: int = -1
+    typed_elapsed_time_index: int = -1
+    typed_elapsed_time_increment: float = 0.0
+    typed_countdown_index: int = -1
+    typed_countdown_decrement: float = 0.0
 
 
 @dataclass
@@ -45,6 +55,51 @@ class WorldModelConfig:
     entity_dim: int = 64
     material_dim: int = 29
     material_transform: str = "signed_log1p"
+    physical_decoder: str = "none"
+
+
+def _canonical_quaternion(quaternion, order):
+    if order == "xyzw":
+        quaternion = quaternion[..., [3, 0, 1, 2]]
+    return quaternion / quaternion.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _quaternion_product(left, right):
+    scalar = left[..., :1] * right[..., :1] - (left[..., 1:] * right[..., 1:]).sum(-1, keepdim=True)
+    vector = left[..., :1] * right[..., 1:] + right[..., :1] * left[..., 1:]
+    vector = vector + torch.linalg.cross(left[..., 1:], right[..., 1:], dim=-1)
+    return torch.cat((scalar, vector), -1)
+
+
+def quaternion_apply_local_delta(quaternion, rotation_vector, *, order="wxyz"):
+    """Compose a local rotation increment [rad] with a unit quaternion."""
+    current = _canonical_quaternion(quaternion, order)
+    angle = rotation_vector.norm(dim=-1, keepdim=True)
+    vector = 0.5 * torch.sinc(angle / (2.0 * torch.pi)) * rotation_vector
+    increment = torch.cat((torch.cos(0.5 * angle), vector), -1)
+    result = _quaternion_product(current, increment)
+    result = result / result.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    return result[..., [1, 2, 3, 0]] if order == "xyzw" else result
+
+
+def quaternion_local_delta(current, target, *, order="wxyz"):
+    """Return the shortest local rotation vector between unit quaternions [rad]."""
+    current, target = _canonical_quaternion(current, order), _canonical_quaternion(target, order)
+    conjugate = torch.cat((current[..., :1], -current[..., 1:]), -1)
+    relative = _quaternion_product(conjugate, target)
+    relative = torch.where(relative[..., :1] < 0.0, -relative, relative)
+    sine = relative[..., 1:].norm(dim=-1, keepdim=True)
+    angle = 2.0 * torch.atan2(sine, relative[..., :1])
+    factor = torch.where(sine > 1e-6, angle / sine.clamp_min(1e-12), 2.0 * torch.ones_like(sine))
+    return factor * relative[..., 1:]
+
+
+def quaternion_geodesic_error(predicted, target, *, order="wxyz"):
+    """Measure sign-invariant angular error without changing recorded vectors [rad]."""
+    predicted, target = _canonical_quaternion(predicted, order), _canonical_quaternion(target, order)
+    conjugate = torch.cat((target[..., :1], -target[..., 1:]), -1)
+    relative = _quaternion_product(conjugate, predicted)
+    return 2.0 * torch.atan2(relative[..., 1:].norm(dim=-1), relative[..., 0].abs())
 
 
 class FeatureNormalizer(nn.Module):
@@ -128,12 +183,30 @@ class _TaskHeads(nn.Module):
         self.output = _mlp(
             config.hidden_dim,
             config.hidden_dim,
-            spec.observation_dim + spec.critic_observation_dim - spec.shared_observation_prefix_dim + 2,
+            spec.observation_dim
+            + spec.critic_observation_dim
+            - spec.shared_observation_prefix_dim
+            + 2
+            + (
+                len(spec.mass_fraction_indices) ** 2 + 3 * len(spec.quaternion_starts)
+                if config.physical_decoder == "typed"
+                else 0
+            ),
         )
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
         with torch.no_grad():
-            self.output[-1].bias[-1] = -4.6
+            base_dim = spec.observation_dim + spec.critic_observation_dim - spec.shared_observation_prefix_dim + 2
+            self.output[-1].bias[base_dim - 1] = -4.6
+            if config.physical_decoder == "typed" and spec.mass_fraction_indices:
+                count = len(spec.mass_fraction_indices)
+                self.output[-1].bias[base_dim : base_dim + count * count].view(count, count).diagonal().fill_(6.0)
+        self.rotation_norm = None
+        if config.physical_decoder == "typed":
+            self.register_buffer("fraction_indices", torch.tensor(spec.mass_fraction_indices, dtype=torch.long))
+            indices = [i + offset for i in spec.quaternion_starts for offset in range(4)]
+            self.register_buffer("quaternion_indices", torch.tensor(indices, dtype=torch.long))
+            self.rotation_norm = FeatureNormalizer(3 * len(spec.quaternion_starts))
 
 
 class CoupledWorldModel(nn.Module):
@@ -155,6 +228,19 @@ class CoupledWorldModel(nn.Module):
         self.config = config
         if config.material_transform not in ("identity", "signed_log1p"):
             raise ValueError("Unsupported material aggregate transform")
+        if config.physical_decoder not in ("none", "typed"):
+            raise ValueError("Unsupported physical decoder")
+        for spec in config.tasks:
+            if spec.quaternion_order not in ("xyzw", "wxyz"):
+                raise ValueError("Quaternion order must be declared explicitly as xyzw or wxyz")
+            indices = spec.mass_fraction_indices + [i + offset for i in spec.quaternion_starts for offset in range(4)]
+            if len(set(indices)) != len(indices) or any(i < 0 or i >= spec.observation_dim for i in indices):
+                raise ValueError("Typed physical observation groups must be disjoint and inside the task observation")
+            constants = spec.constant_observation_indices + spec.zero_observation_indices
+            if len(set(constants + indices)) != len(constants + indices) or any(
+                i < 0 or i >= spec.observation_dim for i in constants
+            ):
+                raise ValueError("Constant observation groups must be disjoint and inside the task observation")
         self._specs = {spec.task_id: spec for spec in config.tasks}
         self._task_indices = {spec.task_id: str(i) for i, spec in enumerate(config.tasks)}
         self.particle_encoder = _SetEncoder(6, config.entity_dim)
@@ -188,6 +274,28 @@ class CoupledWorldModel(nn.Module):
             -1,
         )
 
+    def _validate_typed_seed(self, observation, *, task_id):
+        # Validate once at snapshot encoding, never synchronize the GPU inside
+        # the recurrent step. Actor groups are independent of masked entities.
+        spec, heads = self._specs[task_id], self.task(task_id)
+        if spec.mass_fraction_indices:
+            fractions = observation.index_select(-1, heads.fraction_indices)
+            valid = torch.isfinite(fractions).all(-1) & (fractions >= 0.0).all(-1)
+            valid &= (fractions.sum(-1) - 1.0).abs() <= 1e-4
+            if not valid.all():
+                raise ValueError("Typed seed mass fractions must be finite, nonnegative and sum to one within 1e-4")
+        if spec.quaternion_starts:
+            quaternions = observation.index_select(-1, heads.quaternion_indices).reshape(
+                *observation.shape[:-1], len(spec.quaternion_starts), 4
+            )
+            norm = quaternions.norm(dim=-1)
+            if not (torch.isfinite(norm) & ((norm - 1.0).abs() <= 1e-3)).all():
+                raise ValueError("Typed seed actor quaternions must be finite and unit norm within 1e-3")
+        if spec.zero_observation_indices:
+            values = observation[..., spec.zero_observation_indices]
+            if not (torch.isfinite(values) & (values.abs() <= 1e-6)).all():
+                raise ValueError("Typed seed numerical-failure observation bins must be zero")
+
     def encode(
         self,
         observation,
@@ -205,6 +313,8 @@ class CoupledWorldModel(nn.Module):
     ):
         """Initialize memory from one real, masked simulator snapshot."""
         heads = self.task(task_id)
+        if self.config.physical_decoder == "typed":
+            self._validate_typed_seed(observation, task_id=task_id)
         if controller_state is None:
             controller_state = observation.new_zeros((*observation.shape[:-1], heads.controller_norm.mean.numel()))
         if material_summary is None:
@@ -225,7 +335,9 @@ class CoupledWorldModel(nn.Module):
         """Advance one recorded control interval without reference-state inputs."""
         heads = self.task(task_id)
         spec = self._specs[task_id]
-        if spec.last_action_observation_start >= 0:
+        if spec.last_action_observation_start >= 0 or (
+            self.config.physical_decoder == "typed" and spec.typed_action_observation_start >= 0
+        ):
             action = action.clamp(-1.0, 1.0)
         inputs = torch.cat(
             (self._state_features(observation, critic_observation, context, task_id), heads.action_norm(action)), -1
@@ -234,10 +346,52 @@ class CoupledWorldModel(nn.Module):
         output = heads.output(hidden)
         actor_dim, critic_dim = observation.shape[-1], critic_observation.shape[-1]
         prefix = self._specs[task_id].shared_observation_prefix_dim
-        actor_delta, critic_delta, reward, termination = output.split((actor_dim, critic_dim - prefix, 1, 1), -1)
+        base_dim = actor_dim + critic_dim - prefix + 2
+        actor_delta, critic_delta, reward, termination = output[..., :base_dim].split(
+            (actor_dim, critic_dim - prefix, 1, 1), -1
+        )
         next_observation = (
             observation + actor_delta * heads.observation_delta_norm.std + heads.observation_delta_norm.mean
         )
+        if self.config.physical_decoder == "typed":
+            fraction_count, rotation_count = len(spec.mass_fraction_indices), len(spec.quaternion_starts)
+            fraction_dim = fraction_count * fraction_count
+            if fraction_count:
+                logits = output[..., base_dim : base_dim + fraction_dim].reshape(
+                    *observation.shape[:-1], fraction_count, fraction_count
+                )
+                transport = logits.softmax(-1)
+                fractions = observation.index_select(-1, heads.fraction_indices)
+                next_fractions = (fractions.unsqueeze(-2) @ transport).squeeze(-2)
+                next_observation = next_observation.index_copy(-1, heads.fraction_indices, next_fractions)
+            if rotation_count:
+                rotations = output[..., base_dim + fraction_dim :] * heads.rotation_norm.std + heads.rotation_norm.mean
+                rotations = rotations.reshape(*observation.shape[:-1], rotation_count, 3)
+                current = observation.index_select(-1, heads.quaternion_indices).reshape(
+                    *observation.shape[:-1], rotation_count, 4
+                )
+                next_rotation = quaternion_apply_local_delta(current, rotations, order=spec.quaternion_order)
+                next_observation = next_observation.index_copy(-1, heads.quaternion_indices, next_rotation.flatten(-2))
+            if spec.constant_observation_indices or spec.zero_observation_indices:
+                next_observation = next_observation.clone()
+                next_observation[..., spec.constant_observation_indices] = observation[
+                    ..., spec.constant_observation_indices
+                ]
+                next_observation[..., spec.zero_observation_indices] = 0.0
+            if spec.typed_action_observation_start >= 0:
+                start = spec.typed_action_observation_start
+                next_observation = next_observation.clone()
+                next_observation[..., start : start + spec.action_dim] = action
+            if spec.typed_elapsed_time_index >= 0:
+                index = spec.typed_elapsed_time_index
+                next_observation = next_observation.clone()
+                next_observation[..., index] = observation[..., index] + spec.typed_elapsed_time_increment
+            if spec.typed_countdown_index >= 0:
+                index = spec.typed_countdown_index
+                next_observation = next_observation.clone()
+                next_observation[..., index] = (observation[..., index] - spec.typed_countdown_decrement).clamp(
+                    0.0, 1.0
+                )
         if spec.last_action_observation_start >= 0:
             start = spec.last_action_observation_start
             next_observation = torch.cat(
@@ -293,7 +447,10 @@ def rollout_loss(model: CoupledWorldModel, batch: dict, *, task_id: str, burn_in
     hidden = model.encode_batch(batch, task_id=task_id)
     observation, critic_observation = batch["observation"][:, 0], batch["critic_observation"][:, 0]
     heads = model.task(task_id)
-    losses = {key: observation.new_zeros(()) for key in ("observation", "critic_observation", "reward", "termination")}
+    losses = {
+        key: observation.new_zeros(())
+        for key in ("observation", "critic_observation", "reward", "termination", "rotation")
+    }
     weight_sum = observation.new_zeros(())
     for step in range(batch["action"].shape[1]):
         if step < burn_in:
@@ -319,7 +476,22 @@ def rollout_loss(model: CoupledWorldModel, batch: dict, *, task_id: str, burn_in
             target = batch[key][:, step + 1]
             predicted = torch.where(valid[:, None], prediction[key], 0.0)
             target = torch.where(valid[:, None], target, 0.0)
-            error = ((predicted - target) / scale).square().mean(-1)
+            component_error = ((predicted - target) / scale).square()
+            if model.config.physical_decoder == "typed":
+                spec = model._specs[task_id]
+                indices = [
+                    i + offset
+                    for i in spec.quaternion_starts
+                    for offset in range(4)
+                    if key == "observation" or i + 4 <= spec.shared_observation_prefix_dim
+                ]
+                if indices:
+                    component_error = component_error.clone()
+                    component_error[..., indices] = 0.0
+                denominator = max(1, component_error.shape[-1] - len(indices))
+                error = component_error.sum(-1) / denominator
+            else:
+                error = component_error.mean(-1)
             losses[key] = losses[key] + (error * mask).sum()
         predicted_reward = torch.where(valid, prediction["reward"], 0.0)
         target_reward = torch.where(valid, batch["reward"][:, step], 0.0)
@@ -331,9 +503,29 @@ def rollout_loss(model: CoupledWorldModel, batch: dict, *, task_id: str, burn_in
             reduction="none",
         )
         losses["termination"] = losses["termination"] + (termination_error * mask).sum()
+        if model.config.physical_decoder == "typed" and model._specs[task_id].quaternion_starts:
+            spec = model._specs[task_id]
+            count = len(spec.quaternion_starts)
+            predicted_quat = prediction["observation"].index_select(-1, heads.quaternion_indices).reshape(-1, count, 4)
+            target_quat = (
+                batch["observation"][:, step + 1].index_select(-1, heads.quaternion_indices).reshape(-1, count, 4)
+            )
+            identity = torch.zeros_like(predicted_quat)
+            identity[..., 0 if spec.quaternion_order == "wxyz" else 3] = 1.0
+            predicted_quat = torch.where(valid[:, None, None], predicted_quat, identity)
+            target_quat = torch.where(valid[:, None, None], target_quat, identity)
+            angle = quaternion_geodesic_error(predicted_quat, target_quat, order=spec.quaternion_order)
+            angular_scale = heads.rotation_norm.std.reshape(count, 3).norm(dim=-1).clamp_min(1e-3)
+            losses["rotation"] = losses["rotation"] + ((angle / angular_scale).square().mean(-1) * mask).sum()
         weight_sum = weight_sum + mask.sum()
     losses = {key: value / weight_sum.clamp_min(1) for key, value in losses.items()}
-    total = losses["observation"] + 0.5 * losses["critic_observation"] + losses["reward"] + losses["termination"]
+    total = (
+        losses["observation"]
+        + 0.5 * losses["critic_observation"]
+        + losses["reward"]
+        + losses["termination"]
+        + losses["rotation"]
+    )
     return total, losses
 
 
@@ -346,6 +538,7 @@ def load_checkpoint(path: str | Path, *, device: str = "cpu"):
     # Version-1 checkpoints created before the explicit transform used raw
     # aggregate moments; never reinterpret their learned normalization silently.
     config_dict.setdefault("material_transform", "identity")
+    config_dict.setdefault("physical_decoder", "none")
     config_dict["tasks"] = [TaskSpec(**spec) for spec in config_dict["tasks"]]
     models = []
     for weights in checkpoint["models"]:

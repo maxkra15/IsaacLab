@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from .models import CoupledWorldModel, TaskSpec
+from .models import CoupledWorldModel, TaskSpec, quaternion_local_delta
 
 
 def _metadata(episode, name, default=None):
@@ -116,6 +116,15 @@ def _validate_episode(episode):
     for key, mask in (("particle_state", episode["particle_mask"]), ("rigid_state", episode["rigid_mask"])):
         episode["finite_mask"] &= (torch.isfinite(episode[key]).all(-1) | ~mask[None]).all(-1)
     episode["material_summary"] = _material_summary(episode)
+    capacity_valid = torch.as_tensor(episode.get("rigid_capacity_valid", torch.ones(count + 1)), dtype=torch.bool)
+    if capacity_valid.shape != (count + 1,):
+        raise ValueError("rigid_capacity_valid must contain one Boolean per state")
+    if ((~capacity_valid[:-1]) & capacity_valid[1:]).any():
+        raise ValueError("Rigid capacity validity cannot recover inside a recorded episode")
+    episode["rigid_capacity_valid"] = capacity_valid
+    # Capacity loss can leave numerically finite states after native constraints
+    # were dropped. Preserve raw numerical validity as a separate diagnostic.
+    episode["valid_mask"] = episode["finite_mask"] & capacity_valid
 
 
 def _material_summary(episode):
@@ -145,7 +154,7 @@ def task_specs(episodes: list[dict]) -> list[TaskSpec]:
     field_names = {}
     for episode in episodes:
         actor_dim = episode["observation"].shape[-1]
-        finite = episode["finite_mask"]
+        finite = episode.get("valid_mask", episode["finite_mask"])
         shared_prefix = 0
         if episode["critic_observation"].shape[-1] >= actor_dim and torch.equal(
             episode["observation"][finite], episode["critic_observation"][finite, :actor_dim]
@@ -172,6 +181,9 @@ def task_specs(episodes: list[dict]) -> list[TaskSpec]:
             max_steps = int(_metadata(episode, "max_episode_length", math.ceil(12.0 / dt)))
             spec.last_action_observation_start, spec.last_action_scale = 54, 0.2
             spec.time_remaining_index, spec.time_remaining_decrement = 14, 1.0 / max_steps
+            spec.mass_fraction_indices = [68, 69, 70, 83]
+            spec.quaternion_starts, spec.quaternion_order = [19, 26, 33, 40], "xyzw"
+            spec.constant_observation_indices = [15]
             valid = finite[:-1] & finite[1:]
             expected_action = 0.2 * episode["action"][valid].clamp(-1.0, 1.0)
             expected_time = (episode["observation"][:-1, 14][valid] - spec.time_remaining_decrement).clamp(0.0, 1.0)
@@ -179,6 +191,28 @@ def task_specs(episodes: list[dict]) -> list[TaskSpec]:
                 raise ValueError("Franka recorded last-action observations violate their declared scaling")
             if not torch.allclose(episode["observation"][1:, 14][valid], expected_time, atol=2e-6, rtol=0):
                 raise ValueError("Franka recorded remaining-time observations violate their declared counter")
+        if spec.task_id == "rizon_sharpa_teapot_held_pour" and spec.observation_dim == 121:
+            spec.mass_fraction_indices = [91, 92, 93, 94]
+            spec.quaternion_starts, spec.quaternion_order = [61, 74], "wxyz"
+            spec.constant_observation_indices = [120]
+            dt = float(_metadata(episode, "dt"))
+            spec.typed_action_observation_start = 112
+            spec.typed_elapsed_time_index, spec.typed_elapsed_time_increment = 118, dt
+            spec.typed_countdown_index, spec.typed_countdown_decrement = 119, dt / 16.0
+            valid = finite[:-1] & finite[1:]
+            expected_action = episode["action"][valid].clamp(-1.0, 1.0)
+            expected_elapsed = episode["observation"][:-1, 118][valid] + dt
+            expected_countdown = (episode["observation"][:-1, 119][valid] - dt / 16.0).clamp(0.0, 1.0)
+            for index, expected in (
+                (slice(112, 118), expected_action),
+                (118, expected_elapsed),
+                (119, expected_countdown),
+            ):
+                if not torch.allclose(episode["observation"][1:, index][valid], expected, atol=3e-6, rtol=0):
+                    raise ValueError("Teapot recorded action/clock observations violate their declared bookkeeping")
+            # The fifth partition bin records numerical failure, not a region
+            # into which physical material can be transported.
+            spec.zero_observation_indices = [95]
         if spec.task_id in specs and spec != specs[spec.task_id]:
             raise ValueError(f"Incompatible state/action dimensions for task {spec.task_id}")
         for field in ("context_names", "observation_names", "action_names"):
@@ -198,7 +232,9 @@ def fit_normalizers(model: CoupledWorldModel, episodes: list[dict]) -> None:
         raise ValueError("Normalizer fitting accepts training episodes only")
     for episode in episodes:
         heads = model.task(episode["task_id"])
-        finite = episode["finite_mask"]
+        finite = episode.get("valid_mask", episode["finite_mask"])
+        if not finite.any():
+            continue
         for key, normalizer in (
             ("observation", heads.observation_norm),
             ("critic_observation", heads.critic_norm),
@@ -214,6 +250,12 @@ def fit_normalizers(model: CoupledWorldModel, episodes: list[dict]) -> None:
         heads.critic_delta_norm.update(
             episode["critic_observation"][1:] - episode["critic_observation"][:-1], valid_transition
         )
+        if heads.rotation_norm is not None and model._specs[episode["task_id"]].quaternion_starts:
+            spec = model._specs[episode["task_id"]]
+            count = len(spec.quaternion_starts)
+            quaternions = episode["observation"].index_select(-1, heads.quaternion_indices).reshape(-1, count, 4)
+            rotation = quaternion_local_delta(quaternions[:-1], quaternions[1:], order=spec.quaternion_order)
+            heads.rotation_norm.update(rotation.flatten(-2), valid_transition)
         model.particle_encoder.normalizer.update(
             episode["particle_state"], finite[:, None] & episode["particle_mask"][None]
         )
@@ -235,7 +277,7 @@ class EpisodeWindows:
         self.generator = torch.Generator().manual_seed(seed)
         self.starts = []
         for i, episode in enumerate(self.episodes):
-            finite = episode["finite_mask"]
+            finite = episode.get("valid_mask", episode["finite_mask"])
             valid = finite[:-1] & finite[1:]
             valid &= torch.isfinite(episode["action"]).all(-1) & torch.isfinite(episode["reward"])
             self.starts.extend((i, int(start)) for start in valid.nonzero().flatten())
@@ -267,7 +309,7 @@ class EpisodeWindows:
         count = len(episode["action"])
         state_indices = torch.arange(start, start + self.horizon + 1).clamp_max(count)
         transition_indices = torch.arange(start, start + self.horizon).clamp_max(count - 1)
-        finite = episode["finite_mask"][state_indices]
+        finite = episode.get("valid_mask", episode["finite_mask"])[state_indices]
         mask = finite[:-1] & finite[1:] & (torch.arange(self.horizon) < count - start)
         done = (episode["terminated"] | episode["truncated"])[transition_indices]
         valid_transition = torch.isfinite(episode["action"][transition_indices]).all(-1)
