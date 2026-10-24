@@ -6,6 +6,12 @@ then load the same policy into the real MPM task for evaluation and fine-tuning.
 It does not replace Newton's material solver, predict a complete particle cloud,
 or establish accurate contact forces.
 
+During learned PPO, the network predicts the next policy observations; it does
+not run particle-to-grid transfer, a constitutive/contact solve or grid-to-particle
+transfer. During data collection, native evaluation and native fine-tuning,
+Newton still performs real MPM. Videos from the capture helpers show that native
+replay, not particles imagined by the observation model.
+
 The architecture takes inspiration from SuperMimic
 ([paper](https://arxiv.org/abs/2610.28480)). This implementation uses a recurrent
 ensemble and ordinary RSL-RL PPO, rather than SuperMimic's analytical policy
@@ -118,9 +124,9 @@ uv run python -m examples.mpm_world_model.collect_franka_pour \
   --perturb-std 0 --perturb-fraction 0 --headless
 ```
 
-The explicit `2 / 2 / 0` settings reproduce the historical policy reference.
-The collector's default `8 / 1 / 1` settings define different coupled dynamics;
-changing them requires an independent physics and policy check. A smaller
+The default `2 / 2 / 0` settings reproduce the historical policy reference.
+Using `8 / 1 / 1` instead defines different coupled dynamics;
+changing these settings requires an independent physics and policy check. A smaller
 timestep does not automatically preserve a trained controller's behavior.
 
 Collect a second dataset with bounded action perturbations for coverage. Preserve
@@ -177,6 +183,24 @@ Compare unchanged 7450, model-adapted, and MPM-fine-tuned policies using the sam
 physics, reset distribution and full episode horizon. Report numerical failures
 separately from physical task failures.
 
+For an illustrative native video, install the optional MoviePy/FFmpeg recording
+dependencies in a compatible rendering environment and set `CUDA_VISIBLE_DEVICES`
+to one physical GPU UUID. `--egl-device-index` is the host EGL ordinal, independent
+of the masked logical CUDA index:
+
+```bash
+uv run python -m examples.mpm_world_model.capture_franka_pour \
+  --checkpoint /results/model-ppo/model_final.pt \
+  --reset-dataset /path/to/reset_dataset.pt --output /results/franka-video \
+  --egl-device-index 0 --steps 360 --warmup-steps 16
+```
+
+This records one world at 1x playback with physical particles. `capture.json`
+retains every frame's policy clock, reset row and episode-reset boundaries.
+These clips illustrate the saved policy; use the separate batched evaluations
+for success statistics. The native task starts from its reset-dataset states,
+which can already be partway through a skill.
+
 ## Teapot transfer experiment
 
 ```bash
@@ -206,6 +230,11 @@ provides a stricter adapter-only transfer control. Each task keeps its own polic
 The teapot policy task ID is `rizon_sharpa_teapot_held_pour`; `train_policy` creates
 a small new actor when no checkpoint/config is supplied and exports `policy.pt`.
 Replay it through `collect_teapot --policy-checkpoint /results/teapot-ppo/policy.pt`.
+Add `--video-path /results/teapot-video.mp4 --video-fps 25` to record the full
+physical grasp/pour loop. Its sidecar labels scripted versus learned residual
+control and retains physical outcomes even when the task fails. For explicit
+headless EGL selection, set `PYGLET_HEADLESS_DEVICE` to the host device ordinal
+before launching; `CUDA_VISIBLE_DEVICES` separately selects physics.
 For a narrow-action pilot, set the new actor's exploration standard deviation
 through its runner JSON and use the same action limit in imagined training and
 native replay. Reducing collection amplitude alone does not constrain a policy's
@@ -226,6 +255,86 @@ material/contact data. The typed decoder supplies only a few necessary output
 constraints. Learned
 warm-starts inside the native solver are a separate path when retaining MPM's
 physical constraints is more important than eliminating simulation cost.
+
+## Measured Franka pilot, 2026-10-24
+
+The initial unconstrained-model experiment used the official 7450 policy,
+47,104 real transitions and two recurrent ensemble members. Its model fit took
+528 seconds on an L40. PPO used at most four imagined steps before resetting to
+a training replay seed; these are not independent complete physical episodes.
+The starting policy was already strong and received only 20 learned PPO
+iterations at learning rate 1e-5. Preserving its success rate demonstrates
+interface compatibility and limited adaptation, not learning pouring from
+scratch inside the model.
+
+| Actual MPM replay | First completed successes | Aggregate successes | Recorded nonfinite material-state events |
+| --- | --- | --- | --- |
+| Unchanged official 7450 | 63 / 64 | 563 / 569 | 1 |
+| After learned-model PPO | 62 / 64 | 484 / 490 | 0 |
+| Then real-MPM PPO fine-tuning | 64 / 64 | 538 / 545 | 0 |
+
+The replays share the historical coupling settings, seed 42 and the fixed reset
+dataset, with 16 warmup and 360 evaluation actions. Initial-cohort metrics include
+warmup; aggregate metrics exclude warmup completions. Subsequent resets diverge
+with policy timing, so aggregate episodes are not paired. Fifty initial reset
+rows belong to model-training groups; this is a policy-interface and stability
+check, not a held-out generalization score or evidence of improved success.
+
+| Recorded PPO workload | Transitions | Loop seconds | Transitions / second |
+| --- | --- | --- | --- |
+| Native MPM, 64 environments | 20,480 | 50.177 | 408 |
+| Learned model, 64 environments | 20,480 | 6.132 | 3,340 |
+| Learned model, 8,192 environments | 2,621,440 | 6.229 | 420,873 |
+
+Both 64-environment runs use 20 iterations, 16 rollout steps, two epochs, four
+minibatches and learning rate 1e-5. Their recorded loop times differ by 8.18x;
+the starting checkpoints differ and native timing can include initial graph
+capture and automatic saves. Data generation, fitting and process startup are
+excluded. The 8,192-world result is a separate batch-capacity measurement, not
+an equal-batch MPM speedup. This short pilot does not establish an end-to-end
+training speedup after amortizing the model's fitting cost.
+
+The optional typed model fit took 831 seconds and subsequently reached 464,666
+PPO transitions per second at 8,192 worlds, with no nonfinite predictions or
+mass-admissibility cuts. These model checks alone do not validate physical flow
+or policy success.
+
+The teapot pilot selected four intact monitored episodes (6,400 transitions)
+from two training reset groups, one validation group and one test group. The
+failed sparse-grid-capacity episode remains in the source record and is excluded;
+selection does not filter by task success. With equal 800-update budgets, core
+transfer changes best validation loss from 0.56215 to 0.56108, a marginal 0.2%.
+Both models are worse than static persistence on aggregate normalized material
+error. Shuffling actions changes material error by only about 0.2-1.7% at four
+or eight steps. These results do not establish reliable control-dependent fluid
+dynamics or broad transfer across objects and materials.
+
+A fresh scratch-model teapot actor completed 6.55 million imagined transitions
+in 28 seconds, with no nonfinite predictions or mass-admissibility cuts. Its
+imagined reward did not improve. Executed actions were restricted to 0.1, giving
+at most 2-mm translation and 0.02-radian orientation residuals around the existing
+motion. This is fast training-loop execution, not evidence that the full teapot
+skill has been learned. Native PPO fine-tuning for this new task still needs its
+own vector-environment adapter; the existing Franka native fine-tuning path is
+already exercised.
+
+Full-horizon native teapot videos were recorded for the nominal script and both
+new residual actors. Every replay uses actual MPM particles, includes the
+two-second physical grasp and sixteen-second pour, remains finite at recorded
+endpoints, and passes contact-capacity checks at all 14,400 native steps. Each
+retains its grasp, with maximum palm translation drift relative to the pot below
+2.3 cm.
+
+| Native teapot replay | Delivered mass | Spilled mass | Reached provisional 50% delivery goal |
+| --- | --- | --- | --- |
+| Nominal script, zero residual | 15.13% | 0% | No |
+| Actor trained in scratch world model | 10.20% | 0% | No |
+| Actor trained in transferred world model | 10.96% | 0% | No |
+
+These three episodes have different initial-cloud reset groups. They illustrate
+valid native replay and unsuccessful task completion, not a paired causal
+comparison of policies. The clips are not evidence that the learned model can
+simulate particles or that transfer improves control.
 
 Run CPU contract tests with:
 

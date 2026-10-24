@@ -464,6 +464,60 @@ def test_typed_rotation_loss_ignores_quaternion_sign():
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
+def test_franka_typed_quaternions_preserve_native_hemisphere_at_180_degrees():
+    """Match the policy's canonical XYZW observations after crossing 180 degrees."""
+    spec = TaskSpec(
+        "franka_pour",
+        84,
+        86,
+        8,
+        1,
+        shared_observation_prefix_dim=84,
+        mass_fraction_indices=[68, 69, 70, 83],
+        quaternion_starts=[19, 26, 33, 40],
+        quaternion_order="xyzw",
+    )
+    typed = CoupledWorldModel(WorldModelConfig([spec], hidden_dim=16, entity_dim=8, physical_decoder="typed"))
+    legacy = CoupledWorldModel(WorldModelConfig([spec], hidden_dim=16, entity_dim=8))
+    observation = torch.zeros(1, 84)
+    observation[:, 68] = 1.0
+    indices = torch.tensor([start + offset for start in spec.quaternion_starts for offset in range(4)])
+    before = torch.tensor(
+        [torch.sin(torch.tensor(85 * torch.pi / 180)), 0.0, 0.0, torch.cos(torch.tensor(85 * torch.pi / 180))]
+    )
+    observation[:, indices] = before.repeat(4)
+    with torch.no_grad():
+        typed.task(spec.task_id).output[-1].bias[-12:] = torch.tensor([20 * torch.pi / 180, 0.0, 0.0]).repeat(4)
+    critic = torch.cat((observation, torch.zeros(1, 2)), -1)
+    result = typed.step(
+        observation, critic, torch.zeros(1, 8), torch.zeros(1, 1), torch.zeros(1, 16), task_id=spec.task_id
+    )
+    actual = result["observation"][:, indices].reshape(1, 4, 4)
+    uncanonical = torch.tensor(
+        [torch.sin(torch.tensor(95 * torch.pi / 180)), 0.0, 0.0, torch.cos(torch.tensor(95 * torch.pi / 180))]
+    )
+    expected = -uncanonical.expand(1, 4, 4)
+    assert (actual[..., 3] >= 0.0).all()
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        quaternion_geodesic_error(actual, -expected, order="xyzw"), torch.zeros(1, 4), atol=1e-6, rtol=0
+    )
+    torch.testing.assert_close(result["critic_observation"][:, :84], result["observation"], atol=0, rtol=0)
+    # Legacy residual prediction keeps its previous raw-component behavior,
+    # including negative-hemisphere inputs supplied by an external caller.
+    negative = observation.clone()
+    negative[:, indices] *= -1.0
+    legacy_result = legacy.step(
+        negative,
+        torch.cat((negative, torch.zeros(1, 2)), -1),
+        torch.zeros(1, 8),
+        torch.zeros(1, 1),
+        torch.zeros(1, 16),
+        task_id=spec.task_id,
+    )
+    torch.testing.assert_close(legacy_result["observation"], negative, atol=0, rtol=0)
+
+
 def test_teapot_typed_bookkeeping_retains_native_control_contract(tmp_path):
     """Advance exact action memory and clocks without changing legacy predictions."""
     episode = _episode(12, transitions=2)

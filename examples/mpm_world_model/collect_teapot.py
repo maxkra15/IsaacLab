@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from examples.mpm_world_model.teapot_state import (
     rigid_state,
     spatial_sample,
 )
+from examples.mpm_world_model.teapot_video import NativeTeapotVideo, configure_capture_environment
 
 
 def _warp_array(value):
@@ -716,6 +718,10 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rigid-nconmax", type=int, help="Opt-in rigid contact capacity per world.")
     parser.add_argument("--transfer-scheme", choices=("pic", "apic"))
     parser.add_argument("--policy-checkpoint", type=Path, help="TorchScript actor121->6 for real-physics evaluation.")
+    parser.add_argument(
+        "--video-path", type=Path, help="Capture native particle evolution to this MP4; suffix per episode."
+    )
+    parser.add_argument("--video-fps", type=int, default=25, help="Capture rate; must divide800Hz.")
     parser.add_argument("--without-material", action="store_true")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--device", default="cuda:0")
@@ -763,6 +769,7 @@ def run(args) -> dict:
             raise ValueError("A split plan requires positive reset jitter and a matching episode count.")
         args.episodes = len(args.split_plan)
     configure_source_paths(args.repo, args.newton_root)
+    configure_capture_environment(args.video_path is not None)
     import newton
 
     from isaaclab.paths import ISAACLAB_ROOT
@@ -774,7 +781,7 @@ def run(args) -> dict:
     sys.path.insert(0, str(args.repo / "examples"))
     native = args.native_args[1:] if args.native_args[:1] == ["--"] else args.native_args
     if any(flag in native for flag in ("--robot", "--max_steps", "--video")):
-        raise ValueError("The collector owns robot/max_steps and video is not supported by this data loop.")
+        raise ValueError("The collector owns robot/max_steps; request recording with --video-path.")
     argv = [
         str(args.repo / "examples/demos/teapot_fill.py"),
         "--robot",
@@ -787,6 +794,8 @@ def run(args) -> dict:
         args.device,
         *native,
     ]
+    if args.video_path is not None:
+        argv.extend(["--video", "--video_fps", str(args.video_fps), "--visualizer", "newton_gl"])
     original_argv = sys.argv
     sys.argv = argv
     try:
@@ -796,7 +805,7 @@ def run(args) -> dict:
         specification.loader.exec_module(demo)
     finally:
         sys.argv = original_argv
-    if args.headless:
+    if args.headless and args.video_path is None:
         demo.args_cli.visualizer = []
     demo.FILL_SEED = args.fill_seed
     _configure_native_solvers(demo, args)
@@ -826,6 +835,7 @@ def run(args) -> dict:
         dt = sim.get_physics_dt()
         if not np.isclose(dt, 1 / 800):
             raise ValueError("The calibrated physical grasp requires800Hz.")
+        video = None
 
         def native_step(step):
             robot_motion.update(step * dt)
@@ -833,6 +843,8 @@ def run(args) -> dict:
             sim.step(render=False)
             adapter.capacity.sample()
             scene.update(dt)
+            if video is not None:
+                video.step()
 
         reset = TeapotEpisodeReset(adapter) if args.episodes > 1 or args.split_plan else None
         writer = EpisodeWriter(
@@ -844,6 +856,9 @@ def run(args) -> dict:
                 "newton_sources_sha256": source_digest(Path(newton.__file__).resolve().parent),
                 "collector_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "adapter_sha256": hashlib.sha256((Path(__file__).parent / "teapot_state.py").read_bytes()).hexdigest(),
+                "video_helper_sha256": hashlib.sha256(
+                    (Path(__file__).parent / "teapot_video.py").read_bytes()
+                ).hexdigest(),
                 "native_demo_file": demo.__file__,
                 "native_demo_sha256": hashlib.sha256(Path(demo.__file__).read_bytes()).hexdigest(),
                 "native_controller_file": sys.modules["rizon_sharpa_teapot"].__file__,
@@ -900,6 +915,42 @@ def run(args) -> dict:
                 phases = rng.uniform(-np.pi, np.pi, 6)
                 frequencies = rng.uniform(0.12, 0.4, 6)
                 adapter.capacity.clear()
+                if args.video_path is not None:
+                    video_path = args.video_path
+                    if args.episodes > 1:
+                        video_path = video_path.with_name(f"{video_path.stem}-episode-{episode_index:04d}.mp4")
+                    video = NativeTeapotVideo(
+                        video_path,
+                        args.video_fps,
+                        1600 + args.steps * 8,
+                        sim,
+                        scene,
+                        surface_renderer,
+                        {
+                            "task_id": episode_metadata["task_id"],
+                            "reset_group": group,
+                            "action_seed": args.seed + episode_index,
+                            "fill_seed": args.fill_seed,
+                            "reset_validation": validation,
+                            "particle_count": len(adapter.mass),
+                            "fidelity": demo.args_cli.fidelity,
+                            "fluid_render_mode": demo.args_cli.fluid_render_mode,
+                            "control": "scripted_grasp_then_learned_residual_around_scripted_pour"
+                            if actor is not None
+                            else (
+                                "scripted_grasp_then_nominal_scripted_pour_zero_residual"
+                                if args.action_amplitude == 0
+                                else "scripted_grasp_then_scripted_pour_with_residual_actions"
+                            ),
+                            "action_amplitude": None if actor is not None else args.action_amplitude,
+                            "scripted_grasp_duration_s": 2.0,
+                            "provenance": writer.manifest["metadata"],
+                            "graphics_environment": {
+                                name: os.environ.get(name)
+                                for name in ("CUDA_VISIBLE_DEVICES", "EGL_DEVICE_ID", "DISPLAY", "PYOPENGL_PLATFORM")
+                            },
+                        },
+                    )
                 for step in range(1600):
                     native_step(step)
                 adapter.begin_held_episode()
@@ -977,11 +1028,19 @@ def run(args) -> dict:
                 if requested_split is not None and outcome["split"] != requested_split:
                     raise RuntimeError("Recorder split disagrees with the pre-physics reset selector.")
                 outcomes.append(outcome)
+                if video is not None:
+                    video.close(outcome)
+                    outcome["video_path"] = str(video.path.resolve())
+                    video = None
                 atomic_json(args.output / "episode-outcomes.json", {"episodes": outcomes})
                 print(f"[TEAPOT EPISODE] {json.dumps(outcome)}", flush=True)
             complete = True
         finally:
-            writer.close(complete=complete)
+            try:
+                if video is not None:
+                    video.close()
+            finally:
+                writer.close(complete=complete)
         metrics.update(
             {
                 **outcomes[-1],
@@ -1019,6 +1078,10 @@ def main() -> None:
         parser.error("Rigid capacities must be positive.")
     if args.policy_checkpoint is not None and not args.policy_checkpoint.is_file():
         parser.error(f"Missing policy: {args.policy_checkpoint}")
+    if args.video_path is not None and (
+        args.video_path.suffix.lower() != ".mp4" or args.video_fps < 1 or 800 % args.video_fps
+    ):
+        parser.error("Video output must be.mp4 and video-fps must divide800Hz.")
     print(json.dumps(run(args), indent=2))
 
 

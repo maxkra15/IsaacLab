@@ -371,6 +371,14 @@ class CoupledWorldModel(nn.Module):
                     *observation.shape[:-1], rotation_count, 4
                 )
                 next_rotation = quaternion_apply_local_delta(current, rotations, order=spec.quaternion_order)
+                if task_id == "franka_pour":
+                    # Native Franka observations use quat_unique. Restoring the
+                    # same hemisphere preserves the saved policy's raw inputs;
+                    # sign-invariant physical loss alone cannot enforce this.
+                    scalar = 3 if spec.quaternion_order == "xyzw" else 0
+                    next_rotation = torch.where(
+                        next_rotation[..., scalar : scalar + 1] < 0.0, -next_rotation, next_rotation
+                    )
                 next_observation = next_observation.index_copy(-1, heads.quaternion_indices, next_rotation.flatten(-2))
             if spec.constant_observation_indices or spec.zero_observation_indices:
                 next_observation = next_observation.clone()

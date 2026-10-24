@@ -9,8 +9,20 @@ from types import SimpleNamespace
 
 import torch
 
-from examples.mpm_world_model.collect_franka_pour import override_loaded_learning_rate, reset_exploration_state
+from examples.mpm_world_model.collect_franka_pour import (
+    argument_parser,
+    override_loaded_learning_rate,
+    reset_exploration_state,
+)
 from examples.mpm_world_model.recording import EpisodeMetrics
+
+
+def test_saved_policy_defaults_preserve_reference_coupling():
+    """The 7450 interface includes its validated global/media/collision cadence."""
+    args = argument_parser().parse_args(
+        ["--checkpoint", "model_7450.pt", "--reset-dataset", "reset_dataset.pt", "--output", "unused"]
+    )
+    assert (args.global_substeps, args.media_substeps, args.collision_decimation) == (2, 2, 0)
 
 
 def test_integer_done_flags_reset_only_ended_worlds():
