@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Collect or evaluate a six-action held-pour task using the actual Rizon demo.
+"""Collect or evaluate held-pour and full-control tasks using the actual Rizon demo.
 
 Reuse the finalized native scene with --episodes. Episode zero retains the
 original cloud; later episodes perturb particles within the validated cavity.
@@ -17,6 +17,12 @@ The prefix uses the original contact-acquired grasp. After two seconds the actor
 controls bounded desired-pot residuals through the original differential IK.
 --policy-checkpoint accepts a TorchScript actor [B,121] -> [B,6]. This is a new
 prototype task, with its own observation, reward and success definition.
+
+For full grasp-lift-pour demonstrations, pass ``--task full --control teacher``.
+The full task has182 observations and30 joint/gain actions from the open-hand
+native reset. ``--control policy --policy-checkpoint ...`` removes all scripted
+motion and finger feedback from rollout execution; ``--control zero`` holds the
+initial joint targets for a physical negative control.
 """
 
 from __future__ import annotations
@@ -192,6 +198,8 @@ class RigidCapacityMonitor:
 class TeapotState:
     """Read the exact demo's state; classify mass against its actual hollow meshes."""
 
+    target_excludes_source = False
+
     def __init__(self, scene, motion, residual, demo, samples: int, seed: int, target_fraction: float, material: bool):
         import warp as wp
         from isaaclab_newton.physics import NewtonManager
@@ -321,7 +329,7 @@ class TeapotState:
         self.max_position_tracking_error = 0.0
         self.max_rotation_tracking_error = 0.0
 
-    def _grasp_diagnostics(self, sim_time: float) -> torch.Tensor:
+    def _grasp_diagnostics(self, sim_time: float, observation=None) -> torch.Tensor:
         pot = self.container.data.root_link_pose_w.torch[0]
         palm = self.robot.data.body_link_pose_w.torch[0, self.motion._palm, :3]
         relative = point_in_body_frame(palm, pot)
@@ -381,24 +389,9 @@ class TeapotState:
             )
         )
 
-    def capture(self, sim_time: float) -> dict[str, torch.Tensor]:
-        """Capture a pre-action or pre-reset endpoint, with all-cloud finite checks."""
-        positions = self.fluid.data.particle_pos_w.torch.reshape(-1, 3)
-        velocities = self.fluid.data.particle_vel_w.torch.reshape(-1, 3)
-        source_pose = self.container.data.root_link_pose_w.torch[0]
-        source = self._cavity(positions, source_pose, 0)
-        target = self._cavity(positions, self.bowl_pose, 1)
-        spilled = (positions[:, 2] <= self.demo.TABLE_TOP_Z + 2 * self.radius) | (positions.abs().amax(-1) > 3.0)
-        summary, finite = particle_summary(positions - self.origin, velocities, self.mass, source, target, spilled)
-        boundary = self.boundary()
-        controller = self._controller(sim_time)
+    def _policy_observation(self, boundary, summary, sim_time):
         clock = torch.tensor(
-            [
-                sim_time - 2.0,
-                max(0.0, (18.0 - sim_time) / 16.0),
-                self.target_fraction,
-            ],
-            device=self.device,
+            [sim_time - 2.0, max(0.0, (18.0 - sim_time) / 16.0), self.target_fraction], device=self.device
         )
         observation = torch.cat(
             (
@@ -412,6 +405,68 @@ class TeapotState:
         )
         if observation.shape != (121,):
             raise ValueError(f"Teapot actor expects121 values, got {observation.shape}.")
+        return observation
+
+    def apply_control(self, state, actor, args, sim_time, phases, frequencies):
+        """Latch a six-action residual; the held task retains its native motion."""
+        if actor is None:
+            action = torch.as_tensor(
+                args.action_amplitude * np.sin(2 * np.pi * frequencies * (sim_time - 2) + phases),
+                device=self.device,
+                dtype=torch.float32,
+            )
+        else:
+            with torch.inference_mode():
+                action = actor(state["observation"][None])[0]
+            if action.shape != (6,) or not bool(torch.isfinite(action).all()):
+                raise ValueError("The held-task actor must return six finite residual actions.")
+            action = action.clamp(-1, 1)
+        self.residual.apply_action(action.detach().cpu().numpy(), sim_time)
+        return action
+
+    def reward(self, previous, current, action):
+        return pour_reward(previous["particle_summary"], current["particle_summary"], action)
+
+    def control_description(self, args, actor):
+        if actor is not None:
+            return "scripted_grasp_then_learned_residual_around_scripted_pour"
+        if args.action_amplitude == 0:
+            return "scripted_grasp_then_nominal_scripted_pour_zero_residual"
+        return "scripted_grasp_then_scripted_pour_with_residual_actions"
+
+    def success(self, state):
+        return (
+            bool(state["finite_mask"])
+            and bool(state["particle_summary"][8] >= self.target_fraction)
+            and bool(state["particle_summary"][9] <= 0.1)
+            and bool(state["grasp_diagnostics"][-1])
+            and bool(state["rigid_capacity_valid"])
+        )
+
+    def outcome_diagnostics(self, args):
+        return {
+            "max_palm_relative_translation_drift_m": self.max_grasp_drift,
+            "max_pot_position_tracking_error_m": self.max_position_tracking_error,
+            "max_pot_rotation_tracking_error_rad": self.max_rotation_tracking_error,
+            "grasp_drift_threshold_m_provisional": self.grasp_drift_threshold,
+        }
+
+    def capture(self, sim_time: float) -> dict[str, torch.Tensor]:
+        """Capture a pre-action or pre-reset endpoint, with all-cloud finite checks."""
+        positions = self.fluid.data.particle_pos_w.torch.reshape(-1, 3)
+        velocities = self.fluid.data.particle_vel_w.torch.reshape(-1, 3)
+        source_pose = self.container.data.root_link_pose_w.torch[0]
+        source = self._cavity(positions, source_pose, 0)
+        target = self._cavity(positions, self.bowl_pose, 1)
+        if self.target_excludes_source:
+            # A free controller must not earn delivery by placing the loaded
+            # source inside the receiver. Water still in the source stays there.
+            target = target & ~source
+        spilled = (positions[:, 2] <= self.demo.TABLE_TOP_Z + 2 * self.radius) | (positions.abs().amax(-1) > 3.0)
+        summary, finite = particle_summary(positions - self.origin, velocities, self.mass, source, target, spilled)
+        boundary = self.boundary()
+        controller = self._controller(sim_time)
+        observation = self._policy_observation(boundary, summary, sim_time)
         result = {
             "observation": observation,
             "critic_observation": observation.clone(),
@@ -419,7 +474,7 @@ class TeapotState:
             "rigid_state": boundary,
             "controller_state": controller,
             "particle_summary": summary,
-            "grasp_diagnostics": self._grasp_diagnostics(sim_time),
+            "grasp_diagnostics": self._grasp_diagnostics(sim_time, observation),
         }
         result["rigid_capacity_diagnostics"], result["rigid_capacity_valid"] = self.capacity.snapshot()
         finite &= torch.isfinite(boundary).all() & torch.isfinite(controller).all() & torch.isfinite(observation).all()
@@ -541,6 +596,158 @@ class TeapotState:
         }
 
 
+class FullTeapotState(TeapotState):
+    """Measure an ungrasped, policy-controlled episode without scripted future state."""
+
+    target_excludes_source = True
+
+    def __init__(self, *args, **kwargs):
+        from examples.mpm_world_model.teapot_full_task import INITIAL_ROOT_Z
+
+        super().__init__(*args, **kwargs)
+        self.joint_ids = self.wp.to_torch(self.motion._joint_ids).long()
+        self.hand_joint_ids = self.joint_ids[7:].tolist()
+        self.start_height = float(self.container.data.root_link_pose_w.torch[0, 2])
+        if not np.isclose(self.start_height, INITIAL_ROOT_Z, rtol=0, atol=1.0e-5):
+            raise ValueError("Full-task lift measurements require the calibrated native tabletop reset height.")
+        self.max_lift_height = 0.0
+        self.grasp_acquired_proxy = False
+        names = [self.robot.joint_names[int(index)] for index in self.joint_ids]
+        self.observation_names = (
+            [f"joint_position_{name}" for name in names]
+            + [f"joint_velocity_{name}" for name in names]
+            + self.observation_names[58:106]
+            + [f"joint_target_{name}" for name in names]
+            + [f"previous_action_{index}" for index in range(30)]
+            + ["hand_stiffness"]
+            + [f"palm_{field}" for field in ("x", "y", "z", "qw", "qx", "qy", "qz", "vx", "vy", "vz", "wx", "wy", "wz")]
+            + ["elapsed_time_s", "remaining_fraction", "target_fraction"]
+        )
+        self.grasp_diagnostic_names = ["palm_grasp_distance_m", "lift_height_m", "lifted_grasp_proxy"]
+
+    def _controller(self, sim_time):
+        return self.residual.state()
+
+    def _policy_observation(self, boundary, summary, sim_time):
+        palm = rigid_state(
+            self.robot.data.body_link_pose_w.torch[0, self.motion._palm],
+            self.robot.data.body_link_vel_w.torch[0, self.motion._palm],
+            self.origin,
+        )
+        return torch.cat(
+            (
+                self.robot.data.joint_pos.torch[0, self.joint_ids],
+                self.robot.data.joint_vel.torch[0, self.joint_ids],
+                boundary.reshape(-1),
+                summary,
+                self.residual.state(),
+                palm,
+                torch.tensor([sim_time, max(0.0, (18.0 - sim_time) / 18.0), self.target_fraction], device=self.device),
+            )
+        )
+
+    def _grasp_diagnostics(self, sim_time, observation):
+        from examples.mpm_world_model.teapot_full_task import full_phase_metrics
+
+        metrics = full_phase_metrics(observation)
+        lift = float(metrics["lift_height_m"])
+        self.max_lift_height = max(self.max_lift_height, lift)
+        self.grasp_acquired_proxy |= bool(metrics["lifted_grasp_proxy"])
+        return torch.stack(
+            (metrics["palm_grasp_distance_m"], metrics["lift_height_m"], metrics["lifted_grasp_proxy"].float())
+        )
+
+    def begin_held_episode(self):
+        raise RuntimeError("Full-task collection starts ungrasped and has no scripted grasp prefix.")
+
+    def apply_control(self, state, actor, args, sim_time, phases, frequencies):
+        """Control every joint from time zero; teacher calls are explicit data collection only."""
+        if args.control == "teacher":
+            self.motion.update(sim_time)
+            target = self.wp.to_torch(_warp_array(self.robot.actuators.target_command.position))
+            gain = self.robot.data.joint_stiffness.torch[0, self.joint_ids[7:]].mean()
+            action = self.residual.encode_command(target[0, self.joint_ids].clone(), gain)
+        elif args.control == "zero":
+            action = torch.zeros(30, device=self.device)
+            action[-1] = -1.0
+        else:
+            with torch.inference_mode():
+                action = actor(state["observation"][None])[0]
+        if action.shape != (30,) or not bool(torch.isfinite(action).all()):
+            raise ValueError("The full-task actor must return30 finite joint/gain actions.")
+        action = action.clamp(-1, 1)
+        self.residual.apply_action(action, sim_time)
+        self.write_targets()
+        return action
+
+    def reward(self, previous, current, action):
+        from examples.mpm_world_model.teapot_full_task import full_task_reward
+
+        return full_task_reward(previous["observation"], current["observation"], action)
+
+    def control_description(self, args, actor):
+        return f"full_sequence_{args.control}_all_joints_from_time_zero"
+
+    def success(self, state):
+        from examples.mpm_world_model.teapot_full_task import full_task_success
+
+        return (
+            bool(state["finite_mask"])
+            and bool(state["rigid_capacity_valid"])
+            and bool(full_task_success(state["observation"]))
+        )
+
+    def metadata(self, args, initial):
+        from examples.mpm_world_model.teapot_full_task import FULL_TASK_ID
+
+        metadata = super().metadata(args, initial)
+        names = [self.robot.joint_names[int(index)] for index in self.joint_ids]
+        metadata.update(
+            task_id=FULL_TASK_ID,
+            action_names=[f"joint_target_{name}" for name in names] + ["hand_stiffness"],
+            observation_names=self.observation_names,
+            scripted_grasp_prefix_s=0.0,
+            controller_feedback_hz=100.0,
+            initial_state="native_open_hand_35mm_lateral_approach_on_table_no_acquired_grasp",
+            action_semantics="normalized_joint_targets_and_hand_stiffness_no_scripted_motion_in_policy_or_zero_mode",
+            joint_target_initial=self.residual.initial.cpu(),
+            joint_target_lower=self.residual.lower.cpu(),
+            joint_target_upper=self.residual.upper.cpu(),
+            joint_target_speed_limits=self.residual.speed_limits.cpu(),
+            hand_stiffness_range=[24.0, 100.0],
+            reward_definition=(
+                "full_task_reward: measured_reach_lift_potential_and_lift_gated_delivered_mass"
+                "_minus_spill_and_action_change"
+            ),
+            success_definition="full_task_success_and_finite_and_rigid_capacity_valid;geometric_lift_grasp_proxy_not_contact_force_proof",
+            grasp_diagnostic_names=self.grasp_diagnostic_names,
+            grasp_diagnostic_semantics="measured_palm_to_handle_geometry_and_pot_lift_from_table_no_scheduled_grasp_reference",
+            target_mass_semantics="receiver_cavity_excluding_particles_still_inside_source_cavity",
+            control_mode=args.control,
+            teacher_sampling_semantics="100Hz_joint_targets_through_same_rate_limiter_and_zero_velocity_PD_as_policy",
+        )
+        return metadata
+
+    def outcome_diagnostics(self, args):
+        return {
+            "control_mode": args.control,
+            "scripted_prefix_steps": 0,
+            "max_lift_height_m": self.max_lift_height,
+            "grasp_acquired_proxy": self.grasp_acquired_proxy,
+            "grasp_proxy_semantics": "measured_lift_and_palm_to_handle_distance_not_contact_wrench",
+        }
+
+    def write_targets(self):
+        """Write only actuator commands; rigid and particle poses remain physical."""
+        self.wp.to_torch(_warp_array(self.robot.actuators.target_command.position))[0, self.joint_ids] = (
+            self.residual.current
+        )
+        self.wp.to_torch(_warp_array(self.robot.actuators.target_command.velocity))[0, self.joint_ids] = 0.0
+        gain = float(self.residual.stiffness)
+        self.robot.write_joint_stiffness_to_sim_index(stiffness=gain, joint_ids=self.hand_joint_ids)
+        self.robot.write_joint_damping_to_sim_index(damping=1.2 * (gain / 24.0) ** 0.5, joint_ids=self.hand_joint_ids)
+
+
 class TeapotEpisodeReset:
     """Restore this exact native demo in place, preserving captured array addresses.
 
@@ -624,6 +831,9 @@ class TeapotEpisodeReset:
         adapter.max_grasp_drift = 0.0
         adapter.max_position_tracking_error = 0.0
         adapter.max_rotation_tracking_error = 0.0
+        if adapter.target_excludes_source:
+            adapter.max_lift_height = 0.0
+            adapter.grasp_acquired_proxy = False
         adapter.wp.copy(_warp_array(adapter.robot.actuators.target_command.position), self.target_position)
         adapter.wp.copy(_warp_array(adapter.robot.actuators.target_command.velocity), self.target_velocity)
         particles = self.particle_initial.clone()
@@ -691,6 +901,17 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--newton-root", type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--task",
+        choices=("held", "full"),
+        default="held",
+        help="Full starts ungrasped and controls all joints from time zero.",
+    )
+    parser.add_argument(
+        "--control",
+        choices=("teacher", "zero", "policy"),
+        help="Required for full task; teacher is demonstration data only.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fill-seed", type=int, default=7)
     parser.add_argument("--episodes", type=int, default=1)
@@ -704,7 +925,7 @@ def argument_parser() -> argparse.ArgumentParser:
         "--reset-jitter", type=float, default=0.05, help="Post-first-reset jitter as fraction of fill spacing."
     )
     parser.add_argument("--particle-samples", type=int, default=1024)
-    parser.add_argument("--steps", type=int, default=1600, help="100 Hz post-grasp action steps; at most1600.")
+    parser.add_argument("--steps", type=int, help="100 Hz action steps; default1600 held or1800 full.")
     parser.add_argument("--target-fraction", type=float, default=0.5)
     parser.add_argument("--translation-limit", type=float, default=0.02)
     parser.add_argument("--rotation-limit", type=float, default=0.2)
@@ -762,6 +983,37 @@ def _configure_native_solvers(demo, args) -> None:
     demo.create_sim_cfg = configured_sim_cfg
 
 
+def _make_state_adapter(scene, robot_motion, demo, args):
+    """Bind the selected task's controller before its first physical step."""
+    if args.task == "full":
+        from examples.mpm_world_model.teapot_full_task import FullJointController
+
+        joint_ids = wp.to_torch(robot_motion._joint_ids).long()
+        limits = scene["robot"].data.joint_pos_limits.torch[0, joint_ids]
+        residual = FullJointController(
+            wp.to_torch(_warp_array(scene["robot"].actuators.target_command.position))[0, joint_ids].clone(),
+            limits[:, 0],
+            limits[:, 1],
+            scene["robot"].data.joint_vel_limits.torch[0, joint_ids],
+        )
+        state_type = FullTeapotState
+    else:
+        residual = TeapotResidualController(
+            robot_motion, translation_limit=args.translation_limit, rotation_limit=args.rotation_limit
+        )
+        state_type = TeapotState
+    return state_type(
+        scene,
+        robot_motion,
+        residual,
+        demo,
+        args.particle_samples,
+        args.fill_seed,
+        args.target_fraction,
+        not args.without_material,
+    )
+
+
 def run(args) -> dict:
     """Reuse the native scene and startup, replacing only its outer data loop."""
     if args.split_plan:
@@ -787,7 +1039,7 @@ def run(args) -> dict:
         "--robot",
         "rizon_sharpa",
         "--max_steps",
-        str(1600 + args.steps * 8),
+        str((0 if args.task == "full" else 1600) + args.steps * 8),
         "--fluid_render_mode",
         "particles",
         "--device",
@@ -819,26 +1071,18 @@ def run(args) -> dict:
     def collect_loop(sim, scene, surface_renderer, robot_motion):
         if robot_motion is None:
             raise RuntimeError("Held-pour collection requires the physical Rizon grasp controller.")
-        residual = TeapotResidualController(
-            robot_motion, translation_limit=args.translation_limit, rotation_limit=args.rotation_limit
-        )
-        adapter = TeapotState(
-            scene,
-            robot_motion,
-            residual,
-            demo,
-            args.particle_samples,
-            args.fill_seed,
-            args.target_fraction,
-            not args.without_material,
-        )
+        full = args.task == "full"
+        adapter = _make_state_adapter(scene, robot_motion, demo, args)
         dt = sim.get_physics_dt()
         if not np.isclose(dt, 1 / 800):
             raise ValueError("The calibrated physical grasp requires800Hz.")
         video = None
 
         def native_step(step):
-            robot_motion.update(step * dt)
+            if not full:
+                robot_motion.update(step * dt)
+            # Full policy/zero paths never enter the scripted motion controller.
+            # The full teacher is sampled explicitly at action boundaries below.
             scene.write_data_to_sim()
             sim.step(render=False)
             adapter.capacity.sample()
@@ -856,6 +1100,9 @@ def run(args) -> dict:
                 "newton_sources_sha256": source_digest(Path(newton.__file__).resolve().parent),
                 "collector_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "adapter_sha256": hashlib.sha256((Path(__file__).parent / "teapot_state.py").read_bytes()).hexdigest(),
+                "full_task_sha256": hashlib.sha256(
+                    (Path(__file__).parent / "teapot_full_task.py").read_bytes()
+                ).hexdigest(),
                 "video_helper_sha256": hashlib.sha256(
                     (Path(__file__).parent / "teapot_video.py").read_bytes()
                 ).hexdigest(),
@@ -915,6 +1162,7 @@ def run(args) -> dict:
                 phases = rng.uniform(-np.pi, np.pi, 6)
                 frequencies = rng.uniform(0.12, 0.4, 6)
                 adapter.capacity.clear()
+                prefix_steps = 0 if full else 1600
                 if args.video_path is not None:
                     video_path = args.video_path
                     if args.episodes > 1:
@@ -922,7 +1170,7 @@ def run(args) -> dict:
                     video = NativeTeapotVideo(
                         video_path,
                         args.video_fps,
-                        1600 + args.steps * 8,
+                        prefix_steps + args.steps * 8,
                         sim,
                         scene,
                         surface_renderer,
@@ -935,15 +1183,9 @@ def run(args) -> dict:
                             "particle_count": len(adapter.mass),
                             "fidelity": demo.args_cli.fidelity,
                             "fluid_render_mode": demo.args_cli.fluid_render_mode,
-                            "control": "scripted_grasp_then_learned_residual_around_scripted_pour"
-                            if actor is not None
-                            else (
-                                "scripted_grasp_then_nominal_scripted_pour_zero_residual"
-                                if args.action_amplitude == 0
-                                else "scripted_grasp_then_scripted_pour_with_residual_actions"
-                            ),
+                            "control": adapter.control_description(args, actor),
                             "action_amplitude": None if actor is not None else args.action_amplitude,
-                            "scripted_grasp_duration_s": 2.0,
+                            "scripted_grasp_duration_s": 0.0 if full else 2.0,
                             "provenance": writer.manifest["metadata"],
                             "graphics_environment": {
                                 name: os.environ.get(name)
@@ -951,35 +1193,25 @@ def run(args) -> dict:
                             },
                         },
                     )
-                for step in range(1600):
+                for step in range(prefix_steps):
                     native_step(step)
-                adapter.begin_held_episode()
-                state = adapter.capture(2.0)
+                if not full:
+                    adapter.begin_held_episode()
+                start_time = prefix_steps * dt
+                state = adapter.capture(start_time)
                 writer.start_episode(0, state, episode_metadata)
                 for index in range(args.steps):
-                    sim_time = 2 + index * 0.01
-                    if actor is None:
-                        action = torch.as_tensor(
-                            args.action_amplitude * np.sin(2 * np.pi * frequencies * (sim_time - 2) + phases),
-                            device=args.device,
-                            dtype=torch.float32,
-                        )
-                    else:
-                        with torch.inference_mode():
-                            action = actor(state["observation"][None])[0]
-                        if action.shape != (6,) or not torch.isfinite(action).all():
-                            raise ValueError("The actor must return six finite residual actions.")
-                        action = action.clamp(-1, 1)
-                    residual.apply_action(action.detach().cpu().numpy(), sim_time)
+                    sim_time = start_time + index * 0.01
+                    action = adapter.apply_control(state, actor, args, sim_time, phases, frequencies)
                     boundary = []
                     for microstep in range(8):
-                        native_step(1600 + index * 8 + microstep)
+                        native_step(prefix_steps + index * 8 + microstep)
                         boundary.append(adapter.boundary().detach().clone())
                     next_state = adapter.capture(sim_time + 0.01)
-                    reward = pour_reward(state["particle_summary"], next_state["particle_summary"], action)
+                    reward = adapter.reward(state, next_state, action)
                     finite = bool(next_state["finite_mask"])
                     terminated = not finite
-                    truncated = index == 1599
+                    truncated = index == (1799 if full else 1599)
                     writer.append_transition(
                         0,
                         action,
@@ -989,11 +1221,7 @@ def run(args) -> dict:
                         next_state,
                         extra={
                             "boundary_microtrajectory": torch.stack(boundary),
-                            "success": finite
-                            and bool(next_state["particle_summary"][8] >= args.target_fraction)
-                            and bool(next_state["particle_summary"][9] <= 0.1)
-                            and bool(next_state["grasp_diagnostics"][-1])
-                            and bool(next_state["rigid_capacity_valid"]),
+                            "success": adapter.success(next_state),
                         },
                     )
                     state = next_state
@@ -1012,17 +1240,10 @@ def run(args) -> dict:
                     "spilled_fraction": float(summary[9]),
                     "in_flight_fraction": float(summary[10]),
                     "invalid_fraction": float(summary[11]),
-                    "success": bool(state["finite_mask"])
-                    and float(summary[8]) >= args.target_fraction
-                    and float(summary[9]) <= 0.1
-                    and bool(state["grasp_diagnostics"][-1])
-                    and bool(state["rigid_capacity_valid"]),
+                    "success": adapter.success(state),
                     "physics_valid": bool(state["finite_mask"]) and bool(state["rigid_capacity_valid"]),
                     "retained_grasp_proxy": bool(state["grasp_diagnostics"][-1]),
-                    "max_palm_relative_translation_drift_m": adapter.max_grasp_drift,
-                    "max_pot_position_tracking_error_m": adapter.max_position_tracking_error,
-                    "max_pot_rotation_tracking_error_rad": adapter.max_rotation_tracking_error,
-                    "grasp_drift_threshold_m_provisional": adapter.grasp_drift_threshold,
+                    **adapter.outcome_diagnostics(args),
                     **adapter.capacity.outcome(),
                 }
                 if requested_split is not None and outcome["split"] != requested_split:
@@ -1049,7 +1270,7 @@ def run(args) -> dict:
                 "episodes": outcomes,
                 "transitions": sum(row["transitions"] for row in outcomes),
                 "success_rate": sum(row["success"] for row in outcomes) / len(outcomes),
-                "held_pour_only": True,
+                "held_pour_only": not full,
                 "policy_used": actor is not None,
                 "physics_mode": demo.args_cli.fidelity,
             }
@@ -1064,8 +1285,17 @@ def run(args) -> dict:
 def main() -> None:
     parser = argument_parser()
     args = parser.parse_args()
-    if not 1 <= args.steps <= 1600 or min(args.particle_samples, args.episodes) < 1:
-        parser.error("steps must lie in[1,1600]; particle-samples and episodes must be positive.")
+    max_steps = 1800 if args.task == "full" else 1600
+    if args.steps is None:
+        args.steps = max_steps
+    if not 1 <= args.steps <= max_steps or min(args.particle_samples, args.episodes) < 1:
+        parser.error(f"steps must lie in[1,{max_steps}]; particle-samples and episodes must be positive.")
+    if args.task == "full" and (
+        args.control is None or (args.control == "policy") != (args.policy_checkpoint is not None)
+    ):
+        parser.error("Full task requires --control teacher, zero, or policy; only policy accepts --policy-checkpoint.")
+    if args.task == "held" and args.control is not None:
+        parser.error("--control belongs to the full task; held uses its existing residual contract.")
     if not 0 <= args.reset_jitter <= 0.2:
         parser.error("reset-jitter must lie in[0,.2] of the native fill spacing.")
     if not 0 < args.target_fraction <= 1 or not 0 <= args.action_amplitude <= 1:

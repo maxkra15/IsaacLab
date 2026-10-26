@@ -80,6 +80,12 @@ def _initialize(model, source):
     source_specs = {spec.task_id: spec for spec in source.config.tasks}
     for spec in model.config.tasks:
         source_spec = source_specs.get(spec.task_id)
+        if source_spec is not None and (
+            spec.observation_dim,
+            spec.critic_observation_dim,
+            spec.action_dim,
+        ) != (source_spec.observation_dim, source_spec.critic_observation_dim, source_spec.action_dim):
+            raise ValueError(f"Transferred checkpoint has an incompatible native interface for task {spec.task_id}")
         if source_spec is None or model.config.physical_decoder != source.config.physical_decoder:
             continue
         target_contract, source_contract = asdict(spec), asdict(source_spec)
@@ -158,13 +164,17 @@ def train(args):
     metadata = {}
     for spec in specs:
         episode = next(episode for episode in episodes if episode["task_id"] == spec.task_id)
+        recorded = {**episode.get("metadata", {}), **episode}
         metadata[spec.task_id] = {
-            "context_names": episode.get("context_names", episode.get("metadata", {}).get("context_names", [])),
-            "dt": episode.get("dt", episode.get("metadata", {}).get("dt")),
-            "coordinate_frame": episode.get("coordinate_frame", "environment_local"),
-            "quaternion_order": episode.get("quaternion_order", "wxyz"),
-            "observation_names": episode.get("observation_names", []),
-            "action_names": episode.get("action_names", []),
+            "context_names": recorded.get("context_names", []),
+            "dt": recorded.get("dt"),
+            "coordinate_frame": recorded.get("coordinate_frame", "environment_local"),
+            "quaternion_order": recorded.get("quaternion_order", "wxyz"),
+            "observation_names": recorded.get("observation_names", []),
+            "action_names": recorded.get("action_names", []),
+            "controller_names": recorded.get("controller_names", []),
+            "control_mode": recorded.get("control_mode"),
+            "action_contract": recorded.get("action_contract"),
         }
     train_episodes = [episode for episode in episodes if episode["split"] == "train"]
     windows = {

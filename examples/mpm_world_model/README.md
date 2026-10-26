@@ -31,11 +31,14 @@ actions; it cannot read future reference geometry or observations.
 | --- | --- | --- | --- |
 | Franka Pour | 84 / 86 | Existing 8 actions | Two-way staggered proxy coupling |
 | Rizon Sharpa held pour | 121 / 121 | 6 bounded pose residuals through the existing IK | Measured rigid boundaries drive fluid; no fluid reaction on the robot |
+| Rizon Sharpa full grasp–lift–pour | 182 / 182 | 29 joint targets and hand stiffness | Dynamic hand–pot contacts; measured pot boundary drives fluid without fluid reaction |
 
 Franka keeps its original observation groups and ordering, action clipping and
 RSL checkpoint format, including the official iteration-7450 policy. Actor and
-critic predictions share their identical observation prefix exactly. Known
-previous-action and episode-clock updates are computed exactly. Large finite
+critic predictions share their identical observation prefix exactly. Franka
+computes previous-action and episode-clock updates exactly. The typed teapot
+decoder also copies declared action/clock fields; the default `none` decoder
+learns those teapot fields. Large finite
 material-history aggregates use a versioned signed-log encoding for numerical
 conditioning; the original physical recordings remain unchanged.
 
@@ -55,7 +58,7 @@ equivariance. Evaluation reports each ensemble member's violations separately
 from the ensemble mean, because an arithmetic mean of unit quaternions need not
 have unit norm.
 
-The teapot adapter reuses the scripted contact-acquired grasp. After two seconds,
+The held-pour teapot adapter reuses the scripted contact-acquired grasp. After two seconds,
 the policy adjusts desired translation and rotation through the original physical
 IK controller; it does not teleport the pot. This is a new residual-control task,
 not a learned full grasp/lift/pour policy. Its reward measures newly delivered
@@ -100,7 +103,8 @@ predictions and task-declared mass-admissibility checks end a rollout. Artificia
 cuts bootstrap the value at the predicted endpoint, never the unrelated replay
 snapshot used for reset. Model rewards are bounded to the observed training range.
 These safeguards limit obvious exploitation; they do not establish fidelity.
-Teapot's known 16-second control timeout also ends imagination before replay reset.
+The held-pour teapot task's known 16-second control timeout also ends imagination
+before replay reset; the full task uses 18 seconds from its ungrasped reset.
 `train_policy --action-limit` can keep a new task's executed actions within its
 collected range. The exported TorchScript `policy.pt` embeds the same clipping;
 the raw RSL checkpoint does not. Franka requires the original limit of one to
@@ -244,6 +248,178 @@ MPM before claiming the policy learned to pour. The collector reports maximum
 sampled palm drift relative to the pot; success additionally requires drift
 below a provisional 0.1-m threshold. This geometry proxy tolerates compliance
 and does not prove a particular contact force or wrench.
+
+## Full Sharpa grasp–lift–pour task
+
+The separate task `rizon_sharpa_teapot_full` starts at time zero with the pot on
+the table and the hand open, before a grasp has been acquired. Its authored reset
+is near the handle, with a 35-mm lateral approach offset; this is not a random
+workspace grasp benchmark. There is no two-second scripted prefix. The policy
+must control approach, finger closure, lift and pour through actual joint
+actuation. The pot remains a dynamic rigid body rather than a welded attachment.
+
+Select the control path explicitly with `collect_teapot --task full`:
+
+| Control | Behavior from time zero |
+| --- | --- |
+| `--control teacher` | Sample the native motion controller for demonstration labels, then execute them through the same bounded joint-target controller used by the policy. |
+| `--control zero` | Hold the initial open-hand joint targets and initial hand stiffness. No scripted motion or thumb feedback runs. |
+| `--control policy --policy-checkpoint .../policy.pt` | The actor commands every joint and hand stiffness. No scripted approach, finger closure, pot trajectory, thumb feedback or scheduled gain ramp runs. |
+
+The 30 actions comprise seven arm joint targets, 22 hand joint targets and one
+hand-stiffness command. Joint actions are normalized offsets from the initial
+targets, scaled to reach either hard limit. Targets are clipped to hard limits
+and advanced by at most each joint's rated speed times the 0.01-second control
+period. Hand stiffness maps its action from `[-1, 1]` to `[24, 100]`, changes at
+at most 500 units per second, and sets damping to `1.2 * sqrt(stiffness / 24)`.
+Reset restores stiffness 24. The zero-control path explicitly requests that
+initial gain; a numerical zero stiffness action instead requests the midpoint,
+62. Native effort limits and physical contacts still determine actual motion.
+
+The actor and critic interfaces each have 182 values:
+
+| Observation group | Values |
+| --- | ---: |
+| Joint positions and velocities | 29 + 29 |
+| Source and receiver poses/twists | 13 + 13 |
+| Full-cloud particle motion and mass summary | 22 |
+| Current joint targets, previous/applied action and stiffness | 29 + 30 + 1 |
+| Measured palm pose/twist | 13 |
+| Elapsed time, remaining fraction and delivery goal | 3 |
+
+Poses use environment-local coordinates and WXYZ quaternions. Controller state
+contains only the policy controller's actual commands, not the native teacher's
+future targets, thumb anchor or trajectory phase. This task and its checkpoints
+are incompatible with the held-pour `121 / 6` interface.
+The identifier names this experimental collector/training adapter; it is not a
+registered task for `isaaclab train`. Use the example entry points below.
+
+Collect full-sequence demonstrations with separate reset groups:
+
+```bash
+uv run python -m examples.mpm_world_model.collect_teapot \
+  --task full --control teacher --output /results/teapot-full-demonstrations \
+  --fill-seed 7 --seed 42 --split-plan train validation test \
+  --steps 1800 --particle-samples 1024 --collider-basis pic356 \
+  --velocity-basis Q1 --strain-basis P0 \
+  --mpm-iterations 256 --rigid-njmax 1024 --rigid-nconmax 512 \
+  --headless -- --voxel_size 0.004 --grid_type sparse
+```
+
+These explicit physics settings match the teapot pilot above, but full control
+still requires its own per-step capacity and native outcome checks. The teacher
+is sampled at 100 Hz and uses the same rate limiter and zero-velocity PD targets
+as the policy. This differs from the original demo's 800-Hz scripted interpolation
+and arm velocity feed-forward; the original demo's outcome cannot be assumed for
+these newly collected demonstrations.
+
+Bootstrap a new actor with behavior cloning:
+
+```bash
+uv run python -m examples.mpm_world_model.train_imitation \
+  --data /results/teapot-full-demonstrations \
+  --task rizon_sharpa_teapot_full --output /results/teapot-full-bc \
+  --updates 5000 --validate-every 250 --device cuda:0
+```
+
+Behavior cloning learns all 30 actuation outputs, rather than pose residuals
+around a running script. Only valid training transitions fit the actor;
+validation selects the checkpoint. Low action error does not establish native
+grasp or pouring success. The exported `policy.pt` includes action bounds.
+`model_imitation.pt` and `runner_cfg.json` preserve the RSL policy interface for
+later PPO, but the critic weights have not learned a value function.
+
+`train_imitation --observation-mode` controls which inputs the full-task actor
+can use while preserving its 182-input/30-output native checkpoint interface:
+
+| Mode | Actor inputs | Scope |
+| --- | --- | --- |
+| `full` (default) | All recorded fields | Reference feedback actor; the first native pilot diverged before contact despite low offline action error. |
+| `teapot_reduced` | Excludes joint velocities, controller/action history and palm twist | Diagnostic feedback actor; the first native pilot also failed to grasp. |
+| `teapot_phase` | Elapsed time only | Learned neural trajectory for the fixed reset; does not react to measured pose, fluid state or disturbances. |
+
+The restricted modes zero excluded first-layer columns at initialization, mask
+their gradients and reapply the constraint after each imitation update. They use
+ordinary RSL weights and JIT deployment, without a custom inference wrapper.
+Ordinary later PPO can update those columns again unless the constraint is
+separately enforced. Phase conditioning still learns all joint and gain outputs;
+it does not call the scripted grasp or pour controller during deployment.
+
+The two feedback pilots remained finite and within native capacity, but neither
+lifted during its four-second screen. Initial robot states matched the teacher.
+The first actor's small errors activated poorly constrained velocity and command
+history directions, including unused-finger inputs that never varied in training.
+This is a learned-controller failure, not evidence that native MPM diverged.
+Low teacher-forced action error is insufficient: general reactive control needs
+corrective demonstrations on policy-induced states and independent native replay.
+
+Evaluate the TorchScript actor in a fresh native MPM process:
+
+```bash
+uv run python -m examples.mpm_world_model.collect_teapot \
+  --task full --control policy --policy-checkpoint /results/teapot-full-bc/policy.pt \
+  --output /results/teapot-full-native --fill-seed 7 --seed 43 --split-plan test \
+  --steps 1800 --particle-samples 1024 --collider-basis pic356 \
+  --velocity-basis Q1 --strain-basis P0 \
+  --mpm-iterations 256 --rigid-njmax 1024 --rigid-nconmax 512 \
+  --video-path /results/teapot-full-native.mp4 --video-fps 25 \
+  --headless -- --voxel_size 0.004 --grid_type sparse
+```
+
+For a no-motion control, use `--control zero` and omit `--policy-checkpoint`.
+Keep the same physics settings and reset protocol. A two-second native zero
+probe passed: all 22 hand joints started in the native open configuration,
+joint targets remained unchanged, and no grasp, lift or delivery occurred.
+All 201 recorded endpoints were valid, with no capacity failure in 1,600 native
+steps (maximum 28 constraint rows and nine contacts). This negative control is
+not a complete episode. Three full teacher episodes subsequently remained valid
+for all 14,400 native steps each, ended with the instantaneous lifted-grasp proxy
+true and lifted about 0.37 m. Delivered mass was 15.02%, 15.37% and 15.47% for
+train, validation and test; none reached the 50% goal.
+
+The first full-control imitation pilot used one complete 1,800-transition
+training demonstration and one separate 1,800-transition validation episode.
+Training normalization and actor fitting used only the training episode;
+validation action error selected each checkpoint. The separate teacher test
+episode did not select checkpoints. Native test-labeled screens informed these
+architecture experiments, so they are development diagnostics rather than a
+final held-out generalization score.
+
+| Imitation actor | Updates | Validation action RMSE | Native four-second grasp screen |
+| --- | ---: | ---: | --- |
+| Full feedback | 15,000 | 0.000618 | No lift or acquired grasp proxy. |
+| Reduced feedback | 15,000 | 0.001783 | No lift or acquired grasp proxy. |
+| Elapsed-time only | 50,000 | 0.004403 | Pot root rose 2.9 cm while tipping; no acquired grasp proxy or delivery. |
+
+All three native screens were finite at recorded endpoints and passed capacity
+checks at all 3,200 physics steps. None passed the critical grasp screen; no
+complete learned 18-second grasp–lift–pour replay is claimed. The phase-only
+actor approached and tipped the pot, which settled back on the table as the
+hand withdrew. Root height alone did not establish a secure lift. Its first-four-second
+teacher-forced arm-command RMSE was 0.0151 rad, with a worst error of 0.0454 rad;
+small offline errors are consequential around this narrow handle. This result
+does not establish a reactive learned full skill. Corrective demonstrations on
+policy-induced states are the next step before claiming successful full control.
+
+The provisional goal is 50% delivered mass with at most 10% spill, finite state
+and valid rigid capacity, plus a geometric lift/grasp proxy. The proxy requires
+the pot root at least 5 cm above its pinned initial height of 0.90041 m and the
+palm within 8 cm of a calibrated pot-frame grasp reference. It is not a contact
+wrench or force-closure measurement. Delivery classification excludes particles
+still inside the source cavity, preventing source/receiver overlap from counting
+as delivery. Reward shapes measured reach and lift, rewards positive delivered
+mass changes only with the lift/grasp proxy, and penalizes spill and action changes.
+The 50% goal is a task definition, not an achieved learning result.
+
+Fluid follows the measured dynamic pot boundary without reaction forces on the
+pot or robot, so water-load feedback remains outside this scene's coupling.
+Nothing in this bootstrap establishes full-task world-model accuracy, successful
+PPO or generalization beyond the reset distribution. Before learned-model PPO,
+collect action perturbations and failures across the full skill, then require
+held-out multi-step physical-observable checks and counterfactual action tests
+that distinguish correct actions from shuffled actions and static persistence.
+Compatible policy and runner checkpoints do not bypass that dynamics gate or
+the need for native full-horizon policy evaluation and a native PPO task adapter.
 
 ## Remaining scope
 

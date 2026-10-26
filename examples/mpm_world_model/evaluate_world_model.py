@@ -28,6 +28,8 @@ def _quaternion_groups(task_id):
         return (19, 26, 33, 40), "xyzw"
     if task_id == "rizon_sharpa_teapot_held_pour":
         return (61, 74), "wxyz"
+    if task_id == "rizon_sharpa_teapot_full":
+        return (61, 74, 169), "wxyz"
     return (), "wxyz"
 
 
@@ -48,7 +50,7 @@ def physical_observation_errors(observation, *, task_id, action=None):
 
     Fractions are dimensionless, kinetic energy is in joules, speed in m/s,
     covariance in m², and quaternion error is dimensionless. Indices are the
-    unchanged Franka interface and the explicit held-teapot prototype interface.
+    unchanged Franka interface and the declared held/full-teapot interfaces.
     """
     finite = torch.isfinite(observation).all(-1)
     safe = torch.where(finite[..., None], observation, 0.0)
@@ -58,9 +60,11 @@ def physical_observation_errors(observation, *, task_id, action=None):
         quaternions = torch.stack([safe[..., index : index + 4] for index in (19, 26, 33, 40)], -2)
         if action is not None:
             result["last_action_absolute_error"] = (safe[..., 54:62] - 0.2 * action).abs().mean(-1)
-    elif task_id == "rizon_sharpa_teapot_held_pour":
+    elif task_id in ("rizon_sharpa_teapot_held_pour", "rizon_sharpa_teapot_full"):
+        full = task_id == "rizon_sharpa_teapot_full"
         fractions = safe[..., 91:96]
-        quaternions = torch.stack((safe[..., 61:65], safe[..., 74:78]), -2)
+        starts, _ = _quaternion_groups(task_id)
+        quaternions = torch.stack([safe[..., start : start + 4] for start in starts], -2)
         result["negative_kinetic_energy"] = (safe[..., 90] < -1e-6).float()
         result["negative_speed"] = ((safe[..., 96:98] < -1e-6).any(-1)).float()
         result["rms_exceeds_max_speed"] = (safe[..., 96] > safe[..., 97] + 1e-4).float()
@@ -70,7 +74,8 @@ def physical_observation_errors(observation, *, task_id, action=None):
         covariance = torch.stack((xx, xy, xz, xy, yy, yz, xz, yz, zz), -1).reshape(*safe.shape[:-1], 3, 3)
         result["non_psd_position_covariance"] = (torch.linalg.eigvalsh(covariance).amin(-1) < -1e-7).float()
         if action is not None:
-            result["last_action_absolute_error"] = (safe[..., 112:118] - action).abs().mean(-1)
+            start = 135 if full else 112
+            result["last_action_absolute_error"] = (safe[..., start : start + action.shape[-1]] - action).abs().mean(-1)
     else:
         return result
     result["mass_fraction_out_of_bounds"] = ((fractions < -1e-5) | (fractions > 1.0 + 1e-5)).any(-1).float()
@@ -171,6 +176,10 @@ def _physical_indices(task_id, dimension):
         }
     if task_id == "rizon_sharpa_teapot_held_pour":
         return {"dynamics": list(range(106)), "material": list(range(84, 106))}
+    if task_id == "rizon_sharpa_teapot_full":
+        # Do not inflate action response by scoring exact action memory, joint
+        # targets, actuator gains, or clocks as learned physical dynamics.
+        return {"dynamics": [*range(106), *range(166, 179)], "material": list(range(84, 106))}
     return {"dynamics": list(range(dimension)), "material": []}
 
 

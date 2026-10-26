@@ -169,6 +169,16 @@ def task_specs(episodes: list[dict]) -> list[TaskSpec]:
             controller_dim=episode["controller_state"].shape[-1],
             shared_observation_prefix_dim=shared_prefix,
         )
+        interfaces = {
+            "franka_pour": (84, 86, 8),
+            "rizon_sharpa_teapot_held_pour": (121, 121, 6),
+            "rizon_sharpa_teapot_full": (182, 182, 30),
+        }
+        dimensions = (spec.observation_dim, spec.critic_observation_dim, spec.action_dim)
+        if spec.task_id in interfaces and dimensions != interfaces[spec.task_id]:
+            raise ValueError(
+                f"Task {spec.task_id} requires native interface {interfaces[spec.task_id]}, got {dimensions}"
+            )
         if spec.task_id == "franka_pour" and (spec.observation_dim, spec.critic_observation_dim, spec.action_dim) == (
             84,
             86,
@@ -191,25 +201,45 @@ def task_specs(episodes: list[dict]) -> list[TaskSpec]:
                 raise ValueError("Franka recorded last-action observations violate their declared scaling")
             if not torch.allclose(episode["observation"][1:, 14][valid], expected_time, atol=2e-6, rtol=0):
                 raise ValueError("Franka recorded remaining-time observations violate their declared counter")
-        if spec.task_id == "rizon_sharpa_teapot_held_pour" and spec.observation_dim == 121:
+        if spec.task_id in ("rizon_sharpa_teapot_held_pour", "rizon_sharpa_teapot_full"):
+            full = spec.task_id == "rizon_sharpa_teapot_full"
+            action_start, elapsed_index, countdown_index = (135, 179, 180) if full else (112, 118, 119)
+            duration = 18.0 if full else 16.0
             spec.mass_fraction_indices = [91, 92, 93, 94]
-            spec.quaternion_starts, spec.quaternion_order = [61, 74], "wxyz"
-            spec.constant_observation_indices = [120]
+            spec.quaternion_starts, spec.quaternion_order = ([61, 74, 169] if full else [61, 74]), "wxyz"
+            spec.constant_observation_indices = [*range(71, 84), 181] if full else [120]
             dt = float(_metadata(episode, "dt"))
-            spec.typed_action_observation_start = 112
-            spec.typed_elapsed_time_index, spec.typed_elapsed_time_increment = 118, dt
-            spec.typed_countdown_index, spec.typed_countdown_decrement = 119, dt / 16.0
+            if not math.isfinite(dt) or dt <= 0.0:
+                raise ValueError("Teapot interface requires a positive finite policy timestep")
+            if full and (spec.controller_dim != 60 or shared_prefix != 182):
+                raise ValueError(
+                    "Full teapot interface requires controller dimension 60 and shared observation prefix 182"
+                )
+            spec.typed_action_observation_start = action_start
+            spec.typed_elapsed_time_index, spec.typed_elapsed_time_increment = elapsed_index, dt
+            spec.typed_countdown_index, spec.typed_countdown_decrement = countdown_index, dt / duration
             valid = finite[:-1] & finite[1:]
             expected_action = episode["action"][valid].clamp(-1.0, 1.0)
-            expected_elapsed = episode["observation"][:-1, 118][valid] + dt
-            expected_countdown = (episode["observation"][:-1, 119][valid] - dt / 16.0).clamp(0.0, 1.0)
+            expected_elapsed = episode["observation"][:-1, elapsed_index][valid] + dt
+            expected_countdown = (episode["observation"][:-1, countdown_index][valid] - dt / duration).clamp(0.0, 1.0)
             for index, expected in (
-                (slice(112, 118), expected_action),
-                (118, expected_elapsed),
-                (119, expected_countdown),
+                (slice(action_start, action_start + spec.action_dim), expected_action),
+                (elapsed_index, expected_elapsed),
+                (countdown_index, expected_countdown),
             ):
                 if not torch.allclose(episode["observation"][1:, index][valid], expected, atol=3e-6, rtol=0):
                     raise ValueError("Teapot recorded action/clock observations violate their declared bookkeeping")
+            if full:
+                if not torch.equal(episode["controller_state"][finite], episode["observation"][finite, 106:166]):
+                    raise ValueError("Full teapot controller observations violate the declared native interface")
+                constant = spec.constant_observation_indices
+                if not torch.allclose(
+                    episode["observation"][1:][valid][:, constant],
+                    episode["observation"][:-1][valid][:, constant],
+                    atol=3e-6,
+                    rtol=0,
+                ):
+                    raise ValueError("Full teapot target boundary and goal must remain constant within an episode")
             # The fifth partition bin records numerical failure, not a region
             # into which physical material can be transported.
             spec.zero_observation_indices = [95]

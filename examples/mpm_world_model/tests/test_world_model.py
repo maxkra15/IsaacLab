@@ -14,10 +14,13 @@ from mpm_world_model.dataset import EpisodeWindows, fit_normalizers, load_episod
 from mpm_world_model.evaluate_world_model import (
     _accumulate,
     _finish,
+    _physical_indices,
     _statistics,
+    _subset_metrics,
     evaluate_task,
     physical_observation_errors,
 )
+from mpm_world_model.learned_env import LearnedParticleEnv
 from mpm_world_model.models import (
     CoupledWorldModel,
     TaskSpec,
@@ -29,7 +32,7 @@ from mpm_world_model.models import (
     quaternion_local_delta,
     rollout_loss,
 )
-from mpm_world_model.train_world_model import evaluate_models
+from mpm_world_model.train_world_model import _initialize, evaluate_models
 
 
 def _episode(seed, *, transitions=16):
@@ -139,6 +142,13 @@ def test_full_cloud_history_and_legacy_weight_units(tmp_path):
     """Fit authoritative material aggregates and convert legacy weights to mass."""
     episode = _episode(7)
     episode["task_id"] = "franka_pour"
+    episode["dt"] = 1.0 / 30.0
+    observation = torch.zeros(17, 84)
+    observation[:, 14] = 1.0 - torch.arange(17) / 360.0
+    episode["action"] = episode["action"].expand(-1, 8).clone()
+    observation[1:, 54:62] = 0.2 * episode["action"]
+    episode["observation"] = observation
+    episode["critic_observation"] = torch.cat((observation, torch.ones(17, 2)), -1)
     episode["particle_mass"] = torch.tensor([0.03, 0.07])
     episode["particle_weights"] = torch.tensor([2.0, 3.0])
     episode["material_state"] = torch.zeros(17, 2, 28)
@@ -575,6 +585,173 @@ def test_teapot_typed_bookkeeping_retains_native_control_contract(tmp_path):
         assert diagnostic["physical_observables"]["nonunit_quaternion"] == 0.0
         assert diagnostic["physical_observables"]["mass_fraction_out_of_bounds"] == 0.0
         assert diagnostic["rollout_average"]["quaternion_angular_count"] == 8
+
+
+def _full_teapot_episode(*, transitions=3):
+    episode = _episode(74, transitions=transitions)
+    observation = torch.zeros(transitions + 1, 182)
+    observation[:, [61, 74, 169, 91]] = 1.0
+    observation[:, 58:61] = torch.tensor([0.0, 0.0, 0.72])
+    observation[:, 71:74] = torch.tensor([0.3, 0.0, 0.7])
+    observation[:, 166:169] = torch.tensor([0.0, 0.0, 0.74])
+    observation[:, 100:103] = 0.01
+    observation[:, 165] = 24.0
+    observation[:, 179] = torch.arange(transitions + 1) * 0.01
+    observation[:, 180] = 1.0 - torch.arange(transitions + 1) * 0.01 / 18.0
+    observation[:, 181] = 0.5
+    action = torch.linspace(-0.7, 0.7, transitions * 30).reshape(transitions, 30)
+    observation[1:, 135:165] = action
+    episode.update(
+        task_id="rizon_sharpa_teapot_full",
+        observation=observation,
+        critic_observation=observation.clone(),
+        action=action,
+        controller_state=observation[:, 106:166].clone(),
+        dt=0.01,
+    )
+    return episode
+
+
+def test_full_teapot_typed_contract_and_transfer_preserve_distinct_control(tmp_path):
+    """Keep full 30-actuator dynamics separate from the old held-pour interface."""
+    episodes = _write(tmp_path, [(_full_teapot_episode(), "train")])
+    spec = task_specs(episodes)[0]
+    assert spec.shared_observation_prefix_dim == 182
+    assert spec.controller_dim == 60
+    assert spec.mass_fraction_indices == [91, 92, 93, 94]
+    assert spec.quaternion_starts == [61, 74, 169]
+    model = CoupledWorldModel(WorldModelConfig([spec], hidden_dim=16, entity_dim=8, physical_decoder="typed"))
+    with torch.no_grad():
+        model.task(spec.task_id).output[-1].bias[:182].fill_(0.25)
+        model.task(spec.task_id).output[-1].bias[-6:-3].fill_(0.5)
+    initial = episodes[0]["observation"][1:2]
+    action = torch.linspace(-2.0, 2.0, 30).reshape(1, 30)
+    result = model.step(initial, initial, action, torch.zeros(1, 1), torch.zeros(1, 16), task_id=spec.task_id)
+    predicted = result["observation"]
+    torch.testing.assert_close(predicted[:, 135:165], action.clamp(-1.0, 1.0))
+    torch.testing.assert_close(predicted[:, 179:181], episodes[0]["observation"][2:3, 179:181])
+    torch.testing.assert_close(predicted[:, 71:84], initial[:, 71:84], rtol=0, atol=0)
+    torch.testing.assert_close(predicted[:, 181], initial[:, 181], rtol=0, atol=0)
+    assert predicted[:, 95] == 0.0
+    torch.testing.assert_close(result["critic_observation"], predicted, rtol=0, atol=0)
+    # A same-width Franka recurrent core can initialize this new task, while
+    # its 8-action adapter and fitted observation units cannot replace the
+    # fresh 30-action task adapter or normalizers.
+    source = CoupledWorldModel(
+        WorldModelConfig([TaskSpec("franka_pour", 84, 86, 8, 1)], hidden_dim=16, entity_dim=8, physical_decoder="typed")
+    )
+    with torch.no_grad():
+        source.transition.weight_hh.fill_(0.17)
+        model.task(spec.task_id).observation_norm.mean.fill_(0.42)
+    before = {name: value.clone() for name, value in model.task(spec.task_id).state_dict().items()}
+    _initialize(model, source)
+    torch.testing.assert_close(model.transition.weight_hh, source.transition.weight_hh, rtol=0, atol=0)
+    for name, value in model.task(spec.task_id).state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    incompatible = CoupledWorldModel(
+        WorldModelConfig(
+            [TaskSpec(spec.task_id, 121, 121, 6, 1)], hidden_dim=16, entity_dim=8, physical_decoder="typed"
+        )
+    )
+    with pytest.raises(ValueError, match="incompatible native interface"):
+        _initialize(model, incompatible)
+    with pytest.raises(ValueError, match="recorded native task interface"):
+        LearnedParticleEnv([incompatible], episodes, task_id=spec.task_id, num_envs=1, device="cpu")
+
+
+def test_constant_quaternion_must_copy_its_entire_pose():
+    """Permit a fixed rigid target while rejecting partial and invalid pose groups."""
+    for constants, zero in (([1], []), ([1, 2, 3], []), ([], [1, 2, 3, 4])):
+        spec = TaskSpec(
+            "constant_boundary",
+            6,
+            6,
+            1,
+            1,
+            quaternion_starts=[1],
+            constant_observation_indices=constants,
+            zero_observation_indices=zero,
+        )
+        with pytest.raises(ValueError, match="constant quaternion"):
+            CoupledWorldModel(WorldModelConfig([spec], physical_decoder="typed"))
+    spec = TaskSpec("constant_mass", 2, 2, 1, 1, mass_fraction_indices=[0], constant_observation_indices=[0])
+    with pytest.raises(ValueError, match="Constant observation"):
+        CoupledWorldModel(WorldModelConfig([spec], physical_decoder="typed"))
+
+
+@pytest.mark.parametrize("task_id", ["rizon_sharpa_teapot_held_pour", "rizon_sharpa_teapot_full", "franka_pour"])
+def test_known_task_labels_reject_incompatible_native_interfaces(tmp_path, task_id):
+    """Reject stale policy/dataset interfaces rather than silently creating generic heads."""
+    episode = _episode(2)
+    episode["task_id"] = task_id
+    episode["particle_weight_units"] = "kg"
+    episodes = _write(tmp_path, [(episode, "train")])
+    with pytest.raises(ValueError, match="interface"):
+        task_specs(episodes)
+
+
+def test_full_teapot_diagnostics_include_palm_and_exclude_copied_controls():
+    """Physical controls measure material/robot response, not copied 30-action memory."""
+    observation = _full_teapot_episode()["observation"][:2].clone()
+    observation[1, 169:173] *= 2.0
+    errors = physical_observation_errors(observation, task_id="rizon_sharpa_teapot_full", action=torch.zeros(2, 30))
+    assert errors["nonunit_quaternion"].tolist() == [0.0, 1.0]
+    assert errors["mass_fraction_sum_absolute_error"].max() == 0.0
+    statistics = _statistics()
+    _accumulate(
+        statistics, observation, observation, torch.ones(182), torch.ones(2), task_id="rizon_sharpa_teapot_full"
+    )
+    assert _finish(statistics)["quaternion_angular_count"] == 6
+    subsets = _physical_indices("rizon_sharpa_teapot_full", 182)
+    assert subsets["material"] == list(range(84, 106))
+    assert set(range(106)).issubset(subsets["dynamics"])
+    assert set(range(166, 179)).issubset(subsets["dynamics"])
+    assert not set(range(106, 166)).intersection(subsets["dynamics"])
+    assert not set(range(179, 182)).intersection(subsets["dynamics"])
+    # A decoder that only echoes action memory would get a strong apparent
+    # action-shuffle effect in whole-vector RMSE despite no physical response.
+    copied_only = observation.clone()
+    copied_only[:, 135:165] += 1.0
+    statistics = _statistics()
+    _accumulate(statistics, copied_only, observation, torch.ones(182), torch.ones(2))
+    report = _subset_metrics(_finish(statistics), subsets, torch.ones(182))
+    assert report["observation_rmse"] > 0.4
+    assert report["dynamics_observation_rmse"] == 0.0
+    assert report["material_observation_rmse"] == 0.0
+
+
+def test_full_teapot_imagination_shares_native_reward_and_18_second_timeout(tmp_path):
+    """Use full-task shaping and native clocks without losing terminal endpoints."""
+    from mpm_world_model.teapot_full_task import full_task_reward
+
+    episodes = _write(tmp_path, [(_full_teapot_episode(), "train")])
+    task_id = episodes[0]["task_id"]
+    model = CoupledWorldModel(
+        WorldModelConfig(task_specs(episodes), hidden_dim=16, entity_dim=8, physical_decoder="typed")
+    )
+    with torch.no_grad():
+        model.task(task_id).output[-1].bias[182] = 50.0  # A false independent reward prediction.
+    env = LearnedParticleEnv([model], episodes, task_id=task_id, num_envs=5, horizon=8, seed_bank_size=8, device="cpu")
+    env.reward_min, env.reward_max = -100.0, 100.0
+    clocks = torch.tensor([[17.99, 0.01 / 18], [17.99, 0.5], [1.0, 0.01 / 18], [1.0, 0.5], [17.99, 0.01 / 18]])
+    for values in (env.observations, env.critics):
+        values[0][:, 179:181] = clocks
+    env.observations[0][4, 0] = float("nan")
+    previous = env.get_observations()["policy"].clone()
+    actions = torch.full((5, 30), 0.25)
+    observations, reward, done, info = env.step(actions)
+    endpoint = info["terminal_observations"]["policy"]
+    torch.testing.assert_close(reward[:4], full_task_reward(previous[:4], endpoint[:4], actions[:4]))
+    assert (reward[:4] < 1.0).all()  # Do not consume the independent +50 reward head.
+    assert done.tolist() == [True, True, True, False, True]
+    assert info["native_timeout"].tolist() == [True, True, True, False, False]
+    assert info["terminated"].tolist() == [False, False, False, False, True]
+    assert info["truncated"].tolist() == [True, True, True, False, False]
+    torch.testing.assert_close(endpoint[:4, 179], clocks[:4, 0] + 0.01)
+    torch.testing.assert_close(endpoint[:4, 180], (clocks[:4, 1] - 0.01 / 18).clamp(0.0, 1.0))
+    torch.testing.assert_close(endpoint[:4, 135:165], actions[:4])
+    assert (observations["policy"][[0, 1, 2, 4], 179] < 0.1).all()
+    assert env.episode_length_buf.tolist() == [0, 0, 0, 1, 0]
 
 
 def test_typed_transport_learns_held_out_action_dependent_flow(tmp_path):

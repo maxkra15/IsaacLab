@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from .dataset import EpisodeWindows
+from .dataset import EpisodeWindows, task_specs
 
 
 def observation_groups(observation: torch.Tensor, critic: torch.Tensor, task_id: str) -> TensorDict:
@@ -60,6 +60,13 @@ class LearnedParticleEnv:
         self.models = [model.to(device).eval().requires_grad_(False) for model in models]
         self.task_id, self.device, self.num_envs = task_id, device, num_envs
         spec = next(spec for spec in models[0].config.tasks if spec.task_id == task_id)
+        if task_id == "rizon_sharpa_teapot_full":
+            recorded_spec = task_specs([episode for episode in episodes if episode["task_id"] == task_id])
+            if recorded_spec != [spec] or any(
+                next(item for item in model.config.tasks if item.task_id == task_id) != spec for model in models
+            ):
+                raise ValueError("Full teapot model checkpoints must match the recorded native task interface")
+        self.task_spec = spec
         self.num_actions, self.max_episode_length = spec.action_dim, horizon
         self.uncertainty_limit, self.uncertainty_penalty = uncertainty_limit, uncertainty_penalty
         self.mass_tolerance = mass_tolerance
@@ -108,6 +115,7 @@ class LearnedParticleEnv:
         self.mass_indices = {
             "franka_pour": [68, 69, 70, 83],
             "rizon_sharpa_teapot_held_pour": [91, 92, 93, 94, 95],
+            "rizon_sharpa_teapot_full": [91, 92, 93, 94, 95],
         }.get(task_id, list(getattr(spec, "mass_fraction_indices", [])))
         self._rows = torch.arange(num_envs, device=device)
         self._reset(self._rows)
@@ -164,6 +172,12 @@ class LearnedParticleEnv:
             # independent reward head is not allowed to invent pouring progress.
             reward = 100.0 * (selected[:, 92] - previous[:, 92])
             reward -= 200.0 * (selected[:, 93] - previous[:, 93]) + 0.001 * actions.square().sum(-1)
+        elif self.task_id == "rizon_sharpa_teapot_full":
+            from .teapot_full_task import full_task_reward
+
+            # Share shaping algebra with native control. This does not establish
+            # that predicted grasp/contact states are accurate enough for PPO.
+            reward = full_task_reward(previous, self._selected(self.observations), actions)
         if self.mass_indices:
             fractions = ensemble[..., self.mass_indices]
             tolerance = self.mass_tolerance
@@ -178,11 +192,16 @@ class LearnedParticleEnv:
         physical_done = self._selected(probabilities) > 0.5
         self.episode_length_buf += 1
         native_timeout = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        if self.task_id == "rizon_sharpa_teapot_held_pour":
-            # The native held-pour task ends after 16 s. This is a known task
-            # time limit, separate from the shorter imagination horizon.
+        spec = self.task_spec
+        if spec.typed_countdown_index >= 0 and spec.typed_countdown_decrement > 0.0:
+            # Native task clocks remain separate from the shorter imagination
+            # horizon. Their indices/units come from the validated task spec.
             selected = self._selected(self.observations)
-            native_timeout = finite & ((selected[:, 118] >= 16.0) | (selected[:, 119] <= 0.0))
+            expired = selected[:, spec.typed_countdown_index] <= 0.0
+            if spec.typed_elapsed_time_index >= 0:
+                duration = spec.typed_elapsed_time_increment / spec.typed_countdown_decrement
+                expired |= selected[:, spec.typed_elapsed_time_index] >= duration
+            native_timeout = finite & expired
         cutoff = (self.episode_length_buf >= self.max_episode_length) | (disagreement > self.uncertainty_limit)
         cutoff |= inadmissible | native_timeout
         terminated = physical_done | ~finite

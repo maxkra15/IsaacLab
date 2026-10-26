@@ -237,10 +237,16 @@ class CoupledWorldModel(nn.Module):
             if len(set(indices)) != len(indices) or any(i < 0 or i >= spec.observation_dim for i in indices):
                 raise ValueError("Typed physical observation groups must be disjoint and inside the task observation")
             constants = spec.constant_observation_indices + spec.zero_observation_indices
-            if len(set(constants + indices)) != len(constants + indices) or any(
-                i < 0 or i >= spec.observation_dim for i in constants
+            if (
+                len(set(constants)) != len(constants)
+                or set(constants).intersection(spec.mass_fraction_indices)
+                or any(i < 0 or i >= spec.observation_dim for i in constants)
             ):
                 raise ValueError("Constant observation groups must be disjoint and inside the task observation")
+            for start in spec.quaternion_starts:
+                overlap = set(constants).intersection(range(start, start + 4))
+                if overlap and (len(overlap) != 4 or overlap.intersection(spec.zero_observation_indices)):
+                    raise ValueError("A constant quaternion must copy all four components of its current unit pose")
         self._specs = {spec.task_id: spec for spec in config.tasks}
         self._task_indices = {spec.task_id: str(i) for i, spec in enumerate(config.tasks)}
         self.particle_encoder = _SetEncoder(6, config.entity_dim)
