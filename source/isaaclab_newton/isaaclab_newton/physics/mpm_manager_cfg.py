@@ -81,11 +81,12 @@ class MPMSolverCfg(NewtonSolverCfg):
     warmstart_mode: Literal["none", "auto", "particles", "grid", "smoothed"] = "auto"
     """Warm-start mode for the rheology solver."""
 
-    warmstart_contact_impulses: bool = field(default=False, kw_only=True)
-    """Whether to retain spatial contact impulses across sparse-grid rebuilds.
+    warmstart_contact_impulses: bool | None = field(default=None, kw_only=True)
+    """Override Newton's native spatial contact-impulse warm start.
 
-    This experimental cache improves low-iteration S2 contact solves without
-    changing the particle material or enabling the approximate particle mode.
+    ``None`` preserves Newton's default keyed grid history. ``True`` enables
+    that history explicitly; ``False`` clears grid contact impulses before each
+    solve. Particle contact bases retain their own per-particle history.
     """
 
     collider_velocity_mode: Literal["forward", "backward", "instantaneous", "finite_difference"] = "forward"

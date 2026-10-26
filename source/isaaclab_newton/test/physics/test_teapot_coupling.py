@@ -17,7 +17,7 @@ from newton.solvers.experimental.coupled import SolverCoupled
 from scipy.spatial.transform import Rotation, Slerp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "examples"))
-from rizon_sharpa_teapot import _TeapotColliderSyncSolver
+from _rizon_sharpa_teapot_coupler import _TeapotColliderSyncSolver
 
 
 @pytest.mark.parametrize("substeps", (1, 2, 4))

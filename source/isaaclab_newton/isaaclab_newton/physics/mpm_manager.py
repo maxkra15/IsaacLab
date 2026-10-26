@@ -28,15 +28,13 @@ from newton.solvers import SolverImplicitMPM
 from newton.solvers.experimental.coupled import SolverCoupled
 from warp.fem import TemporaryStore
 
-from isaaclab.physics import PhysicsManager
+from isaaclab.sim import SimulationContext
 
 from .mpm_manager_cfg import MPMSolverCfg
 from .newton_manager import NewtonManager
 
 if TYPE_CHECKING:
     from pxr import Usd
-
-    from isaaclab.sim import SimulationContext
 
 
 def _canonical_collider_velocity_mode(solver_cfg: MPMSolverCfg) -> str:
@@ -194,18 +192,16 @@ class NewtonMPMManager(NewtonManager):
     _implicit_mpm_solver_root: object | None = None
     _implicit_mpm_solver_cache: tuple[SolverImplicitMPM, ...] = ()
 
-    @classmethod
-    def get_fidelity(cls, *, entry_name: str | None = None) -> Literal["mpm", "particles"]:
+    def get_fidelity(self, *, entry_name: str | None = None) -> Literal["mpm", "particles"]:
         """Return the material mode currently used by a direct or coupled MPM solver.
 
         Args:
             entry_name: Coupled MPM entry to query. Omit when there is only one.
         """
-        solver, _, _ = cls._runtime_mpm_target(entry_name)
+        solver, _, _ = NewtonMPMManager._runtime_mpm_target(self, entry_name)
         return solver.fidelity.value
 
-    @classmethod
-    def set_fidelity(cls, fidelity: Literal["mpm", "particles"], *, entry_name: str | None = None) -> None:
+    def set_fidelity(self, fidelity: Literal["mpm", "particles"], *, entry_name: str | None = None) -> None:
         """Change material fidelity between simulation steps without changing particle IDs.
 
         Positions, velocities, masses, and observation ordering are preserved. MPM
@@ -217,13 +213,12 @@ class NewtonMPMManager(NewtonManager):
             entry_name: Coupled MPM entry to update. Omit for a direct MPM solver
                 or a coupled solver containing exactly one MPM entry.
         """
-        solver, state, solver_cfg = cls._runtime_mpm_target(entry_name)
+        solver, state, solver_cfg = NewtonMPMManager._runtime_mpm_target(self, entry_name)
         solver.set_fidelity(fidelity, state=state)
         solver_cfg.fidelity = fidelity
-        PhysicsManager._sim.physics_manager._invalidate_graph()
+        self._invalidate_graph()
 
-    @classmethod
-    def set_voxel_size(cls, voxel_size: float, *, entry_name: str | None = None) -> None:
+    def set_voxel_size(self, voxel_size: float, *, entry_name: str | None = None) -> None:
         """Rebuild an MPM grid around the current particles between simulation steps.
 
         Particle state and material history are retained. Resolution changes
@@ -234,13 +229,12 @@ class NewtonMPMManager(NewtonManager):
             voxel_size: New uniform grid spacing [m].
             entry_name: Coupled MPM entry to update. Omit when there is only one.
         """
-        solver, state, solver_cfg = cls._runtime_mpm_target(entry_name)
+        solver, state, solver_cfg = NewtonMPMManager._runtime_mpm_target(self, entry_name)
         solver.set_voxel_size(voxel_size, state=state)
         solver_cfg.voxel_size = voxel_size
-        PhysicsManager._sim.physics_manager._invalidate_graph()
+        self._invalidate_graph()
 
-    @classmethod
-    def set_particle_radius(cls, radius: float, *, entry_name: str | None = None) -> None:
+    def set_particle_radius(self, radius: float, *, entry_name: str | None = None) -> None:
         """Change a uniform particle radius between simulation steps, preserving masses.
 
         MPM support volume is ``8 * radius**3``; changing radius at fixed mass
@@ -254,27 +248,26 @@ class NewtonMPMManager(NewtonManager):
         Raises:
             ValueError: If a coupled entry contains only a subset of model particles.
         """
-        solver, _, _ = cls._runtime_mpm_target(entry_name)
-        parent = NewtonManager.backend.model
+        solver, _, _ = NewtonMPMManager._runtime_mpm_target(self, entry_name)
+        parent = self.backend.model
         if solver.model.particle_count != parent.particle_count:
             raise ValueError("Runtime particle radius changes require an MPM entry owning all model particles.")
         solver.set_particle_radius(radius)
         if solver.model is not parent:
             parent.particle_radius.fill_(radius)
             parent.particle_max_radius = radius
-            NewtonManager._solver.notify_model_changed(ModelFlags.MODEL_PROPERTIES)
-        PhysicsManager._sim.physics_manager._invalidate_graph()
+            self._solver.notify_model_changed(ModelFlags.MODEL_PROPERTIES)
+        self._invalidate_graph()
 
-    @classmethod
-    def _runtime_mpm_target(cls, entry_name: str | None) -> tuple[SolverImplicitMPM, State, MPMSolverCfg]:
+    def _runtime_mpm_target(self, entry_name: str | None) -> tuple[SolverImplicitMPM, State, MPMSolverCfg]:
         """Resolve a direct or named coupled MPM solver and its current local state."""
-        root = NewtonManager._solver
-        if NewtonManager.backend is None or PhysicsManager._sim is None:
+        root = self._solver
+        if self.backend is None or self._sim is None:
             raise RuntimeError("Newton physics must be initialized before changing MPM settings.")
         if isinstance(root, SolverImplicitMPM):
             if entry_name is not None:
                 raise ValueError("entry_name is only valid for coupled solvers.")
-            return root, NewtonManager.backend.state_0, PhysicsManager._cfg.solver_cfg
+            return root, self.backend.state_0, self._cfg.solver_cfg
         if not isinstance(root, SolverCoupled):
             raise RuntimeError("The active physics solver does not contain an MPM entry.")
         names = tuple(name for name in root.entry_names() if isinstance(root.solver(name), SolverImplicitMPM))
@@ -284,13 +277,10 @@ class NewtonMPMManager(NewtonManager):
             entry_name = names[0]
         elif entry_name not in names:
             raise ValueError(f"{entry_name!r} is not an MPM entry; select from {names}.")
-        solver_cfg = next(
-            entry.solver_cfg for entry in PhysicsManager._cfg.solver_cfg.entries if entry.name == entry_name
-        )
+        solver_cfg = next(entry.solver_cfg for entry in self._cfg.solver_cfg.entries if entry.name == entry_name)
         return root.solver(entry_name), root.entry_state(entry_name), solver_cfg
 
-    @classmethod
-    def initialize(cls, sim_context: SimulationContext) -> None:
+    def initialize(self, sim_context: SimulationContext) -> None:
         """Initialize Newton and author the MPM solver configuration in USD."""
         super().initialize(sim_context)
         scene_prim = sim_context.stage.GetPrimAtPath(sim_context.cfg.physics_prim_path)
@@ -337,10 +327,15 @@ class NewtonMPMManager(NewtonManager):
                 builder.shape_type[shape_id] = GeoType.MESH
 
     @classmethod
-    def _create_solver(cls, model: Model, solver_cfg: MPMSolverCfg) -> SolverImplicitMPM:
+    def _create_solver(
+        cls,
+        model: Model,
+        solver_cfg: MPMSolverCfg,
+        deterministic_mode: wp.DeterministicMode = wp.DeterministicMode.NOT_GUARANTEED,
+    ) -> SolverImplicitMPM:
         """Construct the configured implicit MPM solver."""
         scene_prim = None
-        sim = PhysicsManager._sim
+        sim = SimulationContext.instance()
         if sim is not None:
             scene_prim = sim.stage.GetPrimAtPath(sim.cfg.physics_prim_path)
             _author_mpm_scene_config(scene_prim, solver_cfg)
@@ -357,9 +352,8 @@ class NewtonMPMManager(NewtonManager):
         """
         return SolverImplicitMPM(model, config, temporary_store=TemporaryStore())
 
-    @classmethod
-    def _build_solver(cls, model: Model, solver_cfg: MPMSolverCfg) -> None:
-        """Construct :class:`SolverImplicitMPM` and populate the base-class slots.
+    def _build_solver(self, model: Model, solver_cfg: MPMSolverCfg) -> None:
+        """Construct :class:`SolverImplicitMPM` and populate the solver slots.
 
         MPM steps in-place on a single :class:`State` and runs collision
         handling internally, so it neither double-buffers state nor drives
@@ -369,16 +363,15 @@ class NewtonMPMManager(NewtonManager):
             model: Finalized Newton model the solver should run on.
             solver_cfg: Implicit MPM solver configuration.
         """
-        NewtonManager._solver = cls._create_solver(model, solver_cfg)
-        NewtonManager._use_single_state = True
-        NewtonManager._needs_collision_pipeline = False
-        NewtonManager._supports_rigid_body_force_input = False
-        cls._project_outside_colliders = solver_cfg.project_outside_colliders
+        self._solver = self._create_solver(model, solver_cfg, self._deterministic_mode)
+        self._use_single_state = True
+        self._needs_collision_pipeline = False
+        self._supports_rigid_body_force_input = False
+        self._project_outside_colliders = solver_cfg.project_outside_colliders
 
-    @classmethod
-    def _supports_cuda_graph_capture(cls) -> bool:
+    def _supports_cuda_graph_capture(self) -> bool:
         """Return whether the active MPM grid has capture-stable storage."""
-        return cls._solver_supports_cuda_graph_capture(cls._solver)
+        return self._solver_supports_cuda_graph_capture(self._solver)
 
     @staticmethod
     def _solver_supports_cuda_graph_capture(solver: SolverImplicitMPM) -> bool:
@@ -408,20 +401,18 @@ class NewtonMPMManager(NewtonManager):
             and collider_rebuild_safe
         )
 
-    @classmethod
-    def _check_solver_status(cls) -> None:
+    def _check_solver_status(self) -> None:
         """Raise asynchronous sparse-grid rebuild failures after graph replay."""
-        if NewtonManager._graph is None:
+        if self._graph is None:
             return
-        for solver in cls._implicit_mpm_solvers():
+        for solver in self._implicit_mpm_solvers():
             solver.check_sparse_grid_rebuild_status()
 
-    @classmethod
-    def _implicit_mpm_solvers(cls) -> tuple[SolverImplicitMPM, ...]:
+    def _implicit_mpm_solvers(self) -> tuple[SolverImplicitMPM, ...]:
         """Return direct or coupled implicit-MPM solvers without importing the coupler."""
-        root_solver = NewtonManager._solver
-        if root_solver is cls._implicit_mpm_solver_root:
-            return cls._implicit_mpm_solver_cache
+        root_solver = self._solver
+        if root_solver is self._implicit_mpm_solver_root:
+            return self._implicit_mpm_solver_cache
         if isinstance(root_solver, SolverImplicitMPM):
             solvers = (root_solver,)
         elif root_solver is None or not hasattr(root_solver, "entry_names") or not hasattr(root_solver, "solver"):
@@ -432,13 +423,12 @@ class NewtonMPMManager(NewtonManager):
                 for name in root_solver.entry_names()
                 if isinstance((entry_solver := root_solver.solver(name)), SolverImplicitMPM)
             )
-        cls._implicit_mpm_solver_root = root_solver
-        cls._implicit_mpm_solver_cache = solvers
+        self._implicit_mpm_solver_root = root_solver
+        self._implicit_mpm_solver_cache = solvers
         return solvers
 
-    @classmethod
     def _step_solver(
-        cls, state_0: State, state_1: State, control: Control, contacts: Contacts | None, substep_dt: float
+        self, state_0: State, state_1: State, control: Control, contacts: Contacts | None, substep_dt: float
     ) -> None:
         """Run one implicit MPM substep, optionally projecting particles out of colliders.
 
@@ -449,12 +439,11 @@ class NewtonMPMManager(NewtonManager):
         when the step is first run, so the chosen branch is baked into any
         captured CUDA graph.
         """
-        cls._solver.step(state_0, state_1, control, contacts, substep_dt)
-        if cls._project_outside_colliders:
-            cls._solver.project_outside(state_1, state_1, substep_dt)
+        self._solver.step(state_0, state_1, control, contacts, substep_dt)
+        if self._project_outside_colliders:
+            self._solver.project_outside(state_1, state_1, substep_dt)
 
-    @classmethod
-    def _reset_solver_internals(cls, world_mask: wp.array | None) -> None:
+    def _reset_solver_internals(self, world_mask: wp.array | None) -> None:
         """Preserve the existing implicit-MPM behavior for automatic asset resets.
 
         Shared-grid MPM configurations cannot reset solver history for only a
@@ -466,9 +455,8 @@ class NewtonMPMManager(NewtonManager):
             world_mask: Per-world reset mask, intentionally ignored.
         """
 
-    @classmethod
     def reset_solver_state(
-        cls,
+        self,
         state: State | None = None,
         world_mask: wp.array(dtype=wp.bool) | None = None,
         flags: StateFlags | int | None = None,
@@ -492,10 +480,10 @@ class NewtonMPMManager(NewtonManager):
             RuntimeError: If the MPM solver or a usable state is not initialized.
             ValueError: If :paramref:`world_mask` does not use Newton's canonical shape.
         """
-        solver = NewtonManager._solver
-        if solver is None or NewtonManager.backend is None or not cls._implicit_mpm_solvers():
+        solver = self._solver
+        if solver is None or self.backend is None or not self._implicit_mpm_solvers():
             raise RuntimeError("An implicit MPM solver is not initialized; cannot reset solver state.")
-        model = NewtonManager.backend.model
+        model = self.backend.model
 
         reset_mask = world_mask
         if world_mask is not None:
@@ -509,7 +497,7 @@ class NewtonMPMManager(NewtonManager):
                 if selected[0] and not selected[-1]:
                     reset_mask = None
 
-        candidates = (state,) if state is not None else (NewtonManager.backend.state_1, NewtonManager.backend.state_0)
+        candidates = (state,) if state is not None else (self.backend.state_1, self.backend.state_0)
         states: list[State] = []
         seen: set[int] = set()
         for candidate in candidates:
@@ -523,8 +511,7 @@ class NewtonMPMManager(NewtonManager):
         for candidate in states:
             solver.reset(candidate, world_mask=reset_mask, flags=flags)
 
-    @classmethod
-    def _solver_specific_clear(cls) -> None:
+    def _solver_specific_clear(self) -> None:
         """Reset MPM-specific class state on teardown.
 
         :meth:`_build_solver` sets :attr:`_project_outside_colliders` from the
@@ -532,6 +519,6 @@ class NewtonMPMManager(NewtonManager):
         (without a follow-up rebuild) from leaving a stale value on the class,
         mirroring how :meth:`NewtonManager.clear` resets the base-class flags.
         """
-        cls._project_outside_colliders = False
-        cls._implicit_mpm_solver_root = None
-        cls._implicit_mpm_solver_cache = ()
+        self._project_outside_colliders = False
+        self._implicit_mpm_solver_root = None
+        self._implicit_mpm_solver_cache = ()

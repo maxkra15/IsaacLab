@@ -182,9 +182,11 @@ The benchmark does not resolve the literal value `pretrained`.
 
 Use `--mode particles4` to test a larger particle-contact iteration budget. `--mode s2` and
 `--mode s2_cached` compare S2 MPM contacts with the same Gauss-Seidel budget
-(`--mpm_iterations 5` by default), changing only the optional spatial contact-impulse cache.
-The task's existing `pic27` basis already retains particle contact history. The new S2 cache is
-therefore a separate numerical experiment, not an automatic change to the checkpoint baseline.
+(`--mpm_iterations 5` by default), disabling or enabling Newton's native keyed spatial contact history.
+Ordinary modes preserve Newton's default with `warmstart_contact_impulses=None`.
+The task's existing `pic27` basis already retains particle contact history. The S2 basis remains
+a separate numerical experiment from the checkpoint's particle contact basis. The historical
+measurements below used the earlier branch cache, not upstream's keyed implementation.
 
 The JSON records environment transitions per second and policy batches per second separately.
 Rollout timing includes policy inference, physics, observations, rewards, resets, and curriculum
@@ -360,12 +362,12 @@ included in that run's timing, so use non-video runs for throughput comparisons.
 For an existing environment, the public manager exposes transitions between physics steps:
 
 ```python
-from isaaclab_newton.physics import NewtonMPMManager
+manager = env.sim.backend_manager
 
-NewtonMPMManager.set_fidelity("particles", entry_name="media")
-NewtonMPMManager.set_voxel_size(0.012, entry_name="media")
-NewtonMPMManager.set_particle_radius(0.003, entry_name="media")
-NewtonMPMManager.set_fidelity("mpm", entry_name="media")
+manager.set_fidelity("particles", entry_name="media")
+manager.set_voxel_size(0.012, entry_name="media")
+manager.set_particle_radius(0.003, entry_name="media")
+manager.set_fidelity("mpm", entry_name="media")
 ```
 
 The manager resolves the current entry-local state and schedules CUDA graph capture again.
@@ -397,7 +399,8 @@ experiments. Changing solver voxel spacing does not change the configured partic
 Use an S2 contact basis for voxel curricula (`--collider_basis S2` in the workflow). Coarsening
 the grid can exceed the fixed 27-particles-per-cell bound of the default `pic27` contact basis;
 the default bound is not a general guarantee for a changed grid or denser packing. Add
-`--warmstart_contact_impulses` to enable the S2 contact cache in an initially particle-based run.
+`--warmstart_contact_impulses` explicitly enables native spatial contact history; omitting it now
+preserves Newton's default history behavior, including after a particle-to-MPM handoff.
 
 The 16-world continuation experiment also exercised these APIs inside PPO. A 50% success gate
 did not trigger within five iterations. A separate, explicitly forced zero-threshold mechanism

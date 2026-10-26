@@ -11,7 +11,6 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
-from isaaclab_newton.physics import NewtonMPMManager
 
 from isaaclab.managers import CurriculumTermCfg, ManagerTermBase
 
@@ -61,11 +60,11 @@ class PourMediaFidelityCurriculum(ManagerTermBase):
         # Allocation failures propagate without advancing the stage. Voxel
         # rebuilding is transactional in Newton; do it before changing fidelity.
         if stage.voxel_size is not None:
-            NewtonMPMManager.set_voxel_size(stage.voxel_size, entry_name="media")
+            env.sim.backend_manager.set_voxel_size(stage.voxel_size, entry_name="media")
         if stage.particle_radius is not None:
-            NewtonMPMManager.set_particle_radius(stage.particle_radius, entry_name="media")
+            env.sim.backend_manager.set_particle_radius(stage.particle_radius, entry_name="media")
         if stage.fidelity is not None:
-            NewtonMPMManager.set_fidelity(stage.fidelity, entry_name="media")
+            env.sim.backend_manager.set_fidelity(stage.fidelity, entry_name="media")
         self._stage += 1
         self._transition_step = env.common_step_counter
         return self._metrics()

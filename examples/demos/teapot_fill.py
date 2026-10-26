@@ -14,10 +14,6 @@ The teapot is a hollow, double-walled shell, so the fluid is seeded in its enclo
     uvx isaaclab demo teapot-fill --device cuda:0 --visualizer newton_gl
     # Display both the raw particles and reconstructed surface:
     uvx isaaclab demo teapot-fill --visualizer newton_gl --fluid_render_mode both
-    # Newton RTX path-traced visualizer:
-    uvx --from 'isaaclab[ovrtx]' isaaclab demo teapot-fill --device cuda:0 --visualizer newton_rtx
-    # Isaac Sim Kit visualizer:
-    uvx --from 'isaaclab[isaacsim]' isaaclab demo teapot-fill --device cuda:0 --visualizer kit
     # Fuller / coarser (faster) fill:
     uvx isaaclab demo teapot-fill --fill_level 1.0 --fill_spacing 0.003
 """
@@ -35,9 +31,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from isaaclab_visualizers.newton import NewtonGLBackendCfg
 
 from isaaclab.app import add_launcher_args, launch_simulation
+from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR, retrieve_file_path
+from isaaclab.visualizers import VisualizerCfg
+from isaaclab.visualizers.visualizer_cfg import WindowCfg
 
 if TYPE_CHECKING:
     from isaaclab_visualizers.newton import ParticleSurfaceRenderer
@@ -76,7 +76,7 @@ def _positive_int(value: str) -> int:
     return resolved
 
 
-parser = argparse.ArgumentParser(description="Newton implicit MPM teapot-fill demo.")
+parser = argparse.ArgumentParser(description="Newton implicit MPM teapot-fill demo.", conflict_handler="resolve")
 parser.add_argument("--robot", choices=["none", "rizon_sharpa"], default="none", help="Use the fixed physical grasp.")
 parser.add_argument("--fidelity", choices=["mpm", "particles"], default="mpm", help="Material simulation mode.")
 parser.add_argument(
@@ -177,7 +177,7 @@ parser.add_argument(
     help="SimReady catch-bowl USD used for both visualization and fluid collisions.",
 )
 add_launcher_args(parser)
-parser.set_defaults(visualizer=["newton_gl"])
+parser.add_argument("--visualizer", "--viz", choices=["newton_gl"], default="newton_gl", help="Visualizer backend.")
 args_cli = parser.parse_args()
 if args_cli.fill_jitter > 0.5:
     parser.error("--fill_jitter must be in [0, 0.5]")
@@ -195,8 +195,6 @@ if not ROBOT_ENABLED and FLUID_SUBSTEPS != 1:
 SIMULATION_HZ = 800
 if args_cli.video and (SIMULATION_HZ % args_cli.video_fps or args_cli.max_steps <= 0):
     parser.error("--video requires a finite positive --max_steps and a --video_fps that divides 800 Hz")
-if args_cli.video and not {"kit", "newton_gl", "newton_rtx"}.intersection(args_cli.visualizer or []):
-    parser.error("--video requires --visualizer kit, newton_gl, or newton_rtx")
 RENDER_INTERVAL = 2
 VIDEO_STRIDE = SIMULATION_HZ // args_cli.video_fps
 VOXEL_SIZE = args_cli.voxel_size
@@ -268,34 +266,12 @@ SURFACE_MAX_GRID_CELLS = 4_000_000
 SURFACE_PATH = "/fluid_surface"
 
 
-def create_visualizer_cfgs():
-    """Create demo-specific visualizer configs for requested backends."""
-    requested = args_cli.visualizer or []
-    if not any(name in requested for name in ("newton_gl", "newton_rtx")):
-        return []
-
-    from isaaclab_visualizers.newton import NewtonGLVisualizerCfg, NewtonRTXVisualizerCfg
-
-    cfgs = []
-    for name in requested:
-        if name == "newton_gl":
-            cfgs.append(NewtonGLVisualizerCfg(show_particles=SHOW_FLUID_PARTICLES, particle_color=WATER_COLOR))
-        elif name == "newton_rtx":
-            cfgs.append(NewtonRTXVisualizerCfg())
-    if args_cli.video:
-        for cfg in cfgs:
-            cfg.headless = True
-            cfg.window.size = (1280, 720)
-    return cfgs
-
-
 def create_surface_renderer(sim) -> ParticleSurfaceRenderer:
     """Configure teapot-specific surface extraction after Newton initializes."""
-    from isaaclab_newton.physics import NewtonManager
     from isaaclab_visualizers.newton import ParticleSurfaceRenderer
     from newton.geometry import ParticleSurface
 
-    model = NewtonManager.get_model()
+    model = sim.backend_manager.get_model()
     surface = ParticleSurface(
         voxel_size=SURFACE_VOXEL_SIZE,
         max_grid_cells=SURFACE_MAX_GRID_CELLS,
@@ -569,7 +545,13 @@ def create_sim_cfg():
         dt=1.0 / SIMULATION_HZ,
         device=args_cli.device,
         gravity=(0.0, 0.0, -9.81),
-        visualizer_cfgs=create_visualizer_cfgs(),
+        visualizer_cfgs=VisualizerCfg(
+            headless=args_cli.video,
+            window=WindowCfg(size=(1280, 720)) if args_cli.video else WindowCfg(),
+            eye=CAMERA_EYE,
+            lookat=CAMERA_TARGET,
+            backend=NewtonGLBackendCfg(show_particles=SHOW_FLUID_PARTICLES, particle_color=WATER_COLOR),
+        ),
         physics=NewtonCfg(
             solver_cfg=MPMSolverCfg(
                 fidelity=args_cli.fidelity,
@@ -627,7 +609,6 @@ def create_scene_cfg(container_usd: str, island_usd: str, bowl_usd: str):
 
     import isaaclab.sim as sim_utils
     from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
-    from isaaclab.scene import InteractiveSceneCfg
     from isaaclab.sim.spawners.materials import UsdPhysicsRigidBodyMaterialCfg
     from isaaclab.sim.utils import clone
     from isaaclab.utils import configclass
@@ -798,7 +779,7 @@ def create_scene_cfg(container_usd: str, island_usd: str, bowl_usd: str):
             ),
             init_state=AssetBaseCfg.InitialStateCfg(pos=(*ROBOT_BASE_POS[:2], 0.5 * ROBOT_BASE_POS[2])),
         )
-        if {"kit", "newton_gl", "newton_rtx"}.intersection(args_cli.visualizer or []):
+        if args_cli.visualizer == "newton_gl":
             cfg.room = AssetBaseCfg(
                 prim_path="/World/Room",
                 spawn=sim_utils.UsdFileCfg(
@@ -884,22 +865,12 @@ def run_simulator(sim, scene, surface_renderer: ParticleSurfaceRenderer | None, 
 
 def main() -> None:
     """Set up and run the Isaac Lab Newton MPM teapot-fill demo."""
-    if ROBOT_ENABLED:
-        from rizon_sharpa_teapot import configured_asset_path
-
-        configured_asset_path()
     sim_cfg = create_sim_cfg()
     with launch_simulation(sim_cfg, args_cli):
-        if "kit" in (args_cli.visualizer or []):
-            from isaaclab_physx.renderers import IsaacRtxRendererGlobalSettingsCfg
-            from isaaclab_physx.renderers.isaac_rtx_renderer_utils import apply_isaac_rtx_global_settings
+        if ROBOT_ENABLED:
+            from rizon_sharpa_teapot import configured_asset_path
 
-            apply_isaac_rtx_global_settings(
-                IsaacRtxRendererGlobalSettingsCfg(enable_translucency=True),
-            )
-
-        # Resolve after launching so Kit runs never import USD modules before
-        # Kit starts; Newton-only runs still use standalone omni.client.
+            configured_asset_path()
         container_usd = retrieve_file_path(args_cli.container_usd)
         island_usd = retrieve_file_path(args_cli.island_usd)
         bowl_usd = retrieve_file_path(args_cli.bowl_usd)
@@ -941,11 +912,7 @@ def main() -> None:
             sim.forward()
         sim.initialize_visualizers()
         sim.set_camera_view(eye=CAMERA_EYE, target=CAMERA_TARGET)
-        surface_renderer = (
-            create_surface_renderer(sim)
-            if SHOW_FLUID_SURFACE and any(v in (args_cli.visualizer or []) for v in ("kit", "newton_gl", "newton_rtx"))
-            else None
-        )
+        surface_renderer = create_surface_renderer(sim) if SHOW_FLUID_SURFACE and sim.visualizers else None
         surface_triangle_count = surface_renderer.update() if surface_renderer is not None else 0
 
         print(

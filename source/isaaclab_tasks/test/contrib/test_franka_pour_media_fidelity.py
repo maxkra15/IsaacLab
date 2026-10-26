@@ -8,7 +8,6 @@
 from types import SimpleNamespace
 
 import torch
-from isaaclab_newton.physics import NewtonMPMManager
 
 from isaaclab.managers import CurriculumTermCfg
 
@@ -16,7 +15,7 @@ from isaaclab_tasks.contrib.franka_pour.mdp.media_fidelity import PourMediaFidel
 from isaaclab_tasks.contrib.franka_pour.pour_env_cfg import FrankaPourResetDatasetEnvCfg, PourMediaFidelityStageCfg
 
 
-def test_media_curriculum_requires_completed_success_cohorts_and_respects_freeze(monkeypatch):
+def test_media_curriculum_requires_completed_success_cohorts_and_respects_freeze():
     """Initial states and insufficient success cannot trigger a global physics transition."""
     cfg = FrankaPourResetDatasetEnvCfg()
     cfg.media_fidelity_min_episodes = 4
@@ -43,9 +42,11 @@ def test_media_curriculum_requires_completed_success_cohorts_and_respects_freeze
     def record_fidelity(value, *, entry_name):
         changes.append(("fidelity", value, entry_name))
 
-    monkeypatch.setattr(NewtonMPMManager, "set_voxel_size", record_voxel)
-    monkeypatch.setattr(NewtonMPMManager, "set_particle_radius", record_radius)
-    monkeypatch.setattr(NewtonMPMManager, "set_fidelity", record_fidelity)
+    env.sim = SimpleNamespace(
+        backend_manager=SimpleNamespace(
+            set_voxel_size=record_voxel, set_particle_radius=record_radius, set_fidelity=record_fidelity
+        )
+    )
     curriculum = PourMediaFidelityCurriculum(CurriculumTermCfg(func=PourMediaFidelityCurriculum), env)
 
     assert curriculum(env, slice(None))["stage"] == 0.0

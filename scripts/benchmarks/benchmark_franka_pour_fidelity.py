@@ -25,7 +25,6 @@ from pathlib import Path
 import newton
 import torch
 import warp as wp
-from isaaclab_newton.physics import NewtonMPMManager
 from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab.app import add_launcher_args, launch_simulation
@@ -135,14 +134,15 @@ def main() -> None:
     log_dir = args.output.parent / args.output.stem
     cfg.log_dir = str(log_dir)
     if args.video:
-        from isaaclab_visualizers.newton import NewtonGLVisualizerCfg  # noqa: PLC0415
+        from isaaclab_visualizers.newton import NewtonGLBackendCfg  # noqa: PLC0415
+
+        from isaaclab.visualizers import VisualizerCfg  # noqa: PLC0415
 
         cfg.sim.visualizer_cfgs = [
-            NewtonGLVisualizerCfg(
+            VisualizerCfg(
                 eye=(0.9, 0.65, 0.5),
                 lookat=(0.5, 0.0, 0.1),
-                show_particles=True,
-                particle_color=(0.85, 0.72, 0.45),
+                backend=NewtonGLBackendCfg(show_particles=True, particle_color=(0.85, 0.72, 0.45)),
             )
         ]
         cfg.video_recorders = [
@@ -189,7 +189,7 @@ def main() -> None:
     with launch_simulation(cfg, args):
         env = FrankaPourEnv(cfg)
         try:
-            model = NewtonMPMManager.get_model()
+            model = env.sim.backend_manager.get_model()
             shape_types = model.shape_type.numpy()
             shape_flags = model.shape_flags.numpy()
             rigid_shapes = (shape_flags & int(newton.ShapeFlags.COLLIDE_SHAPES)) != 0
@@ -203,8 +203,8 @@ def main() -> None:
             report["initial_particle_count"] = int(model.particle_count)
             report["initial_total_particle_mass_kg"] = wp.to_torch(model.particle_mass).sum().item()
             if args.particle_radius is not None:
-                NewtonMPMManager.set_particle_radius(args.particle_radius, entry_name="media")
-            report["initial_active_fidelity"] = NewtonMPMManager.get_fidelity(entry_name="media")
+                env.sim.backend_manager.set_particle_radius(args.particle_radius, entry_name="media")
+            report["initial_active_fidelity"] = env.sim.backend_manager.get_fidelity(entry_name="media")
             print("Preparing the RSL-RL environment wrapper.", flush=True)
             wrapped = RslRlVecEnvWrapper(env, clip_actions=1.0)
             agent_cfg = FrankaPourResetDatasetPPORunnerCfg()
@@ -242,7 +242,9 @@ def main() -> None:
                 report["warmup_wall_seconds"] = time.perf_counter() - warmup_started
                 initial_particles = env.scene["media"].data.particle_pos_w.torch.clone()
                 initial_joints = env.scene["robot"].data.joint_pos.torch.clone()
-                physics_particles = wp.to_torch(NewtonMPMManager.get_state_0().particle_q).reshape(args.num_envs, -1, 3)
+                physics_particles = wp.to_torch(env.sim.backend_manager.get_state_0().particle_q).reshape(
+                    args.num_envs, -1, 3
+                )
                 centroids = physics_particles[:4].mean(dim=1)
                 report["physics_particle_centroids_first_worlds_m"] = centroids.tolist()
                 report["env_origins_first_worlds_m"] = env.scene.env_origins[:4].tolist()
@@ -276,7 +278,7 @@ def main() -> None:
             }
             if args.train_iterations:
                 training_start_step = env.common_step_counter
-                training_start_fidelity = NewtonMPMManager.get_fidelity(entry_name="media")
+                training_start_fidelity = env.sim.backend_manager.get_fidelity(entry_name="media")
                 wp.synchronize_device(args.device)
                 started = time.perf_counter()
                 runner.learn(num_learning_iterations=args.train_iterations, init_at_random_ep_len=False)
@@ -288,7 +290,7 @@ def main() -> None:
                     "start_policy_step": training_start_step,
                     "end_policy_step": env.common_step_counter,
                     "start_fidelity": training_start_fidelity,
-                    "end_fidelity": NewtonMPMManager.get_fidelity(entry_name="media"),
+                    "end_fidelity": env.sim.backend_manager.get_fidelity(entry_name="media"),
                     "environment_steps": transitions,
                     "wall_seconds": elapsed,
                     "environment_steps_per_second": transitions / elapsed,
@@ -307,14 +309,14 @@ def main() -> None:
                 "spill": spill_fraction,
                 "retained_in_cups": source_fraction + target_fraction,
             }
-            report["final_active_fidelity"] = NewtonMPMManager.get_fidelity(entry_name="media")
+            report["final_active_fidelity"] = env.sim.backend_manager.get_fidelity(entry_name="media")
             curriculum_metrics = dict(env.curriculum_manager.get_active_iterable_terms(0)).get("media_fidelity", [])
             report["media_fidelity_curriculum"] = dict(
                 zip(("stage", "success_rate", "last_transition_policy_step"), curriculum_metrics)
             )
             report["final_particle_count"] = int(model.particle_count)
             report["final_total_particle_mass_kg"] = wp.to_torch(model.particle_mass).sum().item()
-            radii = wp.to_torch(NewtonMPMManager.get_model().particle_radius)
+            radii = wp.to_torch(env.sim.backend_manager.get_model().particle_radius)
             report["final_particle_radius_m"] = {"min": radii.min().item(), "max": radii.max().item()}
             report["final_media_solver"] = to_dict(media_solver)
             if torch.cuda.is_available():
