@@ -24,6 +24,18 @@ from .renderer_cfg import RendererCfg
 logger = logging.getLogger(__name__)
 
 
+def _current_warp_stream(device: torch.device) -> wp.Stream | None:
+    """Borrow the current Warp stream when Torch already uses the same CUDA handle."""
+    if device.type != "cuda":
+        return None
+    torch_stream = torch.cuda.current_stream(device)
+    warp_stream = wp.get_stream(str(device))
+    # Destroying a temporary wrapper can unregister the existing shared stream.
+    if (warp_stream.cuda_stream or 0) == torch_stream.cuda_stream:
+        return warp_stream
+    return wp.stream_from_torch(torch_stream)
+
+
 def __getattr__(name: str) -> Any:
     if name == "RENDER_PROFILE_SCOPE":
         from ..benchmark.stepping import RENDER_PROFILE_SCOPE
@@ -211,7 +223,7 @@ class RenderContext:
         try:
             if batches:
                 device = batches[0].values.device
-                stream = wp.stream_from_torch(torch.cuda.current_stream(device)) if device.type == "cuda" else None
+                stream = _current_warp_stream(device)
                 with wp.ScopedStream(stream, sync_enter=False):
                     for factory in factories:
                         writers.append(factory(self._visual_material_batches))
@@ -252,7 +264,7 @@ class RenderContext:
             env_tensor = env_ids.to(device=device, dtype=torch.int32)
             selected = (env_tensor, wp.from_torch(env_tensor, dtype=wp.int32))
 
-        stream = wp.stream_from_torch(torch.cuda.current_stream(device)) if device.type == "cuda" else None
+        stream = _current_warp_stream(device)
         with wp.ScopedStream(stream, sync_enter=False):
             material_offsets = {}
             material_key = tuple(id(material) for material in materials)
