@@ -248,6 +248,9 @@ class ResetParcels(ManagerTermBase):
         self._tool_positions = torch.where(
             (self.phase_ids == 0)[:, None], goal, torch.where((self.phase_ids == 1)[:, None], carry, pick)
         )
+        pregrasp = (self.phase_ids == 2) & (variants == 1)
+        self._tool_positions[pregrasp, 0] -= 0.02
+        self._tool_positions[pregrasp, 2] += 0.07
         self._arm_positions = torch.tensor((0.0, -0.35, 0.0, -2.35, 0.0, 2.0, 0.0), device=self.device).repeat(
             self.row_count, 1
         )
