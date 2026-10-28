@@ -379,7 +379,8 @@ def _add_destination(scene: SuctionSortingSceneCfg, index: int, angle: float) ->
     box("Frame", (1.20, 0.28, 0.08), 1.35, 0.0, -0.045, _FRAME_COLOR, colliding=False)
     for leg, radius in enumerate((0.92, 1.78)):
         box(f"Leg{leg}", (0.065, 0.24, 0.72), radius, 0.0, -0.44, _FRAME_COLOR, colliding=False)
-    box("BinFloor", (0.64, 0.60, 0.04), 2.17, 0.0, -0.78, _FRAME_COLOR)
+    # Extend below ground to prevent small parcels from crossing the floor during impact.
+    box("BinFloor", (0.64, 0.60, 0.20), 2.17, 0.0, -0.86, _FRAME_COLOR)
     for part, radius in (("BinFront", 1.86), ("BinBack", 2.48)):
         box(part, (0.02, 0.60, 0.56), radius, 0.0, -0.48, CLASS_COLORS[index])
     for part, offset in (("BinLeft", -0.29), ("BinRight", 0.29)):

@@ -37,19 +37,34 @@ def test_partial_reset_cannot_credit_the_next_selected_parcel(device):
         command = env.command_manager.get_term("sort")
         actions = torch.zeros((2, 4), device=device)
         actions[:, 3] = 1.0
+        # A recorded outfeed impact must settle in the bin without crossing its floor.
+        impact_ids = torch.tensor([0], device=device)
+        pose = torch.tensor(
+            [[2.07563591, 0.28751278, -0.72892869, -0.97748345, -0.07764439, -0.19566739, -0.01455657]],
+            device=device,
+        )
+        pose[:, :3] += env.scene.env_origins[impact_ids]
+        velocity = torch.tensor(
+            [[0.31988335, 0.05606911, -3.89049959, -1.84165192, 10.48158455, 0.01690909]], device=device
+        )
+        env.parcels[0].write_root_pose_to_sim_index(root_pose=pose, env_ids=impact_ids)
+        env.parcels[0].write_root_velocity_to_sim_index(root_velocity=velocity, env_ids=impact_ids)
+        env.sim.forward()
+        env.scene.update(env.step_dt)
         for _ in range(720):
             env.step(actions)
-            if command.delivered[1].any():
+            if command.delivered[0, 0] and command.delivered[1, 4]:
                 break
         else:
             pytest.fail("The seeded release never reached its physical bin.")
+        assert not command.failed.any()
         assert env.active_ids[1] != 4, "The release fixture must also reach the next-target handoff."
         expected = torch.zeros(len(env.parcels), dtype=torch.bool, device=device)
         expected[4] = True
         torch.testing.assert_close(command.delivered[1], expected)
 
         # Resetting the other world invalidates the shared evaluation cache without advancing physics.
-        env.reset(env_ids=torch.tensor([0], device=device))
+        env.reset(env_ids=impact_ids)
         command.evaluate()
         torch.testing.assert_close(command.delivered[1], expected)
         assert command.metrics["correct_deliveries"][1] == 1
