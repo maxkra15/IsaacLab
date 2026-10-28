@@ -62,6 +62,11 @@ when the environment is recreated. Training success from an easier reset is not 
 end-to-end pickup result. Evaluate separately from full belt starts and report correct-bin
 deliveries by size class, wrong-bin deliveries, drops, and complete twelve-parcel batches.
 
+Training episodes require two deliveries, so the policy practices the next pickup after
+receiving a parcel. Playback requires all twelve. `commands.sort.deliveries_per_episode`
+defines the same success criterion for termination, metrics, and reset sampling; set it to
+one for isolated pick-and-transfer evaluation. Losing an unsorted parcel ends the episode.
+
 ## Facility references
 
 The induction-loop/offload layout follows ordinary distribution-center organization,

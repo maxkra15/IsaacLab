@@ -58,10 +58,10 @@ def suction_observation(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def successful_delivery(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """End single-delivery training episodes after a correct physical delivery."""
+    """End an episode after its configured number of correct physical deliveries."""
     command = env.command_manager.get_term("sort")
     command.evaluate()
-    return torch.zeros_like(env.episode_success) if command.cfg.continue_sorting else env.episode_success
+    return env.episode_success
 
 
 def failed_delivery(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -71,13 +71,6 @@ def failed_delivery(env: ManagerBasedRLEnv) -> torch.Tensor:
     return command.failed
 
 
-def full_batch_complete(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return whether every package in the circulating pool reached its correct bin."""
-    command = env.command_manager.get_term("sort")
-    command.evaluate()
-    return command.delivered.all(dim=-1)
-
-
 @configclass
 class SizeSortCommandCfg(CommandTermCfg):
     """Select active packages and verify their size-specific physical destinations."""
@@ -85,8 +78,8 @@ class SizeSortCommandCfg(CommandTermCfg):
     class_type: type | str = "{DIR}.mdp:SizeSortCommand"
     resampling_time_range: tuple[float, float] = (1.0e6, 1.0e6)
     reset_event_name: str = "reset_parcels"
-    continue_sorting: bool = False
-    """Select another reachable, unsorted parcel after each successful delivery."""
+    deliveries_per_episode: int = 2
+    """Required receipts; select another reachable, unsorted parcel until this goal is met."""
 
 
 class SizeSortCommand(CommandTerm):
@@ -96,6 +89,8 @@ class SizeSortCommand(CommandTerm):
 
     def __init__(self, cfg: SizeSortCommandCfg, env: ManagerBasedRLEnv) -> None:
         super().__init__(cfg, env)
+        if not 1 <= cfg.deliveries_per_episode <= len(env.parcels):
+            raise ValueError("deliveries_per_episode must be between one and the number of parcels.")
         self._reset_term = env.event_manager.get_term_cfg(cfg.reset_event_name).func
         self._ids = torch.arange(self.num_envs, device=self.device)
         self.delivered = torch.zeros((self.num_envs, len(env.parcels)), dtype=torch.bool, device=self.device)
@@ -141,18 +136,21 @@ class SizeSortCommand(CommandTerm):
         if self._evaluation_step == env.common_step_counter:
             return
         changed = self._last_step != env.episode_length_buf
-        state = _active_state(env)
+        states = torch.stack([parcel.data.root_state_w.torch for parcel in env.parcels], dim=1)
+        state = states[self._ids, env.active_ids]
         local = state[:, :3] - env.scene.env_origins
         self.lifted |= changed & ~self._waiting & env.gripper.engaged & (local[:, 2] > BELT_TOP_Z + 0.10)
-        offsets = local[:, None] - env.bin_positions
-        in_bin_frame = torch.einsum("kij,nkj->nki", self._bin_frames, offsets)
+        all_local = states[:, :, :3] - env.scene.env_origins[:, None]
+        offsets = all_local[:, :, None] - env.bin_positions
+        all_in_bin_frame = torch.einsum("kij,npkj->npki", self._bin_frames, offsets)
+        in_bin_frame = all_in_bin_frame[self._ids, env.active_ids]
         rotation = math_utils.matrix_from_quat(state[:, 3:7])
         half_extents = (
             torch.einsum("kij,njl->nkil", self._bin_frames, rotation).abs()
             * (env.parcel_sizes[env.active_ids, None, None] / 2.0)
         ).sum(dim=-1)
         inside = (in_bin_frame.abs() + half_extents < self._bin_half_size + 0.005).all(dim=-1)
-        over_bin = (in_bin_frame.abs() < self._bin_half_size + 0.03).all(dim=-1)
+        over_bin = (all_in_bin_frame.abs() < self._bin_half_size + 0.03).all(dim=-1).any(dim=-1)
         released = ~env.gripper.engaged
         settled = torch.linalg.vector_norm(state[:, 7:10], dim=-1) < 0.35
         correct = inside[self._ids, env.parcel_classes[env.active_ids]]
@@ -162,13 +160,16 @@ class SizeSortCommand(CommandTerm):
         completed = (self._stable_steps >= 3) & ~self.delivered[self._ids, env.active_ids]
         self.new_success = torch.where(changed, completed, self.new_success)
         self.delivered[self._ids, env.active_ids] |= self.new_success
-        env.episode_success |= self.new_success
         wrong = eligible & inside.any(dim=-1) & ~correct
-        fallen = (local[:, 2] < -0.65) & ~over_bin.any(dim=-1)
-        finite = torch.isfinite(state).all(dim=-1) & torch.isfinite(env.scene["robot"].data.joint_pos.torch).all(dim=-1)
+        fallen = ((all_local[:, :, 2] < -0.65) & ~over_bin & ~self.delivered).any(dim=-1)
+        finite = torch.isfinite(states).all(dim=(1, 2)) & torch.isfinite(env.scene["robot"].data.joint_pos.torch).all(
+            dim=-1
+        )
         self.failed |= changed & (wrong | fallen | ~finite)
-        self.metrics["success_rate"][:] = self.delivered.any(dim=-1).float()
-        self.metrics["correct_deliveries"][:] = self.delivered.sum(dim=-1).float()
+        count = self.delivered.sum(dim=-1)
+        env.episode_success[:] = (count >= self.cfg.deliveries_per_episode) & ~self.failed
+        self.metrics["success_rate"][:] = env.episode_success.float()
+        self.metrics["correct_deliveries"][:] = count.float()
         self.metrics["wrong_deliveries"][changed & wrong] = 1.0
         self.metrics["full_batch_success_rate"][:] = self.delivered.all(dim=-1).float()
         self._last_step.copy_(env.episode_length_buf)
@@ -190,7 +191,7 @@ class SizeSortCommand(CommandTerm):
         self._evaluation_step = -1
 
     def _update_command(self) -> None:
-        if not self.cfg.continue_sorting:
+        if self.cfg.deliveries_per_episode == 1:
             return
         self._waiting |= self.new_success
         ids = self._waiting.nonzero(as_tuple=False).flatten()

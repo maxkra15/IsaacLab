@@ -93,7 +93,6 @@ class TerminationsCfg:
     time_out = TerminationTermCfg(func=common_mdp.time_out, time_out=True)
     success = TerminationTermCfg(func=mdp.successful_delivery)
     failure = TerminationTermCfg(func=mdp.failed_delivery)
-    batch_complete = TerminationTermCfg(func=mdp.full_batch_complete)
     invalid_action = TerminationTermCfg(
         func=invalid_policy_action, params={"action_names": ("arm_action", "gripper_action")}
     )
@@ -110,7 +109,7 @@ class SuctionSortingEnvCfg(ConveyorFrankaEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     curriculum = None
-    episode_length_s: float = 20.0
+    episode_length_s: float = 30.0
     conveyor_force: ConveyorForceCfg = ConveyorForceCfg(
         speed=0.25,
         friction=0.6,
@@ -136,9 +135,8 @@ class SuctionSortingEnvCfg(ConveyorFrankaEnvCfg):
         self.scene.num_envs = min(self.scene.num_envs, 4)
         self.events.reset_parcels.params["full_starts"] = True
         self.events.reset_parcels.params["sampling"].sampling = SamplerCfg(strategies=[UniformSamplingStrategyCfg()])
-        self.commands.sort.continue_sorting = True
-        self.terminations.success = None
-        self.episode_length_s = 120.0
+        self.commands.sort.deliveries_per_episode = 12
+        self.episode_length_s = 240.0
 
     def validate_config(self) -> None:
         """Require the force-based suction and conveyor contact path."""
