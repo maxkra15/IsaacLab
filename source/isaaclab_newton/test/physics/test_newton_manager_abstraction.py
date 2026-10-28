@@ -1187,7 +1187,7 @@ def _recording_manager(events, *, single_state, num_substeps, device="cpu", capt
             return False
 
         @classmethod
-        def step(cls, cfg, solver, state_in, state_out, *_args):
+        def step(cls, cfg, solver, state_in, state_out, *_args, observables=None):
             events.append(("step", state_in.name, state_out.name))
 
         @classmethod
@@ -1210,6 +1210,7 @@ def _recording_manager(events, *, single_state, num_substeps, device="cpu", capt
         control=object(),
         collision_pipeline=None,
         contacts=None,
+        observables=None,
         dt=0.002,
         num_substeps=num_substeps,
         solver_dt=0.002 / num_substeps,

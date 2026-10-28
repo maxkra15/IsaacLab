@@ -22,13 +22,13 @@ def test_box_acquisition_lift_release_and_rebind(device):
     """A vacuum command needs a fitting face; sealed payloads lift and reset independently."""
     cfg = SimulationCfg(
         device=device,
-        dt=1 / 240,
+        dt=1 / 120,
         physics=NewtonCfg(
             solver_cfg=MJWarpSolverCfg(use_mujoco_contacts=False, integrator="implicitfast", cone="elliptic"),
             use_cuda_graph=True,
         ),
     )
-    half_sizes = np.asarray(((0.025, 0.025, 0.02), (0.06, 0.04, 0.035)))
+    half_sizes = np.asarray(((0.02, 0.02, 0.02), (0.075, 0.045, 0.0425)))
     with build_simulation_context(sim_cfg=cfg) as sim:
         manager = sim.backend_manager
         builder = sim.get_or_create_backend(NewtonBuilderCfg(physics_cfg=cfg.physics))
@@ -43,7 +43,13 @@ def test_box_acquisition_lift_release_and_rebind(device):
             )
             builder.add_shape_sphere(tool, radius=0.01)
             parcel = builder.add_body(xform=wp.transform((0, 0, hz), wp.quat_identity()), label=f"{root}/Cube0")
-            builder.add_shape_box(parcel, hx=hx, hy=hy, hz=hz, cfg=builder.ShapeConfig(density=800))
+            builder.add_shape_box(
+                parcel,
+                hx=hx,
+                hy=hy,
+                hz=hz,
+                cfg=builder.ShapeConfig(density=float((0.03, 0.2)[world] / (8 * hx * hy * hz))),
+            )
             builder.end_world()
         gripper = SurfaceGripper(
             2,
@@ -76,8 +82,9 @@ def test_box_acquisition_lift_release_and_rebind(device):
                 sim.step(render=False)
 
             for step in range(400):
-                step_tools(min(max(step - 100, 0), 250) * 0.0006, 0.144 if 100 <= step < 350 else 0.0)
+                step_tools(min(max(step - 100, 0), 250) * 0.0006, 0.072 if 100 <= step < 350 else 0.0)
             assert gripper.engaged.all()
+            assert gripper.seal_error.max() < 0.006
             assert np.all(manager.backend.state_0.body_q.numpy()[parcels, 2] > half_sizes[:, 2] + 0.12)
             assert manager._graph is not None
 

@@ -155,10 +155,14 @@ class SurfaceGripper:
             self._queue_binding, PhysicsEvent.PHYSICS_READY, name="surface_gripper_solver_init"
         )
 
-    def set_command(self, enabled: torch.Tensor, target_ids: torch.Tensor) -> None:
+    def set_command(self, enabled: torch.Tensor, target_ids: torch.Tensor, env_ids: torch.Tensor | None = None) -> None:
         """Write per-environment vacuum commands and target parcel indices."""
-        self._enabled.copy_(enabled)
-        self._target_ids.copy_(target_ids)
+        if env_ids is None:
+            self._enabled.copy_(enabled)
+            self._target_ids.copy_(target_ids)
+        else:
+            self._enabled[env_ids] = enabled
+            self._target_ids[env_ids] = target_ids.to(dtype=self._target_ids.dtype)
 
     def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
         """Release selected tools without moving their robot or parcel."""
@@ -226,24 +230,26 @@ class SurfaceGripper:
         builder = SurfaceGripperBuilder()
         for world, bodies in enumerate(tool_bodies):
             gripper = NewtonSurfaceGripper(bodies[0], wp.transform(self._tool_offset, wp.quat_identity()), world=world)
-            # Fixed hardware gains cover the parcel catalog; the prototype damper
-            # uses each actual parcel's mass and inertia at every solver substep.
+            # Four compliant pads share each payload. These fixed hardware gains
+            # keep the 30 g / 40 mm parcel stable at 120 Hz; the 200 g parcel's
+            # static deflection is about 4 mm (m*g / (4*120 N/m)). The upstream
+            # damper still uses each actual body's mass and inertia every step.
             gripper.set_stiffness_damping(
-                700.0,
-                5.0,
+                120.0,
+                0.6,
                 self._force_per_pad,
-                400.0,
-                3.0,
-                400.0,
-                3.0,
+                50.0,
+                0.4,
+                50.0,
+                0.4,
                 self._force_per_pad,
+                0.001,
+                0.00003,
+                0.001,
+                0.00003,
                 0.15,
-                0.02,
-                0.15,
-                0.02,
-                0.15,
-                0.08,
-                0.01,
+                0.0005,
+                0.00002,
                 0.08,
             )
             for x, y in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
