@@ -136,21 +136,19 @@ class SizeSortCommand(CommandTerm):
         if self._evaluation_step == env.common_step_counter:
             return
         changed = self._last_step != env.episode_length_buf
-        states = torch.stack([parcel.data.root_state_w.torch for parcel in env.parcels], dim=1)
+        states = _parcel_states(env)
         state = states[self._ids, env.active_ids]
         local = state[:, :3] - env.scene.env_origins
         self.lifted |= changed & ~self._waiting & env.gripper.engaged & (local[:, 2] > BELT_TOP_Z + 0.10)
-        all_local = states[:, :, :3] - env.scene.env_origins[:, None]
-        offsets = all_local[:, :, None] - env.bin_positions
-        all_in_bin_frame = torch.einsum("kij,npkj->npki", self._bin_frames, offsets)
-        in_bin_frame = all_in_bin_frame[self._ids, env.active_ids]
+        offsets = local[:, None] - env.bin_positions
+        in_bin_frame = torch.einsum("kij,nkj->nki", self._bin_frames, offsets)
         rotation = math_utils.matrix_from_quat(state[:, 3:7])
         half_extents = (
             torch.einsum("kij,njl->nkil", self._bin_frames, rotation).abs()
             * (env.parcel_sizes[env.active_ids, None, None] / 2.0)
         ).sum(dim=-1)
         inside = (in_bin_frame.abs() + half_extents < self._bin_half_size + 0.005).all(dim=-1)
-        over_bin = (all_in_bin_frame.abs() < self._bin_half_size + 0.03).all(dim=-1).any(dim=-1)
+        over_bin = (in_bin_frame.abs() < self._bin_half_size + 0.03).all(dim=-1)
         released = ~env.gripper.engaged
         settled = torch.linalg.vector_norm(state[:, 7:10], dim=-1) < 0.35
         correct = inside[self._ids, env.parcel_classes[env.active_ids]]
@@ -161,11 +159,13 @@ class SizeSortCommand(CommandTerm):
         self.new_success = torch.where(changed, completed, self.new_success)
         self.delivered[self._ids, env.active_ids] |= self.new_success
         wrong = eligible & inside.any(dim=-1) & ~correct
-        fallen = ((all_local[:, :, 2] < -0.65) & ~over_bin & ~self.delivered).any(dim=-1)
+        fallen = (states[:, :, 2] - env.scene.env_origins[:, None, 2] < -0.65) & ~self.delivered
+        correct_bin = over_bin[self._ids, env.parcel_classes[env.active_ids]]
+        fallen[self._ids, env.active_ids] &= ~(self.lifted & released & correct_bin)
         finite = torch.isfinite(states).all(dim=(1, 2)) & torch.isfinite(env.scene["robot"].data.joint_pos.torch).all(
             dim=-1
         )
-        self.failed |= changed & (wrong | fallen | ~finite)
+        self.failed |= changed & (wrong | fallen.any(dim=-1) | ~finite)
         count = self.delivered.sum(dim=-1)
         env.episode_success[:] = (count >= self.cfg.deliveries_per_episode) & ~self.failed
         self.metrics["success_rate"][:] = env.episode_success.float()
@@ -195,6 +195,8 @@ class SizeSortCommand(CommandTerm):
             return
         self._waiting |= self.new_success
         ids = self._waiting.nonzero(as_tuple=False).flatten()
+        if not ids.numel():
+            return
         positions = torch.stack([parcel.data.root_pos_w.torch[ids] for parcel in self._env.parcels], dim=1)
         local = positions - self._env.scene.env_origins[ids, None]
         reachable = (
@@ -208,6 +210,7 @@ class SizeSortCommand(CommandTerm):
         selected = ids[available]
         self._env.active_ids[selected] = choice[available]
         self.lifted[selected] = self._waiting[selected] = False
+        self.new_success[selected] = False
         self._stable_steps[selected] = 0
         self._env.gripper.reset(selected)
 
@@ -305,5 +308,12 @@ class ResetParcels(ManagerTermBase):
 
 def _active_state(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Gather the selected physical parcel without changing its catalog identity."""
-    states = torch.stack([parcel.data.root_state_w.torch for parcel in env.parcels], dim=1)
+    states = _parcel_states(env)
     return states[env.scene._ALL_INDICES, env.active_ids]
+
+
+def _parcel_states(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Read link poses and center-of-mass velocities through the current asset API."""
+    poses = torch.stack([parcel.data.root_link_pose_w.torch for parcel in env.parcels], dim=1)
+    velocities = torch.stack([parcel.data.root_com_vel_w.torch for parcel in env.parcels], dim=1)
+    return torch.cat((poses, velocities), dim=-1)
