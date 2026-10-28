@@ -278,14 +278,20 @@ class ResetParcels(ManagerTermBase):
         env.gripper.reset(ids)
         phase = self.phase_ids[rows]
         self.held_rows[ids] = phase < 2
-        positions = self._initial_poses[None, :, :3].expand(len(ids), -1, -1).clone()
-        positions[:, 0] = self._initial_poses[active, :3]
+        batch = torch.arange(len(ids), device=self.device)
+        slots = torch.rand((len(ids), len(env.parcels)), device=self.device).argsort(dim=1)
+        slot_zero = slots.argmin(dim=1)
+        slots[batch, slot_zero] = slots[batch, active]
+        slots[batch, active] = 0
+        positions = self._initial_poses[slots, :3]
+        positions[:, :, 2] = BELT_TOP_Z + 0.5 * env.parcel_sizes[:, 2] + 0.002
+        positions[:, :, 2] = torch.where(slots == len(env.parcels) - 1, self._initial_poses[-1, 2], positions[:, :, 2])
         active_position = self._pick_positions[rows].clone()
         active_position[:, 0] += (torch.rand(len(ids), device=self.device) - 0.5) * 0.06 * (phase == 3)
         held_position = self._tool_positions[rows].clone()
         held_position[:, 2] -= 0.5 * env.parcel_sizes[active, 2] + 0.002
         active_position = torch.where(self.held_rows[ids, None], held_position, active_position)
-        positions[torch.arange(len(ids), device=self.device), active] = active_position
+        positions[batch, active] = active_position
         yaw = (torch.rand((len(ids), len(env.parcels)), device=self.device) - 0.5) * 0.2
         velocity = torch.zeros((len(ids), 6), device=self.device)
         for index, parcel in enumerate(env.parcels):

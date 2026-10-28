@@ -52,7 +52,8 @@ becoming policy inputs.
 
 The public `isaaclab_tasks.utils.ResetStateSampler` tracks recent outcomes and chooses
 reset rows. Task-local generators produce belt, approach/grasp, carry and near-release states;
-ordinary scene/asset writers restore them. The same sampler is used by the original
+ordinary scene/asset writers restore them. Other parcels are shuffled among the remaining
+belt and feeder slots to vary the order of subsequent pickups. The same sampler is used by the original
 conveyor curriculum and can select procedurally generated or cached reset states.
 It does not add another environment manager or a second scene-state serializer.
 
