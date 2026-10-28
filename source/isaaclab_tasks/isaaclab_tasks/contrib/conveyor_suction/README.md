@@ -29,11 +29,14 @@ the seal implementation into Isaac Lab. Stock Newton releases do not provide thi
 
 ## Training and playback
 
+The default from-scratch configuration uses 512 environments and 6,000 PPO updates.
+It is a starting configuration; reliable twelve-parcel completion has not been established.
+
 ```bash
 uv run isaaclab train --task IsaacContrib-Conveyor-Suction-Sorting \
   --rl_library rsl_rl --num_envs 512 --device cuda:0
 
-DISPLAY=:1 uv run isaaclab play --task IsaacContrib-Conveyor-Suction-Sorting \
+uv run isaaclab play --task IsaacContrib-Conveyor-Suction-Sorting \
   --rl_library rsl_rl --checkpoint /path/to/model.pt \
   --num_envs 1 --device cuda:0 --viz newton_gl --real-time
 ```
@@ -63,10 +66,17 @@ when the environment is recreated. Training success from an easier reset is not 
 end-to-end pickup result. Evaluate separately from full belt starts and report correct-bin
 deliveries by size class, wrong-bin deliveries, drops, and complete twelve-parcel batches.
 
-Training episodes require two deliveries, so the policy practices the next pickup after
-receiving a parcel. Playback requires all twelve. `commands.sort.deliveries_per_episode`
-defines the same success criterion for termination, metrics, and reset sampling; set it to
+Default training episodes require two deliveries within 30 seconds. Playback uses full belt
+starts and requires all twelve within 240 seconds. `commands.sort.deliveries_per_episode`
+defines the success criterion for termination, reset sampling and `full_start_success_rate`;
+`full_batch_success_rate` separately requires all twelve receipts. Set the receipt goal to
 one for isolated pick-and-transfer evaluation. Losing an unsorted parcel ends the episode.
+
+Development runs continued compatible checkpoints through a three-receipt/120-second stage
+before twelve-receipt/240-second fine-tuning. Use `--checkpoint /path/to/model.pt` to resume,
+with `env.commands.sort.deliveries_per_episode` and `env.episode_length_s` overrides as needed.
+Resuming retains optimizer state by default; these staged runs do not validate the default
+from-scratch command as a recipe for complete batches.
 
 ## Facility references
 
