@@ -16,13 +16,7 @@ from isaaclab_tasks.utils.sampling.sampler import Sampler
 
 @configclass
 class SamplerCfg:
-    """Blueprint for a :class:`Sampler`.
-
-    Attributes:
-        class_type: Runtime sampler class to instantiate.
-        strategies: Weighted sampling-strategy cfgs composed by the sampler.
-        eps: Soft floor on per-item probability.
-    """
+    """Blueprint for a :class:`Sampler`."""
 
     class_type: type[Sampler] | str = "{DIR}.sampler:Sampler"
     """Runtime sampler class."""
