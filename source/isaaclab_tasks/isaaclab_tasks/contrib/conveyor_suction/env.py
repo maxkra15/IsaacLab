@@ -14,7 +14,7 @@ import torch
 from isaaclab_contrib.surface_gripper.newton import SurfaceGripper
 
 from ..conveyor_franka.conveyor_franka_env import ConveyorFrankaEnv
-from .actions import TOOL_OFFSET
+from .actions_cfg import TOOL_OFFSET
 from .scene import BIN_POSITIONS, GOAL_DIRECTIONS, GOAL_POSITIONS, PARCEL_CLASS_IDS, PARCEL_SIZES
 
 

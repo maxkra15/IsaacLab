@@ -9,27 +9,17 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from scipy.optimize import least_squares
 
-import isaaclab.sim as sim_utils
-from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
+from isaaclab.envs import ManagerBasedEnv
 from isaaclab.envs.mdp.actions.task_space_actions import DifferentialInverseKinematicsAction
-from isaaclab.managers import ActionTerm, ActionTermCfg
-from isaaclab.utils import configclass
+from isaaclab.managers import ActionTerm
 
 from ..conveyor_franka.mdp.reset_events import franka_tool_position
-
-if TYPE_CHECKING:
-    from pxr import Usd
-
-    from isaaclab.envs import ManagerBasedEnv
-
-TOOL_OFFSET = (0.0, 0.0, 0.105)
-DOWN_QUATERNION = (0.9238795325, 0.3826834324, 0.0, 0.0)
+from .actions_cfg import DOWN_QUATERNION, CartesianSuctionArmCfg, VacuumActionCfg
 
 
 class CartesianSuctionArm(DifferentialInverseKinematicsAction):
@@ -68,13 +58,6 @@ class CartesianSuctionArm(DifferentialInverseKinematicsAction):
         self.invalid_actions[slice(None) if env_ids is None else env_ids] = False
         self.previous_actions[slice(None) if env_ids is None else env_ids] = 0.0
         self._needs_reference[slice(None) if env_ids is None else env_ids] = True
-
-
-@configclass
-class CartesianSuctionArmCfg(DifferentialInverseKinematicsActionCfg):
-    """Three Cartesian residuals, with orientation constrained by the tool."""
-
-    class_type: type = CartesianSuctionArm
 
 
 class VacuumAction(ActionTerm):
@@ -116,14 +99,6 @@ class VacuumAction(ActionTerm):
         self.previous_actions[ids] = 0.0
 
 
-@configclass
-class VacuumActionCfg(ActionTermCfg):
-    """One binary action for a Newton suction tool."""
-
-    class_type: type = VacuumAction
-    asset_name: str = "robot"
-
-
 def solve_tool_ik(positions: torch.Tensor) -> torch.Tensor:
     """Generate collision-screenable downward Panda reset poses at startup, on the CPU."""
     targets = positions.detach().cpu().numpy()
@@ -144,38 +119,3 @@ def solve_tool_ik(positions: torch.Tensor) -> torch.Tensor:
             raise ValueError(f"Unreachable suction reset position {target.tolist()}: {fit.fun.tolist()}")
         solutions.append(joints(fit.x).to(dtype=positions.dtype))
     return torch.stack(solutions).to(device=positions.device)
-
-
-def spawn_suction_franka(
-    prim_path: str,
-    cfg: sim_utils.UsdFileCfg,
-    translation: tuple[float, float, float] | None = None,
-    orientation: tuple[float, float, float, float] | None = None,
-) -> Usd.Prim:
-    """Keep the existing arm asset and author a compact, hand-mounted suction tool."""
-    from pxr import Gf, Usd, UsdGeom, UsdPhysics
-
-    prim = sim_utils.spawn_from_usd(prim_path, cfg, translation=translation, orientation=orientation)
-    sim_utils.make_uninstanceable(str(prim.GetPath()))
-    hand = next(p for p in Usd.PrimRange(prim) if p.GetName() == "panda_hand")
-    for child in Usd.PrimRange(prim):
-        if "finger" in child.GetPath().pathString:
-            if child.IsA(UsdGeom.Imageable):
-                UsdGeom.Imageable(child).MakeInvisible()
-            if child.HasAPI(UsdPhysics.CollisionAPI):
-                UsdPhysics.CollisionAPI(child).GetCollisionEnabledAttr().Set(False)
-    tool = str(hand.GetPath()) + "/SuctionTool"
-    for name, position, size, color in (
-        ("Mount", (0.0, 0.0, 0.065), (0.035, 0.035, 0.055), (0.18, 0.20, 0.23)),
-        ("Plate", (0.0, 0.0, 0.096), (0.028, 0.028, 0.005), (0.62, 0.67, 0.72)),
-    ):
-        geometry = sim_utils.CuboidCfg(size=size, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color))
-        geometry.func(f"{tool}/{name}", geometry, translation=position)
-    for index, (x, y) in enumerate(((-1, -1), (-1, 1), (1, -1), (1, 1))):
-        cup = UsdGeom.Cylinder.Define(prim.GetStage(), f"{tool}/Cup{index}")
-        cup.CreateRadiusAttr(0.004)
-        cup.CreateHeightAttr(0.006)
-        cup.AddTranslateOp().Set(Gf.Vec3d(x * 0.007, y * 0.007, 0.102))
-        cup.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.55, 0.65)])
-        UsdPhysics.CollisionAPI.Apply(cup.GetPrim()).CreateCollisionEnabledAttr(True)
-    return prim

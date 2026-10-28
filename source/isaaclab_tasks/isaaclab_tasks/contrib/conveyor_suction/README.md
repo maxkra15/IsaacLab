@@ -13,6 +13,8 @@ a compact workcell with a gravity-drop feeder. A Franka places parcels onto five
 outlets, whose powered belts deliver them into physical bins. The policy controls the arm
 and vacuum; belts run continuously.
 
+![Franka suction parcel sorting](../../../../../docs/source/_static/environment-previews/conveyor_suction_sorting.jpg)
+
 The tool has four suction cups of 4 mm radius on the existing Panda hand. Suction requires a nearby,
 aligned parcel face and applies the upstream Newton prototype's compliant, capped forces.
 It does not move parcels by writing their poses. The original fingers are visually hidden

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 from isaaclab_newton.sim.schemas import NewtonMaterialPropertiesCfg
 
@@ -21,6 +22,9 @@ from isaaclab_contrib.conveyors.surface_velocity import SurfaceVelocitySpec
 from ..conveyor_franka.conveyor_franka_env_cfg import _collision_properties, _conveyor_asset
 from ..conveyor_franka.conveyor_geometry import ConveyorSectionSpec, CuboidSpec, MeshSpec, _prism_faces
 from ..conveyor_franka.franka_robot_cfg import FRANKA_PANDA_CONVEYOR_CFG
+
+if TYPE_CHECKING:
+    from pxr import Usd
 
 BELT_TOP_Z = 0.04
 INTAKE_CENTER = (0.95, -0.47)
@@ -391,3 +395,38 @@ def _add_destination(scene: SuctionSortingSceneCfg, index: int, angle: float) ->
         box(part, (0.02, 0.60, 0.56), radius, 0.0, -0.48, CLASS_COLORS[index])
     for part, offset in (("BinLeft", -0.29), ("BinRight", 0.29)):
         box(part, (0.60, 0.02, 0.56), 2.17, offset, -0.48, CLASS_COLORS[index])
+
+
+def spawn_suction_franka(
+    prim_path: str,
+    cfg: sim_utils.UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+) -> Usd.Prim:
+    """Keep the existing arm asset and author a compact, hand-mounted suction tool."""
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    prim = sim_utils.spawn_from_usd(prim_path, cfg, translation=translation, orientation=orientation)
+    sim_utils.make_uninstanceable(str(prim.GetPath()))
+    hand = next(p for p in Usd.PrimRange(prim) if p.GetName() == "panda_hand")
+    for child in Usd.PrimRange(prim):
+        if "finger" in child.GetPath().pathString:
+            if child.IsA(UsdGeom.Imageable):
+                UsdGeom.Imageable(child).MakeInvisible()
+            if child.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI(child).GetCollisionEnabledAttr().Set(False)
+    tool = str(hand.GetPath()) + "/SuctionTool"
+    for name, position, size, color in (
+        ("Mount", (0.0, 0.0, 0.065), (0.035, 0.035, 0.055), (0.18, 0.20, 0.23)),
+        ("Plate", (0.0, 0.0, 0.096), (0.028, 0.028, 0.005), (0.62, 0.67, 0.72)),
+    ):
+        geometry = sim_utils.CuboidCfg(size=size, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color))
+        geometry.func(f"{tool}/{name}", geometry, translation=position)
+    for index, (x, y) in enumerate(((-1, -1), (-1, 1), (1, -1), (1, 1))):
+        cup = UsdGeom.Cylinder.Define(prim.GetStage(), f"{tool}/Cup{index}")
+        cup.CreateRadiusAttr(0.004)
+        cup.CreateHeightAttr(0.006)
+        cup.AddTranslateOp().Set(Gf.Vec3d(x * 0.007, y * 0.007, 0.102))
+        cup.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.55, 0.65)])
+        UsdPhysics.CollisionAPI.Apply(cup.GetPrim()).CreateCollisionEnabledAttr(True)
+    return prim

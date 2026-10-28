@@ -21,8 +21,8 @@ from ..conveyor_franka.conveyor_franka_env_cfg import ConveyorForceCfg, Conveyor
 from ..conveyor_franka.mdp import action_term_l2, finite_action_rate_l2, finite_joint_velocity_l2
 from ..conveyor_franka.mdp.terminations import invalid_action as invalid_policy_action
 from . import mdp
-from .actions import TOOL_OFFSET, CartesianSuctionArmCfg, VacuumActionCfg, spawn_suction_franka
-from .scene import SuctionSortingSceneCfg
+from .actions_cfg import TOOL_OFFSET, CartesianSuctionArmCfg, VacuumActionCfg
+from .scene import SuctionSortingSceneCfg, spawn_suction_franka
 
 _ARM = [f"panda_joint{index}" for index in range(1, 8)]
 
@@ -124,9 +124,9 @@ class SuctionSortingEnvCfg(ConveyorFrankaEnvCfg):
         self.sim.physics.solver_cfg.njmax = 700
         self.sim.physics.collision_cfg.include_static_kinematic_pairs = False
         self.sim.visualizer_cfgs = VisualizerCfg(
-            eye=(2.6, -4.2, 3.2),
-            lookat=(0.7, 0.35, 0.0),
-            focal_length=24.0,
+            eye=(-2.6, -4.2, 2.8),
+            lookat=(0.8, 0.2, -0.25),
+            focal_length=32.0,
             max_visible_envs=1,
             randomly_sample_visible_envs=False,
         )
