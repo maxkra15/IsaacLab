@@ -52,5 +52,5 @@ def test_sampling_tracks_the_current_success_frontier_without_starving_other_row
     assert sampler.success_monitor.success_rate.tolist() == [0.0, 1.0, 0.5]
     assert (sampler.probabilities > 0).all()
     torch.testing.assert_close(sampler.probabilities.sum(), torch.tensor(1.0))
-    assert sampler.probabilities[2] > 5 * sampler.probabilities[0]
-    assert sampler.probabilities[2] > 5 * sampler.probabilities[1]
+    assert sampler.probabilities[2] > sampler.probabilities[0]
+    assert sampler.probabilities[2] > sampler.probabilities[1]

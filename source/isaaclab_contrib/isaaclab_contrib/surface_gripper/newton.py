@@ -49,6 +49,25 @@ def _box_seal_fits(seal: wp.transform, box: wp.transform, half_extents: wp.vec3,
 
 
 @wp.kernel
+def _reset_pads(
+    world_ids: wp.array[wp.int64],
+    previous: wp.array[wp.vec2i],
+    current: wp.array[wp.vec2i],
+    vacuum: wp.array[wp.float32],
+    load: wp.array[wp.vec4],
+    unclamped_load: wp.array[wp.vec4],
+):
+    first = int(world_ids[wp.tid()]) * 4
+    for offset in range(4):
+        pad = first + offset
+        previous[pad] = wp.vec2i(-1, -1)
+        current[pad] = wp.vec2i(-1, -1)
+        vacuum[pad] = 0.0
+        load[pad] = wp.vec4(0.0)
+        unclamped_load[pad] = wp.vec4(0.0)
+
+
+@wp.kernel
 def _update_engagement(
     enabled: wp.array[wp.bool],
     target_ids: wp.array[wp.int32],
@@ -171,11 +190,20 @@ class SurfaceGripper:
         self._target_ids[ids] = -1
         self.engaged[ids] = False
         self.seal_error[ids] = 0.0
-        for state in (self._previous, self._current):
-            wp.to_torch(state.pad_engaged_bs).view(self._num_envs, 4, 2)[ids] = -1
-        wp.to_torch(self._control.pad_grip_control).view(self._num_envs, 4)[ids] = 0.0
-        wp.to_torch(self._output.pad_seal_load).view(self._num_envs, 4, 4)[ids] = 0.0
-        wp.to_torch(self._output.pad_seal_load_unclamped).view(self._num_envs, 4, 4)[ids] = 0.0
+        world_ids = self._world_ids[ids]
+        wp.launch(
+            _reset_pads,
+            dim=world_ids.numel(),
+            inputs=[wp.from_torch(world_ids)],
+            outputs=[
+                self._previous.pad_engaged_bs,
+                self._current.pad_engaged_bs,
+                self._control.pad_grip_control,
+                self._output.pad_seal_load,
+                self._output.pad_seal_load_unclamped,
+            ],
+            device=self._model.device,
+        )
 
     def close(self) -> None:
         """Detach callbacks before the model is released; safe to call twice."""
@@ -267,6 +295,7 @@ class SurfaceGripper:
         self._target_shape = wp.array(np.asarray(target_shapes, dtype=np.int32), dtype=wp.int32, device=model.device)
         self._shape_mesh_id = wp.zeros(model.shape_count, dtype=wp.uint64, device=model.device)
         device = str(model.device)
+        self._world_ids = torch.arange(self._num_envs, device=device)
         self._enabled = torch.zeros(self._num_envs, dtype=torch.bool, device=device)
         self._target_ids = torch.full((self._num_envs,), -1, dtype=torch.int32, device=device)
         self.engaged = torch.zeros(self._num_envs, dtype=torch.bool, device=device)
