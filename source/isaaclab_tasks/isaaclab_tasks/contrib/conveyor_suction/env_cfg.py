@@ -19,6 +19,7 @@ from isaaclab_tasks.utils.sampling import SamplerCfg, UniformSamplingStrategyCfg
 
 from ..conveyor_franka.conveyor_franka_env_cfg import ConveyorForceCfg, ConveyorFrankaEnvCfg
 from ..conveyor_franka.mdp import action_term_l2, finite_action_rate_l2, finite_joint_velocity_l2
+from ..conveyor_franka.mdp.rewards import transfer_success_reward
 from ..conveyor_franka.mdp.terminations import invalid_action as invalid_policy_action
 from . import mdp
 from .actions_cfg import TOOL_OFFSET, CartesianSuctionArmCfg, VacuumActionCfg
@@ -76,7 +77,7 @@ class EventsCfg:
 
 @configclass
 class RewardsCfg:
-    delivery = RewardTermCfg(func=mdp.delivery_reward, weight=600.0)
+    delivery = RewardTermCfg(func=transfer_success_reward, params={"command_name": "sort"}, weight=600.0)
     failure = RewardTermCfg(func=mdp.failed_delivery, weight=-60.0)
     effort = RewardTermCfg(func=action_term_l2, params={"action_name": "arm_action"}, weight=-0.001)
     action_rate = RewardTermCfg(

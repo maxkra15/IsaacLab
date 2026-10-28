@@ -57,13 +57,6 @@ def suction_observation(env: ManagerBasedRLEnv) -> torch.Tensor:
     return env.gripper.engaged.unsqueeze(-1).float()
 
 
-def delivery_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Reward each new, physically verified delivery once."""
-    command = env.command_manager.get_term("sort")
-    command.evaluate()
-    return command.new_success.float()
-
-
 def successful_delivery(env: ManagerBasedRLEnv) -> torch.Tensor:
     """End single-delivery training episodes after a correct physical delivery."""
     command = env.command_manager.get_term("sort")

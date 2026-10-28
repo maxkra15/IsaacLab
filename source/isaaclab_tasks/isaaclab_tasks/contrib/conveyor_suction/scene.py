@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING
 from isaaclab_newton.sim.schemas import NewtonMaterialPropertiesCfg
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 
 from isaaclab_contrib.conveyors.surface_velocity import SurfaceVelocitySpec
 
-from ..conveyor_franka.conveyor_franka_env_cfg import _collision_properties, _conveyor_asset
+from ..conveyor_franka.conveyor_franka_env_cfg import _ROBOT_INITIAL_STATE, _collision_properties, _conveyor_asset
 from ..conveyor_franka.conveyor_geometry import ConveyorSectionSpec, CuboidSpec, MeshSpec, _prism_faces
 from ..conveyor_franka.franka_robot_cfg import FRANKA_PANDA_CONVEYOR_CFG
 
@@ -87,18 +87,7 @@ class SuctionSortingSceneCfg(InteractiveSceneCfg):
 
     robot = FRANKA_PANDA_CONVEYOR_CFG.replace(
         prim_path="{ENV_REGEX_NS}/Robot",
-        init_state=ArticulationCfg.InitialStateCfg(
-            joint_pos={
-                "panda_joint1": 0.0,
-                "panda_joint2": -0.35,
-                "panda_joint3": 0.0,
-                "panda_joint4": -2.35,
-                "panda_joint5": 0.0,
-                "panda_joint6": 2.0,
-                "panda_joint7": 0.78,
-                "panda_finger_joint.*": 0.04,
-            },
-        ),
+        init_state=_ROBOT_INITIAL_STATE,
     )
     ground = AssetBaseCfg(
         prim_path="/World/GroundPlane",
