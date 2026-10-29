@@ -2,3 +2,4 @@
   collection lanes, and success-guided sampling through the shared reset-state API.
   This experimental task uses the upstream Newton surface-gripper prototype and trains
   a new policy; finger-gripper conveyor checkpoints are not compatible.
+  Invalid policy actions and non-finite physical states cannot count as successful episodes.

@@ -19,6 +19,7 @@ from isaaclab.utils import math as math_utils
 from isaaclab_tasks.utils.reset_states import ResetStateSampler, ResetStateSamplerCfg
 
 from ..conveyor_franka.mdp.kinematics import end_effector_pose, tool_velocity
+from ..conveyor_franka.mdp.terminations import invalid_action as invalid_policy_action
 from .scene import BELT_TOP_Z, BIN_INTERIOR_SIZE, GOAL_POSITIONS, PARCEL_CLASS_IDS, PARCEL_SIZES
 
 if TYPE_CHECKING:
@@ -165,13 +166,13 @@ class SizeSortCommand(CommandTerm):
         finite = torch.isfinite(states).all(dim=(1, 2)) & torch.isfinite(env.scene["robot"].data.joint_pos.torch).all(
             dim=-1
         )
-        self.failed |= changed & (wrong | fallen.any(dim=-1) | ~finite)
+        self.failed |= changed & (wrong | fallen.any(dim=-1) | ~finite | invalid_policy_action(env))
         count = self.delivered.sum(dim=-1)
         env.episode_success[:] = (count >= self.cfg.deliveries_per_episode) & ~self.failed
         self.metrics["success_rate"][:] = env.episode_success.float()
         self.metrics["correct_deliveries"][:] = count.float()
         self.metrics["wrong_deliveries"][changed & wrong] = 1.0
-        self.metrics["full_batch_success_rate"][:] = self.delivered.all(dim=-1).float()
+        self.metrics["full_batch_success_rate"][:] = (self.delivered.all(dim=-1) & ~self.failed).float()
         self._last_step.copy_(env.episode_length_buf)
         self._evaluation_step = env.common_step_counter
         env.extras["successes"] = env.episode_success.clone()

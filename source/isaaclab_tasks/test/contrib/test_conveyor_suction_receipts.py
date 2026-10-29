@@ -27,6 +27,7 @@ def test_partial_reset_cannot_credit_the_next_selected_parcel(device):
     cfg.seed = 41
     cfg.terminations.success = None
     cfg.terminations.failure = None
+    cfg.terminations.invalid_action = None
     with closing(gym.make(task, cfg=cfg).unwrapped) as env:
         reset = env.event_manager.get_term_cfg("reset_parcels").func
         rows = torch.stack(
@@ -99,3 +100,11 @@ def test_partial_reset_cannot_credit_the_next_selected_parcel(device):
             env.step(actions)
         assert command.failed.tolist() == [True, False]
         assert env.episode_success.tolist() == [False, True]
+
+        # A rejected policy action must not become a successful reset-sampling outcome.
+        actions[1, 0] = torch.nan
+        _, rewards, _, _, _ = env.step(actions)
+        assert command.failed[1]
+        assert not env.episode_success[1]
+        assert command.metrics["success_rate"][1] == 0
+        assert torch.isfinite(rewards).all()
