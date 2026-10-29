@@ -20,7 +20,16 @@ from isaaclab_tasks.utils.reset_states import ResetStateSampler, ResetStateSampl
 
 from ..conveyor_franka.mdp.kinematics import end_effector_pose, tool_velocity
 from ..conveyor_franka.mdp.terminations import invalid_action as invalid_policy_action
-from .scene import BELT_TOP_Z, BIN_INTERIOR_SIZE, GOAL_POSITIONS, PARCEL_CLASS_IDS, PARCEL_SIZES
+from .scene import (
+    BELT_TOP_Z,
+    BIN_INTERIOR_SIZE,
+    BIN_POSITIONS,
+    GOAL_ANGLES,
+    GOAL_DIRECTIONS,
+    GOAL_POSITIONS,
+    PARCEL_CLASS_IDS,
+    PARCEL_SIZES,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -59,7 +68,7 @@ def suction_observation(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def successful_delivery(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """End an episode after its configured number of correct physical deliveries."""
+    """End an episode when its configured sorted-inventory goal is met."""
     command = env.command_manager.get_term("sort")
     command.evaluate()
     return env.episode_success
@@ -80,7 +89,7 @@ class SizeSortCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (1.0e6, 1.0e6)
     reset_event_name: str = "reset_parcels"
     deliveries_per_episode: int = 2
-    """Required receipts; select another reachable, unsorted parcel until this goal is met."""
+    """Sorted-parcel goal; full-batch reset recipes can include pre-sorted inventory."""
 
 
 class SizeSortCommand(CommandTerm):
@@ -121,9 +130,15 @@ class SizeSortCommand(CommandTerm):
         """Report only the resetting episodes; preserve all other environments' counters."""
         ids = self._ids[slice(None) if env_ids is None else env_ids]
         full = self.full_start[ids] & (self._env.episode_length_buf[ids] > 0)
-        full_success = (self.metrics["success_rate"][ids] * full).sum() / full.sum().clamp_min(1)
+        full_ids = ids[full]
+        full_success = self.metrics["success_rate"][full_ids]
+        full_batch = self.metrics["full_batch_success_rate"][full_ids]
         extras = super().reset(ids)
-        extras["full_start_success_rate"] = full_success
+        extras.pop("full_batch_success_rate")
+        if full_ids.numel():
+            # RSL concatenates episode values; scalar reset-batch means misweight this conditional rate.
+            extras["full_start_success_rate"] = full_success
+            extras["full_batch_success_rate"] = full_batch
         extras["full_start_episodes"] = full.sum()
         extras["reset_row_coverage"] = (self._reset_term.reset_sampler.success_monitor.success_size > 0).float().mean()
         extras["full_start_sampling_probability"] = self._reset_term.reset_sampler.probabilities[
@@ -170,9 +185,16 @@ class SizeSortCommand(CommandTerm):
         count = self.delivered.sum(dim=-1)
         env.episode_success[:] = (count >= self.cfg.deliveries_per_episode) & ~self.failed
         self.metrics["success_rate"][:] = env.episode_success.float()
-        self.metrics["correct_deliveries"][:] = count.float()
+        initial_count = (
+            self._reset_term.completed_counts[self._reset_term.row_ids]
+            if self.cfg.deliveries_per_episode == len(env.parcels)
+            else 0
+        )
+        self.metrics["correct_deliveries"][:] = (count - initial_count).float()
         self.metrics["wrong_deliveries"][changed & wrong] = 1.0
-        self.metrics["full_batch_success_rate"][:] = (self.delivered.all(dim=-1) & ~self.failed).float()
+        self.metrics["full_batch_success_rate"][:] = (
+            self.full_start & self.delivered.all(dim=-1) & ~self.failed
+        ).float()
         self._last_step.copy_(env.episode_length_buf)
         self._evaluation_step = env.common_step_counter
         env.extras["successes"] = env.episode_success.clone()
@@ -183,7 +205,11 @@ class SizeSortCommand(CommandTerm):
     def _resample_command(self, env_ids: Sequence[int] | torch.Tensor | slice) -> None:
         ids = self._ids[env_ids]
         phase = self._reset_term.phase_ids[self._reset_term.row_ids[ids]]
-        self.delivered[ids] = False
+        self.delivered[ids] = (
+            self._reset_term.completed[self._reset_term.row_ids[ids]]
+            if self.cfg.deliveries_per_episode == len(self._env.parcels)
+            else False
+        )
         self.lifted[ids] = phase < 2
         self.full_start[ids] = phase == 3
         self.failed[ids] = self.new_success[ids] = self._waiting[ids] = False
@@ -234,6 +260,22 @@ class ResetParcels(ManagerTermBase):
         self._initial_poses = torch.stack(
             [env.scene[f"parcel_{index}"].data.default_root_pose.torch[0] for index in range(len(PARCEL_SIZES))]
         )
+        self.completed_counts = torch.tensor((11, 8, 4, 0), device=self.device)[self.phase_ids]
+        rank = (torch.arange(len(PARCEL_SIZES), device=self.device) - self.parcel_ids[:, None] - 1) % len(PARCEL_SIZES)
+        self.completed = rank < self.completed_counts[:, None]
+        self._bin_poses = self._initial_poses.clone()
+        directions = torch.tensor(GOAL_DIRECTIONS, device=self.device)
+        bins = torch.tensor(BIN_POSITIONS, device=self.device)
+        for index, class_id in enumerate(PARCEL_CLASS_IDS):
+            rank_in_bin = PARCEL_CLASS_IDS[:index].count(class_id)
+            radial = -0.14 if rank_in_bin % 2 == 0 else 0.14
+            lateral = -0.12 if rank_in_bin < 2 else 0.12
+            direction = directions[class_id]
+            cross = torch.stack((-direction[1], direction[0], direction[2]))
+            self._bin_poses[index, :3] = bins[class_id] + radial * direction + lateral * cross
+            self._bin_poses[index, 2] += -BIN_INTERIOR_SIZE[2] / 2 + PARCEL_SIZES[index][2] / 2 + 0.006
+            angle = torch.tensor(GOAL_ANGLES[class_id], device=self.device)
+            self._bin_poses[index, 5:7] = torch.stack((torch.sin(angle / 2), torch.cos(angle / 2)))
         self._arm_ids = env.scene["robot"].find_joints([f"panda_joint{i}" for i in range(1, 8)], preserve_order=True)[0]
         sizes = torch.tensor(PARCEL_SIZES, device=self.device)[self.parcel_ids]
         pick = torch.zeros((self.row_count, 3), device=self.device)
@@ -295,10 +337,14 @@ class ResetParcels(ManagerTermBase):
         positions[batch, active] = active_position
         yaw = (torch.rand((len(ids), len(env.parcels)), device=self.device) - 0.5) * 0.2
         velocity = torch.zeros((len(ids), 6), device=self.device)
+        completed = self.completed[rows] if env.cfg.commands.sort.deliveries_per_episode == len(env.parcels) else None
         for index, parcel in enumerate(env.parcels):
             pose = self._initial_poses[index].expand(len(ids), -1).clone()
-            pose[:, :3] = positions[:, index] + env.scene.env_origins[ids]
+            pose[:, :3] = positions[:, index]
             pose[:, 5], pose[:, 6] = torch.sin(0.5 * yaw[:, index]), torch.cos(0.5 * yaw[:, index])
+            if completed is not None:
+                pose = torch.where(completed[:, index, None], self._bin_poses[index], pose)
+            pose[:, :3] += env.scene.env_origins[ids]
             parcel.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
             parcel.write_root_velocity_to_sim_index(root_velocity=velocity, env_ids=ids)
         robot = env.scene["robot"]

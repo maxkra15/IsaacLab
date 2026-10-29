@@ -18,6 +18,54 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 
 @pytest.mark.parametrize("device", test_devices(DeviceScope.CUDA))
+def test_partial_batch_reset_only_rewards_new_physical_receipts(device):
+    """Pre-sorted inventory is physical, earns no receipt credit, and is excluded from full-start metrics."""
+    cfg = parse_env_cfg("IsaacContrib-Conveyor-Suction-Sorting", device=device, num_envs=2)
+    cfg.commands.sort.deliveries_per_episode = 12
+    cfg.episode_length_s = 240
+    cfg.sim.visualizer_cfgs = []
+    cfg.sim.save_logs_to_file = False
+    cfg.terminations.success = None
+    with closing(gym.make("IsaacContrib-Conveyor-Suction-Sorting", cfg=cfg).unwrapped) as env:
+        reset = env.event_manager.get_term_cfg("reset_parcels").func
+        rows = torch.tensor([0, 38], device=device)  # Last-parcel release and an unsorted full belt start.
+        reset.reset_sampler.sampler.sample = lambda probabilities, count: rows[:count]
+        env.reset(seed=41)
+        command = env.command_manager.get_term("sort")
+        command.evaluate()
+        assert command.delivered.sum(dim=1).tolist() == [11, 0]
+        assert not command.delivered[env.scene._ALL_INDICES, env.active_ids].any()
+        assert not env.episode_success.any()
+        assert not command.new_success.any()
+        assert command.metrics["correct_deliveries"].tolist() == [0, 0]
+        positions = torch.stack([parcel.data.root_pos_w.torch[0] for parcel in env.parcels])
+        offsets = positions - env.scene.env_origins[0] - env.bin_positions[env.parcel_classes]
+        seeded = command.delivered[0]
+        # Bounding circles establish containment independently of the reset's bin-frame transform.
+        assert (
+            torch.linalg.vector_norm(offsets[seeded, :2], dim=-1)
+            + torch.linalg.vector_norm(env.parcel_sizes[seeded, :2] / 2, dim=-1)
+            < 0.28
+        ).all()
+        assert (offsets[seeded, 2].abs() + env.parcel_sizes[seeded, 2] / 2 < 0.28).all()
+        actions = torch.zeros((2, 4), device=device)
+        actions[:, 3] = 1.0
+        for _ in range(720):
+            env.step(actions)
+            if env.episode_success[0]:
+                break
+        assert env.episode_success[0]
+        assert command.delivered[0].all()
+        assert command.metrics["correct_deliveries"][0] == 1
+        extras = command.reset(torch.tensor([0], device=device))
+        assert extras["full_start_episodes"] == 0
+        assert "full_start_success_rate" not in extras and "full_batch_success_rate" not in extras
+        full = command.reset(torch.tensor([1], device=device))
+        assert full["full_start_episodes"] == 1
+        assert full["full_start_success_rate"].tolist() == full["full_batch_success_rate"].tolist() == [0]
+
+
+@pytest.mark.parametrize("device", test_devices(DeviceScope.CUDA))
 def test_partial_reset_cannot_credit_the_next_selected_parcel(device):
     """A handoff is not another receipt; two receipts complete an episode, and an inactive loss fails it."""
     task = "IsaacContrib-Conveyor-Suction-Sorting"

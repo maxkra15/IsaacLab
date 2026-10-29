@@ -69,8 +69,14 @@ deliveries by size class, wrong-bin deliveries, drops, and complete twelve-parce
 Default training episodes require two deliveries within 30 seconds. Playback uses full belt
 starts and requires all twelve within 240 seconds. `commands.sort.deliveries_per_episode`
 defines the success criterion for termination, reset sampling and `full_start_success_rate`;
-`full_batch_success_rate` separately requires all twelve receipts. Set the receipt goal to
+`full_batch_success_rate` separately requires all twelve receipts from a full start. Set the receipt goal to
 one for isolated pick-and-transfer evaluation. Losing an unsorted parcel ends the episode.
+
+For the twelve-parcel objective, the same four reset phases begin with eleven, eight, four,
+or zero parcels already sorted into their physical bins. This provides shorter remaining-batch
+problems without expanding the reset catalog. Pre-sorted inventory earns no receipt reward and
+is excluded from `correct_deliveries`; full-start metrics exclude these partial batches.
+Goals below twelve retain the original all-unsorted inventory. Full-start playback is unchanged.
 
 Development runs continued compatible checkpoints through a three-receipt/120-second stage
 before twelve-receipt/240-second fine-tuning. Use `--checkpoint /path/to/model.pt` to resume,
