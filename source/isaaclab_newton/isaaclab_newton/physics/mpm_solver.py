@@ -53,6 +53,7 @@ def _make_solver_config(solver_cfg: MPMSolverCfg, scene_prim: Usd.Prim | None = 
         "solver": solver_cfg.solver,
         "warmstart_mode": solver_cfg.warmstart_mode,
         "collider_velocity_mode": collider_velocity_mode,
+        "contact_recovery_time": solver_cfg.contact_recovery_time,
         "voxel_size": solver_cfg.voxel_size,
         "grid_type": solver_cfg.grid_type,
         "grid_padding": solver_cfg.grid_padding,

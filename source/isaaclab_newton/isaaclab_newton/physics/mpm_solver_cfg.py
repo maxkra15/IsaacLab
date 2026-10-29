@@ -133,3 +133,11 @@ class MPMSolverCfg(NewtonSolverCfg):
     This is a manager-level stepping option and is intentionally **not** part of
     ``SolverImplicitMPM.Config``.
     """
+
+    contact_recovery_time: float = 0.0
+    """Experimental particle-collider penetration recovery time [s]; zero disables recovery.
+
+    This Python-only setting forwards to Newton's ``SolverImplicitMPM.Config.contact_recovery_time``.
+    The velocity-level bias requires a particle collider basis and can add energy or change deformation.
+    Changing it after CUDA graph capture requires recapture, as with other solver settings.
+    """

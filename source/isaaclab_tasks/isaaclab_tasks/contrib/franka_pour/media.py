@@ -11,7 +11,7 @@ import math
 
 import numpy as np
 from isaaclab_newton.assets import MPMObjectCfg
-from isaaclab_newton.sim.spawners.mpm import MPMGridCfg, MPMParticleMaterialCfg
+from isaaclab_newton.sim.spawners.mpm import MPMGridCfg, MPMParticleMaterialCfg, MPMPointsCfg
 
 _MEDIA_JITTER_FRACTION = 0.3
 """Full Newton jitter interval relative to the particle spacing."""
@@ -58,9 +58,11 @@ def _media_grid_bounds(
 
 
 def media_particle_count(cfg: MPMObjectCfg) -> int:
-    """Return the number of particles represented by a cell-centred MPM grid asset."""
+    """Return the particle count of a grid or explicitly sampled media asset."""
+    if isinstance(cfg.spawn, MPMPointsCfg):
+        return len(cfg.spawn.positions)
     if not isinstance(cfg.spawn, MPMGridCfg):
-        raise TypeError(f"Franka Pour media requires MPMGridCfg, got {type(cfg.spawn).__name__}.")
+        raise TypeError(f"Franka Pour media requires MPMGridCfg or MPMPointsCfg, got {type(cfg.spawn).__name__}.")
     lower = np.asarray(cfg.spawn.lower, dtype=np.float32)
     upper = np.asarray(cfg.spawn.upper, dtype=np.float32)
     extent = upper - lower
@@ -81,9 +83,15 @@ def configure_media_object_fill(
     fill_resolution: float,
     collider_margin: float,
 ) -> None:
-    """Apply a source-cup fill height to an existing grid asset configuration."""
+    """Apply fill height to a grid; explicit clouds retain their authored positions.
+
+    ``fill_level`` and ``fill_resolution`` do not resample ``MPMPointsCfg``.
+    An explicit cloud's positions, masses, and radii are authoritative.
+    """
+    if isinstance(cfg.spawn, MPMPointsCfg):
+        return
     if not isinstance(cfg.spawn, MPMGridCfg):
-        raise TypeError(f"Franka Pour media requires MPMGridCfg, got {type(cfg.spawn).__name__}.")
+        raise TypeError(f"Franka Pour media requires MPMGridCfg or MPMPointsCfg, got {type(cfg.spawn).__name__}.")
     lower, upper = _media_grid_bounds(
         source_inner_width=source_inner_width,
         source_inner_depth=source_inner_depth,

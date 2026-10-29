@@ -301,6 +301,7 @@ _MPM_FIELD_VALUES = [
     ("solver", "gauss-seidel"),
     ("warmstart_mode", "particles"),
     ("collider_velocity_mode", "backward"),
+    ("contact_recovery_time", 0.009),
     ("voxel_size", 0.0375),
     ("grid_type", "dense"),
     ("grid_padding", 4),
@@ -329,6 +330,36 @@ def test_mpm_solver_cfg_forwards_every_solver_field():
             f"{field_name!r} disappeared from SolverImplicitMPM.Config — MPMSolverCfg needs to drop or rename it."
         )
         assert getattr(newton_cfg, field_name) == value
+
+
+def test_mpm_contact_recovery_cfg_reaches_native_step():
+    """Python MPM configuration enables recovery without changing the disabled default."""
+    builder = ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    register_builder_attributes(builder, MPMSolverCfg())
+    builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, -0.02), wp.quat_identity()), hx=0.12, hy=0.12, hz=0.02)
+    builder.add_particle(pos=(0.003, 0.004, -0.0005), vel=(0.0, 0.0, 0.0), mass=0.001, radius=0.005)
+    model = builder.finalize(device="cpu")
+    for recovery_time in (None, 0.0, 0.009336291911926147):
+        cfg = MPMSolverCfg(
+            voxel_size=0.025,
+            grid_type="dense",
+            grid_padding=1,
+            collider_basis="pic8",
+            solver="jacobi",
+            max_iterations=24,
+            warmstart_mode="none",
+            air_drag=0.0,
+        )
+        if recovery_time is not None:
+            cfg.contact_recovery_time = recovery_time
+        expected_time = 0.0 if recovery_time is None else recovery_time
+        assert cfg.contact_recovery_time == expected_time
+        assert _make_solver_config(cfg).contact_recovery_time == expected_time
+        solver = MPMSolver.build(cfg, model, wp.DeterministicMode.NOT_GUARANTEED)
+        assert solver.contact_recovery_time == expected_time
+        state = model.state()
+        MPMSolver.step(cfg, solver, state, state, None, None, 1.0 / 480.0)
+        assert float(state.particle_q.numpy()[0, 2]) == pytest.approx(-0.0004 if expected_time else -0.0005, abs=2e-9)
 
 
 _KAMINO_PADMM_FIELD_VALUES = [
