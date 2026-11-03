@@ -16,7 +16,7 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.utils import configclass
 from isaaclab.visualizers import VisualizerCfg
 
-from isaaclab_tasks.utils import ResetStateSamplerCfg
+from isaaclab_tasks.utils import ResetStateSamplerCfg, preset
 from isaaclab_tasks.utils.sampling import BetaSamplingStrategyCfg, SamplerCfg, UniformSamplingStrategyCfg
 
 from ..conveyor_franka.conveyor_franka_env_cfg import ConveyorForceCfg, ConveyorFrankaEnvCfg
@@ -26,6 +26,7 @@ from ..conveyor_franka.mdp.terminations import invalid_action as invalid_policy_
 from . import mdp, observations
 from .actions_cfg import TOOL_OFFSET, CartesianSuctionArmCfg, VacuumActionCfg
 from .scene import PARCEL_SIZES, SuctionSortingSceneCfg, spawn_suction_franka
+from .supermimic import VectorObservationsCfg, accepted_actions, native_events
 
 _ARM = [f"panda_joint{index}" for index in range(1, 8)]
 
@@ -72,6 +73,34 @@ class ObservationsCfg:
             self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
+
+    @configclass
+    class StateCfg(PolicyCfg):
+        """Physical successors exclude measurement noise used by the deployed actor."""
+
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            self.enable_corruption = False
+
+    state = preset(default=None, supermimic_state=StateCfg())
+    supermimic_goal = preset(
+        default=None,
+        supermimic_state=VectorObservationsCfg(
+            value=ObservationTermCfg(func=common_mdp.generated_commands, params={"command_name": "sort"})
+        ),
+    )
+    supermimic_labels = preset(
+        default=None, supermimic_state=VectorObservationsCfg(value=ObservationTermCfg(func=native_events))
+    )
+    supermimic_action = preset(
+        default=None, supermimic_state=VectorObservationsCfg(value=ObservationTermCfg(func=accepted_actions))
+    )
+    supermimic_previous_action = preset(
+        default=None,
+        supermimic_state=VectorObservationsCfg(
+            value=ObservationTermCfg(func=accepted_actions, params={"previous": True})
+        ),
+    )
 
 
 @configclass

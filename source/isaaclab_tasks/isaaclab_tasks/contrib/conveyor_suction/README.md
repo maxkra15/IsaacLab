@@ -156,6 +156,36 @@ Evaluate the retrained policy from full starts, with held-out reset seeds and de
 commands. Report controlled-placement success and arm contacts alongside physical receipts;
 the earlier receipt-only policies are not evidence for this stricter objective.
 
+## Sparse-event SuperMimic experiment
+
+An optional single-GPU experiment uses the draft [Isaac Lab SuperMimic integration](https://github.com/isaac-sim/IsaacLab/pull/8867)
+and its pinned [RSL-RL implementation](https://github.com/leggedrobotics/rsl_rl/pull/255).
+It starts a new policy on the same native scene, reset sampler and sparse objective:
++10 for a verified controlled delivery, -1 for failure, and the existing motion penalties.
+
+```bash
+uv run isaaclab train --task IsaacContrib-Conveyor-Suction-Sorting \
+  --rl_library rsl_rl --agent rsl_rl_supermimic_cfg_entry_point \
+  presets=supermimic_state --num_envs 512 --device cuda:0
+```
+
+The learner fits observed state changes and two event heads from real simulator transitions.
+Imagined rollouts optimize the predicted receipt and failure probabilities as a differentiable
+surrogate for the native sparse events; they do not create environmental successes or add
+reaching rewards. The commanded goal and parcel dimensions stay fixed during imagination.
+The actor uses five observation frames and the explicit goal, with the same cloud noise and
+fixed feature scales as the native policy. Discount 0.999 and TD(lambda) 0.99 match PPO.
+Imagined rollouts span 32 policy steps (0.53 seconds); later bin receipts depend on learned
+dynamics and bootstrapped values beyond that window. The modeled observation is partial: it does not
+contain the complete scene or all randomized physical properties.
+
+Sparse positive labels can be rare. Training logs therefore report the actual receipt-label
+count and event-head predictions on real positive and negative transitions. These diagnostics
+and model losses do not establish policy success. Evaluate first-assignment deliveries in native
+physics from full-home starts, including independently reserved fixtures. The upstream learner
+does not support distributed training; this experiment requires its matching agent configuration
+and cannot load a PPO checkpoint.
+
 ## Facility references
 
 The compact feeder, vacuum-pick cell and guarded receiving lanes follow ordinary parcel-hub organization,

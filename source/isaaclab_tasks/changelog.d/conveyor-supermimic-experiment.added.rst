@@ -1,0 +1,1 @@
+* Added an experimental single-GPU SuperMimic configuration for suction parcel sorting, using learned native sparse receipt and failure events during imagination while retaining physical success checks.

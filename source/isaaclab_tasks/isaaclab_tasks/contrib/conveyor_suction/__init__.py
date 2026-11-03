@@ -14,5 +14,6 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.env_cfg:SuctionSortingEnvCfg",
         "rsl_rl_cfg_entry_point": f"{__name__}.agent_cfg:SuctionSortingPPORunnerCfg",
+        "rsl_rl_supermimic_cfg_entry_point": f"{__name__}.supermimic_cfg:SuctionSuperMimicRunnerCfg",
     },
 )
