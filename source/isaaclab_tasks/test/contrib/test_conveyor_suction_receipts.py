@@ -5,6 +5,7 @@
 
 """Physical receipt counting across target handoffs and independent environment resets."""
 
+import math
 from contextlib import closing
 
 import gymnasium as gym
@@ -17,6 +18,7 @@ from isaaclab.utils import math as math_utils
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.contrib.conveyor_franka.mdp.kinematics import end_effector_pose
 from isaaclab_tasks.contrib.conveyor_suction.actions import solve_tool_ik
+from isaaclab_tasks.contrib.conveyor_suction.scene import PARCEL_SIZES, OutfeedLayout, OutfeedsCfg
 from isaaclab_tasks.utils import parse_env_cfg
 
 
@@ -28,11 +30,18 @@ def test_receipts_record_success_and_continue_without_reset(device):
     cfg.sim.visualizer_cfgs = []
     cfg.sim.save_logs_to_file = False
     cfg.seed = 41
-    cfg.scene.outfeeds.spawn.assets_cfg = cfg.scene.outfeeds.spawn.assets_cfg[:2]
+    # Keep the measured bin-impact fixture independent of randomized task defaults.
+    angles = tuple(math.radians(value) for value in (10, 35, 60, 85, 110, 135))
+    cfg.scene.outfeeds.spawn.assets_cfg = [
+        OutfeedsCfg(layout=OutfeedLayout(angles[:count], (0.0,) * count, (0.0,) * count)) for count in (5, 6)
+    ]
     cfg.scene.outfeeds.spawn.assets_cfg[1].layout.radial_offsets = (0.035,) * 6
     cfg.scene.outfeeds.spawn.assets_cfg[1].layout.height_offsets = (0.015,) * 6
     cfg.commands.sort.goal_radial_range = (0.02, 0.02)
     cfg.commands.sort.continue_after_delivery = True
+    for index in range(len(PARCEL_SIZES)):
+        setattr(cfg.events, f"parcel_{index}_mass", None)
+        setattr(cfg.events, f"parcel_{index}_material", None)
     cfg.episode_length_s = 240.0
     cfg.terminations.failure = None
     cfg.terminations.invalid_action = None

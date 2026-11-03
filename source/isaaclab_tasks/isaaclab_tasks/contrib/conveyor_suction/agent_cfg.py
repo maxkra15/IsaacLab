@@ -78,6 +78,10 @@ class SuctionSortingPPORunnerCfg(ConveyorFrankaPPORunnerCfg):
         self.actor.distribution_cfg = SuctionGaussianBernoulliDistributionCfg(init_std=0.45)
         self.actor.hidden_dims = [256, 256, 128]
         self.critic.hidden_dims = [256, 256, 128]
+        # Geometry already uses fixed physical scales. Constant training ray cells
+        # must not acquire near-zero variance that amplifies new fixture geometry.
+        self.actor.obs_normalization = False
+        self.critic.obs_normalization = False
         self.algorithm.learning_rate = 0.0003
         self.algorithm.num_mini_batches = 8
         self.algorithm.lam = 0.99

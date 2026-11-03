@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from pxr import Usd
 
 BELT_TOP_Z = 0.04
+INDUCTION_TOP_Z = 0.26
 INTAKE_CENTER = (0.95, -0.47)
 INTAKE_RADIUS = 0.28
 INTAKE_HALF_STRAIGHT = 0.45
@@ -63,7 +64,6 @@ PARCEL_SIZES = (
 )
 """Per-asset cuboid dimensions [m]; shapes vary within a size class."""
 CLASS_COLORS = ((0.20, 0.53, 0.79), (0.88, 0.48, 0.19), (0.26, 0.66, 0.46), (0.68, 0.39, 0.66), (0.74, 0.60, 0.35))
-GOAL_ANGLES = tuple(math.radians(value) for value in (10, 35, 60, 85, 110))
 BIN_INTERIOR_SIZE = (0.60, 0.56, 0.56)
 """Bin interior dimensions [m], with local X pointing along its outfeed."""
 
@@ -77,49 +77,65 @@ class OutfeedLayout:
     height_offsets: tuple[float, ...] = MISSING
 
 
-def make_outfeed_layouts(seed: int = 73) -> tuple[OutfeedLayout, ...]:
-    """Retain both reference fixtures and fill a deterministic, separated layout catalog."""
-    six_angles = (*GOAL_ANGLES, math.radians(135.0))
-    layouts = [
-        OutfeedLayout(angles, (0.0,) * len(angles), (0.0,) * len(angles)) for angles in (GOAL_ANGLES, six_angles)
-    ]
+def make_logistics_layouts(seed: int = 73, count: int = 32, *, held_out: bool = False) -> tuple[OutfeedLayout, ...]:
+    """Build separated five/six-outlet cells, reserving outer angular bands for evaluation.
+
+    Training covers front angles [-145, -105] and back angles [20, 140] degrees.
+    Held-out fixtures put two outlets in [-160, -153] and [151, 158] degrees;
+    their inward radial offsets retain the downward robot's Cartesian workspace.
+    Geometry is selected at spawn and remains fixed throughout an environment's lifetime.
+    """
+    if count < 1:
+        raise ValueError("The logistics fixture catalog must contain at least one layout.")
     generator = random.Random(seed)
-    for _ in range(7):
-        for count in (5, 6):
-            slack = 145.0 - 8.0 - 27.0 * (count - 1)
-            offsets = sorted(generator.uniform(0.0, slack) for _ in range(count))
-            layouts.append(
-                OutfeedLayout(
-                    tuple(math.radians(8.0 + 27.0 * index + offset) for index, offset in enumerate(offsets)),
-                    tuple(generator.uniform(-0.005, 0.035) for _ in range(count)),
-                    tuple(generator.uniform(-0.015, 0.015) for _ in range(count)),
-                )
+    layouts = []
+    for index in range(count):
+        lane_count = 5 + index % 2
+        if held_out:
+            sectors = ((-160.0, -153.0, 1), (20.0, 115.0, lane_count - 2), (151.0, 158.0, 1))
+        else:
+            front_count = 1 if index % 4 == 0 else 2
+            sectors = ((-145.0, -105.0, front_count), (20.0, 140.0, lane_count - front_count))
+        angles = []
+        for lower, upper, lanes in sectors:
+            slack = upper - lower - 30.0 * (lanes - 1)
+            offsets = sorted(generator.uniform(0.0, slack) for _ in range(lanes))
+            angles.extend(math.radians(lower + 30.0 * lane + offset) for lane, offset in enumerate(offsets))
+        radial_bounds = (-0.025, -0.015) if held_out else (-0.015, 0.015)
+        layouts.append(
+            OutfeedLayout(
+                angles=tuple(angles),
+                radial_offsets=tuple(generator.uniform(*radial_bounds) for _ in angles),
+                height_offsets=tuple(generator.uniform(-0.01, 0.01) for _ in angles),
             )
+        )
     return tuple(layouts)
 
 
-OUTFEED_LAYOUTS = make_outfeed_layouts()
+OUTFEED_LAYOUTS = make_logistics_layouts()
 """Static fixture variants shared by physics, observations, commands, and reset recipes."""
-_PARCEL_XY = (
-    (0.60, -0.19),
-    (0.90, -0.19),
-    (1.20, -0.19),
-    (1.598, -0.272),
-    (1.68, -0.47),
-    (1.598, -0.668),
-    (1.20, -0.75),
-    (0.90, -0.75),
-    (0.60, -0.75),
-    (0.302, -0.668),
-    (0.22, -0.47),
+_PARCEL_SLOTS = (
+    (0.60, -0.19, BELT_TOP_Z),
+    (0.90, -0.19, BELT_TOP_Z),
+    (1.20, -0.19, BELT_TOP_Z),
+    (1.6425, -0.33, BELT_TOP_Z),
+    (1.6425, -0.61, BELT_TOP_Z),
+    (1.20, -0.75, BELT_TOP_Z),
+    (0.90, -0.75, BELT_TOP_Z),
+    (0.60, -0.75, BELT_TOP_Z),
+    (1.70, -0.75, INDUCTION_TOP_Z),
+    (2.00, -0.75, INDUCTION_TOP_Z),
+    (2.30, -0.75, INDUCTION_TOP_Z),
 )
 PARCEL_POSITIONS = tuple(
-    (x, y, BELT_TOP_Z + 0.5 * size[2] + 0.002) for (x, y), size in zip(_PARCEL_XY, PARCEL_SIZES[:-1], strict=True)
+    (x, y, support + 0.5 * size[2] + 0.002)
+    for (x, y, support), size in zip(_PARCEL_SLOTS, PARCEL_SIZES[:-1], strict=True)
 ) + (FEEDER_POSITION,)
 _ASSETS_DIR = Path(__file__).with_name("assets")
 _BELT_COLOR = (0.025, 0.032, 0.038)
 _FRAME_COLOR = (0.065, 0.095, 0.12)
 _METAL_COLOR = (0.42, 0.46, 0.50)
+_LANE_COLORS = (*CLASS_COLORS, (0.83, 0.72, 0.20))
 
 
 @sim_utils.clone
@@ -235,7 +251,9 @@ class SuctionSortingSceneCfg(InteractiveSceneCfg):
                         mass_props=sim_utils.MassCfg(mass=max(0.03, 180.0 * math.prod(size))),
                         collision_props=_collision_properties(contact_margin=0.002),
                         physics_material=NewtonMaterialPropertiesCfg(static_friction=0.65, dynamic_friction=0.5),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.34, 0.21, 0.11), roughness=0.9),
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=CLASS_COLORS[PARCEL_CLASS_IDS[index]], roughness=0.9
+                        ),
                     ),
                 ),
             )
@@ -284,10 +302,12 @@ class SuctionSortingSceneCfg(InteractiveSceneCfg):
                 _METAL_COLOR,
                 colliding=False,
             )
-        for index, y in enumerate((-1.16, -1.5)):
-            _add_box(
-                self, f"AisleLine{index}", (4.5, 0.04, 0.001), (0.5, y, -0.799), (0.75, 0.49, 0.045), colliding=False
-            )
+        for index, (x, y) in enumerate(((-2.8, -2.6), (-2.8, 2.6), (2.8, -2.6), (2.8, 2.6))):
+            for axis, size, position in (
+                ("X", (0.55, 0.04, 0.001), (x - math.copysign(0.255, x), y, -0.799)),
+                ("Y", (0.04, 0.55, 0.001), (x, y - math.copysign(0.255, y), -0.799)),
+            ):
+                _add_box(self, f"CellCorner{index}{axis}", size, position, (0.75, 0.49, 0.045), colliding=False)
 
     def build_conveyor_belt_specs(self, **kwargs: float) -> tuple[SurfaceVelocitySpec, ...]:
         """Return prescribed surface velocities in the authored collision frames."""
@@ -344,7 +364,7 @@ def _conveyor_sections(
             radius=INTAKE_RADIUS,
         )
     # A short drop onto the return leg avoids two opposing contact fields at the merge.
-    add(CuboidSpec("InductionBelt", (1.20, 0.24, 0.04), (2.0, -0.75, 0.24)), (-1.0, 0.0, 0.0))
+    add(CuboidSpec("InductionBelt", (1.20, 0.24, 0.04), (2.0, -0.75, INDUCTION_TOP_Z - 0.02)), (-1.0, 0.0, 0.0))
     return tuple(sections)
 
 
@@ -500,6 +520,7 @@ def _add_intake_frame(scene: SuctionSortingSceneCfg) -> None:
 def _add_destination(scene: SuctionSortingSceneCfg | SimpleNamespace, index: int, angle: float) -> None:
     """Build an open receiving mouth, guarded outfeed, and open collection bin."""
     cosine, sine = math.cos(angle), math.sin(angle)
+    color = _LANE_COLORS[index]
 
     def box(
         part: str,
@@ -522,8 +543,10 @@ def _add_destination(scene: SuctionSortingSceneCfg | SimpleNamespace, index: int
         )
 
     for side, offset in (("Left", -0.129), ("Right", 0.129)):
-        box(f"Mouth{side}", (0.25, 0.018, 0.13), 0.705, offset, 0.125, CLASS_COLORS[index % len(CLASS_COLORS)])
+        box(f"Mouth{side}", (0.25, 0.018, 0.13), 0.705, offset, 0.125, color)
         box(f"Outfeed{side}", (1.20, 0.020, 0.045), 1.35, math.copysign(0.13, offset), 0.05, _METAL_COLOR)
+        box(f"RouteStripe{side}", (1.12, 0.015, 0.002), 1.35, offset, 0.074, color, colliding=False)
+        box(f"BinRim{side}", (0.60, 0.025, 0.025), 2.17, math.copysign(0.29, offset), -0.19, color, colliding=False)
     box("Frame", (1.20, 0.28, 0.08), 1.35, 0.0, -0.045, _FRAME_COLOR, colliding=False)
     for leg, radius in enumerate((0.92, 1.78)):
         box(f"Leg{leg}", (0.065, 0.065, 0.72), radius, 0.0, -0.44, _FRAME_COLOR, colliding=False)
@@ -583,9 +606,19 @@ def _spawn_carton(
     orientation: tuple[float, float, float, float] | None = None,
 ) -> Usd.Prim:
     """Keep the physical cuboid and attach one paper-textured, collision-free top face."""
-    prim = sim_utils.spawn_cuboid(prim_path, cfg, translation=translation, orientation=orientation)
+    prim = sim_utils.spawn_cuboid(
+        prim_path,
+        cfg.replace(visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.34, 0.21, 0.11), roughness=0.9)),
+        translation=translation,
+        orientation=orientation,
+    )
     _spawn_textured_surface(
         f"{prim_path}/CartonTop", "carton_top.png", cfg.size[:2], translation=(0.0, 0.0, cfg.size[2] / 2.0 + 0.0002)
+    )
+    sim_utils.spawn_cuboid(
+        f"{prim_path}/SortLabel",
+        sim_utils.CuboidCfg(size=(0.15 * cfg.size[0], 0.5 * cfg.size[1], 0.0004), visual_material=cfg.visual_material),
+        translation=(0.35 * cfg.size[0], 0.0, cfg.size[2] / 2.0 + 0.0005),
     )
     return prim
 
