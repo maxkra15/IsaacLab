@@ -25,7 +25,7 @@ from ..conveyor_franka.mdp.rewards import transfer_success_reward
 from ..conveyor_franka.mdp.terminations import invalid_action as invalid_policy_action
 from . import mdp, observations
 from .actions_cfg import TOOL_OFFSET, CartesianSuctionArmCfg, VacuumActionCfg
-from .scene import SuctionSortingSceneCfg, spawn_suction_franka
+from .scene import PARCEL_SIZES, SuctionSortingSceneCfg, spawn_suction_franka
 
 _ARM = [f"panda_joint{index}" for index in range(1, 8)]
 
@@ -56,17 +56,19 @@ class ObservationsCfg:
             func=common_mdp.joint_pos_rel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=_ARM)}
         )
         joint_velocities = ObservationTermCfg(
-            func=common_mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=_ARM)}
+            func=common_mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=_ARM)}, scale=0.1
         )
         parcel = ObservationTermCfg(func=mdp.parcel_observation)
         tool = ObservationTermCfg(func=mdp.tool_observation)
         suction = ObservationTermCfg(func=mdp.suction_observation)
         goal = ObservationTermCfg(func=common_mdp.generated_commands, params={"command_name": "sort"})
-        collision_point_cloud = ObservationTermCfg(func=observations.collision_point_cloud)
+        collision_point_cloud = ObservationTermCfg(
+            func=observations.collision_point_cloud, noise=observations.CollisionPointCloudNoiseCfg()
+        )
         actions = ObservationTermCfg(func=common_mdp.last_action)
 
         def __post_init__(self) -> None:
-            self.enable_corruption = False
+            self.enable_corruption = True
             self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
@@ -139,6 +141,38 @@ class SuctionSortingEnvCfg(ConveyorFrankaEnvCfg):
         super().__post_init__()
         # Match moving-parcel resets at operating speed after full and partial resets.
         self.conveyor_force.startup_duration_s = self.sim.dt
+        for index in range(len(PARCEL_SIZES)):
+            asset_cfg = SceneEntityCfg(f"parcel_{index}")
+            setattr(
+                self.events,
+                f"parcel_{index}_mass",
+                EventTerm(
+                    func=common_mdp.randomize_rigid_body_mass,
+                    mode="startup",
+                    params={
+                        "asset_cfg": asset_cfg,
+                        "mass_distribution_params": (0.7, 1.3),
+                        "operation": "scale",
+                        "recompute_inertia": True,
+                        "min_mass": 0.01,
+                    },
+                ),
+            )
+            setattr(
+                self.events,
+                f"parcel_{index}_material",
+                EventTerm(
+                    func=common_mdp.randomize_rigid_body_material,
+                    mode="startup",
+                    params={
+                        "asset_cfg": asset_cfg,
+                        "static_friction_range": (0.4, 0.9),
+                        "dynamic_friction_range": (0.4, 0.9),
+                        "restitution_range": (0.0, 0.05),
+                        "num_buckets": 1,
+                    },
+                ),
+            )
         self.scene.robot.spawn.func = spawn_suction_franka
         self.scene.robot.spawn.variants = {"Physics": "mujoco", "Colliders": "primitives"}
         self.scene.robot.spawn.articulation_props = NewtonArticulationCfg(self_collision_enabled=False)
@@ -176,6 +210,7 @@ class SuctionSortingEnvCfg(ConveyorFrankaEnvCfg):
         self.commands.sort.continue_after_delivery = True
         self.events.reset_parcels.params["full_starts"] = True
         self.events.reset_parcels.params["sampling"].sampling = SamplerCfg(strategies=[UniformSamplingStrategyCfg()])
+        self.observations.policy.enable_corruption = False
 
     def validate_config(self) -> None:
         """Require the force-based suction and conveyor contact path."""

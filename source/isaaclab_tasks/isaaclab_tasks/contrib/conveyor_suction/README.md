@@ -32,7 +32,7 @@ the seal implementation into Isaac Lab. Stock Newton releases do not provide thi
 The default configuration uses 512 environments, 6,000 PPO updates, and 30-second training episodes.
 PPO collects 128 steps per environment per update with discount 0.999 and GAE lambda 0.99.
 Training practices one assignment per episode: its first verified receipt ends the episode successfully,
-and missing the assigned pickup fails the attempt. Playback uses the original five-lane fixture and
+and missing the assigned pickup fails the attempt. Playback uses the first randomized five-lane fixture and
 240-second episodes, continuing to another parcel after each controlled placement. Each verified
 delivery counts as a success. Evaluate checkpoints from full starts; curriculum success rates alone
 do not establish end-to-end performance. Conveyors reach operating speed within one physics step
@@ -59,7 +59,11 @@ Keep the matching agent configuration with a checkpoint when resuming or replayi
 Observations include the selected parcel's pose, velocity and
 dimensions, robot and tool states, pickup and placement qualification, and the commanded
 parcel-center goal in the robot frame. A small overhead ray scan observes collision geometry
-as robot-frame points and hit-validity bits. It uses Newton physics rather than an RTX camera;
+as robot-frame points and hit-validity bits. Training adds 3 mm measurement noise and 2% ray dropout;
+playback disables both. Coordinates use the fixed scan range, and joint velocities are scaled by 0.1.
+The actor and critic do not use empirical observation normalization: a previously constant floor ray must
+not amplify a newly observed obstacle through near-zero training variance.
+The scan uses Newton physics rather than an RTX camera;
 the 24 cm ray spacing can miss thin obstacles, and occluded surfaces are not observed.
 Earlier checkpoints require retraining with
 the new observations and controlled-placement objective.
@@ -67,32 +71,46 @@ Parcel dimensions vary across twelve fixed cuboid assets spanning five size clas
 Parcels are 8.5–19 cm long and weigh approximately 64–431 g. The receiving lanes have
 24 cm openings to accommodate the largest packages. Earlier suction checkpoints require
 their matching parcel catalogue and tool configuration; the observation shape alone does not imply compatibility.
-Training distributes parallel environments across sixteen coherent physical fixtures: eight have
-five receiving lanes and eight have six. Lane angles, radial positions, and heights vary together
+Training distributes parallel environments across 32 coherent physical fixtures with five or six
+receiving lanes on both sides of the robot. Lane angles, radial positions, and heights vary together
 with the corresponding goal, bin, and reset geometry. Each environment keeps its fixture for its
-lifetime; placement offsets and starting states vary at reset. The original five-lane fixture and
-its six-lane extension remain in the catalog. Training samples every active destination independently
+lifetime; placement offsets, full-turn parcel yaw, and starting states vary at reset. Parcel mass varies
+from 0.7 to 1.3 times nominal, friction from 0.4 to 0.9, and restitution from 0 to 0.05 through standard
+startup event terms. Mass and inertia change together; these properties stay fixed within each world.
+Training samples every active destination independently
 of package dimensions, with placement offsets inside its supported receiving area. Playback routes each size class to its original
 outlet. Both modes supply the goal explicitly, so dimensions cannot replace following the
 command. Colors make the scene readable without becoming policy inputs. Goals are restricted
 to these reachable, supported receiving areas; this example does not establish transfer to
 arbitrary facilities or obstacles. The interface has 312 observations and four actions. The wider collision scan
 changes the spatial meaning of its samples, so earlier checkpoints require their original observation configuration.
-New training uses fresh weights. Evaluate separately on held-out fixture layouts before claiming generalization.
+New training uses fresh weights; earlier checkpoints require their matching observation scaling and normalizer.
+Evaluate separately on held-out fixture layouts before claiming generalization.
+
+`make_logistics_layouts(seed=73, count=32)` fixes the training catalog. Use a separate seed with
+`held_out=False` to test new combinations inside the training sectors, and
+`make_logistics_layouts(seed=1701, count=8, held_out=True)` for a separate fixture catalog with two
+outlets per fixture in reserved angular bands. Training outlet centers cover front angles
+[-145, -105] and back angles [20, 140] degrees; the reserved bands are [-160, -153] and [151, 158].
+Apply a catalog through `scene.outfeeds.spawn.assets_cfg` using `OutfeedsCfg(layout=layout)` before
+launch. Evaluate the first original assignment from full-home starts and report reserved-outlet
+deliveries separately from familiar outlets. New random seeds alone do not establish extrapolation.
 
 ## Reset distribution and success
 
 The public `isaaclab_tasks.utils.ResetStateSampler` tracks 49 shared progress buckets:
 sixteen points each for controlled descent, held lift/transport, and unheld approach, plus a full-home start.
 Each draw independently chooses a parcel, destination, and pickup anchor on the world's physical fixture.
-The cached geometry contains 135,168 physical states, while the outcome history stays small enough to
+The default cached geometry contains 270,336 physical states, while the outcome history stays small enough to
 receive repeated attempts. Layout and package variations share progress history instead of fragmenting it.
 The Beta sampler favors intermediate success and retains a uniform strategy with weight 0.005.
 
 Connected paths cover contact, lift, transport around the pedestal, and controlled descent.
 Earlier approach states rewind the moving parcel around the incoming turn. Held starts restore native
 suction seals against the reset geometry before the first observation. Other parcels are shuffled among
-the remaining belt and feeder slots. Initially, about 6% of sampled starts are already near enough to
+the remaining belt and feeder slots, preserving each slot's support height. The loop's pickup turn
+stays clear, and neighboring slots accommodate every parcel orientation without overlap.
+Initially, about 6% of sampled starts are already near enough to
 practice a controlled release. These bootstrap states connect continuously to larger descents;
 progress levels 9–15 retain at least 6 cm of geometric clearance above the receiving surface.
 Released outfeed starts are excluded: the conveyor can complete those deliveries without a policy
@@ -140,8 +158,9 @@ the earlier receipt-only policies are not evidence for this stricter objective.
 
 ## Facility references
 
-The induction-loop/offload layout follows ordinary distribution-center organization,
-including [Vanderlande's robotic induction at DHL](https://awlautomation.com/customer-experience-dhl-express).
+The compact feeder, vacuum-pick cell and guarded receiving lanes follow ordinary parcel-hub organization,
+including [BEUMER robotpick](https://www.beumergroup.com/products-systems/logistics-systems/beumer-robotpick/)
+and [Vanderlande's infeed, sorters and chutes](https://www.vanderlande.com/parcel/systems/).
 The scene uses native primitives with physical decks, guards and bins; decorative
 supports remain visual only.
 

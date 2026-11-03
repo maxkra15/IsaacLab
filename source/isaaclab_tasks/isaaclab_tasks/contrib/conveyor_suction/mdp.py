@@ -535,7 +535,6 @@ class ResetParcels(ManagerTermBase):
         self._parcel_velocities = torch.zeros((self.row_count, 6), device=self.device)
         speed = env.cfg.conveyor_force.speed
         unheld = (self.phase_ids == 2) | (self.phase_ids == 3)
-        self._reserve_turn = unheld & (distance < -0.21)
         self._parcel_velocities[unheld, 0] = speed * angle[unheld].cos()
         self._parcel_velocities[unheld, 1] = speed * angle[unheld].sin()
         self._parcel_velocities[unheld & (distance < 0.0), 5] = -speed / INTAKE_RADIUS
@@ -621,16 +620,13 @@ class ResetParcels(ManagerTermBase):
         slots[batch, slot_zero] = slots[batch, active]
         slots[batch, active] = 0
         positions = self._initial_poses[slots, :3]
-        # An upstream target frees slot zero; use it to clear the occupied left turn.
-        positions[self._reserve_turn[rows, None] & (slots == len(env.parcels) - 2), :2] = self._initial_poses[0, :2]
-        positions[:, :, 2] = BELT_TOP_Z + 0.5 * env.parcel_sizes[:, 2] + 0.002
-        positions[:, :, 2] = torch.where(slots == len(env.parcels) - 1, self._initial_poses[-1, 2], positions[:, :, 2])
+        positions[:, :, 2] += 0.5 * (env.parcel_sizes[:, 2] - self._parcel_sizes[slots, 2])
         active_position = self._pick_positions[rows].clone()
         held_position = self._tool_positions[rows].clone()
         held_position[:, 2] -= 0.5 * env.parcel_sizes[active, 2] + 0.002
         active_position = torch.where(self.held_rows[ids, None], held_position, active_position)
         positions[batch, active] = active_position
-        yaw = (torch.rand((len(ids), len(env.parcels)), device=self.device) - 0.5) * 0.2
+        yaw = (torch.rand((len(ids), len(env.parcels)), device=self.device) - 0.5) * (2.0 * math.pi)
         yaw[batch, active] += self._pick_yaw[rows] * ~self.held_rows[ids]
         velocity = torch.zeros((len(ids), 6), device=self.device)
         parcel_velocities = torch.zeros((len(ids), len(env.parcels), 6), device=self.device)
