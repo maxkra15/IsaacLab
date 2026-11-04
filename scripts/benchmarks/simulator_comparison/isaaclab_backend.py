@@ -46,7 +46,9 @@ class Adapter:
         self._camera_motion = config.get("camera_motion", "fixed")
         if self._camera_motion not in ("fixed", "root_translation"):
             raise ValueError(f"Unsupported camera motion: {self._camera_motion}")
-        iterations = int(config["solver_iterations"])
+        settings = config.get("solver_settings", {}).get("isaaclab", {})
+        iterations = int(settings.get("position_iterations", config.get("solver_iterations", 50)))
+        velocity_iterations = int(settings.get("velocity_iterations", 1))
         material = PhysxRigidBodyMaterialCfg(
             static_friction=0.8,
             dynamic_friction=0.8,
@@ -62,8 +64,8 @@ class Adapter:
                 solver_type=1,
                 min_position_iteration_count=iterations,
                 max_position_iteration_count=iterations,
-                min_velocity_iteration_count=1,
-                max_velocity_iteration_count=1,
+                min_velocity_iteration_count=velocity_iterations,
+                max_velocity_iteration_count=velocity_iterations,
             ),
             physics_material=material,
             visualizer_cfgs=[],
@@ -108,7 +110,7 @@ class Adapter:
                     PhysxArticulationCfg(
                         enabled_self_collisions=False,
                         solver_position_iteration_count=iterations,
-                        solver_velocity_iteration_count=1,
+                        solver_velocity_iteration_count=velocity_iterations,
                         sleep_threshold=0.0,
                         stabilization_threshold=0.0,
                     )
@@ -193,7 +195,8 @@ class Adapter:
             "physics_backend": "Isaac Sim PhysX GPU",
             "solver": "TGS",
             "position_iterations": iterations,
-            "velocity_iterations": 1,
+            "velocity_iterations": velocity_iterations,
+            "solver_profile": config.get("solver_profile", "fixed_cap"),
             "substeps": 1,
             "self_collision": False,
             "friction": 0.8,

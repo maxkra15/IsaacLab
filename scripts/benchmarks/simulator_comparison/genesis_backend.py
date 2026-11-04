@@ -25,6 +25,11 @@ class Adapter:
         torch.cuda.set_device(self.device)
         gs.init(backend=gs.cuda, seed=config["seed"], precision="32", logging_level="warning", performance_mode=True)
         self._is_cartpole = config["task"] == "cartpole"
+        settings = config.get("solver_settings", {}).get("genesis", {})
+        iterations = int(settings.get("max_iterations", config.get("solver_iterations", 50)))
+        tolerance = settings.get("tolerance")
+        if tolerance is not None:
+            tolerance = float(tolerance)
         if config["task"] not in ("cartpole", "anymal"):
             raise ValueError(f"Unsupported task: {config['task']}")
         self._joint_names = list(config["joint_names"])
@@ -35,7 +40,8 @@ class Adapter:
             sim_options=gs.options.SimOptions(dt=config["dt"], substeps=1, gravity=(0.0, 0.0, -9.81)),
             rigid_options=gs.options.RigidOptions(
                 constraint_solver=gs.constraint_solver.Newton,
-                iterations=config["solver_iterations"],
+                iterations=iterations,
+                tolerance=tolerance,
                 enable_collision=True,
                 enable_self_collision=False,
                 enable_joint_limit=True,
@@ -105,7 +111,12 @@ class Adapter:
             "physics": "Genesis rigid solver",
             "constraint_solver": "Newton",
             "integrator": "approximate_implicitfast",
-            "solver_iterations": config["solver_iterations"],
+            "solver_profile": config.get("solver_profile", "fixed_cap"),
+            "solver_iterations": iterations,
+            "constraint_tolerance": self.scene.options.rigid.tolerance,
+            "line_search_iterations": self.scene.options.rigid.ls_iterations,
+            "line_search_tolerance": self.scene.options.rigid.ls_tolerance,
+            "noslip_iterations": self.scene.options.rigid.noslip_iterations,
             "substeps": 1,
             "precision": "float32",
             "performance_mode": True,

@@ -321,7 +321,8 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
         '<p class="muted">'
         + " · ".join(
             f"{_escape(key)}={_escape(config.get(key))}"
-            for key in ("num_envs", "dt", "decimation", "steps", "solver_iterations")
+            for key in ("num_envs", "dt", "decimation", "steps", "solver_profile", "solver_iterations")
+            if config.get(key) is not None
         )
         + "</p>",
         "<details><summary>Matched workload configuration</summary><pre>"
@@ -501,6 +502,9 @@ def build_report(input_dir: Path, output_dir: Path) -> Path:
 <p>Physics times synchronized stepping with prescribed controls; rollout includes actions, observations,
 rewards and resets. One environment transition contains the configured number of physics steps.
 Startup and the first step are reported separately from warmed throughput. A fresh process can reuse disk caches.</p>
+<p>Solver profiles use backend-specific settings. The native profile uses Genesis Newton's 25-iteration maximum
+and the maintained Isaac robot profile of TGS 4 position / 0 velocity iterations. Counts have different meanings;
+these profiles do not establish equal solver work or numerical accuracy. Resolved settings are in each raw run.</p>
 <p>ANYmal physics runs can fall or settle under prescribed controls;
 throughput alone does not establish walking quality.
 The backend metadata records controls and assets. Renderers use their native implementations: raster and RTX

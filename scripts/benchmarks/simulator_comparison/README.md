@@ -15,6 +15,11 @@ same CNN policy; this does not establish that vision is necessary to solve eithe
 
 These are matched task inputs, not identical numerical solvers or image quality.
 PhysX uses TGS/implicit drives; Genesis uses its Newton solver/implicitfast integrator.
+The default `native` solver profile uses Genesis's 25-iteration maximum with native
+convergence tolerance and the maintained Isaac robot settings of 4 position / 0
+velocity iterations. This matches practical settings, not numerical work or accuracy.
+Use `--solver_profile fixed_cap --solver_iterations 50` for the separate diagnostic
+profile; it is not the native task profile.
 The native RGB renderers differ. Inspect camera samples and backend metadata before interpreting a ratio.
 Cartpole uses USD clones in Isaac because native replication misplaced its fixed-base
 anchors; the independent dynamics check covers every copy. ANYmal uses native replication.

@@ -41,6 +41,11 @@ revision is not identified by those files.
 Equal numerical solver settings do not guarantee equal physical accuracy. Asset or renderer differences
 must accompany results, and a shorter timed rollout alone must not be called faster learning.
 
+The main `native` profile follows the pinned Genesis `RigidOptions` maximum of 25 iterations
+and the pinned Isaac ANYmal/cartpole articulation settings of TGS 4 position / 0 velocity iterations.
+Genesis exits early on convergence; its precision-dependent tolerance is recorded after scene construction.
+These are backend-specific practical profiles, not an equality of solver work or numerical accuracy.
+
 The shared trainer uses clipped [PPO (Schulman et al., 2017)](https://arxiv.org/abs/1707.06347)
 with generalized advantage estimation. It is one fixed recipe for both engines; it is not either project's
 individually tuned training recipe. A target missed within the fixed budget is recorded as censored.

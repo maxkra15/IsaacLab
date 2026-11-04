@@ -163,7 +163,24 @@ def run_suite(args) -> int:
                                 "device": args.device,
                                 "width": args.width,
                                 "height": args.height,
-                                "solver_iterations": args.solver_iterations,
+                                "solver_profile": args.solver_profile,
+                                "solver_iterations": args.solver_iterations
+                                if args.solver_profile == "fixed_cap"
+                                else None,
+                                "solver_settings": {
+                                    "genesis": {
+                                        "max_iterations": 25
+                                        if args.solver_profile == "native"
+                                        else args.solver_iterations,
+                                        "tolerance": None,
+                                    },
+                                    "isaaclab": {
+                                        "position_iterations": 4
+                                        if args.solver_profile == "native"
+                                        else args.solver_iterations,
+                                        "velocity_iterations": 0 if args.solver_profile == "native" else 1,
+                                    },
+                                },
                                 "steps": args.steps,
                                 "warmup_steps": args.warmup_steps,
                                 "iterations": args.iterations,
@@ -327,6 +344,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--dt", type=float, default=0.005)
     result.add_argument("--decimation", type=int, default=4)
     result.add_argument("--solver_iterations", type=int, default=50)
+    result.add_argument("--solver_profile", choices=["native", "fixed_cap"], default="native")
     result.add_argument("--evaluation_interval", type=int, default=20)
     result.add_argument("--evaluation_steps", type=int, default=250)
     result.add_argument("--width", type=int, default=64)
