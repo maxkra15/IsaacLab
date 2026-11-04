@@ -91,6 +91,7 @@ class EventsCfg:
                 )
             ),
             "full_starts": False,
+            "samples_per_path": 16,
         },
     )
 

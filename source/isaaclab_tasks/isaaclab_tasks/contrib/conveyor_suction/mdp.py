@@ -274,8 +274,8 @@ class SizeSortCommand(CommandTerm):
         extras["full_start_sampling_probability"] = self._reset_term.reset_sampler.probabilities[-1]
         samples = self._reset_term._samples
         rates = self._reset_term.reset_sampler.success_monitor.success_rate
-        extras["release_reset_success_rate"] = rates[:3].mean()
-        extras["descent_success_rate"] = rates[9:samples].mean()
+        extras["release_reset_success_rate"] = rates[: math.floor((samples - 1) * 2 / 15) + 1].mean()
+        extras["descent_success_rate"] = rates[math.ceil((samples - 1) * 9 / 15) : samples].mean()
         for phase, name in enumerate(("place", "carry", "approach")):
             extras[f"{name}_sampling_probability"] = self._reset_term.reset_sampler.probabilities[
                 phase * samples : (phase + 1) * samples
@@ -449,8 +449,10 @@ class ResetParcels(ManagerTermBase):
         from .actions import solve_tool_ik
 
         super().__init__(cfg, env)
-        # Sixteen neighboring states per path, at each of the two pickup anchors.
-        self._samples = samples = 16
+        # Neighboring states per reset path, at each of the two pickup anchors.
+        self._samples = samples = cfg.params["samples_per_path"]
+        if samples < 2:
+            raise ValueError("samples_per_path must be at least 2.")
         variants_per_phase = 2 * samples
         phase_count = 4
         lanes = env.layout_mask.nonzero(as_tuple=False)
@@ -486,7 +488,9 @@ class ResetParcels(ManagerTermBase):
         self._goal_origins = env.layout_origins
         cfg = env.cfg.commands.sort
         # Sample both pad axes independently of path progress, without multiplying catalog dimensions.
-        offsets = torch.quasirandom.SobolEngine(2, scramble=True, seed=0).draw(self.row_count).to(self.device)
+        offsets = (
+            torch.quasirandom.SobolEngine(2, scramble=True, seed=env.cfg.seed).draw(self.row_count).to(self.device)
+        )
         for axis, bounds in enumerate((cfg.goal_radial_range, cfg.goal_lateral_range)):
             offsets[:, axis] = bounds[0] + offsets[:, axis] * (bounds[1] - bounds[0])
         self.goal_positions = self._placement_goals(self.parcel_ids, self.destination_ids, offsets, self.layout_ids)
@@ -516,7 +520,7 @@ class ResetParcels(ManagerTermBase):
         path[:, 0], path[:, 1] = radius * angle.cos(), radius * angle.sin()
         path[:, 2] += lift_distance * (distance / lift_distance).clamp(0.0, 1.0)
         path[:, 2] += (endpoint[:, 2] - pick_high[:, 2]) * travel
-        # A few low starts teach release; progress 9 onward retains at least 6 cm of clearance.
+        # Low starts teach release; the upper 40% retains at least 6 cm of clearance.
         descent = torch.lerp(goal, goal_high, fraction.pow(1.5)[:, None])
         self._tool_positions = torch.where((self.phase_ids == 0)[:, None], descent, path)
         self._tool_positions[self.phase_ids == 3] = home
@@ -583,9 +587,10 @@ class ResetParcels(ManagerTermBase):
         env_ids: torch.Tensor | slice,
         sampling: ResetStateSamplerCfg,
         full_starts: bool = False,
+        samples_per_path: int = 16,
     ) -> None:
         """Record pending failures before sampling and restoring selected environments."""
-        del sampling
+        del sampling, samples_per_path
         ids = env.scene._ALL_INDICES[env_ids] if isinstance(env_ids, slice) else env_ids
         if not ids.numel():
             return
