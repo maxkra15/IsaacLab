@@ -8,6 +8,7 @@
 import argparse
 import importlib
 import json
+import os
 import sys
 import time
 import traceback
@@ -40,10 +41,16 @@ def run(config: dict, output: Path) -> dict:
         metrics["startup_s"] = time.perf_counter() - start
         result["backend_metadata"] = adapter.metadata
         result["provenance"]["runtime"] = {
+            "python": sys.version,
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,
             "adapter_path": module.__file__,
             "cuda_device": torch.cuda.get_device_name(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "cuda_device_uuid": str(getattr(torch.cuda.get_device_properties(config["device"]), "uuid", "unknown")),
+            "torch_matmul_precision": torch.get_float32_matmul_precision(),
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
             "source_packages": {
                 name: sys.modules[name].__file__
                 for name in ("isaaclab", "isaaclab_physx", "genesis", "torch")

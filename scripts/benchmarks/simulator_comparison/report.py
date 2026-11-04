@@ -208,6 +208,7 @@ def group_results(runs: list[dict]) -> list[tuple[dict, list[dict]]]:
         contract["_provenance"] = {
             "source_revisions": provenance.get("source_revisions"),
             "gpu": provenance.get("hardware", {}).get("gpu"),
+            "cuda_device_uuid": provenance.get("runtime", {}).get("cuda_device_uuid"),
             "platform": provenance.get("hardware", {}).get("platform"),
             "source_urdf_sha256": assets.get("source_urdf_sha256"),
             "meshes_sha256": assets.get("meshes_sha256"),
