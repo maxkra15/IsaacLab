@@ -464,6 +464,8 @@ class ResetParcels(ManagerTermBase):
         anchor = variants % 2
         fraction = (variants // 2).float() / (samples - 1)
         progress = (variants // 2).float() / samples
+        # Share pickup/placement endpoints and densely practice their neighboring held states.
+        progress = torch.where(self.phase_ids == 1, 0.5 * (1.0 - torch.cos(math.pi * fraction)), progress)
         # Outcomes share path progress, independently of fixture, parcel, and destination.
         self.reset_sampler = ResetStateSampler(cfg.params["sampling"], self.num_envs, 3 * samples + 1, self.device)
         self.row_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
