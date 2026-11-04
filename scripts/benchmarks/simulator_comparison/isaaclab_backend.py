@@ -148,6 +148,7 @@ class Adapter:
                 height=int(config["height"]),
                 data_types=["rgb"],
                 renderer_cfg=IsaacRtxRendererCfg(
+                    enable_scene_partitioning=True,
                     global_settings=IsaacRtxRendererGlobalSettingsCfg(
                         enable_reflections=False,
                         enable_global_illumination=False,
@@ -155,12 +156,12 @@ class Adapter:
                         antialiasing_mode="Off",
                         samples_per_pixel=1,
                         enable_shadows=False,
-                    )
+                    ),
                 ),
             )
         self._runtime = launch_simulation(
             {"sim": sim_cfg, "scene": scene_cfg},
-            {"headless": True, "device": self.device, "enable_cameras": config["vision"] == "rgb"},
+            {"headless": True, "device": self.device, "enable_cameras": config["vision"] == "rgb", "multi_gpu": False},
         )
         self._runtime.__enter__()
         self._sim = sim_utils.SimulationContext(sim_cfg)
@@ -204,6 +205,8 @@ class Adapter:
             "link_masses_kg": link_masses,
             "moving_mass_kg": moving_mass,
             "renderer": "Isaac RTX batched Camera" if self._camera is not None else None,
+            "single_gpu": True,
+            "scene_partitioning": True if self._camera is not None else None,
             "render_quality": "1 spp; no AA, shadows, reflections or GI" if self._camera is not None else None,
             "camera_motion": self._camera_motion if self._camera is not None else None,
             "camera_pose_update": "Public batched set_world_poses_from_view with GPU torch/Warp tensors",
