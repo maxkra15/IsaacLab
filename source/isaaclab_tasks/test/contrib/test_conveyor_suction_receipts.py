@@ -439,3 +439,45 @@ def test_receipts_record_success_and_continue_without_reset(device):
         env.step(actions)
         assert command.failed[1] and env.active_ids[1] == original
         torch.testing.assert_close(command.goal_positions[1], original_goal)
+
+        # The held carry boundary connects to placement without pre-crediting a delivery.
+        rows.fill_(31)
+        env.reset()
+        active_positions = (
+            torch.stack(
+                [
+                    env.parcels[parcel].data.root_link_pose_w.torch[env_id, :2]
+                    for env_id, parcel in enumerate(env.active_ids.tolist())
+                ]
+            )
+            - env.scene.env_origins[:, :2]
+        )
+        assert (active_positions - command.goal_positions[:, :2]).norm(dim=-1).max() < 0.02, (
+            "The nearest carry reset must connect to the placement region."
+        )
+        assert env.gripper.engaged.all(), "The carry boundary must retain real suction seals."
+        assert not command.delivered.any() and not env.episode_success.any()
+
+        # Single-assignment failures track the selected parcel; continuing play tracks the batch.
+        rows.fill_(48)
+        env.reset()
+        actions.zero_()
+        actions[:, 3] = 1.0
+
+        def drop_parcel(env_id, parcel_id):
+            ids = torch.tensor([env_id], device=device)
+            parcel = env.parcels[parcel_id]
+            pose = parcel.data.root_link_pose_w.torch[ids].clone()
+            pose[:, 2] = env.scene.env_origins[env_id, 2] - 0.8
+            parcel.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
+            parcel.write_root_velocity_to_sim_index(root_velocity=torch.zeros((1, 6), device=device), env_ids=ids)
+
+        drop_parcel(0, (env.active_ids[0].item() + 1) % len(env.parcels))
+        drop_parcel(1, env.active_ids[1].item())
+        env.sim.forward()
+        env.scene.update(env.step_dt)
+        env.step(actions)
+        assert command.failed.tolist() == [False, True]
+        command.cfg.continue_after_delivery = True
+        env.step(actions)
+        assert command.failed.all()

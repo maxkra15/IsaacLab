@@ -325,6 +325,9 @@ class SizeSortCommand(CommandTerm):
         fallen = (local[:, :, 2] < -0.65) & ~self.delivered
         correct_bin = over_bin.gather(-1, destinations[..., None]).squeeze(-1)
         fallen &= ~(pending & correct_bin)
+        if not self.cfg.continue_after_delivery:
+            # One assignment must not inherit an unrelated parcel's transport failure.
+            fallen = fallen.gather(1, env.active_ids[:, None])
         finite = torch.isfinite(states).all(dim=(1, 2)) & torch.isfinite(env.scene["robot"].data.joint_pos.torch).all(
             dim=-1
         )

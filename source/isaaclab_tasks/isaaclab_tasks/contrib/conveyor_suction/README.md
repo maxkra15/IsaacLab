@@ -32,7 +32,9 @@ the seal implementation into Isaac Lab. Stock Newton releases do not provide thi
 The default configuration uses 512 environments, 6,000 PPO updates, and 30-second training episodes.
 PPO collects 128 steps per environment per update with discount 0.999 and GAE lambda 0.99.
 Training practices one assignment per episode: its first verified receipt ends the episode successfully,
-and missing the assigned pickup fails the attempt. Playback uses the first randomized five-lane fixture and
+and missing or losing the assigned parcel fails the attempt. An unrelated parcel falling does not
+relabel that assignment as a failure. Continuing playback still fails when any unsorted parcel is lost.
+Playback uses the first randomized five-lane fixture and
 240-second episodes, continuing to another parcel after each controlled placement. Each verified
 delivery counts as a success. Evaluate checkpoints from full starts; curriculum success rates alone
 do not establish end-to-end performance. Conveyors reach operating speed within one physics step
@@ -105,7 +107,10 @@ The default cached geometry contains 270,336 physical states, while the outcome 
 receive repeated attempts. Layout and package variations share progress history instead of fragmenting it.
 The Beta sampler favors intermediate success and retains a uniform strategy with weight 0.005.
 
-Connected paths cover contact, lift, transport around the pedestal, and controlled descent.
+Held transport includes both pickup and placement endpoints, with cosine spacing that concentrates
+starts near those transitions. This lets a mastered placement receive nearby horizontal starts
+before sampling longer transport paths. Resets restore zero robot and held-parcel velocities;
+they do not certify stability during transport, which must be checked in physical rollouts.
 Earlier approach states rewind the moving parcel around the incoming turn. Held starts restore native
 suction seals against the reset geometry before the first observation. Other parcels are shuffled among
 the remaining belt and feeder slots, preserving each slot's support height. The loop's pickup turn
@@ -145,6 +150,13 @@ every progress bucket remains eligible. Sampling history is local to each worker
 when the environment is recreated. Training success from an easier reset is not an
 end-to-end pickup result. Evaluate separately from full belt starts and report correct-bin
 deliveries by size class, wrong-bin deliveries, drops, and complete twelve-parcel batches.
+
+The sampler follows the success-frontier principle in
+[Success Guided Sampling](https://arxiv.org/abs/2610.12465) and
+[AlphaNIST](https://arxiv.org/abs/2610.13354). This example pools progress outcomes across layouts and
+parcels instead of tracking each fixed configuration independently; intermediate pooled success
+can include both solved and unsolved configurations. Its Beta and uniform-strategy settings also
+differ from the papers. Increasing parallelism cannot repair missing reset coverage.
 
 Playback samples full belt starts uniformly. `full_start_success_rate` measures receipt of the
 original assigned parcel from a full home start; `full_batch_success_rate` separately measures all
