@@ -87,6 +87,8 @@ _build
 
 # No benchmarks output
 /benchmarks/
+/.benchmark_sources/
+/.benchmark_results/
 benchmark_*.json
 /pyrightconfig.json
 
