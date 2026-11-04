@@ -24,6 +24,20 @@ ROOT = HERE.parents[2]
 
 def active_compute(excluded_group: int | None = None) -> list[dict]:
     """Sample active CUDA processes, excluding this benchmark's process group."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    devices = [value.strip() for value in visible.split(",") if value.strip()]
+    selected = None
+    if devices and all(value.isdigit() for value in devices):
+        selected = {int(value) for value in devices}
+    elif devices:
+        rows = command_output(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"])
+        matches = {
+            int(row.split(",")[0])
+            for row in rows.splitlines()
+            if any(row.split(",")[-1].strip().startswith(value) for value in devices)
+        }
+        if matches:
+            selected = matches
     output = command_output(["nvidia-smi", "pmon", "-c", "1", "-s", "u"])
     groups = command_output(["ps", "-eo", "pid=,pgid="])
     own_pids = {
@@ -31,10 +45,14 @@ def active_compute(excluded_group: int | None = None) -> list[dict]:
         for row in groups.splitlines()
         if len(row.split()) == 2 and int(row.split()[1]) == excluded_group
     }
+    if excluded_group is not None:
+        own_pids.add(excluded_group)
     active = []
     for row in output.splitlines():
         fields = row.split()
         if len(fields) < 5 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        if selected is not None and int(fields[0]) not in selected:
             continue
         if "C" in fields[2] and fields[3].isdigit() and int(fields[3]) > 5 and int(fields[1]) not in own_pids:
             active.append({"gpu": int(fields[0]), "pid": int(fields[1]), "sm_percent": int(fields[3])})
