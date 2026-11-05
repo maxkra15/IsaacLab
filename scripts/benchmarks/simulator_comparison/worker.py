@@ -51,9 +51,25 @@ def run(config: dict, output: Path) -> dict:
             "torch_matmul_precision": torch.get_float32_matmul_precision(),
             "cudnn_benchmark": torch.backends.cudnn.benchmark,
             "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "kit_modules_loaded": sorted(
+                name
+                for name in sys.modules
+                if name == "omni.kit.app"
+                or name.startswith("omni.kit.app.")
+                or name == "isaacsim.simulation_app"
+                or name.startswith("isaacsim.simulation_app.")
+            ),
             "source_packages": {
                 name: sys.modules[name].__file__
-                for name in ("isaaclab", "isaaclab_physx", "genesis", "torch")
+                for name in (
+                    "isaaclab",
+                    "isaaclab_newton",
+                    "isaaclab_physx",
+                    "newton",
+                    "mujoco_warp",
+                    "genesis",
+                    "torch",
+                )
                 if name in sys.modules
             },
         }
@@ -139,6 +155,13 @@ def run(config: dict, output: Path) -> dict:
         state = adapter.state()
         if not all(bool(torch.isfinite(value).all()) for value in state.values()):
             raise FloatingPointError("Final dynamics state is non-finite")
+        diagnostics = getattr(adapter, "diagnostics", None)
+        if diagnostics is not None:
+            result["backend_diagnostics"] = diagnostics()
+            if result["backend_diagnostics"].get("graph_active") is False:
+                raise RuntimeError("The requested physics CUDA graph is inactive")
+            if any(result["backend_diagnostics"].get("fatal_capacity_flags_at_end", [])):
+                raise RuntimeError("The solver reported a contact, constraint, or collision capacity overflow")
         metrics["final_root_height_m"] = state["root_pos"][:, 2].mean().item()
         metrics["max_root_displacement_m"] = task.max_root_displacement.item()
         if config["vision"] == "rgb":

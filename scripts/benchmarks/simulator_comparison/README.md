@@ -1,124 +1,142 @@
-# Genesis / Isaac Lab comparison
+# Genesis / Isaac Lab MJWarp comparison
 
-Genesis versus Isaac Lab's PhysX backend with Isaac Sim, using two shared tasks:
-cartpole balance and ANYmal-C forward walking on a flat floor.
-Each runs with proprioception, or proprioception plus 64×64 RGB. Cameras feed the
-same CNN policy; this does not establish that vision is necessary to solve either task.
+Genesis versus **Isaac Lab with Newton/MuJoCo Warp**, using shared cartpole balance
+and ANYmal-C forward walking tasks. The primary `isaaclab` adapter runs without Kit.
+Each task uses proprioception, or proprioception plus 64×64 RGB in the same CNN
+policy. This measures vision processing cost; neither task establishes vision-only navigation.
 
 | Measurement | Included work |
 | --- | --- |
-| Startup | Runtime imports, simulator launch, asset import, scene construction, first reset/observation |
-| First step | First control step, reported separately from warmed throughput |
+| Startup | Runtime imports, asset import, scene construction, first reset/observation |
+| First step | First control step, separately from warmed throughput |
 | Physics | One 5 ms physics step; fixed targets, resets outside timed windows, rendering disabled |
 | Rollout | Four physics steps, actions, observations, reward, termination/reset, optional RGB |
-| Learning | Shared PPO, fixed transition budget, held-out evaluation, wall time and time to threshold |
+| Learning | Shared PPO, fixed transitions, held-out evaluation, training time and first observed target |
 
-These are matched task inputs, not identical numerical solvers or image quality.
-PhysX uses TGS/implicit drives; Genesis uses its Newton solver/implicitfast integrator.
-The default `native` solver profile uses Genesis's 25-iteration maximum with native
-convergence tolerance and the maintained Isaac robot settings of 4 position / 0
-velocity iterations. This matches practical settings, not numerical work or accuracy.
-Use `--solver_profile fixed_cap --solver_iterations 50` for the separate diagnostic
-profile; it is not the native task profile.
-The native RGB renderers differ. Inspect camera samples and backend metadata before interpreting a ratio.
-Cartpole uses USD clones in Isaac because native replication misplaced its fixed-base
-anchors; the independent dynamics check covers every copy. ANYmal uses native replication.
-RGB environments are spaced 100 m apart. The walking camera follows root translation;
-cartpole uses a wider fixed view. Recorded displacement bounds check that other robot
-copies stay outside the cameras' far planes. Native camera update costs remain timed.
-Throughput is **batched environment steps/s**, not one robot's refresh rate.
+## Shared benchmark baseline
 
-## Source and environment
+The default `shared` solver profile uses the following explicit settings:
 
-The initial source pins were current upstream heads on 2026-11-04:
+| Setting | Genesis | Isaac Lab MJWarp |
+| --- | --- | --- |
+| Solver / integrator | Newton / approximate implicitfast | Newton / implicitfast |
+| Iteration limits | 25; native convergence tolerance | 100 solver, 50 line search; tolerance 1e-6 |
+| Contacts / friction | Genesis contacts; coefficient 0.8 | MuJoCo contacts; pyramidal cone; impratio 1; coefficient 0.8 |
+| Substeps / execution | 1 / native GPU execution | 1 / CUDA graphs |
+| Capacity | Native allocation | njmax 300; nconmax native allocation |
+| RGB renderer | Madrona rasterizer | Newton Warp ray tracer; textures/ambient light enabled; shadows disabled |
+
+Iteration counts and rendered image quality are engine specific. This baseline does
+not establish equal numerical accuracy. Stock ANYmal MJWarp training presets use
+two substeps, Newton contacts and elliptic friction; they are a different configuration.
+`--solver_profile fixed_cap --solver_iterations 50` selects a separate diagnostic profile.
+
+Both engines receive the same URDF, masses, controller, reward, observation and reset
+code. Passive joint damping/friction and added armature are zero; self-collision is
+disabled. ANYmal uses PD gains 80/2 and an 80 N·m effort limit. Missing joint bounds in
+the bundled ANYmal model are explicitly represented as continuous joints in both inputs.
+
+RGB environments are separated by 100 m. ANYmal cameras follow root translation;
+cartpole uses a wider fixed view. Native camera-update costs remain timed, including
+Genesis's host-side follow update. Displacement bounds check camera isolation.
+MJWarp graph activity and overflow flags are recorded at the final solver state;
+these flags do not establish that no transient overflow occurred earlier.
+Throughput means **batched environment steps/s**, not one robot's refresh rate.
+
+## Source and environments
+
+Sources were selected from upstream heads on 2026-11-04; Newton follows Isaac Lab's pin:
 
 | Source | Revision |
 | --- | --- |
 | Isaac Lab | `efa240ec39794f5d80430cbe38620626954c2c4d` |
 | Genesis | `969c3bd1449d0f0c79effd7b6a72614ed46ba6e7` |
+| Newton | `42f7def118c2c4299ce493457bafd4e8a22a696e` |
 
-Place this archived harness in the pinned Isaac Lab checkout. Follow its maintained
-[installation guide](../../../docs/source/isaaclab/installation.rst) for an isolated uv environment
-with Isaac Sim/PhysX and RTX rendering. The latest checkout uses `uv run`; older checkouts
-can use `./isaaclab.sh -p` when that wrapper exists. Do not install Genesis into the Isaac environment.
+Place the harness in the pinned Isaac Lab checkout. Its
+[installation guide](../../../docs/source/isaaclab/installation.rst) documents the
+kitless environment. The `importers` extra selects the isolated asset importer
+6.2.0.1; the simulator and Newton Warp renderer do not launch Kit.
 
 ```bash
 mkdir -p .benchmark_sources
+git clone https://github.com/newton-physics/newton.git .benchmark_sources/newton
+git -C .benchmark_sources/newton checkout 42f7def118c2c4299ce493457bafd4e8a22a696e
+UV_PROJECT_ENVIRONMENT="$PWD/.benchmark_sources/mjwarp_env" uv sync --extra importers
+
 git clone https://github.com/Genesis-Embodied-AI/Genesis.git .benchmark_sources/genesis
 git -C .benchmark_sources/genesis checkout 969c3bd1449d0f0c79effd7b6a72614ed46ba6e7
 uv venv --python 3.12 .benchmark_sources/genesis_env
-```
-
-Install a compatible CUDA PyTorch build into that environment using the pinned
-[Genesis instructions](https://github.com/Genesis-Embodied-AI/Genesis/blob/969c3bd1449d0f0c79effd7b6a72614ed46ba6e7/README.md),
-then `uv pip install --python .benchmark_sources/genesis_env/bin/python -e .benchmark_sources/genesis`.
-Use the same Torch version/build in both environments. Retained package freezes describe the actual run.
-Local `.pth` files that borrow an existing installation are a convenience, not the portable setup contract.
-
-```bash
-export ISAACLAB_PYTHON=/absolute/path/to/isaaclab/.venv/bin/python
+export ISAACLAB_PYTHON="$PWD/.benchmark_sources/mjwarp_env/bin/python"
 export GENESIS_PYTHON="$PWD/.benchmark_sources/genesis_env/bin/python"
+uv pip install --python "$GENESIS_PYTHON" torch==2.11.0 torchvision==0.26.0 \
+  --index-url https://download.pytorch.org/whl/cu130
+uv pip install --python "$GENESIS_PYTHON" -e .benchmark_sources/genesis
 export PYGLET_HEADLESS=1 PYOPENGL_PLATFORM=egl ISAACSIM_ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES
 ```
 
-`prepare.py` generates identical URDF inputs and records original model/mesh hashes.
-The bundled ANYmal model lacks bounds on twelve revolute joints: both inputs make
-those joints explicitly continuous. Passive joint damping/friction and added armature
-are zero; self-collision is disabled. ANYmal PD gains are 80/2 with an 80 N·m effort cap.
+Use the same Torch/CUDA build and training flags in both environments. Engine-specific
+packages differ; retained package freezes record actual versions. Local `.pth` files
+that borrow an existing environment are not the portable setup contract.
 
 ## Run and validate
 
-From the Isaac Lab root, first run a small matrix, then validate each backend/task
-configuration with `validate_adapter.py`. Use at least two environments for camera
-isolation and subset-reset checks; four is sufficient. Validation runs are separate
-from throughput measurements and must pass before publishing comparisons.
+Run a small matrix first. Repeat the independent validator for both backends, both
+tasks and both vision modes, with at least two environments (four is sufficient):
 
 ```bash
 uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simulator_comparison/suite.py \
-  --genesis_path .benchmark_sources/genesis --genesis_python "$GENESIS_PYTHON" \
-  --isaaclab_python "$ISAACLAB_PYTHON" --output_dir benchmarks/simulator_smoke \
+  --genesis_path .benchmark_sources/genesis --newton_path .benchmark_sources/newton \
+  --genesis_python "$GENESIS_PYTHON" --isaaclab_python "$ISAACLAB_PYTHON" \
+  --output_dir benchmarks/simulator_smoke --solver_profile shared \
   --modes physics rollout --num_envs 4 --vision_num_envs 4 --seeds 0 --steps 32 --warmup_steps 8
 
 uv run --no-project --python "$GENESIS_PYTHON" python scripts/benchmarks/simulator_comparison/validate_adapter.py \
   --config benchmarks/simulator_smoke/GENESIS_CASE/config.json --output benchmarks/validation/genesis.json
 ```
 
-Replace `GENESIS_CASE` with the generated case directory; repeat with the Isaac interpreter
-and an Isaac case. The validator checks cartpole against independent Lagrange/RK4 dynamics,
-force direction, imported moving mass, canonical resets, ANYmal short stability, and actual batched RGB.
-JSON records numerical errors and screenshots. A failed check exits nonzero.
+Replace `GENESIS_CASE` with the generated directory; use the Isaac interpreter for
+Isaac cases. The validator checks independent cartpole Lagrange/RK4 dynamics, force
+direction, imported masses, canonical/subset resets, ANYmal short stability and
+batched RGB isolation. Preserve its JSON and screenshots; failed checks exit nonzero.
+
+The publication matrix contains 84 runs across three seeds:
 
 ```bash
 uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simulator_comparison/suite.py \
-  --genesis_path .benchmark_sources/genesis --genesis_python "$GENESIS_PYTHON" \
-  --isaaclab_python "$ISAACLAB_PYTHON" --output_dir benchmarks/simulator_full \
-  --seeds 0 1 2 --steps 1000 --iterations 1000
+  --genesis_path .benchmark_sources/genesis --newton_path .benchmark_sources/newton \
+  --genesis_python "$GENESIS_PYTHON" --isaaclab_python "$ISAACLAB_PYTHON" \
+  --output_dir benchmarks/simulator_full --solver_profile shared \
+  --num_envs 256 4096 --vision_num_envs 64 --learning_num_envs 512 --vision_learning_num_envs 512 \
+  --seeds 0 1 2 --steps 500 --iterations 500 --rollout_steps 24 --evaluation_interval 50 --evaluation_steps 250
 
 uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simulator_comparison/report.py \
   --input_dir benchmarks/simulator_full --output_dir benchmarks/simulator_report
-
 uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simulator_comparison/export_figures.py \
   --input_dir benchmarks/simulator_full --output_dir benchmarks/simulator_report/figures
 ```
 
-Use an idle GPU for publishable timings. Keep hardware, batch sizes, image settings,
-seeds and budgets matched; report failures/OOMs rather than silently reducing one engine's batch.
-Jobs run serially in shuffled order and resume completed cases; `--rerun` repeats them.
-Each worker starts a new process; disk, JIT and shader caches are reused. This is not a
-cold-machine startup measurement. Retain config, logs, package freezes, source/harness hashes,
-asset manifest, validation output and checkpoints. Learning budgets that miss the threshold
-remain censored; throughput alone does not establish learned task quality.
+Use an idle GPU. Jobs run serially in shuffled order and resume completed cases;
+`--rerun` repeats them. Workers start fresh processes while disk/JIT caches are reused.
+Retain configs, logs, freezes, source/harness hashes, asset manifests and checkpoints.
+The first observed target uses the training clock, including evaluation and excluding
+startup; checks every 50 iterations limit its time resolution. Missed targets remain
+censored. Final task quality accompanies speed.
 
-Publish the generated report directory under
-`site/reports/YYYY-MM-DD-genesis-isaaclab/` in `maxkra15/maxkra15.github.io` using its existing
-Pages workflow, with raw evidence alongside it. [REFERENCES.md](REFERENCES.md) audits the quoted benchmark claim.
+Publish the complete generated directory under `site/reports/YYYY-MM-DD-genesis-isaaclab/`
+in `maxkra15/maxkra15.github.io`. [REFERENCES.md](REFERENCES.md) explains why this MJWarp
+comparison is a different backend/version comparison from the older RTX 5070 headline.
+
+PhysX is an optional separate reference: explicitly select `--backends genesis isaaclab_physx`
+and `--isaaclab_physx_python /path/to/physx/bin/python`. Its default interpreter path is
+`.benchmark_sources/isaaclab_env/bin/python`; those results are excluded from the main MJWarp report.
 
 ## Another engine
 
 Add an adapter module and interpreter selection to `suite.py`; shared task/PPO code stays unchanged.
-Select another interpreter with `--backends mjlab --backend_python mjlab=/path/to/python` once its adapter exists.
+Use `--backends mjlab --backend_python mjlab=/path/to/python` once its adapter exists.
 An adapter owns `joint_names`, `metadata`, `reset(env_ids=None, joint_pos=None)`, `state()`,
 `apply_action()`, `physics_step()`, `physics_only_step()`, `refresh_state()`, `render()`,
 `synchronize()` and `close()`. `state()` returns ordered CUDA joint/root tensors in SI units,
 world-frame root velocities and **wxyz** quaternions. `render()` returns CUDA uint8 `[N,H,W,3]`.
-Run the physical validator before adding mjlab results. Report unsupported capabilities explicitly.
+Run the physical validator before including another engine, and report unsupported capabilities explicitly.

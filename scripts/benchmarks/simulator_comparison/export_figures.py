@@ -18,9 +18,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
-from report import group_results
+from report import BACKEND_LABELS, group_results
 
-COLORS = {"genesis": "#245cab", "isaaclab": "#b04b17", "mjlab": "#347a4a"}
+COLORS = {"genesis": "#245cab", "isaaclab": "#b04b17", "mjlab": "#347a4a", "isaaclab_physx": "#8050a4"}
 STYLES = ("-", "--", "-.", ":")
 
 
@@ -59,7 +59,9 @@ def _runtime(records: list[dict], output: Path) -> None:
                     series[(record["backend"], _identity(condition))].append(record)
             counts = Counter(backend for backend, _ in series)
             for index, ((backend, condition), points) in enumerate(sorted(series.items())):
-                label = backend + (f" · condition {condition}" if counts[backend] > 1 else "")
+                label = BACKEND_LABELS.get(backend, backend) + (
+                    f" · condition {condition}" if counts[backend] > 1 else ""
+                )
                 points.sort(key=lambda point: point["config"]["num_envs"])
                 for column, metric in enumerate((throughput, "startup_s")):
                     values = [point for point in points if metric in point["summary"]]
@@ -92,9 +94,12 @@ def _runtime(records: list[dict], output: Path) -> None:
                 else:
                     ax.text(0.5, 0.5, "No successful measurements", ha="center", transform=ax.transAxes)
         image_label = f"RGB {width}×{height}" if vision == "rgb" else "no vision"
-        fig.suptitle(
-            f"{mode.capitalize()} · {image_label}\nMedians and observed min–max; each line holds other conditions fixed"
+        baseline = (
+            "Shared benchmark baseline; "
+            if all(record["config"].get("solver_profile") == "shared" for record in matched)
+            else ""
         )
+        fig.suptitle(f"{mode.capitalize()} · {image_label}\n{baseline}medians and observed min–max")
         _save(fig, output, f"runtime-{mode}-{vision}-{width}x{height}")
 
 
@@ -110,7 +115,7 @@ def _learning(records: list[dict], output: Path) -> None:
         error_label = "Speed tracking error [m/s]" if config["task"] == "anymal" else "Pole angle error [rad]"
         for record in matched:
             for index, trace in enumerate(record["learning"]):
-                label = f"{record['backend']} · seed {trace['seed']}"
+                label = f"{BACKEND_LABELS.get(record['backend'], record['backend'])} · seed {trace['seed']}"
                 for row, (metric, ylabel) in enumerate(
                     (("survival_fraction", "Held-out survival [fraction]"), (error, error_label))
                 ):
@@ -140,7 +145,9 @@ def _learning(records: list[dict], output: Path) -> None:
                     ax.legend(handles, labels, fontsize=7)
         fig.suptitle(
             f"{config['task'].upper()} · {config['vision']} · {config['num_envs']} environments · "
-            f"{config.get('iterations', '?')} training iterations\nHeld-out evaluation; one curve per seed"
+            f"{config.get('iterations', '?')} training iterations\n"
+            f"{config.get('solver_profile', 'Unrecorded profile')} benchmark baseline; "
+            "held-out evaluation; one curve per seed"
         )
         _save(fig, output, f"learning-{config['task']}-{config['vision']}-{config['num_envs']}-{identity}")
 

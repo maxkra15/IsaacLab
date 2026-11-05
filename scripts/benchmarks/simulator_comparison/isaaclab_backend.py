@@ -3,15 +3,16 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Isaac Lab / Isaac Sim PhysX adapter for the simulator comparison.
+"""Isaac Lab Newton/MuJoCo Warp adapter for the simulator comparison.
 
 This module is imported only inside a benchmark subprocess, so runtime imports
-and Kit startup are included in the subprocess's startup measurement.
+and kitless scene construction are included in the startup measurement.
 """
 
 from __future__ import annotations
 
 import math
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -19,14 +20,16 @@ import torch
 
 
 class Adapter:
-    """Own a headless PhysX scene with a shared URDF and optional batched RGB cameras."""
+    """Own a kitless MJWarp scene with a shared URDF and optional GPU RGB cameras."""
 
     def __init__(self, config: dict[str, Any]):
         """Build the scene using the resolved benchmark configuration."""
-        from isaaclab_physx.physics import PhysxCfg
-        from isaaclab_physx.renderers import IsaacRtxRendererCfg, IsaacRtxRendererGlobalSettingsCfg
-        from isaaclab_physx.sim.schemas import PhysxArticulationCfg, PhysxRigidBodyCfg
-        from isaaclab_physx.sim.spawners.materials import PhysxRigidBodyMaterialCfg
+        # Register importer schemas before USD caches definitions for the first scene.
+        import_module("isaacsim.asset.importer.urdf")
+
+        from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+        from isaaclab_newton.renderers import NewtonWarpRendererCfg
+        from isaaclab_newton.sim.schemas import NewtonArticulationCfg
 
         import isaaclab.sim as sim_utils
         from isaaclab.actuators import ImplicitActuatorCfg
@@ -47,30 +50,38 @@ class Adapter:
         if self._camera_motion not in ("fixed", "root_translation"):
             raise ValueError(f"Unsupported camera motion: {self._camera_motion}")
         settings = config.get("solver_settings", {}).get("isaaclab", {})
-        iterations = int(settings.get("position_iterations", config.get("solver_iterations", 50)))
-        velocity_iterations = int(settings.get("velocity_iterations", 1))
-        material = PhysxRigidBodyMaterialCfg(
+        solver_cfg = MJWarpSolverCfg(
+            solver="newton",
+            integrator=str(settings.get("integrator", "implicitfast")),
+            iterations=int(settings.get("iterations", 100)),
+            ls_iterations=int(settings.get("ls_iterations", 50)),
+            tolerance=float(settings.get("tolerance", 1e-6)),
+            cone=str(settings.get("cone", "pyramidal")),
+            impratio=float(settings.get("impratio", 1.0)),
+            use_mujoco_contacts=bool(settings.get("use_mujoco_contacts", True)),
+            njmax=int(settings.get("njmax", 300)),
+            nconmax=settings.get("nconmax"),
+            use_mujoco_cpu=False,
+        )
+        material = sim_utils.RigidBodyMaterialBaseCfg(
             static_friction=0.8,
             dynamic_friction=0.8,
             restitution=0.0,
-            friction_combine_mode="max",
-            restitution_combine_mode="max",
         )
         sim_cfg = sim_utils.SimulationCfg(
             device=self.device,
             dt=self.dt,
             gravity=(0.0, 0.0, -9.81),
-            physics=PhysxCfg(
-                solver_type=1,
-                min_position_iteration_count=iterations,
-                max_position_iteration_count=iterations,
-                min_velocity_iteration_count=velocity_iterations,
-                max_velocity_iteration_count=velocity_iterations,
+            physics=NewtonCfg(
+                solver_cfg=solver_cfg,
+                num_substeps=1,
+                debug_mode=False,
+                use_cuda_graph=True,
             ),
             physics_material=material,
             visualizer_cfgs=[],
             use_fabric=True,
-            use_newton_actuators=False,
+            use_newton_actuators=True,
         )
         scene_cfg = InteractiveSceneCfg(
             num_envs=self.num_envs,
@@ -81,18 +92,11 @@ class Adapter:
             prim_path="/World/Ground",
             spawn=sim_utils.GroundPlaneCfg(physics_material=material),
         )
-        scene_cfg.light = AssetBaseCfg(
-            prim_path="/World/Light",
-            spawn=sim_utils.DomeLightCfg(intensity=1000.0),
-        )
         initial_positions = dict(zip(self.joint_names, config["initial_joint_pos"], strict=True))
         asset_path = Path(config["asset_path"]).resolve()
-        usd_dir = Path(config.get("asset_cache_dir", asset_path.parent / "isaaclab_usd"))
+        usd_dir = Path(config.get("asset_cache_dir", asset_path.parent / "isaaclab_mjwarp_usd"))
         scene_cfg.robot = ArticulationCfg(
             prim_path="{ENV_REGEX_NS}/Robot",
-            # PhysX's native replicator does not translate a world-fixed joint's
-            # anchor. Parsing the USD clones preserves each fixed base's frame.
-            cloning_contexts=() if self._cartpole else None,
             joint_ordering=self.joint_names,
             spawn=sim_utils.UrdfFileCfg(
                 asset_path=str(asset_path),
@@ -101,20 +105,12 @@ class Adapter:
                 merge_fixed_joints=True,
                 self_collision=False,
                 collision_type="Convex Hull",
+                run_asset_transformer=True,
+                run_multi_physics_conversion=True,
                 joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(target_type="none"),
-                rigid_props=[
-                    sim_utils.UsdPhysicsRigidBodyCfg(rigid_body_enabled=True),
-                    PhysxRigidBodyCfg(enable_gyroscopic_forces=True, max_depenetration_velocity=10.0),
-                ],
-                articulation_props=[
-                    PhysxArticulationCfg(
-                        enabled_self_collisions=False,
-                        solver_position_iteration_count=iterations,
-                        solver_velocity_iteration_count=velocity_iterations,
-                        sleep_threshold=0.0,
-                        stabilization_threshold=0.0,
-                    )
-                ],
+                rigid_props=[sim_utils.UsdPhysicsRigidBodyCfg(rigid_body_enabled=True)],
+                articulation_props=[NewtonArticulationCfg(self_collision_enabled=False)],
+                physics_material=material,
             ),
             init_state=ArticulationCfg.InitialStateCfg(
                 pos=(0.0, 0.0, float(config["initial_height"])),
@@ -135,7 +131,7 @@ class Adapter:
         )
         if config["vision"] == "rgb":
             # Match camera geometry and output dimensions. Renderer quality is
-            # recorded separately because RTX and Madrona have different lighting.
+            # recorded separately because Newton Warp and Madrona have different lighting.
             vertical_fov = float(config.get("camera_fov", 60.0))
             aperture = 2.0 * 24.0 * math.tan(math.radians(vertical_fov) / 2.0)
             scene_cfg.camera = CameraCfg(
@@ -149,21 +145,17 @@ class Adapter:
                 width=int(config["width"]),
                 height=int(config["height"]),
                 data_types=["rgb"],
-                renderer_cfg=IsaacRtxRendererCfg(
-                    enable_scene_partitioning=True,
-                    global_settings=IsaacRtxRendererGlobalSettingsCfg(
-                        enable_reflections=False,
-                        enable_global_illumination=False,
-                        enable_translucency=False,
-                        antialiasing_mode="Off",
-                        samples_per_pixel=1,
-                        enable_shadows=False,
-                    ),
+                renderer_cfg=NewtonWarpRendererCfg(
+                    use_cuda_graph=True,
+                    enable_textures=True,
+                    enable_shadows=False,
+                    enable_ambient_lighting=True,
+                    create_default_light=True,
                 ),
             )
         self._runtime = launch_simulation(
             {"sim": sim_cfg, "scene": scene_cfg},
-            {"headless": True, "device": self.device, "enable_cameras": config["vision"] == "rgb", "multi_gpu": False},
+            {"headless": True, "device": self.device},
         )
         self._runtime.__enter__()
         self._sim = sim_utils.SimulationContext(sim_cfg)
@@ -191,34 +183,63 @@ class Adapter:
         moving_mass = sum(
             mass for name, mass in zip(link_names, link_masses, strict=True) if not self._cartpole or name != "base"
         )
+        backend = self._sim.backend_manager.backend
+        solver = backend.solver
+        options = solver.mj_model.opt
         self.metadata = {
-            "physics_backend": "Isaac Sim PhysX GPU",
-            "solver": "TGS",
-            "position_iterations": iterations,
-            "velocity_iterations": velocity_iterations,
-            "solver_profile": config.get("solver_profile", "fixed_cap"),
+            "physics_backend": "Isaac Lab Newton / MuJoCo Warp",
+            "solver": solver_cfg.solver,
+            "iterations": solver_cfg.iterations,
+            "ls_iterations": solver_cfg.ls_iterations,
+            "tolerance": solver_cfg.tolerance,
+            "integrator": solver_cfg.integrator,
+            "cone": solver_cfg.cone,
+            "impratio": solver_cfg.impratio,
+            "use_mujoco_contacts": solver_cfg.use_mujoco_contacts,
+            "njmax": solver_cfg.njmax,
+            "nconmax": solver_cfg.nconmax,
+            "actual_solver": {
+                "class": f"{type(solver).__module__}.{type(solver).__qualname__}",
+                "iterations": int(options.iterations),
+                "ls_iterations": int(options.ls_iterations),
+                "tolerance": float(options.tolerance),
+                "solver_enum": int(options.solver),
+                "integrator_enum": int(options.integrator),
+                "cone_enum": int(options.cone),
+                "impratio": float(options.impratio),
+                "njmax": int(solver.mjw_data.njmax),
+                "contact_buffer_capacity_all_worlds": int(solver.get_max_contact_count()),
+            },
+            "solver_profile": config.get("solver_profile", "shared"),
             "substeps": 1,
+            "cuda_graph": True,
+            "cuda_graph_available": backend.capture is not None,
+            "cuda_graph_capture": "After the first eager physics step; commands update graph-bound arrays in place",
+            "kit_runtime": False,
             "self_collision": False,
             "friction": 0.8,
-            "friction_combine": "max",
+            "friction_combine": "MuJoCo material mixing; equal 0.8 coefficients on floor and robot",
             "restitution": 0.0,
             "joint_order": self.joint_names,
-            "physics_replication": "USD clones" if self._cartpole else "native PhysX replication",
+            "physics_replication": "Newton native world replication",
             "link_names": link_names,
             "link_masses_kg": link_masses,
             "moving_mass_kg": moving_mass,
-            "renderer": "Isaac RTX batched Camera" if self._camera is not None else None,
+            "renderer": "Newton Warp batched Camera" if self._camera is not None else None,
             "single_gpu": True,
-            "scene_partitioning": True if self._camera is not None else None,
-            "render_quality": "1 spp; no AA, shadows, reflections or GI" if self._camera is not None else None,
+            "render_quality": "Native textured ray tracing; ambient/default light; no shadows"
+            if self._camera is not None
+            else None,
+            "camera_cuda_graph": True if self._camera is not None else None,
             "camera_motion": self._camera_motion if self._camera is not None else None,
             "camera_pose_update": "Public batched set_world_poses_from_view with GPU torch/Warp tensors",
             "camera_pose_adapter_host_transfers": "No explicit GPU-to-CPU pose downloads",
             "camera_clipping_m": [0.01, 20.0] if self._camera is not None else None,
+            "camera_near_clip_enforced": False if self._camera is not None else None,
             "env_spacing_m": float(config.get("env_spacing", 5.0)),
             "pd": None if self._cartpole else {"kp": 80.0, "kd": 2.0, "effort_limit_nm": 80.0},
-            "pd_integration": "PhysX implicit drives",
-            "model_conversion": "Common URDF; fixed links merged; mesh collisions cooked as convex hulls",
+            "pd_integration": "MuJoCo implicitfast native joint drives",
+            "model_conversion": "Common URDF; fixed links merged; convex hull collisions; multi-physics USD conversion",
             "cache_dir": str(usd_dir),
             "physics_only_scope": "SimulationContext.step(render=False); no command flush or asset update",
         }
@@ -300,6 +321,37 @@ class Adapter:
         """Wait for all CUDA work on the configured device."""
         torch.cuda.synchronize(self.device)
 
+    def diagnostics(self) -> dict[str, Any]:
+        """Read final solver diagnostics outside benchmark timing windows.
+
+        Overflow flags describe the last solver state, rather than cumulative
+        overflow history. Downloading them may synchronize CUDA.
+        """
+        from mujoco_warp import OverflowType
+
+        backend = self._sim.backend_manager.backend
+        solver = backend.solver
+        flags = solver.mjw_data.overflow.numpy().tolist()
+        convergence_mask = int(OverflowType.ITERATIONS | OverflowType.LS_ITERATIONS)
+        capacity_mask = int(OverflowType.ALL) & ~convergence_mask
+        unknown_flags = [flag & ~int(OverflowType.ALL) for flag in flags]
+        return {
+            "graph_active": backend.graph is not None,
+            "overflow_flags_at_end": flags,
+            "fatal_capacity_flags_at_end": [
+                (flag & capacity_mask) | unknown for flag, unknown in zip(flags, unknown_flags, strict=True)
+            ],
+            "convergence_limit_flags_at_end": [flag & convergence_mask for flag in flags],
+            "unknown_overflow_flags_at_end": unknown_flags,
+            "overflow_flags_decoded_at_end": [
+                [entry.name for entry in OverflowType if flag & int(entry)] for flag in flags
+            ],
+            "overflow_flag_values": {flag.name: int(flag) for flag in OverflowType},
+            "overflow_scope": "Last solver state only; not a cumulative history",
+            "constraint_capacity_per_world": int(solver.mjw_data.njmax),
+            "contact_capacity_all_worlds": int(solver.get_max_contact_count()),
+        }
+
     def close(self) -> None:
-        """Release the scene, PhysX context, renderer, and Kit runtime."""
+        """Release the scene, Newton context, and renderer."""
         self._runtime.__exit__(None, None, None)

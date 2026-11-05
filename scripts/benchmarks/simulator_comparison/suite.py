@@ -97,6 +97,8 @@ def run_suite(args) -> int:
         "isaaclab": command_output(["git", "rev-parse", "HEAD"], ROOT),
         "genesis": command_output(["git", "rev-parse", "HEAD"], args.genesis_path),
     }
+    if args.newton_path.is_dir():
+        source_revisions["newton"] = command_output(["git", "rev-parse", "HEAD"], args.newton_path)
     hardware = {
         "platform": platform.platform(),
         "cpu": command_output(["lscpu"]),
@@ -112,6 +114,7 @@ def run_suite(args) -> int:
         interpreters = {
             "genesis": args.genesis_python,
             "isaaclab": args.isaaclab_python,
+            "isaaclab_physx": args.isaaclab_physx_python,
             **dict(value.split("=", 1) for value in args.backend_python),
         }
         if backend not in interpreters:
@@ -153,7 +156,7 @@ def run_suite(args) -> int:
                 b"".join(
                     p.name.encode() + p.read_bytes()
                     for p in sorted(HERE.glob("*.py"))
-                    if p.stem not in {"report", "export_figures", "validate_adapter"}
+                    if p.stem not in {"report", "export_figures", "assemble_report", "validate_adapter"}
                 )
             ).hexdigest(),
             "cache_policy": "process cold; disk/kernel/shader caches reused; no OS cache flush",
@@ -188,15 +191,31 @@ def run_suite(args) -> int:
                                 "solver_settings": {
                                     "genesis": {
                                         "max_iterations": 25
-                                        if args.solver_profile == "native"
+                                        if args.solver_profile != "fixed_cap"
                                         else args.solver_iterations,
                                         "tolerance": None,
                                     },
                                     "isaaclab": {
-                                        "position_iterations": 4
-                                        if args.solver_profile == "native"
+                                        "solver": "newton",
+                                        "integrator": "implicitfast",
+                                        "iterations": 100
+                                        if args.solver_profile != "fixed_cap"
                                         else args.solver_iterations,
-                                        "velocity_iterations": 0 if args.solver_profile == "native" else 1,
+                                        "ls_iterations": 50,
+                                        "tolerance": 1e-6,
+                                        "cone": "pyramidal",
+                                        "impratio": 1.0,
+                                        "use_mujoco_contacts": True,
+                                        "njmax": 300,
+                                        "nconmax": None,
+                                        "num_substeps": 1,
+                                        "use_cuda_graph": True,
+                                    },
+                                    "isaaclab_physx": {
+                                        "position_iterations": 4
+                                        if args.solver_profile != "fixed_cap"
+                                        else args.solver_iterations,
+                                        "velocity_iterations": 0 if args.solver_profile != "fixed_cap" else 1,
                                     },
                                 },
                                 "steps": args.steps,
@@ -341,7 +360,9 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--genesis_path", type=Path, required=True)
     result.add_argument("--genesis_python", default=str(ROOT / ".benchmark_sources/genesis_env/bin/python"))
-    result.add_argument("--isaaclab_python", default=str(ROOT / ".benchmark_sources/isaaclab_env/bin/python"))
+    result.add_argument("--isaaclab_python", default=str(ROOT / ".benchmark_sources/mjwarp_env/bin/python"))
+    result.add_argument("--isaaclab_physx_python", default=str(ROOT / ".benchmark_sources/isaaclab_env/bin/python"))
+    result.add_argument("--newton_path", type=Path, default=ROOT / ".benchmark_sources/newton")
     result.add_argument("--output_dir", type=Path, required=True)
     result.add_argument("--backends", nargs="+", default=["genesis", "isaaclab"])
     result.add_argument("--backend_python", action="append", default=[], metavar="NAME=PATH")
@@ -362,7 +383,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--dt", type=float, default=0.005)
     result.add_argument("--decimation", type=int, default=4)
     result.add_argument("--solver_iterations", type=int, default=50)
-    result.add_argument("--solver_profile", choices=["native", "fixed_cap"], default="native")
+    result.add_argument("--solver_profile", choices=["shared", "native", "fixed_cap"], default="shared")
     result.add_argument("--evaluation_interval", type=int, default=20)
     result.add_argument("--evaluation_steps", type=int, default=250)
     result.add_argument("--width", type=int, default=64)

@@ -1,6 +1,6 @@
 # Sources and comparison rules
 
-Sources checked on 2026-11-04. External results below are references, not measurements made by this suite.
+Sources checked on 2026-11-04/05. External results below are references, not measurements made by this suite.
 
 ## What the “6×” claim measures
 
@@ -26,6 +26,9 @@ These observable code differences prevent treating the public scripts as a match
 comparison. They do not prove which code produced the paper’s table; the paper’s exact executable
 revision is not identified by those files.
 
+The main comparison here uses **Isaac Lab Newton/MuJoCo Warp**. GPUSimBench's older Isaac Lab stack used
+PhysX; different physics backends, versions and hardware prevent a direct reproduction claim.
+
 ## Rules used for new measurements
 
 | Measurement | Required interpretation |
@@ -41,19 +44,27 @@ revision is not identified by those files.
 Equal numerical solver settings do not guarantee equal physical accuracy. Asset or renderer differences
 must accompany results, and a shorter timed rollout alone must not be called faster learning.
 
-The main `native` profile follows the pinned Genesis `RigidOptions` maximum of 25 iterations
-and the pinned Isaac ANYmal/cartpole articulation settings of TGS 4 position / 0 velocity iterations.
-Genesis exits early on convergence; its precision-dependent tolerance is recorded after scene construction.
-These are backend-specific practical profiles, not an equality of solver work or numerical accuracy.
+The main `shared` profile is an explicit benchmark baseline: Genesis Newton has a 25-iteration maximum
+and native tolerance; Isaac Lab Newton/MuJoCo Warp uses Newton solving, implicitfast integration,
+100 iterations, 50 line-search iterations, tolerance 1e-6, MuJoCo contacts, pyramidal friction and one substep.
+Resolved settings, graph activity and final-state overflow flags are retained. Final flags are not an overflow history.
+The existing [ANYmal flat preset](https://github.com/isaac-sim/IsaacLab/blob/efa240ec39794f5d80430cbe38620626954c2c4d/source/isaaclab_tasks/isaaclab_tasks/contrib/velocity/config/anymal_c/flat_env_cfg.py)
+and [velocity baseline](https://github.com/isaac-sim/IsaacLab/blob/efa240ec39794f5d80430cbe38620626954c2c4d/source/isaaclab_tasks/isaaclab_tasks/core/velocity/velocity_env_cfg.py)
+use a different combination of substeps, contact generation and friction cone. They are not the configuration measured here.
+Neither matching iteration limits nor this shared baseline establishes equal numerical accuracy.
 
 The shared trainer uses clipped [PPO (Schulman et al., 2017)](https://arxiv.org/abs/1707.06347)
 with generalized advantage estimation. It is one fixed recipe for both engines; it is not either project's
-individually tuned training recipe. A target missed within the fixed budget is recorded as censored.
+individually tuned training recipe. RGB augments proprioception; the tasks do not establish vision-only navigation.
+The first observed target is checked every 50 iterations on the training clock, including evaluations and excluding
+startup. A target missed within the fixed budget is recorded as censored.
 
 ## Upstream projects and publication
 
 - [Genesis](https://github.com/Genesis-Embodied-AI/Genesis): upstream source and examples.
 - [Isaac Lab](https://github.com/isaac-sim/IsaacLab): upstream source and task definitions.
+- [Newton at the pinned revision](https://github.com/newton-physics/newton/tree/42f7def118c2c4299ce493457bafd4e8a22a696e)
+  and [MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp): the primary Isaac Lab physics stack.
 - [mjlab](https://github.com/mujocolab/mjlab): potential future backend; not measured by this report.
 - [Existing report host](https://github.com/maxkra15/maxkra15.github.io): `site/reports/YYYY-MM-DD-topic/`
   holds standalone HTML, measurements, figures and provenance. Its existing Pages workflow publishes

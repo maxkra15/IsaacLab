@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import math
@@ -29,7 +30,14 @@ def validate(config: dict, output: Path) -> dict:
     """
     os.environ.setdefault("PYGLET_HEADLESS", "1")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-    result = {"schema_version": 1, "kind": "adapter_validation", "status": "failed", "config": config, "checks": {}}
+    result = {
+        "schema_version": 1,
+        "kind": "adapter_validation",
+        "validator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "status": "failed",
+        "config": config,
+        "checks": {},
+    }
     checks = result["checks"]
     adapter = None
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +100,9 @@ def validate(config: dict, output: Path) -> dict:
         )
         if config["vision"] == "rgb":
             _validate_images(adapter, config, initial, output.parent, checks)
+        if adapter.metadata.get("physics_backend") == "Isaac Lab Newton / MuJoCo Warp":
+            _validate_mjwarp(adapter, config, initial, output.parent, checks)
+            result["backend_diagnostics"] = adapter.diagnostics()
         result["status"] = "ok" if all(check["passed"] for check in checks.values()) else "failed"
         if result["status"] == "failed":
             result["error"] = "Failed: " + ", ".join(name for name, check in checks.items() if not check["passed"])
@@ -273,6 +284,118 @@ def _validate_images(adapter, config: dict, initial, directory: Path, checks: di
         Image.fromarray(images[index].cpu().numpy()).save(directory / filename)
         samples.append(filename)
     checks["rgb_tensor_contract"]["samples"] = samples
+
+
+def _validate_mjwarp(adapter, config: dict, initial, directory: Path, checks: dict) -> None:
+    """Verify graph-bound controls using paired trajectories from identical resets."""
+    import sys
+
+    import torch
+
+    nominal = (
+        initial.expand(config["num_envs"], -1)
+        if config["task"] == "anymal"
+        else torch.zeros((config["num_envs"], 1), device=config["device"])
+    )
+    adapter.reset()
+    adapter.apply_action(nominal)
+    for _ in range(8):
+        adapter.physics_step()
+    graph = adapter._sim.backend_manager.backend.graph
+    _record(checks, "mjwarp_graph_after_warmup", adapter.diagnostics()["graph_active"])
+    trajectories = []
+    for action in (nominal, nominal + (0.1 if config["task"] == "anymal" else 10.0)):
+        adapter.reset()
+        adapter.apply_action(action)
+        for _ in range(16):
+            adapter.physics_step()
+        adapter.synchronize()
+        trajectories.append(adapter.state()["joint_pos"].clone())
+    response = trajectories[1] - trajectories[0]
+    response_per_env = response.abs().amax(-1) if config["task"] == "anymal" else response[:, 0]
+    _record(
+        checks,
+        "mjwarp_changed_control_after_capture",
+        bool((response_per_env > 1e-3).all()),
+        response_per_env=response_per_env.tolist(),
+        control_delta=0.1 if config["task"] == "anymal" else 10.0,
+        control_units="rad" if config["task"] == "anymal" else "N",
+        response_units="rad" if config["task"] == "anymal" else "m",
+        comparison="Changed versus nominal controls, identical initial states and 16 physics steps",
+    )
+    _record(checks, "mjwarp_commands_preserve_graph", graph is adapter._sim.backend_manager.backend.graph)
+    diagnostics = adapter.diagnostics()
+    _record(
+        checks,
+        "mjwarp_no_capacity_overflow_at_end",
+        all(flag == 0 for flag in diagnostics["fatal_capacity_flags_at_end"]),
+        **diagnostics,
+    )
+    kit_modules = sorted(name for name in sys.modules if name == "omni.kit" or name.startswith("omni.kit."))
+    _record(checks, "mjwarp_kitless_runtime", not kit_modules, loaded_kit_modules=kit_modules)
+    _record(
+        checks,
+        "mjwarp_finite_after_controls",
+        all(bool(torch.isfinite(value).all()) for value in adapter.state().values()),
+    )
+    if config["task"] == "anymal" and config["vision"] == "rgb" and config.get("camera_motion") == "root_translation":
+        _validate_camera_motion(adapter, config, directory, checks)
+
+
+def _validate_camera_motion(adapter, config: dict, directory: Path, checks: dict) -> None:
+    """Check every camera's world pose and rendered framing after a root translation."""
+    import torch
+    from PIL import Image
+
+    adapter.reset()
+    before = adapter.render().clone()
+    root_before = adapter.state()["root_pos"].clone()
+    eye_before, quat_before = (value.clone() for value in adapter._camera.get_world_poses())
+    delta = torch.zeros_like(root_before)
+    delta[:, 0] = 3.0
+    pose = adapter._robot.data.root_pose_w.torch.clone()
+    pose[:, :3] += delta
+    adapter._robot.write_root_pose_to_sim_index(root_pose=pose)
+    after = adapter.render().clone()
+    adapter.synchronize()
+    eye_after, quat_after = adapter._camera.get_world_poses()
+    root_error = (adapter.state()["root_pos"] - root_before - delta).abs().max().item()
+    eye_error = (eye_after - eye_before - delta).abs().max().item()
+    orientation_error = (
+        torch.minimum((quat_after - quat_before).norm(dim=-1), (quat_after + quat_before).norm(dim=-1)).max().item()
+    )
+    _record(checks, "camera_follow_root_translation", root_error < 1e-4, maximum_root_error_m=root_error)
+    _record(checks, "camera_follow_every_env", eye_error < 1e-4, maximum_camera_error_m=eye_error)
+    _record(checks, "camera_follow_fixed_orientation", orientation_error < 1e-5, maximum_error=orientation_error)
+    centroids = []
+    for label, frames in (("before", before), ("after", after)):
+        pixels = frames.float()
+        # The shared ANYmal model has a red shell, which supplies an image-space oracle.
+        shell = (
+            (pixels[..., 0] > 1.3 * pixels[..., 1]) & (pixels[..., 0] > 1.3 * pixels[..., 2]) & (pixels[..., 0] > 30)
+        )
+        centers = []
+        for index in range(config["num_envs"]):
+            y, x = shell[index].nonzero(as_tuple=True)
+            if not len(x):
+                raise AssertionError(f"No ANYmal shell pixels in {label} frame, environment {index}")
+            centers.append(torch.stack((x.float().mean(), y.float().mean())))
+            Image.fromarray(frames[index].cpu().numpy()).save(directory / f"movement_{label}_env{index}.png")
+        centroids.append(torch.stack(centers))
+    displacement = (centroids[1] - centroids[0]).norm(dim=-1)
+    minimum_std = min(
+        before.float().flatten(1).std(dim=1).min().item(), after.float().flatten(1).std(dim=1).min().item()
+    )
+    _record(
+        checks,
+        "camera_follow_stable_image_framing",
+        bool((displacement <= 2.0).all()) and minimum_std > 1.0,
+        maximum_displacement_pixels=displacement.max().item(),
+        tolerance_pixels=2.0,
+        minimum_pixel_std=minimum_std,
+        before_centroids_xy_pixels=centroids[0].tolist(),
+        after_centroids_xy_pixels=centroids[1].tolist(),
+    )
 
 
 if __name__ == "__main__":

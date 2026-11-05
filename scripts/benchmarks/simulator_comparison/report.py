@@ -48,6 +48,12 @@ MATCH_FIELDS = (
     "camera_fov",
 )
 COLORS = ("#245cab", "#b04b17", "#347a4a", "#8050a4", "#a43662", "#217e83")
+BACKEND_LABELS = {
+    "genesis": "Genesis",
+    "isaaclab": "Isaac Lab · MJWarp",
+    "isaaclab_physx": "Isaac Lab · PhysX (reference)",
+    "mjlab": "mjlab",
+}
 METRICS = {
     "startup_s": ("Startup to usable scene", "s", False),
     "first_step_s": ("First step", "s", False),
@@ -116,7 +122,7 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
                     [
                         label,
                         _escape(config.get("mode")),
-                        _escape(backend),
+                        _escape(BACKEND_LABELS.get(backend, backend)),
                         count,
                         _statistics(successful, "metrics.startup_s"),
                         _statistics(successful, "metrics.physics_steps_per_s"),
@@ -136,7 +142,7 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
             learning.append(
                 [
                     label,
-                    _escape(backend),
+                    _escape(BACKEND_LABELS.get(backend, backend)),
                     count,
                     _escape(seeds),
                     _statistics(successful, "metrics.evaluation.survival_fraction"),
@@ -169,7 +175,9 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
         parts.append(
             '<h3>Held-out learning outcomes</h3><p class="muted">Survival means no fall during the '
             "evaluation horizon. Task error is speed tracking for ANYmal and pole angle for cartpole. "
-            "An unreached target is censored at the recorded budget, not a measured time to success.</p>"
+            "The first observed target uses the training clock, including evaluation and excluding startup. "
+            "Checks occur every configured evaluation interval (50 iterations in the main matrix). "
+            "An unreached target is censored at the recorded budget.</p>"
         )
         parts.append(
             _table(
@@ -181,7 +189,7 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
                     "Survival [fraction]",
                     "Task error",
                     "Training [s]",
-                    "Time to target [s]",
+                    "First target [training s]",
                 ),
                 learning,
             )
@@ -238,7 +246,7 @@ def _bar_chart(series: list[tuple[str, list[float]]], unit: str, label: str) -> 
         lower, upper = (160 + 410 * value / maximum for value in (min(values), max(values)))
         parts.extend(
             [
-                f'<text x="148" y="{y + 13}" text-anchor="end">{_escape(name)}</text>',
+                f'<text x="148" y="{y + 13}" text-anchor="end">{_escape(BACKEND_LABELS.get(name, name))}</text>',
                 f'<rect x="160" y="{y}" width="{width:.2f}" height="20" fill="{COLORS[index % len(COLORS)]}"/>',
                 f'<path d="M {lower:.2f} {y + 10} H {upper:.2f} M {lower:.2f} {y + 5} V {y + 15}'
                 f' M {upper:.2f} {y + 5} V {y + 15}" stroke="#192333" stroke-width="2"/>',
@@ -291,7 +299,8 @@ def _learning_chart(runs: list[dict], x_key: str, y_key: str, x_label: str, y_la
         coordinates = " ".join(f"{80 + 640 * x / max_x:.2f},{270 - 240 * (y - min_y) / span_y:.2f}" for x, y in points)
         parts.append(
             f'<polyline points="{coordinates}" fill="none" stroke="{colors[name]}"'
-            f' stroke-width="2" opacity=".7"><title>{_escape(name)} seed {_escape(seed)}</title></polyline>'
+            f' stroke-width="2" opacity=".7"><title>{_escape(BACKEND_LABELS.get(name, name))} '
+            f"seed {_escape(seed)}</title></polyline>"
         )
         if len(points) == 1:
             x, y = points[0]
@@ -305,7 +314,9 @@ def _learning_chart(runs: list[dict], x_key: str, y_key: str, x_label: str, y_la
             f'<text x="400" y="318" text-anchor="middle">{_escape(x_label)}</text>',
             f'<text x="80" y="17">{_escape(y_label)}</text></svg>',
             '<p class="legend">'
-            + " · ".join(f'<span style="color:{colors[name]}">{_escape(name)}</span>' for name in names)
+            + " · ".join(
+                f'<span style="color:{colors[name]}">{_escape(BACKEND_LABELS.get(name, name))}</span>' for name in names
+            )
             + " · one trace per seed</p>",
         ]
     )
@@ -356,7 +367,8 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
             for backend, values in series:
                 if values:
                     rows.append(
-                        f"<tr><td>{_escape(label)}</td><td>{_escape(backend)}</td><td>{_format(statistics.median(values))}</td>"
+                        f"<tr><td>{_escape(label)}</td><td>{_escape(BACKEND_LABELS.get(backend, backend))}</td>"
+                        f"<td>{_format(statistics.median(values))}</td>"
                         f"<td>{_format(min(values))}–{_format(max(values))}</td><td>{len(values)}</td></tr>"
                     )
         if rows:
@@ -393,7 +405,7 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
                     threshold_time = "censored"
                 evaluations.append(
                     [
-                        _escape(run.get("config", {}).get("backend")),
+                        _escape(BACKEND_LABELS.get(run["config"]["backend"], run["config"]["backend"])),
                         _escape(run.get("config", {}).get("seed")),
                         _statistics([run], "metrics.evaluation.survival_fraction"),
                         _statistics([run], f"metrics.evaluation.{error_key}"),
@@ -405,7 +417,14 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
                 parts.append(
                     "<details><summary>Final held-out evaluations per seed</summary>"
                     + _table(
-                        ("Backend", "Seed", "Survival [fraction]", error_label, "Target reached", "Time to target [s]"),
+                        (
+                            "Backend",
+                            "Seed",
+                            "Survival [fraction]",
+                            error_label,
+                            "Target reached",
+                            "First target [training s]",
+                        ),
                         evaluations,
                     )
                     + "</details>"
@@ -416,9 +435,11 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
     )
     for run in runs:
         cfg = run.get("config", {})
+        backend = str(cfg.get("backend", "unknown"))
+        label = BACKEND_LABELS.get(backend, backend)
         status = run.get("status", "unknown")
         parts.append(
-            f"<tr><td>{_escape(cfg.get('backend', 'unknown'))}</td><td>{_escape(cfg.get('seed', '?'))}</td>"
+            f"<tr><td>{_escape(label)}</td><td>{_escape(cfg.get('seed', '?'))}</td>"
             f'<td>{_escape(status)}</td><td><a href="{_escape(run["download"])}">JSON</a>'
             + (f" · {_escape(run.get('error', ''))}" if status != "ok" else "")
             + "</td></tr>"
@@ -427,7 +448,7 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
             parts.append(
                 f'<tr><td colspan="4"><a href="{_escape(run["camera_download"])}">'
                 f'<img src="{_escape(run["camera_download"])}" width="160" loading="lazy"'
-                f' alt="{_escape(cfg.get("backend", "unknown"))} camera validation frame">'
+                f' alt="{_escape(label)} camera validation frame">'
                 "</a> First usable RGB frame; native renderer quality differs.</td></tr>"
             )
     parts.append("</tbody></table></div></section>")
@@ -498,21 +519,26 @@ def build_report(input_dir: Path, output_dir: Path) -> Path:
             environment["hardware"] = {key: value.get("hardware", {}).get(key) for key in ("platform", "cpu", "gpu")}
             provenance[json.dumps(environment, sort_keys=True)] = environment
     methods = """
-<section id="methods"><h2>Measurement contract</h2>
+<section id="methods"><details><summary>Measurement contract</summary>
 <p>Physics times synchronized stepping with prescribed controls; rollout includes actions, observations,
 rewards and resets. One environment transition contains the configured number of physics steps.
 Startup and the first step are reported separately from warmed throughput. A fresh process can reuse disk caches.</p>
-<p>Solver profiles use backend-specific settings. The native profile uses Genesis Newton's 25-iteration maximum
-and the maintained Isaac robot profile of TGS 4 position / 0 velocity iterations. Counts have different meanings;
-these profiles do not establish equal solver work or numerical accuracy. Resolved settings are in each raw run.</p>
+<p>The shared benchmark baseline uses Genesis's Newton solver with a 25-iteration maximum and native tolerance.
+Isaac Lab runs without Kit and uses Newton/MuJoCo Warp with Newton solving, implicitfast integration,
+100 solver / 50 line-search iterations, tolerance 1e-6, pyramidal friction, MuJoCo contacts,
+one substep and CUDA graphs.
+These settings do not establish equal solver work or numerical accuracy. Stock ANYmal training presets use
+different substep/contact/friction settings; this shared task is a separate benchmark baseline.</p>
 <p>ANYmal physics runs can fall or settle under prescribed controls;
 throughput alone does not establish walking quality.
-The backend metadata records controls and assets. Renderers use their native implementations: raster and RTX
-images need not have equal visual quality. Image throughput does not establish quality equivalence.</p>
+The backend metadata records controls and assets. Genesis uses Madrona rasterization and Isaac Lab uses
+Newton Warp ray tracing. RGB augments proprioception in the common CNN policy; these tasks do not establish
+vision-only navigation. Renderer quality differs, and image throughput does not establish quality equivalence.
+MJWarp graph activity and overflow flags are checked at the final solver state; flags are not a cumulative history.</p>
 <p>Comparisons share task, vision mode, mode, batch size, timestep, decimation, image dimensions and measured
 step count. Maximum capacity is separate from speed at a matched batch size. Successful-run summaries retain
-their sample count and observed range; they are not confidence intervals. Hardware and package versions below
-must match before attributing a difference to the simulator.</p>
+their sample count and observed range; they are not confidence intervals. Hardware and shared training dependencies
+must match. Engine-specific simulation and rendering packages differ and are pinned below.</p>
 <p>Learning curves use each seed’s held-out survival and task error against wall time and transitions.
 The target requires survival ≥0.95 and error ≤0.25 m/s for ANYmal or ≤0.1 rad for cartpole.
 Evaluation uses automatic
@@ -520,17 +546,18 @@ resets after failure: survival means no failure at any point in the evaluation h
 also include steps after resets. Training time includes periodic evaluation but excludes model/optimizer creation,
 simulator startup and checkpoint saving. Complete process time includes those costs and teardown.
 Asset equivalence and useful final behavior are necessary before claiming a learning advantage.</p>
-</section>
+</details></section>
 <section><h2>Why repeat this comparison?</h2>
 <p><a href="https://arxiv.org/html/2607.13059v1">GPUSimBench</a> reported approximately 6× Franka throughput
 for Genesis using different maximum batch sizes (131,072 versus 32,768), with rendering and learning excluded.
 Its public <a href="https://github.com/zhanghuzhenyu/gpu_sim_bench/tree/7d39254e6642bef924166ac74e7c6940c713a471">implementation</a>
 also compares Genesis scene stepping with an Isaac Lab task step. These results motivate matched workloads;
-they do not establish a general training speedup.</p></section>
+they do not establish a general training speedup. That study used an older Isaac Lab/PhysX stack.
+This MJWarp comparison changes the backend and versions, so it is not a direct RTX 5070 reproduction.</p></section>
 """
     document = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light"><title>Genesis and Isaac Lab · Simulator comparison</title>
+<meta name="color-scheme" content="light"><title>Genesis and Isaac Lab MJWarp · Simulator comparison</title>
 <style>
 :root{--paper:#fafaf8;--ink:#192333;--muted:#536174;--line:#d9dfe5;--blue:#245cab}
 *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 system-ui,sans-serif}
@@ -550,8 +577,8 @@ summary{cursor:pointer;font-weight:600}details{margin:16px 0}
 .pending{padding:16px;background:#fff5df;border:1px solid #e4c98d}
 nav{display:flex;flex-wrap:wrap;gap:10px 20px;margin:22px 0}footer{margin-top:40px;color:var(--muted);font-size:.85rem}
 </style></head><body><main><a href="../../">Research reports · Maximilian Krause</a>
-<p class="muted">SIMULATION · VISION · LEARNING</p><h1>Genesis and Isaac Lab</h1>
-<p>Genesis versus Isaac Lab with PhysX and Isaac Sim: ANYmal-C walking and cartpole balance,
+<p class="muted">SIMULATION · VISION · LEARNING</p><h1>Genesis and Isaac Lab MJWarp</h1>
+<p>Genesis versus Isaac Lab with Newton/MuJoCo Warp: ANYmal-C walking and cartpole balance,
 with proprioception or proprioception plus RGB.</p>
 """
     document += f'<p class="muted">Generated {_escape(summary["generated_at"])} · measurement schema 1</p>'
