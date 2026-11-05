@@ -36,7 +36,7 @@ PhysX; different physics backends, versions and hardware prevent a direct reprod
 | Physics throughput | Environment × physics steps / elapsed time; identical physics timestep, substeps, assets, contacts and controllers where supported. Synchronize before and after timing. |
 | Environment throughput | Include actions, observations, rewards and resets. State control decimation separately; one policy step can contain several physics steps. |
 | Scaling | Compare the same environment counts first. Maximum capacity is a separate result, with failures and memory limits retained. |
-| Startup | Measure a fresh process through first usable state; record imports, scene build, first step and compilation separately. Identify cache state; a fresh process does not imply an empty disk cache. |
+| Startup | Worker-clock runtime imports through first usable observation; Python/site initialization is outside this clock. Record first step and complete process wall separately. Disk/JIT caches are reused. |
 | Vision | Match resolution, channels, frame rate, camera count and transfer destination. Prove frames are produced. Report renderer and any device-to-host transfer. |
 | Learning | Match task definition, observations, actions, reward, termination, policy, optimizer and evaluation. Show quality against both transitions and wall time across fixed seeds. |
 | Reliability | Retain failed runs, exact source revisions, commands, dependencies, hardware, seeds and raw timing samples. Label unsupported combinations explicitly. |
@@ -59,6 +59,9 @@ with generalized advantage estimation. It is one fixed recipe for both engines; 
 individually tuned training recipe. RGB augments proprioception; the tasks do not establish vision-only navigation.
 The first observed target is checked every 50 iterations on the training clock, including evaluations and excluding
 startup. A target missed within the fixed budget is recorded as censored.
+Reported target-time medians condition on reached seeds. Franka measures fixed-base seven-joint reaching
+to seeded reachable FK targets with open fixed fingers, not grasping. Its error is mean tool-position distance [m];
+survival is joint-state validity within limits plus 0.1 rad. The 5 s target is error ≤0.05 m and survival ≥0.95.
 
 ## Upstream projects and publication
 

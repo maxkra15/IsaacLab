@@ -54,6 +54,11 @@ BACKEND_LABELS = {
     "isaaclab_physx": "Isaac Lab · PhysX (reference)",
     "mjlab": "mjlab",
 }
+TASK_ERRORS = {
+    "anymal": ("tracking_error_m_s", "Speed tracking error [m/s]", "m/s"),
+    "cartpole": ("pole_angle_abs_rad", "Pole angle error [rad]", "rad"),
+    "franka": ("reaching_error_m", "End-effector reaching error [m]", "m"),
+}
 METRICS = {
     "startup_s": ("Worker startup", "s", False),
     "first_step_s": ("First step", "s", False),
@@ -131,8 +136,7 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
                 )
                 continue
             seeds = ", ".join(str(run.get("config", {}).get("seed", "?")) for run in successful) or "—"
-            error_key = "tracking_error_m_s" if config.get("task") == "anymal" else "pole_angle_abs_rad"
-            unit = "m/s" if config.get("task") == "anymal" else "rad"
+            error_key, _, unit = TASK_ERRORS.get(config.get("task"), ("task_error", "Task error", ""))
             threshold_runs = [run for run in successful if isinstance(_value(run, "metrics.time_to_threshold"), dict)]
             reported = [run for run in successful if "time_to_threshold" in run.get("metrics", {})]
             reached = len(threshold_runs)
@@ -163,8 +167,8 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
                     "Task · vision · envs",
                     "Mode",
                     "Backend",
-                    "Successful/attempted",
-                    "Worker startup [s]",
+                    "Runs",
+                    "Startup [s]",
                     "Physics [env steps/s]",
                     "Rollout [transitions/s]",
                 ),
@@ -173,8 +177,10 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
         )
     if learning:
         parts.append(
-            '<h3>Held-out learning outcomes</h3><p class="muted">Survival means no fall during the '
-            "evaluation horizon. Task error is speed tracking for ANYmal and pole angle for cartpole. "
+            '<h3>Held-out learning outcomes</h3><p class="muted">Survival means no task failure during the '
+            "evaluation horizon: no balance termination for ANYmal/cartpole, and valid joint state for Franka. "
+            "Task error is speed tracking for ANYmal, pole angle for cartpole, "
+            "and end-effector distance for Franka. "
             "The first observed target uses the training clock, including evaluation and excluding startup. "
             "Target-time medians are conditional on reaching the target; censored seeds are excluded from that median. "
             "Checks occur every configured evaluation interval (50 iterations in the main matrix). "
@@ -185,7 +191,7 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
                 (
                     "Task · vision · envs",
                     "Backend",
-                    "Successful/attempted",
+                    "Runs",
                     "Seeds",
                     "Survival [fraction]",
                     "Task error",
@@ -214,6 +220,8 @@ def group_results(runs: list[dict]) -> list[tuple[dict, list[dict]]]:
         )
         provenance = run.get("provenance", {})
         assets = provenance.get("asset_manifest", {})
+        if config.get("task") == "franka":
+            assets = assets.get("franka", {})
         contract["_provenance"] = {
             "source_revisions": provenance.get("source_revisions"),
             "gpu": provenance.get("hardware", {}).get("gpu"),
@@ -382,8 +390,7 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
             )
         if config.get("mode") == "learning":
             parts.append("</details>")
-            error_key = "tracking_error_m_s" if config.get("task") == "anymal" else "pole_angle_abs_rad"
-            error_label = "Speed tracking error [m/s]" if config.get("task") == "anymal" else "Pole angle error [rad]"
+            error_key, error_label, _ = TASK_ERRORS.get(config.get("task"), ("task_error", "Task error", ""))
             for y_key, y_label in (("survival_fraction", "Held-out survival [fraction]"), (error_key, error_label)):
                 for x_key, x_label in (
                     ("elapsed_s", "Training wall time [s]"),
@@ -545,9 +552,11 @@ step count. Maximum capacity is separate from speed at a matched batch size. Suc
 their sample count and observed range; they are not confidence intervals. Hardware and shared training dependencies
 must match. Engine-specific simulation and rendering packages differ and are pinned below.</p>
 <p>Learning curves use each seed’s held-out survival and task error against wall time and transitions.
-The target requires survival ≥0.95 and error ≤0.25 m/s for ANYmal or ≤0.1 rad for cartpole.
+The target requires survival ≥0.95 and error ≤0.25 m/s for ANYmal, ≤0.1 rad for cartpole, or ≤0.05 m for Franka.
 Evaluation uses automatic
-resets after failure: survival means no failure at any point in the evaluation horizon; reported reward and error
+resets after failure: survival means no failure at any point in the evaluation horizon; for Franka this means
+finite joint state within joint limits plus a 0.1 rad margin, rather than no fall. Its evaluation lasts 5 s.
+Reported reward and error
 also include steps after resets. Training time includes periodic evaluation but excludes model/optimizer creation,
 simulator startup and checkpoint saving. Complete process time includes those costs and teardown.
 Asset equivalence and useful final behavior are necessary before claiming a learning advantage.</p>
@@ -575,7 +584,7 @@ figure{margin:24px 0;padding:22px;background:white;border:1px solid var(--line);
 svg{display:block;width:100%;height:auto;min-width:540px}svg text{font:13px system-ui,sans-serif;fill:var(--ink)}
 figure,.table{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.9rem}
 th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
-th{white-space:nowrap}td{overflow-wrap:anywhere}
+th{white-space:nowrap}td{overflow-wrap:anywhere}section>p+.table td,section>h3+p+.table td{white-space:nowrap}
 pre{font-size:.78rem;white-space:pre-wrap;overflow-wrap:anywhere;
 background:white;padding:16px;border:1px solid var(--line)}
 summary{cursor:pointer;font-weight:600}details{margin:16px 0}
@@ -583,7 +592,7 @@ summary{cursor:pointer;font-weight:600}details{margin:16px 0}
 nav{display:flex;flex-wrap:wrap;gap:10px 20px;margin:22px 0}footer{margin-top:40px;color:var(--muted);font-size:.85rem}
 </style></head><body><main><a href="../../">Research reports · Maximilian Krause</a>
 <p class="muted">SIMULATION · VISION · LEARNING</p><h1>Genesis and Isaac Lab MJWarp</h1>
-<p>Genesis versus Isaac Lab with Newton/MuJoCo Warp: ANYmal-C walking and cartpole balance,
+<p>Genesis versus Isaac Lab with Newton/MuJoCo Warp: ANYmal-C walking, cartpole balance and Franka reaching,
 with proprioception or proprioception plus RGB.</p>
 """
     document += f'<p class="muted">Generated {_escape(summary["generated_at"])} · measurement schema 1</p>'

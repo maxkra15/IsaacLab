@@ -1,9 +1,9 @@
 # Genesis / Isaac Lab MJWarp comparison
 
-Genesis versus **Isaac Lab with Newton/MuJoCo Warp**, using shared cartpole balance
-and ANYmal-C forward walking tasks. The primary `isaaclab` adapter runs without Kit.
+Genesis versus **Isaac Lab with Newton/MuJoCo Warp**, using shared cartpole balance,
+ANYmal-C forward walking and Franka reaching tasks. The primary `isaaclab` adapter runs without Kit.
 Each task uses proprioception, or proprioception plus 64×64 RGB in the same CNN
-policy. This measures vision processing cost; neither task establishes vision-only navigation.
+policy. This measures vision processing cost; these tasks do not establish vision-only navigation.
 
 | Measurement | Included work |
 | --- | --- |
@@ -35,6 +35,11 @@ Both engines receive the same URDF, masses, controller, reward, observation and 
 code. Passive joint damping/friction and added armature are zero; self-collision is
 disabled. ANYmal uses PD gains 80/2 and an 80 N·m effort limit. Missing joint bounds in
 the bundled ANYmal model are explicitly represented as continuous joints in both inputs.
+Franka uses a fixed-base seven-joint Panda, fixed open fingers, PD gains 80/4 and
+authored effort limits (87 N·m for joints 1–4, 12 N·m for joints 5–7). Seeded FK poses
+near home define reachable targets. The 5 s evaluation target requires mean tool-position
+error ≤0.05 m and survival ≥0.95; survival means valid joint state within limits plus
+a 0.1 rad margin. It does not establish grasping or contact manipulation.
 
 RGB environments are separated by 100 m. ANYmal cameras follow root translation;
 cartpole uses a wider fixed view. Native camera-update costs remain timed, including
@@ -82,8 +87,8 @@ that borrow an existing environment are not the portable setup contract.
 
 ## Run and validate
 
-Run a small matrix first. Repeat the independent validator for both backends, both
-tasks and both vision modes, with at least two environments (four is sufficient):
+Run a small matrix first. Repeat the independent validator for both backends,
+all three tasks and both vision modes, with at least two environments (four is sufficient):
 
 ```bash
 uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simulator_comparison/suite.py \
@@ -98,16 +103,18 @@ uv run --no-project --python "$GENESIS_PYTHON" python scripts/benchmarks/simulat
 
 Replace `GENESIS_CASE` with the generated directory; use the Isaac interpreter for
 Isaac cases. The validator checks independent cartpole Lagrange/RK4 dynamics, force
-direction, imported masses, canonical/subset resets, ANYmal short stability and
+direction, imported masses, canonical/subset resets, ANYmal/Franka short stability,
+independent URDF-to-tool Franka kinematics and
 batched RGB isolation. Preserve its JSON and screenshots; failed checks exit nonzero.
 
-The publication matrix contains 84 runs across three seeds:
+The complete matrix contains 126 runs across three seeds (42 per task). Collect the
+84 ANYmal/cartpole cases with the original baseline source:
 
 ```bash
 uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simulator_comparison/suite.py \
   --genesis_path .benchmark_sources/genesis --newton_path .benchmark_sources/newton \
   --genesis_python "$GENESIS_PYTHON" --isaaclab_python "$ISAACLAB_PYTHON" \
-  --output_dir benchmarks/simulator_full --solver_profile shared \
+  --output_dir benchmarks/simulator_full --solver_profile shared --tasks anymal cartpole \
   --num_envs 256 4096 --vision_num_envs 64 --learning_num_envs 512 --vision_learning_num_envs 512 \
   --seeds 0 1 2 --steps 500 --iterations 500 --rollout_steps 24 --evaluation_interval 50 --evaluation_steps 250
 
@@ -117,20 +124,40 @@ uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simula
   --input_dir benchmarks/simulator_full --output_dir benchmarks/simulator_report/figures
 ```
 
-For publication, use an empty output directory and the committed harness revision:
+Repeat that suite command at the Franka source revision with `--tasks franka` and
+`--output_dir benchmarks/simulator_franka` for its 42 cases. For publication, use an
+empty output directory and the committed publication-helper revision:
 
 ```bash
 uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simulator_comparison/assemble_report.py \
-  --input_dir benchmarks/simulator_full --output_dir benchmarks/simulator_publication \
+  --cohort_manifest benchmarks/cohorts.launch.json --output_dir benchmarks/simulator_publication \
   --harness_dir scripts/benchmarks/simulator_comparison --source_commit "$(git rev-parse HEAD)" \
-  --validation_dir benchmarks/validation --include_run_archive
+  --include_run_archive
 ```
 
-The assembler requires all 84 matched successful runs and eight successful independent
-validators from the same runtime, validator source and physical inputs. Use a separate
-output directory for each RGB validator so its frames remain intact. Old/failed attempts
+For the measured two-stage study, keep the original ANYmal/cartpole source and 84 runs
+intact; collect Franka's 42 cases with `--tasks franka` using its separately committed
+runtime. A launch manifest declares both sources and local evidence directories:
+
+```json
+{"cohorts": [
+  {"name": "baseline", "tasks": ["anymal", "cartpole"], "source_commit": "FULL_BASELINE_SHA",
+   "input_dir": "simulator_full", "validation_dir": "validation_baseline"},
+  {"name": "franka", "tasks": ["franka"], "source_commit": "FULL_FRANKA_SHA",
+   "input_dir": "simulator_franka", "validation_dir": "validation_franka"}
+]}
+```
+
+Manifest paths resolve relative to that file. `--source_commit` identifies the current publication helpers.
+Each cohort requires all matched runs and four independent validators per task using
+its exact runtime, validator source and physical inputs. Backends share one physical GPU
+within each cohort; cohorts may use separate L40s on the same recorded CPU host.
+Use a separate output directory for each RGB validator so its frames remain intact. Old/failed attempts
 are archived separately. The bundle includes source plus license, CSV, figures, validation
 frames, provenance and checksums; the optional run archive includes policies and logs.
+The exported `data/cohorts.json` uses relative record/validation/archive paths and can be
+passed back to the same assembler to rebuild from the downloaded bundle. Each measured
+cohort has its own source ZIP; `source.zip` contains the exact publication helpers.
 
 Use an idle GPU. Jobs run serially in shuffled order and resume completed cases;
 `--rerun` repeats them. Workers start fresh processes while disk/JIT caches are reused.

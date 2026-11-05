@@ -97,6 +97,18 @@ class TestReport(unittest.TestCase):
             self.assertEqual((root / "site" / published["download"]).read_bytes(), original)
             self.assertEqual(published["sha256"], hashlib.sha256(original).hexdigest())
 
+    def test_franka_asset_mismatch_prevents_a_matched_comparison(self):
+        baseline = measurement()
+        baseline["config"]["task"] = "franka"
+        baseline["provenance"]["asset_manifest"] = {
+            "franka": {"source_urdf_sha256": "panda-a", "meshes_sha256": {"tool": "mesh-a"}}
+        }
+        peer = copy.deepcopy(baseline)
+        peer["config"]["backend"] = "isaaclab"
+        self.assertEqual(len(report.group_results([baseline, peer])), 1)
+        peer["provenance"]["asset_manifest"]["franka"]["meshes_sha256"]["tool"] = "different-mesh"
+        self.assertEqual(len(report.group_results([baseline, peer])), 2)
+
     def test_single_sample_bar_and_whisker_share_the_same_scale(self):
         class Chart(HTMLParser):
             def __init__(self):

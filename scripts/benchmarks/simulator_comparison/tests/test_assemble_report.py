@@ -16,7 +16,11 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 publication = importlib.import_module("assemble_report")
 
 
-def recorded_matrix() -> list[tuple[Path, dict]]:
+def recorded_matrix(
+    tasks: tuple[str, ...] = ("anymal", "cartpole"),
+    fingerprint: str = "test-runtime",
+    device_uuid: str = "00000000-0000-0000-0000-000000000001",
+) -> list[tuple[Path, dict]]:
     """Provide the required study matrix as JSON records, without measured or simulated data."""
     workloads = [
         ("physics", "none", 256),
@@ -28,8 +32,11 @@ def recorded_matrix() -> list[tuple[Path, dict]]:
         ("learning", "rgb", 512),
     ]
     runs = []
-    for backend, task, workload, seed in product(("genesis", "isaaclab"), ("anymal", "cartpole"), workloads, (0, 1, 2)):
+    for backend, task, workload, seed in product(("genesis", "isaaclab"), tasks, workloads, (0, 1, 2)):
         mode, vision, count = workload
+        error_key = {"anymal": "tracking_error_m_s", "cartpole": "pole_angle_abs_rad", "franka": "reaching_error_m"}[
+            task
+        ]
         config = dict(zip(publication.FIELDS, (backend, task, mode, vision, count, seed)))
         config.update(
             solver_profile="shared",
@@ -80,17 +87,23 @@ def recorded_matrix() -> list[tuple[Path, dict]]:
                 "startup_s": 1,
                 "physics_steps_per_s": 1,
                 "env_steps_per_s": 1,
-                "evaluation": {"steps": 250},
+                "evaluation": {
+                    "steps": 250,
+                    "survival_fraction": 1.0,
+                    error_key: 0.01,
+                },
                 "learning": [{"iteration": 0}, {"iteration": 500, "env_steps": 6144000}],
             },
             "provenance": {
-                "harness_sha256": "test-runtime",
+                "harness_sha256": fingerprint,
                 "source_revisions": publication.UPSTREAM.copy(),
-                "runtime": dict(
-                    publication.RUNTIME, cuda_device_uuid="00000000-0000-0000-0000-000000000001", kit_modules_loaded=[]
-                ),
-                "hardware": {"gpu": "test, GPU-00000000-0000-0000-0000-000000000001"},
-                "asset_manifest": {"source_urdf_sha256": "0" * 64, "meshes_sha256": {"mesh": "1" * 64}},
+                "runtime": dict(publication.RUNTIME, cuda_device_uuid=device_uuid, kit_modules_loaded=[]),
+                "hardware": {"gpu": f"test, GPU-{device_uuid}"},
+                "asset_manifest": {
+                    "source_urdf_sha256": "0" * 64,
+                    "meshes_sha256": {"mesh": "1" * 64},
+                    "franka": {"source_urdf_sha256": "2" * 64, "meshes_sha256": {"panda": "3" * 64}},
+                },
                 "other_active_compute_detected": False,
                 "gpu_activity_samples": [{"external_compute": []}],
             },
@@ -126,6 +139,28 @@ class TestPublication(unittest.TestCase):
         diagnostics.update(overflow_flags_at_end=[513], fatal_capacity_flags_at_end=[1])
         with self.assertRaisesRegex(ValueError, "fatal capacity"):
             publication.validate_runs(records, "test-runtime")
+
+    def test_task_cohorts_allow_separate_devices_but_reject_mixed_runtime_or_devices_within_a_cohort(self):
+        baseline = recorded_matrix()
+        franka = recorded_matrix(("franka",), "franka-runtime", "00000000-0000-0000-0000-000000000002")
+        self.assertEqual(len(publication.validate_runs(baseline, "test-runtime")), 84)
+        self.assertEqual(len(publication.validate_runs(franka, "franka-runtime", ("franka",))), 42)
+        provenance = franka[0][1]["provenance"]
+        provenance["harness_sha256"] = "test-runtime"
+        with self.assertRaisesRegex(ValueError, "source code"):
+            publication.validate_runs(franka, "franka-runtime", ("franka",))
+        provenance["harness_sha256"] = "franka-runtime"
+        provenance["runtime"]["cuda_device_uuid"] = "00000000-0000-0000-0000-000000000001"
+        provenance["hardware"]["gpu"] += ", GPU-00000000-0000-0000-0000-000000000001"
+        with self.assertRaisesRegex(ValueError, "Different physical GPUs"):
+            publication.validate_runs(franka, "franka-runtime", ("franka",))
+
+    def test_a_contended_success_is_retained_outside_the_accepted_matrix(self):
+        records = recorded_matrix()
+        contended = copy.deepcopy(records[0][1])
+        contended["provenance"]["other_active_compute_detected"] = True
+        records.append((Path("contended-attempt.result.json"), contended))
+        self.assertEqual(len(publication.validate_runs(records, "test-runtime")), 84)
 
     def test_physx_or_loaded_kit_cannot_be_published_as_mjwarp(self):
         records = recorded_matrix()

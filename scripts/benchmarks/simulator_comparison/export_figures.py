@@ -18,7 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
-from report import BACKEND_LABELS, group_results
+from report import BACKEND_LABELS, TASK_ERRORS, group_results
 
 COLORS = {"genesis": "#245cab", "isaaclab": "#b04b17", "mjlab": "#347a4a", "isaaclab_physx": "#8050a4"}
 STYLES = ("-", "--", "-.", ":")
@@ -47,10 +47,11 @@ def _runtime(records: list[dict], output: Path) -> None:
         if config["mode"] in ("physics", "rollout"):
             workloads[(config["mode"], config["vision"], config.get("width"), config.get("height"))].append(record)
     for (mode, vision, width, height), matched in workloads.items():
-        fig, axes = plt.subplots(2, 2, figsize=(10.5, 6.5), squeeze=False, layout="constrained")
+        tasks = sorted({record["config"]["task"] for record in matched})
+        fig, axes = plt.subplots(len(tasks), 2, figsize=(10.5, 3.25 * len(tasks)), squeeze=False, layout="constrained")
         throughput = "physics_steps_per_s" if mode == "physics" else "env_steps_per_s"
         unit = "Environment physics steps/s" if mode == "physics" else "Environment transitions/s"
-        for row, task in enumerate(("anymal", "cartpole")):
+        for row, task in enumerate(tasks):
             series = defaultdict(list)
             for record in matched:
                 config = record["config"]
@@ -111,8 +112,7 @@ def _learning(records: list[dict], output: Path) -> None:
     for identity, matched in grouped.items():
         config = matched[0]["config"]
         fig, axes = plt.subplots(2, 2, figsize=(10.5, 6.5), squeeze=False, layout="constrained")
-        error = "tracking_error_m_s" if config["task"] == "anymal" else "pole_angle_abs_rad"
-        error_label = "Speed tracking error [m/s]" if config["task"] == "anymal" else "Pole angle error [rad]"
+        error, error_label, _ = TASK_ERRORS.get(config["task"], ("task_error", "Task error", ""))
         for record in matched:
             for index, trace in enumerate(record["learning"]):
                 label = f"{BACKEND_LABELS.get(record['backend'], record['backend'])} · seed {trace['seed']}"
