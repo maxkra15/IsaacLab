@@ -183,4 +183,5 @@ An adapter owns `joint_names`, `metadata`, `reset(env_ids=None, joint_pos=None)`
 `apply_action()`, `physics_step()`, `physics_only_step()`, `refresh_state()`, `render()`,
 `synchronize()` and `close()`. `state()` returns ordered CUDA joint/root tensors in SI units,
 world-frame root velocities and **wxyz** quaternions. `render()` returns CUDA uint8 `[N,H,W,3]`.
+Franka additionally requires `ee_pos` with shape `[N,3]`: environment-local world grasp-center coordinates [m].
 Run the physical validator before including another engine, and report unsupported capabilities explicitly.

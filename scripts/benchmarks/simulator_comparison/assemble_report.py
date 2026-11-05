@@ -498,6 +498,8 @@ def assemble_report(args: argparse.Namespace) -> None:
     from report import BACKEND_LABELS, build_report
 
     cohorts, publisher = load_cohorts(args, harness)
+    execution_note = publisher.get("execution_note")
+    require(execution_note is None or isinstance(execution_note, str), "publisher.execution_note must be text")
     manifest_path = getattr(args, "cohort_manifest", None)
     publisher_archive = None
     if publisher.get("source_archive"):
@@ -631,6 +633,8 @@ def assemble_report(args: argparse.Namespace) -> None:
         },
         "cohorts": portable_cohorts,
     }
+    if execution_note is not None:
+        portable_manifest["publisher"]["execution_note"] = execution_note
     write_json(data / "cohorts.json", portable_manifest)
     if args.include_run_archive:
         with zipfile.ZipFile(output / "run_artifacts.zip", "w", zipfile.ZIP_DEFLATED) as archive:
@@ -688,8 +692,11 @@ def assemble_report(args: argparse.Namespace) -> None:
             f"{revision[:12]}</a></td><td>{html.escape(cohort['cuda_device_uuid'])}</td>"
             f'<td><a href="source-{name}.zip">ZIP + license</a></td></tr>'
         )
+    links += "</tbody></table></div>"
+    if execution_note:
+        links += f"<p>{html.escape(execution_note)}</p>"
     links += (
-        "</tbody></table></div><p>Each backend pair uses the same source and physical GPU. "
+        "<p>Each backend pair uses the same source and physical GPU. "
         "Cohorts share the recorded CPU host; comparisons apply within each task.</p></details>"
         "<p>Shared benchmark baseline: Genesis Newton, maximum 25 iterations with native tolerance; "
         "Isaac Lab Newton/MuJoCo Warp, implicitfast, 100 solver / 50 line-search iterations, tolerance 1e-6, "
