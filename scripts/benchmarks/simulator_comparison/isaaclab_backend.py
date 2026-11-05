@@ -88,9 +88,14 @@ class Adapter:
             env_spacing=float(config.get("env_spacing", 5.0)),
             lazy_sensor_update=True,
         )
+        ground_size = (
+            max(100.0, math.ceil(math.sqrt(self.num_envs)) * scene_cfg.env_spacing + 100.0)
+            if config["vision"] == "rgb"
+            else 100.0
+        )
         scene_cfg.ground = AssetBaseCfg(
             prim_path="/World/Ground",
-            spawn=sim_utils.GroundPlaneCfg(physics_material=material),
+            spawn=sim_utils.GroundPlaneCfg(size=(ground_size, ground_size), physics_material=material),
         )
         initial_positions = dict(zip(self.joint_names, config["initial_joint_pos"], strict=True))
         asset_path = Path(config["asset_path"]).resolve()
@@ -237,6 +242,7 @@ class Adapter:
             "camera_clipping_m": [0.01, 20.0] if self._camera is not None else None,
             "camera_near_clip_enforced": False if self._camera is not None else None,
             "env_spacing_m": float(config.get("env_spacing", 5.0)),
+            "visual_ground_size_m": [ground_size, ground_size],
             "pd": None if self._cartpole else {"kp": 80.0, "kd": 2.0, "effort_limit_nm": 80.0},
             "pd_integration": "MuJoCo implicitfast native joint drives",
             "model_conversion": "Common URDF; fixed links merged; convex hull collisions; multi-physics USD conversion",
