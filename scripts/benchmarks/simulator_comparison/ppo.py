@@ -56,7 +56,7 @@ def evaluate(task, policy: Policy, steps: int, seed: int) -> dict:
     failed = torch.zeros(task.n, dtype=torch.bool, device=task.device)
     returns = torch.zeros(task.n, device=task.device)
     errors = torch.zeros_like(returns)
-    key = "tracking_error_m_s" if task.walk else "pole_angle_abs_rad"
+    key = task.error_key
     for _ in range(steps):
         distribution, _ = policy(obs, task.images)
         obs, reward, _, info = task.step(distribution.mean)
@@ -70,7 +70,7 @@ def evaluate(task, policy: Policy, steps: int, seed: int) -> dict:
         "steps": steps,
         "seed": seed,
     }
-    result["threshold_reached"] = result["survival_fraction"] >= 0.95 and (result[key] <= (0.25 if task.walk else 0.1))
+    result["threshold_reached"] = result["survival_fraction"] >= 0.95 and result[key] <= task.error_threshold
     task.generator.set_state(old_generator)
     return result
 

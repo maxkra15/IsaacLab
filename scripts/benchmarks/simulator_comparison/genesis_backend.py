@@ -25,12 +25,13 @@ class Adapter:
         torch.cuda.set_device(self.device)
         gs.init(backend=gs.cuda, seed=config["seed"], precision="32", logging_level="warning", performance_mode=True)
         self._is_cartpole = config["task"] == "cartpole"
+        self._is_franka = config["task"] == "franka"
         settings = config.get("solver_settings", {}).get("genesis", {})
         iterations = int(settings.get("max_iterations", config.get("solver_iterations", 50)))
         tolerance = settings.get("tolerance")
         if tolerance is not None:
             tolerance = float(tolerance)
-        if config["task"] not in ("cartpole", "anymal"):
+        if config["task"] not in ("cartpole", "anymal", "franka"):
             raise ValueError(f"Unsupported task: {config['task']}")
         self._joint_names = list(config["joint_names"])
         has_camera = config["vision"] == "rgb"
@@ -52,12 +53,12 @@ class Adapter:
             profiling_options=gs.options.ProfilingOptions(show_FPS=False),
         )
         floor = self.scene.add_entity(gs.morphs.Plane())
-        root_height = 0.0 if self._is_cartpole else config.get("initial_height", 0.55)
+        root_height = config.get("initial_height", 0.55) if config["task"] == "anymal" else 0.0
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file=config["asset_path"],
                 pos=(0.0, 0.0, root_height),
-                fixed=self._is_cartpole,
+                fixed=self._is_cartpole or self._is_franka,
                 merge_fixed_links=True,
                 recompute_inertia=False,
                 default_armature=0.0,
@@ -83,6 +84,11 @@ class Adapter:
                 directional=True,
             )
         self.scene.build(n_envs=config["num_envs"])
+        if self._is_franka:
+            self._ee_link = self.robot.get_link(config["end_effector_link"])
+            self._ee_offset = torch.tensor(config["end_effector_offset"], device=self.device).expand(
+                config["num_envs"], -1
+            )
         if camera_follows_root:
             self._camera.follow_entity(self.robot, fix_orientation=True)
         self._joint_indices = [self.robot.get_joint(name).dofs_idx_local[0] for name in self._joint_names]
@@ -95,9 +101,14 @@ class Adapter:
         floor.set_friction(config.get("friction", 0.8))
         self.robot.set_friction(config.get("friction", 0.8))
         if not self._is_cartpole:
-            self.robot.set_dofs_kp(torch.full((12,), config.get("kp", 80.0), device=self.device), self._joint_indices)
-            self.robot.set_dofs_kv(torch.full((12,), config.get("kd", 2.0), device=self.device), self._joint_indices)
-            effort = torch.full((12,), config.get("effort_limit", 80.0), device=self.device)
+            shape = (len(self._joint_indices),)
+            self.robot.set_dofs_kp(torch.full(shape, config.get("kp", 80.0), device=self.device), self._joint_indices)
+            self.robot.set_dofs_kv(torch.full(shape, config.get("kd", 2.0), device=self.device), self._joint_indices)
+            effort = (
+                torch.tensor(config["effort_limits"], device=self.device)
+                if self._is_franka
+                else torch.full(shape, config.get("effort_limit", 80.0), device=self.device)
+            )
             self.robot.set_dofs_force_range(-effort, effort, self._joint_indices)
         self._initial_joint_pos = torch.tensor(
             config["initial_joint_pos"],
@@ -150,6 +161,17 @@ class Adapter:
             "num_links": self.robot.n_links,
             "num_dofs": self.robot.n_dofs,
         }
+        if self._is_franka:
+            lower, upper = self.robot.get_dofs_limit(self._joint_indices)
+            self.metadata.update(
+                fixed_base=True,
+                end_effector_link=config["end_effector_link"],
+                end_effector_offset_m=config["end_effector_offset"],
+                joint_lower_limits=lower.tolist(),
+                joint_upper_limits=upper.tolist(),
+                pd={"kp": config["kp"], "kd": config["kd"], "effort_limits_nm": effort.tolist()},
+                moving_mass_definition="All authored masses except fixed panda_link0",
+            )
         self.reset()
 
     @property
@@ -182,7 +204,7 @@ class Adapter:
         Positions use [m or rad, depending on joint type], velocities use [m/s or rad/s].
         Root quantities use [m], [m/s], [rad/s], and quaternion order (w, x, y, z).
         """
-        return {
+        state = {
             "joint_pos": self.robot.get_dofs_position(self._joint_indices),
             "joint_vel": self.robot.get_dofs_velocity(self._joint_indices),
             "root_pos": self.robot.get_pos(),
@@ -190,9 +212,15 @@ class Adapter:
             "root_lin_vel": self.robot.get_vel(),
             "root_ang_vel": self.robot.get_ang(),
         }
+        if self._is_franka:
+            quaternion = self._ee_link.get_quat()
+            cross = torch.cross(quaternion[:, 1:], self._ee_offset, dim=-1)
+            offset = self._ee_offset + 2 * (quaternion[:, :1] * cross + torch.cross(quaternion[:, 1:], cross, dim=-1))
+            state["ee_pos"] = self._ee_link.get_pos() + offset
+        return state
 
     def apply_action(self, actions: torch.Tensor) -> None:
-        """Set cart force [N] or ANYmal joint position targets [rad] for the next physics steps."""
+        """Set cart force [N] or robot joint position targets [rad] for the next physics steps."""
         if self._is_cartpole:
             self.robot.control_dofs_force(actions, self._action_indices)
         else:

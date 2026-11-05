@@ -45,6 +45,8 @@ class Adapter:
         self.num_envs = int(config["num_envs"])
         self.joint_names = list(config["joint_names"])
         self._cartpole = config["task"] == "cartpole"
+        self._franka = config["task"] == "franka"
+        self._fixed_base = self._cartpole or self._franka
         self._camera = None
         self._camera_motion = config.get("camera_motion", "fixed")
         if self._camera_motion not in ("fixed", "root_translation"):
@@ -98,6 +100,19 @@ class Adapter:
             spawn=sim_utils.GroundPlaneCfg(size=(ground_size, ground_size), physics_material=material),
         )
         initial_positions = dict(zip(self.joint_names, config["initial_joint_pos"], strict=True))
+        kp = 0.0 if self._cartpole else float(config.get("kp", 80.0))
+        kd = 0.0 if self._cartpole else float(config.get("kd", 2.0))
+        if "effort_limits" in config:
+            effort_limits = dict(zip(self.joint_names, config["effort_limits"], strict=True))
+        else:
+            effort_limits = 1000.0 if self._cartpole else float(config.get("effort_limit", 80.0))
+        pd = None
+        if not self._cartpole:
+            pd = {"kp": kp, "kd": kd}
+            if self._franka:
+                pd["effort_limits_nm"] = config["effort_limits"]
+            else:
+                pd["effort_limit_nm"] = float(config.get("effort_limit", 80.0))
         asset_path = Path(config["asset_path"]).resolve()
         usd_dir = Path(config.get("asset_cache_dir", asset_path.parent / "isaaclab_mjwarp_usd"))
         scene_cfg.robot = ArticulationCfg(
@@ -106,7 +121,7 @@ class Adapter:
             spawn=sim_utils.UrdfFileCfg(
                 asset_path=str(asset_path),
                 usd_dir=str(usd_dir),
-                fix_base=self._cartpole,
+                fix_base=self._fixed_base,
                 merge_fixed_joints=True,
                 self_collision=False,
                 collision_type="Convex Hull",
@@ -124,9 +139,9 @@ class Adapter:
             actuators={
                 "joints": ImplicitActuatorCfg(
                     joint_names_expr=[".*"],
-                    joint_effort_limit=1000.0 if self._cartpole else float(config.get("effort_limit", 80.0)),
-                    stiffness=0.0 if self._cartpole else 80.0,
-                    damping=0.0 if self._cartpole else 2.0,
+                    joint_effort_limit=effort_limits,
+                    stiffness=kp,
+                    damping=kd,
                     armature=0.0,
                     friction=0.0,
                     dynamic_friction=0.0,
@@ -173,6 +188,17 @@ class Adapter:
             config["initial_joint_pos"], device=self.device, dtype=torch.float32
         ).repeat(self.num_envs, 1)
         self._efforts = torch.zeros_like(self._initial_joint_pos)
+        if self._franka:
+            from isaaclab.utils.math import quat_apply
+
+            body_ids, _ = self._robot.find_bodies(config["end_effector_link"])
+            if len(body_ids) != 1:
+                raise ValueError(f"Expected one end-effector body, found {len(body_ids)}")
+            self._ee_body_id = body_ids[0]
+            self._ee_offset = torch.tensor(
+                config["end_effector_offset"], device=self.device, dtype=torch.float32
+            ).expand(self.num_envs, -1)
+            self._quat_apply = quat_apply
         if config["vision"] == "rgb":
             self._camera = self._scene["camera"]
             eye = torch.tensor(config.get("camera_pos", (2.0, -2.0, 1.5)), device=self.device, dtype=torch.float32)
@@ -186,7 +212,9 @@ class Adapter:
         link_masses = self._robot.data.body_mass.torch[0].tolist()
         link_names = list(self._robot.body_names)
         moving_mass = sum(
-            mass for name, mass in zip(link_names, link_masses, strict=True) if not self._cartpole or name != "base"
+            mass
+            for name, mass in zip(link_names, link_masses, strict=True)
+            if not (self._cartpole and name == "base") and not (self._franka and name == "panda_link0")
         )
         backend = self._sim.backend_manager.backend
         solver = backend.solver
@@ -243,7 +271,14 @@ class Adapter:
             "camera_near_clip_enforced": False if self._camera is not None else None,
             "env_spacing_m": float(config.get("env_spacing", 5.0)),
             "visual_ground_size_m": [ground_size, ground_size],
-            "pd": None if self._cartpole else {"kp": 80.0, "kd": 2.0, "effort_limit_nm": 80.0},
+            "pd": pd,
+            "end_effector": {
+                "body": config["end_effector_link"],
+                "offset_m": config["end_effector_offset"],
+                "position_frame": "Environment-local world axes",
+            }
+            if self._franka
+            else None,
             "pd_integration": "MuJoCo implicitfast native joint drives",
             "model_conversion": "Common URDF; fixed links merged; convex hull collisions; multi-physics USD conversion",
             "cache_dir": str(usd_dir),
@@ -277,7 +312,7 @@ class Adapter:
         """Return canonical joint and root state in SI units and wxyz quaternions."""
         data = self._robot.data
         quat_xyzw = data.root_quat_w.torch
-        return {
+        state = {
             "joint_pos": data.joint_pos.torch,
             "joint_vel": data.joint_vel.torch,
             "root_pos": data.root_pos_w.torch - self._origins,
@@ -285,9 +320,16 @@ class Adapter:
             "root_lin_vel": data.root_link_lin_vel_w.torch,
             "root_ang_vel": data.root_link_ang_vel_w.torch,
         }
+        if self._franka:
+            state["ee_pos"] = (
+                data.body_link_pos_w.torch[:, self._ee_body_id]
+                - self._origins
+                + self._quat_apply(data.body_link_quat_w.torch[:, self._ee_body_id], self._ee_offset)
+            )
+        return state
 
     def apply_action(self, actions: torch.Tensor) -> None:
-        """Set cart force [N] or ANYmal joint position targets [rad]."""
+        """Set cart force [N] or joint position targets [rad]."""
         if self._cartpole:
             self._efforts.zero_()
             self._efforts[:, 0] = actions[:, 0]

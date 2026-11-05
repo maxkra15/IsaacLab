@@ -244,6 +244,25 @@ def run_suite(args) -> int:
                                 "camera_fov": 60,
                                 "provenance": provenance,
                             }
+                            if task == "franka":
+                                config.update(
+                                    {
+                                        key: manifest["franka"][key]
+                                        for key in (
+                                            "joint_names",
+                                            "initial_joint_pos",
+                                            "joint_lower_limits",
+                                            "joint_upper_limits",
+                                            "kp",
+                                            "kd",
+                                            "effort_limits",
+                                            "end_effector_link",
+                                            "end_effector_offset",
+                                            "kinematic_chain",
+                                        )
+                                    }
+                                )
+                                config.update(camera_pos=[1.8, -1.8, 1.4], camera_lookat=[0.45, 0.0, 0.45])
                             jobs.append((config, interpreter, environment))
     # Interleave engines and batch sizes to reduce ordering/temperature drift.
     random.Random(args.schedule_seed).shuffle(jobs)
@@ -366,7 +385,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output_dir", type=Path, required=True)
     result.add_argument("--backends", nargs="+", default=["genesis", "isaaclab"])
     result.add_argument("--backend_python", action="append", default=[], metavar="NAME=PATH")
-    result.add_argument("--tasks", nargs="+", choices=["cartpole", "anymal"], default=["cartpole", "anymal"])
+    result.add_argument(
+        "--tasks", nargs="+", choices=["cartpole", "anymal", "franka"], default=["cartpole", "anymal", "franka"]
+    )
     result.add_argument(
         "--modes", nargs="+", choices=["physics", "rollout", "learning"], default=["physics", "rollout", "learning"]
     )

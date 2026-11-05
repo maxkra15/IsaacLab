@@ -8,8 +8,81 @@
 import argparse
 import hashlib
 import json
+import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+
+def prepare_franka(genesis_path: Path, output_dir: Path) -> dict:
+    """Prepare the pinned Panda with a fixed open gripper and authored arm limits."""
+    source = genesis_path / "genesis/assets/urdf/panda_bullet/panda.urdf"
+    tree = ET.parse(source)
+    assets = {}
+    for mesh in tree.iter("mesh"):
+        path = (source.parent / mesh.attrib["filename"].removeprefix("package://")).resolve()
+        assets[str(path.relative_to(genesis_path.resolve()))] = hashlib.sha256(path.read_bytes()).hexdigest()
+        mesh.set("filename", str(path))
+    names = [f"panda_joint{index}" for index in range(1, 8)]
+    joints = {joint.attrib["name"]: joint for joint in tree.iter("joint")}
+    limits = [joints[name].find("limit").attrib for name in names]
+    chain = []
+    for name in names:
+        joint = joints[name]
+        origin = joint.find("origin")
+        chain.append(
+            {
+                "origin_xyz": [float(value) for value in origin.attrib["xyz"].split()],
+                "origin_rpy": [float(value) for value in origin.attrib["rpy"].split()],
+                "axis": [float(value) for value in joint.find("axis").attrib["xyz"].split()],
+            }
+        )
+        ET.SubElement(joint, "dynamics", {"damping": "0", "friction": "0"})
+    # Bake each authored prismatic displacement into its fixed-joint origin.
+    # This removes gripper/mimic control differences from a seven-action reach task.
+    fingers = {}
+    for name in ("panda_finger_joint1", "panda_finger_joint2"):
+        joint = joints[name]
+        opening = float(joint.find("limit").attrib["upper"])
+        origin = joint.find("origin")
+        xyz = [float(value) for value in origin.attrib["xyz"].split()]
+        axis = [float(value) for value in joint.find("axis").attrib["xyz"].split()]
+        origin.set("xyz", " ".join(str(value + opening * direction) for value, direction in zip(xyz, axis)))
+        joint.set("type", "fixed")
+        for child in list(joint):
+            if child.tag in {"limit", "axis", "mimic", "dynamics"}:
+                joint.remove(child)
+        fingers[name] = opening
+    zero_inertia_markers = []
+    for link in tree.iter("link"):
+        if link.attrib["name"] in {"panda_link8", "panda_grasptarget"}:
+            inertial = link.find("inertial")
+            if float(inertial.find("mass").attrib["value"]) != 0.0:
+                raise ValueError(f"Expected a massless Panda marker: {link.attrib['name']}")
+            inertia = inertial.find("inertia")
+            for component in inertia.attrib:
+                inertia.set(component, "0")
+            zero_inertia_markers.append(link.attrib["name"])
+    tree.write(output_dir / "franka.urdf", encoding="unicode", xml_declaration=True)
+    return {
+        "joint_names": names,
+        "initial_joint_pos": [0.0, -0.5, 0.0, -2.0, 0.0, 1.5, math.pi / 4],
+        "joint_lower_limits": [float(limit["lower"]) for limit in limits],
+        "joint_upper_limits": [float(limit["upper"]) for limit in limits],
+        "kp": 80.0,
+        "kd": 4.0,
+        "effort_limits": [float(limit["effort"]) for limit in limits],
+        "end_effector_link": "panda_link7",
+        "end_effector_offset": [0.0, 0.0, 0.212],
+        "kinematic_chain": chain,
+        "source_urdf_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "meshes_sha256": assets,
+        "normalization": {
+            "fixed_finger_positions_m": fingers,
+            "zero_mass_marker_inertias_zeroed": zero_inertia_markers,
+            "joint_damping": 0.0,
+            "joint_friction": 0.0,
+        },
+    }
 
 
 def prepare(genesis_path: Path, output_dir: Path) -> dict:
@@ -79,6 +152,7 @@ def prepare(genesis_path: Path, output_dir: Path) -> dict:
             "joint_friction": 0.0,
         },
     }
+    manifest["franka"] = prepare_franka(genesis_path, output_dir)
     # Absolute mesh paths vary between machines; the original model/mesh hashes identify the physical inputs.
     manifest["prepared_sha256"] = {
         p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in output_dir.glob("*.urdf")

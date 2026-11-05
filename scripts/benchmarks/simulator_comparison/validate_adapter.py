@@ -57,7 +57,13 @@ def validate(config: dict, output: Path) -> dict:
         _record(checks, "finite_state", all(bool(torch.isfinite(value).all()) for value in state.values()))
         if not checks["finite_state"]["passed"]:
             raise FloatingPointError("Initial physics state contains non-finite values")
-        expected_names = ANYMAL_JOINTS if task.walk else ["slider", "pole"]
+        reach = config["task"] == "franka"
+        if task.walk:
+            expected_names = ANYMAL_JOINTS
+        elif reach:
+            expected_names = [f"panda_joint{index}" for index in range(1, 8)]
+        else:
+            expected_names = ["slider", "pole"]
         _record(checks, "joint_order", list(adapter.joint_names) == expected_names, actual=list(adapter.joint_names))
         initial = torch.tensor(config["initial_joint_pos"], device=config["device"], dtype=torch.float32)
         _validate_reset(adapter, config, initial, checks)
@@ -86,6 +92,13 @@ def validate(config: dict, output: Path) -> dict:
                 minimum_upright=upright.min().item(),
                 maximum_joint_deflection_rad=joint_deflection,
             )
+        elif reach:
+            expected_mass = sum(
+                float(link.find("inertial/mass").attrib["value"])
+                for link in ET.parse(config["asset_path"]).findall("link")
+                if link.attrib["name"] != "panda_link0" and link.find("inertial/mass") is not None
+            )
+            _validate_franka(adapter, config, initial, checks)
         else:
             expected_mass = 1.1
             _validate_cartpole(adapter, config, checks)
@@ -242,6 +255,115 @@ def _cartpole_reference(dt: float, steps: int):
     return state
 
 
+def _validate_franka(adapter, config: dict, initial, checks: dict) -> None:
+    """Compare native tool positions with independent float64 URDF kinematics."""
+    import torch
+
+    joints = {joint.attrib["name"]: joint for joint in ET.parse(config["asset_path"]).findall("joint")}
+    by_child = {joint.find("child").attrib["link"]: joint for joint in joints.values()}
+    chain = []
+    link = config["end_effector_link"]
+    while link in by_child:
+        joint = by_child[link]
+        chain.append(joint)
+        link = joint.find("parent").attrib["link"]
+    chain.reverse()
+    lower = torch.tensor(
+        [float(joints[name].find("limit").attrib["lower"]) for name in adapter.joint_names], dtype=torch.float64
+    )
+    upper = torch.tensor(
+        [float(joints[name].find("limit").attrib["upper"]) for name in adapter.joint_names], dtype=torch.float64
+    )
+    columns = torch.arange(len(adapter.joint_names), dtype=torch.float64)
+    rows = torch.linspace(-1, 1, config["num_envs"], dtype=torch.float64).unsqueeze(-1)
+    errors = []
+    for phase in (0.0, 1.0, 2.0):
+        positions = initial.double().cpu() + 0.15 * torch.sin(columns + phase) + 0.05 * rows
+        positions = positions.clamp(lower + 0.02, upper - 0.02)
+        adapter.reset(joint_pos=positions.float().to(config["device"]))
+        adapter.synchronize()
+        actual = adapter.state()["ee_pos"].double().cpu()
+        expected = torch.stack(
+            [_franka_reference_position(chain, adapter.joint_names, row, config) for row in positions]
+        )
+        errors.append((actual - expected).norm(dim=-1))
+    maximum_error = torch.stack(errors).max().item()
+    _record(
+        checks,
+        "franka_independent_end_effector_kinematics",
+        maximum_error < 2e-4,
+        maximum_position_error_m=maximum_error,
+        tolerance_m=2e-4,
+        pose_count=len(errors),
+        environment_count=config["num_envs"],
+        reference="Float64 transforms parsed from prepared URDF; authored link origin plus tool offset",
+    )
+    adapter.reset()
+    adapter.apply_action(initial.expand(config["num_envs"], -1))
+    for _ in range(16):
+        adapter.physics_step()
+    state = adapter.state()
+    deviation = (state["joint_pos"] - initial).abs().max().item()
+    base_error = (
+        (state["root_pos"] - torch.tensor([0, 0, config["initial_height"]], device=config["device"])).abs().max().item()
+    )
+    _record(
+        checks,
+        "franka_short_stability",
+        all(bool(torch.isfinite(value).all()) for value in state.values()) and deviation < 0.5 and base_error < 1e-5,
+        maximum_joint_deflection_rad=deviation,
+        maximum_fixed_base_displacement_m=base_error,
+        duration_s=16 * config["dt"],
+    )
+
+
+def _franka_reference_position(chain, names: list[str], positions, config: dict):
+    """Compose URDF origin and revolute transforms without backend FK utilities."""
+    import torch
+
+    transform = torch.eye(4, dtype=torch.float64)
+    transform[2, 3] = config["initial_height"]
+    coordinates = dict(zip(names, positions.tolist(), strict=True))
+    for joint in chain:
+        origin = joint.find("origin")
+        xyz = [float(value) for value in origin.attrib.get("xyz", "0 0 0").split()] if origin is not None else [0, 0, 0]
+        rpy = [float(value) for value in origin.attrib.get("rpy", "0 0 0").split()] if origin is not None else [0, 0, 0]
+        roll, pitch, yaw = rpy
+        cr, sr, cp, sp, cy, sy = (
+            math.cos(roll),
+            math.sin(roll),
+            math.cos(pitch),
+            math.sin(pitch),
+            math.cos(yaw),
+            math.sin(yaw),
+        )
+        local = torch.eye(4, dtype=torch.float64)
+        local[:3, 3] = torch.tensor(xyz, dtype=torch.float64)
+        local[:3, :3] = torch.tensor(
+            [
+                [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                [-sp, cp * sr, cp * cr],
+            ],
+            dtype=torch.float64,
+        )
+        transform = transform @ local
+        if joint.attrib["type"] != "fixed":
+            if joint.attrib["type"] not in ("revolute", "continuous"):
+                raise ValueError(f"Unsupported Franka reference joint type: {joint.attrib['type']}")
+            axis_element = joint.find("axis")
+            axis = torch.tensor([float(value) for value in axis_element.attrib["xyz"].split()], dtype=torch.float64)
+            axis /= axis.norm()
+            x, y, z = axis.tolist()
+            skew = torch.tensor([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=torch.float64)
+            angle = coordinates[joint.attrib["name"]]
+            rotation = torch.eye(4, dtype=torch.float64)
+            rotation[:3, :3] += math.sin(angle) * skew + (1 - math.cos(angle)) * (skew @ skew)
+            transform = transform @ rotation
+    offset = torch.tensor([*config["end_effector_offset"], 1.0], dtype=torch.float64)
+    return (transform @ offset)[:3]
+
+
 def _validate_images(adapter, config: dict, initial, directory: Path, checks: dict) -> None:
     import torch
     from PIL import Image
@@ -292,9 +414,10 @@ def _validate_mjwarp(adapter, config: dict, initial, directory: Path, checks: di
 
     import torch
 
+    position_control = config["task"] != "cartpole"
     nominal = (
         initial.expand(config["num_envs"], -1)
-        if config["task"] == "anymal"
+        if position_control
         else torch.zeros((config["num_envs"], 1), device=config["device"])
     )
     adapter.reset()
@@ -304,7 +427,7 @@ def _validate_mjwarp(adapter, config: dict, initial, directory: Path, checks: di
     graph = adapter._sim.backend_manager.backend.graph
     _record(checks, "mjwarp_graph_after_warmup", adapter.diagnostics()["graph_active"])
     trajectories = []
-    for action in (nominal, nominal + (0.1 if config["task"] == "anymal" else 10.0)):
+    for action in (nominal, nominal + (0.1 if position_control else 10.0)):
         adapter.reset()
         adapter.apply_action(action)
         for _ in range(16):
@@ -312,15 +435,15 @@ def _validate_mjwarp(adapter, config: dict, initial, directory: Path, checks: di
         adapter.synchronize()
         trajectories.append(adapter.state()["joint_pos"].clone())
     response = trajectories[1] - trajectories[0]
-    response_per_env = response.abs().amax(-1) if config["task"] == "anymal" else response[:, 0]
+    response_per_env = response.abs().amax(-1) if position_control else response[:, 0]
     _record(
         checks,
         "mjwarp_changed_control_after_capture",
         bool((response_per_env > 1e-3).all()),
         response_per_env=response_per_env.tolist(),
-        control_delta=0.1 if config["task"] == "anymal" else 10.0,
-        control_units="rad" if config["task"] == "anymal" else "N",
-        response_units="rad" if config["task"] == "anymal" else "m",
+        control_delta=0.1 if position_control else 10.0,
+        control_units="rad" if position_control else "N",
+        response_units="rad" if position_control else "m",
         comparison="Changed versus nominal controls, identical initial states and 16 physics steps",
     )
     _record(checks, "mjwarp_commands_preserve_graph", graph is adapter._sim.backend_manager.backend.graph)

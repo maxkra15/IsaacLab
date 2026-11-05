@@ -110,7 +110,7 @@ def run(config: dict, output: Path) -> dict:
             while remaining:
                 count = min(remaining, 100)
                 task.reset()
-                adapter.apply_action(task.nominal.expand(task.n, -1) if task.walk else actions)
+                adapter.apply_action(task.nominal.expand(task.n, -1) if task.walk or task.reach else actions)
                 adapter.synchronize()
                 begin = time.perf_counter()
                 for _ in range(count):
