@@ -81,7 +81,7 @@ def _runtime(records: list[dict], output: Path) -> None:
                         capsize=3,
                         label=label,
                     )
-            for column, title in enumerate((unit, "Startup to usable scene [s]")):
+            for column, title in enumerate((unit, "Worker startup [s]")):
                 ax = axes[row, column]
                 ax.set(title=f"{task.upper()} · {title}", xlabel="Parallel environments", ylabel=title)
                 if series:

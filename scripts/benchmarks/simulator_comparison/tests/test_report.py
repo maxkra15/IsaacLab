@@ -9,6 +9,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
 from html.parser import HTMLParser
@@ -95,6 +96,37 @@ class TestReport(unittest.TestCase):
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual((root / "site" / published["download"]).read_bytes(), original)
             self.assertEqual(published["sha256"], hashlib.sha256(original).hexdigest())
+
+    def test_single_sample_bar_and_whisker_share_the_same_scale(self):
+        class Chart(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.bars, self.whiskers, self.axes = [], [], []
+
+            def handle_starttag(self, tag, attributes):
+                values = dict(attributes)
+                if tag == "rect":
+                    self.bars.append(values)
+                elif tag == "path":
+                    self.whiskers.append(values["d"])
+                elif tag == "line" and values.get("x1") == values.get("x2"):
+                    self.axes.append(float(values["x1"]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input"
+            source.mkdir()
+            record = measurement()
+            record["config"]["mode"] = "physics"
+            (source / "run.result.json").write_text(json.dumps(record))
+            chart = Chart()
+            chart.feed(report.build_report(source, root / "site").read_text())
+            self.assertEqual(len(chart.bars), 1)
+            bar = chart.bars[0]
+            # A single observation has equal minimum, median and maximum.
+            endpoint = float(re.search(r"H\s*([\d.]+)", chart.whiskers[0]).group(1))
+            self.assertAlmostEqual(float(bar["x"]) + float(bar["width"]), endpoint)
+            self.assertEqual(float(bar["x"]), chart.axes[0])
 
     def test_failed_inputs_do_not_publish_active_html_or_unrelated_files(self):
         class Document(HTMLParser):

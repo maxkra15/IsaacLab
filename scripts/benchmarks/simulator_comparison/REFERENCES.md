@@ -47,7 +47,8 @@ must accompany results, and a shorter timed rollout alone must not be called fas
 The main `shared` profile is an explicit benchmark baseline: Genesis Newton has a 25-iteration maximum
 and native tolerance; Isaac Lab Newton/MuJoCo Warp uses Newton solving, implicitfast integration,
 100 iterations, 50 line-search iterations, tolerance 1e-6, MuJoCo contacts, pyramidal friction and one substep.
-Resolved settings, graph activity and final-state overflow flags are retained. Final flags are not an overflow history.
+Resolved settings, graph activity and final-state flags are retained. Fatal capacity flags reject runs;
+iteration/convergence limits are recorded separately and remain valid measurements. Final flags are not an overflow history.
 The existing [ANYmal flat preset](https://github.com/isaac-sim/IsaacLab/blob/efa240ec39794f5d80430cbe38620626954c2c4d/source/isaaclab_tasks/isaaclab_tasks/contrib/velocity/config/anymal_c/flat_env_cfg.py)
 and [velocity baseline](https://github.com/isaac-sim/IsaacLab/blob/efa240ec39794f5d80430cbe38620626954c2c4d/source/isaaclab_tasks/isaaclab_tasks/core/velocity/velocity_env_cfg.py)
 use a different combination of substeps, contact generation and friction cone. They are not the configuration measured here.

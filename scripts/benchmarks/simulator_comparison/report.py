@@ -55,7 +55,7 @@ BACKEND_LABELS = {
     "mjlab": "mjlab",
 }
 METRICS = {
-    "startup_s": ("Startup to usable scene", "s", False),
+    "startup_s": ("Worker startup", "s", False),
     "first_step_s": ("First step", "s", False),
     "env_steps_per_s": ("Environment throughput", "env transitions/s", True),
     "physics_steps_per_s": ("Physics throughput", "env physics steps/s", True),
@@ -164,7 +164,7 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
                     "Mode",
                     "Backend",
                     "Successful/attempted",
-                    "Startup [s]",
+                    "Worker startup [s]",
                     "Physics [env steps/s]",
                     "Rollout [transitions/s]",
                 ),
@@ -176,6 +176,7 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
             '<h3>Held-out learning outcomes</h3><p class="muted">Survival means no fall during the '
             "evaluation horizon. Task error is speed tracking for ANYmal and pole angle for cartpole. "
             "The first observed target uses the training clock, including evaluation and excluding startup. "
+            "Target-time medians are conditional on reaching the target; censored seeds are excluded from that median. "
             "Checks occur every configured evaluation interval (50 iterations in the main matrix). "
             "An unreached target is censored at the recorded budget.</p>"
         )
@@ -189,7 +190,7 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
                     "Survival [fraction]",
                     "Task error",
                     "Training [s]",
-                    "First target [training s]",
+                    "First target, reached seeds [training s]",
                 ),
                 learning,
             )
@@ -447,7 +448,8 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
         if run.get("camera_download"):
             parts.append(
                 f'<tr><td colspan="4"><a href="{_escape(run["camera_download"])}">'
-                f'<img src="{_escape(run["camera_download"])}" width="160" loading="lazy"'
+                f'<img src="{_escape(run["camera_download"])}" width="{_escape(cfg.get("width", 64))}"'
+                ' loading="lazy" style="image-rendering:pixelated"'
                 f' alt="{_escape(label)} camera validation frame">'
                 "</a> First usable RGB frame; native renderer quality differs.</td></tr>"
             )
@@ -522,7 +524,9 @@ def build_report(input_dir: Path, output_dir: Path) -> Path:
 <section id="methods"><details><summary>Measurement contract</summary>
 <p>Physics times synchronized stepping with prescribed controls; rollout includes actions, observations,
 rewards and resets. One environment transition contains the configured number of physics steps.
-Startup and the first step are reported separately from warmed throughput. A fresh process can reuse disk caches.</p>
+Worker startup covers runtime imports through the first usable observation; Python/site initialization is outside
+this clock. The first step and warmed throughput are separate. Complete process wall time is also recorded.
+A fresh process can reuse disk caches.</p>
 <p>The shared benchmark baseline uses Genesis's Newton solver with a 25-iteration maximum and native tolerance.
 Isaac Lab runs without Kit and uses Newton/MuJoCo Warp with Newton solving, implicitfast integration,
 100 solver / 50 line-search iterations, tolerance 1e-6, pyramidal friction, MuJoCo contacts,
@@ -534,7 +538,8 @@ throughput alone does not establish walking quality.
 The backend metadata records controls and assets. Genesis uses Madrona rasterization and Isaac Lab uses
 Newton Warp ray tracing. RGB augments proprioception in the common CNN policy; these tasks do not establish
 vision-only navigation. Renderer quality differs, and image throughput does not establish quality equivalence.
-MJWarp graph activity and overflow flags are checked at the final solver state; flags are not a cumulative history.</p>
+MJWarp graph activity and fatal capacity flags are checked at the final solver state.
+Convergence-limit flags are retained separately and do not reject a run. Final flags are not a cumulative history.</p>
 <p>Comparisons share task, vision mode, mode, batch size, timestep, decimation, image dimensions and measured
 step count. Maximum capacity is separate from speed at a matched batch size. Successful-run summaries retain
 their sample count and observed range; they are not confidence intervals. Hardware and shared training dependencies

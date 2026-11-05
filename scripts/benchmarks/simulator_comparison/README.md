@@ -7,7 +7,7 @@ policy. This measures vision processing cost; neither task establishes vision-on
 
 | Measurement | Included work |
 | --- | --- |
-| Startup | Runtime imports, asset import, scene construction, first reset/observation |
+| Startup | Worker clock: runtime imports through first usable observation; excludes Python/site initialization |
 | First step | First control step, separately from warmed throughput |
 | Physics | One 5 ms physics step; fixed targets, resets outside timed windows, rendering disabled |
 | Rollout | Four physics steps, actions, observations, reward, termination/reset, optional RGB |
@@ -39,8 +39,9 @@ the bundled ANYmal model are explicitly represented as continuous joints in both
 RGB environments are separated by 100 m. ANYmal cameras follow root translation;
 cartpole uses a wider fixed view. Native camera-update costs remain timed, including
 Genesis's host-side follow update. Displacement bounds check camera isolation.
-MJWarp graph activity and overflow flags are recorded at the final solver state;
-these flags do not establish that no transient overflow occurred earlier.
+MJWarp graph activity and fatal capacity flags are checked at the final solver state.
+Convergence-limit flags are recorded separately and do not reject a run. Final-state
+flags do not establish that no transient overflow occurred earlier.
 Throughput means **batched environment steps/s**, not one robot's refresh rate.
 
 ## Source and environments
@@ -116,12 +117,28 @@ uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simula
   --input_dir benchmarks/simulator_full --output_dir benchmarks/simulator_report/figures
 ```
 
+For publication, use an empty output directory and the committed harness revision:
+
+```bash
+uv run --no-project --python "$ISAACLAB_PYTHON" python scripts/benchmarks/simulator_comparison/assemble_report.py \
+  --input_dir benchmarks/simulator_full --output_dir benchmarks/simulator_publication \
+  --harness_dir scripts/benchmarks/simulator_comparison --source_commit "$(git rev-parse HEAD)" \
+  --validation_dir benchmarks/validation --include_run_archive
+```
+
+The assembler requires all 84 matched successful runs and eight successful independent
+validators from the same runtime, validator source and physical inputs. Use a separate
+output directory for each RGB validator so its frames remain intact. Old/failed attempts
+are archived separately. The bundle includes source plus license, CSV, figures, validation
+frames, provenance and checksums; the optional run archive includes policies and logs.
+
 Use an idle GPU. Jobs run serially in shuffled order and resume completed cases;
 `--rerun` repeats them. Workers start fresh processes while disk/JIT caches are reused.
 Retain configs, logs, freezes, source/harness hashes, asset manifests and checkpoints.
 The first observed target uses the training clock, including evaluation and excluding
 startup; checks every 50 iterations limit its time resolution. Missed targets remain
-censored. Final task quality accompanies speed.
+censored. Target-time medians include reached seeds only. Complete process wall time
+is recorded separately. Final task quality accompanies speed.
 
 Publish the complete generated directory under `site/reports/YYYY-MM-DD-genesis-isaaclab/`
 in `maxkra15/maxkra15.github.io`. [REFERENCES.md](REFERENCES.md) explains why this MJWarp
