@@ -35,7 +35,7 @@ Training practices one assignment per episode: its first verified receipt ends t
 and missing or losing the assigned parcel fails the attempt. An unrelated parcel falling does not
 relabel that assignment as a failure. Continuing playback still fails when any unsorted parcel is lost.
 Playback uses the first randomized five-lane fixture and
-240-second episodes, continuing to another parcel after each controlled placement. Each verified
+240-second episodes, continuing to another parcel after each physical receipt. Each verified
 delivery counts as a success. Evaluate checkpoints from full starts; curriculum success rates alone
 do not establish end-to-end performance. Conveyors reach operating speed within one physics step
 to match ongoing training resets.
@@ -50,6 +50,18 @@ uv run isaaclab play --task IsaacContrib-Conveyor-Suction-Sorting \
 ```
 
 With Isaac Sim installed, use `--viz kit` for RTX visualization.
+
+For continuous five-parcel training, retain the robot and parcels between deliveries:
+
+```bash
+uv run isaaclab train --task IsaacContrib-Conveyor-Suction-Sorting \
+  --rl_library rsl_rl --num_envs 512 --device cuda:0 \
+  env.parcel_count=5 env.commands.sort.continue_after_delivery=true env.episode_length_s=120
+```
+
+Only batch completion, failure, or timeout resets this mode. The policy controls every return
+and pickup; there is no return-to-home controller. Single-assignment checkpoints need continuous
+training and evaluation before they can be considered reliable at successive transfers.
 
 The policy outputs three Cartesian target increments and one binary vacuum command. Standard
 differential IK maintains a downward tool orientation, with bounded target lead and normal
@@ -86,7 +98,7 @@ command. Colors make the scene readable without becoming policy inputs. Goals ar
 to these reachable, supported receiving areas; this example does not establish transfer to
 arbitrary facilities or obstacles. The interface has 312 observations and four actions. The wider collision scan
 changes the spatial meaning of its samples, so earlier checkpoints require their original observation configuration.
-New training uses fresh weights; earlier checkpoints require their matching observation scaling and normalizer.
+Earlier checkpoints require their matching observation scaling and normalizer.
 Evaluate separately on held-out fixture layouts before claiming generalization.
 
 `make_logistics_layouts(seed=73, count=32)` fixes the training catalog. Use a separate seed with
@@ -100,10 +112,11 @@ deliveries separately from familiar outlets. New random seeds alone do not estab
 
 ## Reset distribution and success
 
-The public `isaaclab_tasks.utils.ResetStateSampler` tracks 49 shared progress buckets:
-sixteen points each for controlled descent, held lift/transport, and unheld approach, plus a full-home start.
+The public `isaaclab_tasks.utils.ResetStateSampler` tracks 65 shared progress buckets by default:
+sixteen points each for controlled descent, held lift/transport, home approach, and empty-tool return,
+plus a full-home start. `events.reset_parcels.params.samples_per_path` controls each family's density.
 Each draw independently chooses a parcel, destination, and pickup anchor on the world's physical fixture.
-The default cached geometry contains 270,336 physical states, while the outcome history stays small enough to
+The default cached geometry contains 337,920 physical states, while the outcome history stays small enough to
 receive repeated attempts. Layout and package variations share progress history instead of fragmenting it.
 The Beta sampler favors intermediate success and retains a uniform strategy with weight 0.005.
 
@@ -121,6 +134,10 @@ progress levels 9–15 retain at least 6 cm of geometric clearance above the rec
 Released outfeed starts are excluded: the conveyor can complete those deliveries without a policy
 action. No reset seeds a receipt or successful outcome.
 
+Empty-tool return starts vary the previous outlet independently of the next goal, with reachable
+arm poses and a parcel approaching the dispatch turn. Each path shares its endpoint across progress
+levels. Return outcomes have their own SGS history so successful home pickups cannot mask a failing return.
+
 No parcel starts with delivery credit in any reset phase. Release is checked before detachment:
 the parcel must be upright, close to its commanded position, at most 2 cm above the receiving
 surface, and moving slowly relative to either the stationary world or the moving belt.
@@ -129,11 +146,10 @@ the attempt. Only a qualified placement followed by a settled receipt in the com
 earns credit; a thrown parcel cannot qualify merely by landing in that bin.
 A verified physical receipt earns a reward of +10. Training retains its original target until that
 receipt or a failure; it cannot replace a missed parcel with an easier incoming one.
-During continuing playback, a controlled release that has detached and cleared the suction pads
-allows the dispatcher to select another parcel before the previous bin arrival. Released parcels retain
-their own destinations and receipt checks while the arm handles the next target. Simultaneous receipts
-each earn credit; a receipt never changes the current grasp. Playback also replaces missed pickups
-with incoming targets. Each handoff rebases the Cartesian controller at the measured tool pose without moving the scene.
+During continuous training or playback, the parcel and goal remain observed until their physical receipt.
+The dispatcher then selects an incoming parcel once the suction pads are clear, retaining readiness
+when no parcel is immediately available. Missed pickups also allow selection of an incoming target.
+Each handoff rebases the Cartesian controller at the measured tool pose without moving the scene.
 The original reset parcel's receipt immediately records a successful outcome for its
 shared progress bucket. Other receipts still earn rewards and increment delivery counters, but are not
 attributed to the earlier reset state. A world reset before the original parcel's receipt records a
@@ -149,7 +165,7 @@ Training starts receive more practice when the policy has intermediate success, 
 every progress bucket remains eligible. Sampling history is local to each worker and restarts
 when the environment is recreated. Training success from an easier reset is not an
 end-to-end pickup result. Evaluate separately from full belt starts and report correct-bin
-deliveries by size class, wrong-bin deliveries, drops, and complete twelve-parcel batches.
+deliveries by size class, wrong-bin deliveries, drops, and complete batches.
 
 The sampler follows the success-frontier principle in
 [Success Guided Sampling](https://arxiv.org/abs/2610.12465) and
@@ -159,9 +175,10 @@ can include both solved and unsolved configurations. Its Beta and uniform-strate
 differ from the papers. Increasing parallelism cannot repair missing reset coverage.
 
 Playback samples full belt starts uniformly. `full_start_success_rate` measures receipt of the
-original assigned parcel from a full home start; `full_batch_success_rate` separately measures all
-twelve physical receipts from that start. A single training delivery ends its episode successfully.
-Playback replenishes the scene after all twelve parcels arrive; timeout or losing an unsorted parcel
+original assigned parcel from a full home start; `second_delivery_success_rate` measures at least two
+receipts and `full_batch_success_rate` measures all configured parcels. `later_deliveries` excludes
+the first receipt. A single-assignment training delivery ends its episode successfully; continuous
+training and playback replenish the scene after the whole batch arrives. Timeout or losing an unsorted parcel
 also ends the episode.
 
 Evaluate the retrained policy from full starts, with held-out reset seeds and destination

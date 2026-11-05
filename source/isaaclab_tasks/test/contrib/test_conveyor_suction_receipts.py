@@ -22,6 +22,113 @@ from isaaclab_tasks.contrib.conveyor_suction.scene import PARCEL_SIZES, OutfeedL
 from isaaclab_tasks.utils import parse_env_cfg
 
 
+def _check_delayed_arrival_after_miss(env, rows, actions, hold_at_goal, place_in_bin, place_on_intake):
+    command = env.command_manager.get_term("sort")
+    reset = env.event_manager.get_term_cfg("reset_parcels").func
+    monitor = reset.reset_sampler.success_monitor
+    impact_ids = torch.tensor([0], device=env.device)
+    # A miss stays ready until an arrival, even after the original parcel leaves the miss boundary.
+    env.reset(env_ids=impact_ids)
+    history_size = monitor.success_size[rows[0]].item()
+    history_success = monitor.success_buf[rows[0]].sum().item()
+    first = env.active_ids[0].item()
+    second = (first + 1) % len(env.parcels)
+    env.gripper.reset(impact_ids)
+    command.lifted[0] = command.placed[0] = False
+    actions[0] = 0.0
+    actions[0, 3] = 1.0
+    for parcel_id in range(len(env.parcels)):
+        place_on_intake(0, parcel_id, (0.60 + 0.20 * parcel_id, -0.75))
+    place_on_intake(0, first, (0.92, -0.19))
+    for _ in range(4):
+        env.step(actions)
+        assert env.active_ids[0] == first and not command.delivered[0].any()
+        assert command.metrics["missed_pickups"][0] == 1
+    place_on_intake(0, first, (0.60 + 0.20 * first, -0.75))
+    place_on_intake(0, second, (0.30, -0.72))
+    lengths = env.episode_length_buf.clone()
+    env.step(actions)
+    assert env.active_ids[0] == second, "A delayed arrival must consume the previously observed miss."
+    torch.testing.assert_close(env.episode_length_buf, lengths + 1)
+    assert command.metrics["missed_pickups"][0] == 1
+
+    # Receiving that replacement rewards it once without labeling the missed sampled parcel successful.
+    hold_at_goal(0)
+    place_in_bin(0, second, command.destination_ids[0].item())
+    pulses = 0
+    for _ in range(15):
+        _, _, terminated, timed_out, extras = env.step(actions)
+        assert not terminated[0] and not timed_out[0]
+        pulse = extras["successes"][0].item()
+        pulses += pulse
+        assert dict(env.reward_manager.get_active_iterable_terms(0))["delivery"][0] == 600.0 * pulse
+    assert pulses == 1 and env.episode_success[0]
+    assert command.delivered[0, second] and not command.delivered[0, first]
+    assert command.delivered[0].sum() == command.metrics["correct_deliveries"][0] == 1
+    assert monitor.success_size[rows[0]] == history_size
+    env.reset(env_ids=impact_ids)
+    assert monitor.success_size[rows[0]] == history_size + 1
+    assert monitor.success_rate[rows[0]].item() == pytest.approx(history_success / (history_size + 1))
+
+
+def _check_full_batch_receipts(env, rows, actions, hold_at_goal, place_in_bin, place_on_intake):
+    command = env.command_manager.get_term("sort")
+    reset = env.event_manager.get_term_cfg("reset_parcels").func
+    monitor = reset.reset_sampler.success_monitor
+    cfg = env.cfg
+    training_ids = torch.tensor([1], device=env.device)
+    # Full batches keep all five receipt pulses, and only the fifth receipt terminates.
+    full_bucket = 4 * cfg.events.reset_parcels.params["samples_per_path"]
+    rows.fill_(full_bucket)
+    command.cfg.randomize_destination = False
+    cfg.commands.sort.randomize_destination = False
+    env.reset(env_ids=training_ids)
+    actions[1] = 0.0
+    actions[1, 3] = 1.0
+    for batch_size in (2, 5):
+        history_size = monitor.success_size[full_bucket].item()
+        for receipt in range(1, batch_size + 1):
+            parcel_id = env.active_ids[1].item()
+            assert not command.delivered[1, parcel_id]
+            assert command.destination_ids[1] == env.parcel_classes[parcel_id]
+            hold_at_goal(1)
+            place_in_bin(1, parcel_id, command.destination_ids[1].item())
+            for _ in range(15):
+                lengths = env.episode_length_buf.clone()
+                _, _, terminated, timed_out, extras = env.step(actions)
+                delivery = dict(env.reward_manager.get_active_iterable_terms(1))["delivery"][0]
+                if delivery:
+                    assert delivery == 600.0 and not timed_out[1]
+                    if receipt == 5:
+                        assert terminated[1] and env.episode_length_buf[1] == 0
+                        assert extras["log"]["Metrics/sort/correct_deliveries"] == 5
+                        assert extras["log"]["Metrics/sort/full_batch_success_rate"] == 1
+                        assert extras["log"]["Metrics/sort/second_delivery_success_rate"] == 1
+                    else:
+                        assert not terminated[1]
+                        torch.testing.assert_close(env.episode_length_buf[1], lengths[1] + 1)
+                        assert command.delivered[1].sum() == receipt
+                    break
+                assert not terminated[1] and not timed_out[1]
+            else:
+                pytest.fail("A qualified parcel did not earn its native bin receipt.")
+            if receipt < batch_size:
+                if env.active_ids[1] == parcel_id:
+                    candidate = (~command.delivered[1]).nonzero()[0, 0].item()
+                    place_on_intake(1, candidate, (0.30, -0.72))
+                    _, _, terminated, timed_out, extras = env.step(actions)
+                    assert not terminated[1] and not timed_out[1]
+                    assert not extras["successes"][1]
+                assert env.active_ids[1] != parcel_id
+                assert not command.delivered[1, env.active_ids[1]]
+        assert monitor.success_size[full_bucket] == history_size + 1
+        if batch_size == 2:
+            _, extras = env.reset(env_ids=training_ids)
+            assert extras["log"]["Metrics/sort/correct_deliveries"] == 2
+            assert extras["log"]["Metrics/sort/second_delivery_success_rate"] == 1
+            assert extras["log"]["Metrics/sort/full_batch_success_rate"] == 0
+
+
 @pytest.mark.parametrize("device", test_devices(DeviceScope.CUDA))
 def test_receipts_record_success_and_continue_without_reset(device):
     """Receipts reward once, record the sampled row once, and preserve history through handoffs and failures."""
@@ -30,6 +137,7 @@ def test_receipts_record_success_and_continue_without_reset(device):
     cfg.sim.visualizer_cfgs = []
     cfg.sim.save_logs_to_file = False
     cfg.seed = 41
+    cfg.parcel_count = 5
     # Keep the measured bin-impact fixture independent of randomized task defaults.
     angles = tuple(math.radians(value) for value in (10, 35, 60, 85, 110, 135))
     cfg.scene.outfeeds.spawn.assets_cfg = [
@@ -37,7 +145,7 @@ def test_receipts_record_success_and_continue_without_reset(device):
     ]
     cfg.scene.outfeeds.spawn.assets_cfg[1].layout.radial_offsets = (0.035,) * 6
     cfg.scene.outfeeds.spawn.assets_cfg[1].layout.height_offsets = (0.015,) * 6
-    cfg.commands.sort.goal_radial_range = (0.02, 0.02)
+    cfg.commands.sort.goal_radial_range = (0.0, 0.0)
     cfg.commands.sort.continue_after_delivery = True
     for index in range(len(PARCEL_SIZES)):
         setattr(cfg.events, f"parcel_{index}_mass", None)
@@ -46,6 +154,7 @@ def test_receipts_record_success_and_continue_without_reset(device):
     cfg.terminations.failure = None
     cfg.terminations.invalid_action = None
     with closing(gym.make(task, cfg=cfg).unwrapped) as env:
+        assert len(env.parcels) == 5, "The completion boundary must use five physical parcels."
         assert env.layout_ids.tolist() == [0, 1], "The impact fixture uses the original five-lane world."
         reset = env.event_manager.get_term_cfg("reset_parcels").func
         rows = torch.tensor([9, 10], device=device)
@@ -86,6 +195,17 @@ def test_receipts_record_success_and_continue_without_reset(device):
             pose[:, 0] -= lateral_offset * direction[1]
             pose[:, 1] += lateral_offset * direction[0]
             pose[:, 2] -= 0.28 - env.parcel_sizes[parcel_id, 2] / 2 - 0.006
+            parcel.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
+            parcel.write_root_velocity_to_sim_index(root_velocity=torch.zeros((1, 6), device=device), env_ids=ids)
+            env.sim.forward()
+            env.scene.update(env.step_dt)
+
+        def place_on_intake(env_id, parcel_id, position):
+            ids = torch.tensor([env_id], device=device)
+            parcel = env.parcels[parcel_id]
+            pose = parcel.data.default_root_pose.torch[ids].clone()
+            pose[:, :2] = pose.new_tensor(position) + env.scene.env_origins[ids, :2]
+            pose[:, 2] = env.scene.env_origins[ids, 2] + 0.04 + env.parcel_sizes[parcel_id, 2] / 2 + 0.006
             parcel.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
             parcel.write_root_velocity_to_sim_index(root_velocity=torch.zeros((1, 6), device=device), env_ids=ids)
             env.sim.forward()
@@ -150,22 +270,19 @@ def test_receipts_record_success_and_continue_without_reset(device):
         env.step(actions)
         assert command.placed.all() and not command.failed.any()
         assert command.metrics["controlled_placements"].tolist() == [1, 1]
-        # The next pick starts after real tool clearance, before the released parcel reaches its bin.
+        # Clearance alone must not replace the observed target before its physical receipt.
+        original_goals = command.goal_positions.clone()
         actions[:, 2] = 1.0
         for _ in range(60):
             env.step(actions)
         separation = end_effector_pose(env)[0][1] - env.parcels[initial_parcels[1]].data.root_link_pose_w.torch[1, :3]
         assert separation.norm() > 0.20, "The tool must physically clear the released parcel."
-        assert env.active_ids[1] != initial_parcels[1], (
-            "A clear, released tool must hand off before the physical receipt."
-        )
+        assert env.active_ids.tolist() == initial_parcels
+        torch.testing.assert_close(command.goal_positions, original_goals)
         actions[:, 2] = 0.0
         assert not command.delivered.any() and not env.episode_success.any()
         assert monitor.success_size[rows].tolist() == [0, 0]
         assert dict(env.reward_manager.get_active_iterable_terms(1))["delivery"][0] == 0.0
-        next_parcel = env.active_ids[1].item()
-        next_goal = command.goal_positions[1].clone()
-        hold_at_goal(1, release=False)
         # An outfeed-speed impact must settle in the bin without crossing its floor.
         impact_ids = torch.tensor([0], device=device)
         pose = torch.tensor(
@@ -198,10 +315,10 @@ def test_receipts_record_success_and_continue_without_reset(device):
                     assert monitor.success_size[rows[env_id]] == monitor.success_rate[rows[env_id]] == 1
                     delivery = dict(env.reward_manager.get_active_iterable_terms(env_id))["delivery"][0]
                     assert delivery == 600.0
-                    if env_id == 1:
-                        assert env.active_ids[1] == next_parcel and env.gripper.engaged[1]
-                        torch.testing.assert_close(command.goal_positions[1], next_goal)
                     received[env_id] = True
+                elif not received[env_id]:
+                    assert env.active_ids[env_id] == parcel_id
+                    torch.testing.assert_close(command.goal_positions[env_id], original_goals[env_id])
             if all(received) and env.active_ids[1] != initial_parcels[1]:
                 break
         else:
@@ -211,6 +328,9 @@ def test_receipts_record_success_and_continue_without_reset(device):
         expected = torch.zeros(len(env.parcels), dtype=torch.bool, device=device)
         expected[initial_parcels[1]] = True
         torch.testing.assert_close(command.delivered[1], expected)
+        next_parcel = env.active_ids[1].item()
+        next_goal = command.goal_positions[1].clone()
+        hold_at_goal(1, release=False)
 
         # A handoff and an unrelated reset cannot repeat the receipt or its sampled-row outcome.
         _, _, _, _, extras = env.step(actions)
@@ -221,6 +341,7 @@ def test_receipts_record_success_and_continue_without_reset(device):
         torch.testing.assert_close(command.delivered[1], expected)
         assert command.metrics["correct_deliveries"][1] == 1
         assert env.active_ids[1] == next_parcel and env.gripper.engaged[1]
+        torch.testing.assert_close(command.goal_positions[1], next_goal)
         assert env.episode_success[1]
         assert monitor.success_size[rows].tolist() == [1, 1]
 
@@ -349,42 +470,7 @@ def test_receipts_record_success_and_continue_without_reset(device):
         assert forces.norm(dim=-1).max() > cfg.commands.sort.arm_contact_force_threshold
         assert not command.delivered[0].any() and not command.new_success[0]
 
-        # A later target may arrive first, but only the sampled parcel labels its reset row.
-        for simultaneous in (False, True):
-            env.reset(env_ids=impact_ids)
-            history_size = monitor.success_size[rows[0]].item()
-            history_success = monitor.success_buf[rows[0]].sum().item()
-            first = env.active_ids[0].item()
-            first_destination = command.destination_ids[0].item()
-            hold_at_goal(0)
-            actions[0, 2] = 1.0
-            for _ in range(60):
-                env.step(actions)
-            actions[0, 2] = 0.0
-            second = env.active_ids[0].item()
-            assert second != first and not command.delivered[0].any()
-            second_destination = command.destination_ids[0].item()
-            hold_at_goal(0)
-            place_in_bin(0, second, second_destination, lateral_offset=0.12)
-            if simultaneous:
-                place_in_bin(0, first, first_destination, lateral_offset=-0.12)
-            pulses = []
-            for _ in range(15):
-                _, _, _, _, extras = env.step(actions)
-                count = command.new_success[0].item()
-                pulses.append(count)
-                assert bool(extras["successes"][0]) == (count > 0)
-                assert dict(env.reward_manager.get_active_iterable_terms(0))["delivery"][0] == 600.0 * count
-            assert sum(pulses) == max(pulses) == 1 + int(simultaneous)
-            assert env.episode_success[0]
-            assert command.delivered[0, second] and bool(command.delivered[0, first]) == simultaneous
-            assert command.delivered[0].sum() == command.metrics["correct_deliveries"][0] == sum(pulses)
-            assert monitor.success_size[rows[0]] == history_size + int(simultaneous)
-            env.reset(env_ids=impact_ids)
-            assert monitor.success_size[rows[0]] == history_size + 1
-            assert monitor.success_rate[rows[0]].item() == pytest.approx(
-                (history_success + int(simultaneous)) / (history_size + 1)
-            )
+        _check_delayed_arrival_after_miss(env, rows, actions, hold_at_goal, place_in_bin, place_on_intake)
 
         # Different physical layouts contribute to the same path-progress history.
         history_size = monitor.success_size[rows[0]].item()
@@ -481,3 +567,19 @@ def test_receipts_record_success_and_continue_without_reset(device):
         command.cfg.continue_after_delivery = True
         env.step(actions)
         assert command.failed.all()
+
+        _check_full_batch_receipts(env, rows, actions, hold_at_goal, place_in_bin, place_on_intake)
+
+        # Return resets start empty-handed away from home, with an earlier incoming parcel and no credit.
+        full_bucket = 4 * cfg.events.reset_parcels.params["samples_per_path"]
+        rows.fill_(full_bucket - 1)
+        env.reset(env_ids=training_ids)
+        tool = end_effector_pose(env)[0][1] - env.scene.env_origins[1]
+        active = env.parcels[env.active_ids[1].item()].data.root_link_pose_w.torch[1, :3] - env.scene.env_origins[1]
+        assert tool[1] > 0 and tool[2] > 0.25, "The return start must restore the tool toward an outfeed."
+        assert active[0] < 0.5 and active[1] < -0.47, "The next parcel must approach from the early left turn."
+        assert not env.gripper.engaged[1] and not command.lifted[1] and not command.placed[1]
+        assert not command.delivered[1].any() and not command.new_success[1]
+        assert command.metrics["correct_deliveries"][1] == 0
+        observations = env.observation_manager.compute()["policy"]
+        assert observations.shape == (2, 312) and torch.isfinite(observations).all()

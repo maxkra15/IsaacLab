@@ -27,12 +27,17 @@ class SuctionSortingEnv(ConveyorFrankaEnv):
     """Share conveyor/contact hooks and keep suction attachment state explicit."""
 
     def _init_sim(self) -> None:
+        for index in range(self.cfg.parcel_count, len(PARCEL_SIZES)):
+            setattr(self.cfg.scene, f"parcel_{index}", None)
+            setattr(self.cfg.events, f"parcel_{index}_mass", None)
+            setattr(self.cfg.events, f"parcel_{index}_material", None)
+        self.cfg.conveyor_force.transported_body_count_per_env = self.cfg.parcel_count
         self.gripper = SurfaceGripper(
             self.cfg.scene.num_envs,
             manager=self.sim.backend_manager,
             tool_body_pattern=r".*/panda_hand",
             target_body_pattern=r".*/Cube[0-9]+",
-            target_count_per_env=len(PARCEL_SIZES),
+            target_count_per_env=self.cfg.parcel_count,
             tool_offset=TOOL_OFFSET,
             pad_radius=SUCTION_PAD_RADIUS,
             pad_spacing=SUCTION_PAD_SPACING,
@@ -44,9 +49,11 @@ class SuctionSortingEnv(ConveyorFrankaEnv):
             raise
 
     def load_managers(self) -> None:
-        self.parcels = tuple(self.scene[f"parcel_{index}"] for index in range(len(PARCEL_SIZES)))
-        self.parcel_sizes = torch.tensor(PARCEL_SIZES, device=self.device)
-        self.parcel_classes = torch.tensor(PARCEL_CLASS_IDS, dtype=torch.long, device=self.device)
+        self.parcels = tuple(self.scene[f"parcel_{index}"] for index in range(self.cfg.parcel_count))
+        self.parcel_sizes = torch.tensor(PARCEL_SIZES[: self.cfg.parcel_count], device=self.device)
+        self.parcel_classes = torch.tensor(
+            PARCEL_CLASS_IDS[: self.cfg.parcel_count], dtype=torch.long, device=self.device
+        )
         self.active_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.episode_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         super().load_managers()

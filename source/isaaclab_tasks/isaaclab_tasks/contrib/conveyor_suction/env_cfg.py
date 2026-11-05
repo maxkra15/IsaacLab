@@ -131,6 +131,8 @@ class SuctionSortingEnvCfg(ConveyorFrankaEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     curriculum = None
     episode_length_s: float = 30.0
+    parcel_count: int = 12
+    """Number of physical parcels instantiated in each environment, from 1 to 12."""
     conveyor_force: ConveyorForceCfg = ConveyorForceCfg(
         speed=0.25,
         friction=0.6,
@@ -215,6 +217,8 @@ class SuctionSortingEnvCfg(ConveyorFrankaEnvCfg):
 
     def validate_config(self) -> None:
         """Require the force-based suction and conveyor contact path."""
+        if not isinstance(self.parcel_count, int) or not 1 <= self.parcel_count <= len(PARCEL_SIZES):
+            raise ValueError(f"parcel_count must be an integer between 1 and {len(PARCEL_SIZES)}.")
         physics = self.sim.physics
         if not isinstance(physics, NewtonCfg) or not isinstance(physics.solver_cfg, MJWarpSolverCfg):
             raise ValueError("Suction sorting requires Newton MJWarp physics.")
