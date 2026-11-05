@@ -171,7 +171,8 @@ Publish the complete generated directory under `site/reports/YYYY-MM-DD-genesis-
 in `maxkra15/maxkra15.github.io`. [REFERENCES.md](REFERENCES.md) explains why this MJWarp
 comparison is a different backend/version comparison from the older RTX 5070 headline.
 
-PhysX is an optional separate reference: explicitly select `--backends genesis isaaclab_physx`
+PhysX is an optional separate reference for Cartpole and ANYmal: explicitly select
+`--backends genesis isaaclab_physx --tasks cartpole anymal`
 and `--isaaclab_physx_python /path/to/physx/bin/python`. Its default interpreter path is
 `.benchmark_sources/isaaclab_env/bin/python`; those results are excluded from the main MJWarp report.
 
