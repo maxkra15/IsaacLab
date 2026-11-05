@@ -262,7 +262,8 @@ def _validate_franka(adapter, config: dict, initial, checks: dict) -> None:
     joints = {joint.attrib["name"]: joint for joint in ET.parse(config["asset_path"]).findall("joint")}
     by_child = {joint.find("child").attrib["link"]: joint for joint in joints.values()}
     chain = []
-    link = config["end_effector_link"]
+    # Use the authored grasp frame, independently of the adapter's merged-body offset.
+    link = "panda_grasptarget"
     while link in by_child:
         joint = by_child[link]
         chain.append(joint)
@@ -296,7 +297,7 @@ def _validate_franka(adapter, config: dict, initial, checks: dict) -> None:
         tolerance_m=2e-4,
         pose_count=len(errors),
         environment_count=config["num_envs"],
-        reference="Float64 transforms parsed from prepared URDF; authored link origin plus tool offset",
+        reference="Float64 transforms parsed from prepared URDF through the authored panda_grasptarget frame",
     )
     adapter.reset()
     adapter.apply_action(initial.expand(config["num_envs"], -1))
@@ -360,8 +361,7 @@ def _franka_reference_position(chain, names: list[str], positions, config: dict)
             rotation = torch.eye(4, dtype=torch.float64)
             rotation[:3, :3] += math.sin(angle) * skew + (1 - math.cos(angle)) * (skew @ skew)
             transform = transform @ rotation
-    offset = torch.tensor([*config["end_effector_offset"], 1.0], dtype=torch.float64)
-    return (transform @ offset)[:3]
+    return transform[:3, 3]
 
 
 def _validate_images(adapter, config: dict, initial, directory: Path, checks: dict) -> None:
