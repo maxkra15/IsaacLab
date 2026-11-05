@@ -574,7 +574,7 @@ def assemble_report(args: argparse.Namespace) -> None:
             )
         validation_root = data / "validation" / name
         for path in validation.rglob("*"):
-            if path.is_file() and not path.is_symlink() and path.suffix in {".json", ".png", ".log"}:
+            if path.is_file() and not path.is_symlink() and path.suffix in {".json", ".png", ".log", ".py", ".txt"}:
                 target = validation_root / path.relative_to(validation)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, target)
