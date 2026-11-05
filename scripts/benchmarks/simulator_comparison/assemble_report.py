@@ -16,6 +16,7 @@ import json
 import math
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -298,6 +299,68 @@ def flatten(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         elif not isinstance(item, list):
             result[prefix + key] = item
     return result
+
+
+def measured_findings(runs: list[dict[str, Any]]) -> str:
+    """Summarize matched medians and first-target counts without combining workloads."""
+    from report import group_results
+
+    ratios = {"physics": [], "rollout": []}
+    for config, group in group_results(runs):
+        mode = config.get("mode")
+        if mode not in ratios:
+            continue
+        metric = "physics_steps_per_s" if mode == "physics" else "env_steps_per_s"
+        medians = {
+            backend: statistics.median(run["metrics"][metric] for run in group if run["config"]["backend"] == backend)
+            for backend in ("genesis", "isaaclab")
+        }
+        ratios[mode].append(medians["isaaclab"] / medians["genesis"])
+    rollout = ratios["rollout"]
+    higher = sum(value > 1 for value in rollout)
+    count = f"all {len(rollout)}" if higher == len(rollout) else f"{higher} of {len(rollout)}"
+    timing = (
+        f"MJWarp had higher median rollout throughput in {count} matched settings "
+        f"(ratios of medians {min(rollout):.1f}–{max(rollout):.1f}×). "
+    )
+    timing += (
+        "Pure physics results varied by task and batch."
+        if min(ratios["physics"]) < 1 < max(ratios["physics"])
+        else "Pure physics uses a separate timed window."
+    )
+    outcomes = []
+    for task, label in (("cartpole", "Cartpole"), ("franka", "Franka"), ("anymal", "ANYmal")):
+        modes = []
+        for vision in ("none", "rgb"):
+            counts = []
+            for backend in ("genesis", "isaaclab"):
+                sample = [
+                    run
+                    for run in runs
+                    if run["config"]["mode"] == "learning"
+                    and (run["config"]["task"], run["config"]["vision"], run["config"]["backend"])
+                    == (task, vision, backend)
+                ]
+                if sample:
+                    reached = sum(isinstance(run["metrics"].get("time_to_threshold"), dict) for run in sample)
+                    counts.append(f"{reached}/{len(sample)}")
+            if len(counts) == 2:
+                modes.append(
+                    f"{counts[0]} each" if counts[0] == counts[1] else f"Genesis {counts[0]}, MJWarp {counts[1]}"
+                )
+        if len(modes) == 2:
+            outcome = f"{modes[0]} in both modes" if modes[0] == modes[1] else f"state {modes[0]}; RGB {modes[1]}"
+            outcomes.append(f"{label}: {outcome}")
+    scope = "One shared PPO recipe and fixed budget; native solver settings and renderer quality differ."
+    return (
+        '<ul class="findings"><li>'
+        + html.escape(timing)
+        + "</li><li>First observed target — "
+        + html.escape(" · ".join(outcomes))
+        + ".</li><li>"
+        + html.escape(scope)
+        + "</li></ul>"
+    )
 
 
 def validate_evidence(
@@ -655,6 +718,7 @@ def assemble_report(args: argparse.Namespace) -> None:
         flags=re.S,
     )
     require(count == expected_groups, f"Unexpected detailed report layout: {count} groups")
+    page = page.replace("<nav>", measured_findings([run for _, run in accepted]) + "<nav>", 1)
     page = page.replace(
         f"{len(accepted)} successful runs · 0 failed or unsupported runs.",
         f"{len(accepted)} accepted runs · {len(excluded)} excluded attempts retained separately.",

@@ -130,8 +130,10 @@ def _summary_tables(groups: list[tuple[dict, list[dict]]]) -> str:
                         _escape(BACKEND_LABELS.get(backend, backend)),
                         count,
                         _statistics(successful, "metrics.startup_s"),
-                        _statistics(successful, "metrics.physics_steps_per_s"),
-                        _statistics(successful, "metrics.env_steps_per_s"),
+                        _statistics(successful, "metrics.physics_steps_per_s")
+                        if config.get("mode") == "physics"
+                        else "—",
+                        _statistics(successful, "metrics.env_steps_per_s") if config.get("mode") == "rollout" else "—",
                     ]
                 )
                 continue
@@ -356,6 +358,8 @@ def _comparison(config: dict, runs: list[dict], index: int) -> str:
             parts.append("<details><summary>Timing distributions</summary>")
         rows = []
         for metric, (label, unit, higher) in METRICS.items():
+            if metric == "physics_steps_per_s" and config.get("mode") != "physics":
+                continue
             series = []
             for backend in backends:
                 values = [
