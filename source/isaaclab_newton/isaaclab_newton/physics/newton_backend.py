@@ -18,9 +18,10 @@ from typing import TYPE_CHECKING
 
 import torch
 import warp as wp
-from newton import CollisionPipeline, Contacts, ModelBuilder, State
+from newton import CollisionPipeline, Contacts, ModelBuilder, ModelFlags, State
 from newton.sensors import SensorContact, SensorIMU
-from newton.solvers import SolverBase
+from newton.solvers import SolverBase, SolverImplicitMPM
+from newton.solvers.experimental.coupled import SolverCoupled
 
 from isaaclab.sim import SimulationContext
 from isaaclab.utils import instantiate
@@ -459,6 +460,62 @@ class NewtonBackend:
     def invalidate_graph(self) -> None:
         """Drop the captured step; with capture enabled, the next step runs eagerly and is captured again."""
         self.graphs = {}
+
+    def set_voxel_size(self, voxel_size: float, *, entry_name: str | None = None) -> None:
+        """Rebuild an MPM grid around its current local state and recapture on the next step.
+
+        Particle state and constitutive history stay intact; grid warm starts are discarded.
+        This allocates resources, so call it between steps at infrequent resolution boundaries.
+        Finer grids can require more reserved cells. Fixed grids cannot be resized.
+        """
+        solver, state, driver = self._runtime_mpm_target(entry_name)
+        solver.set_voxel_size(voxel_size, state=state)
+        driver.cfg.voxel_size = voxel_size
+        self.invalidate_graph()
+
+    def set_particle_radius(self, radius: float, *, entry_name: str | None = None) -> None:
+        """Change uniform MPM support radius at fixed count, mass and state between steps.
+
+        Reference volume is ``8 * radius**3``, so this changes reference density; it does not
+        split or merge particles. A coupled entry must own all particles, including those
+        represented by other entries' proxies. Capture is invalidated after a successful change.
+        """
+        solver, _, _ = self._runtime_mpm_target(entry_name)
+        if isinstance(self.solver, SolverCoupled):
+            counts = getattr(self.solver_ops, "particle_owner_counts", {})
+            name = next(name for name in self.solver.entry_names() if self.solver.solver(name) is solver)
+            if counts.get(name) != self.model.particle_count:
+                raise ValueError("Runtime radius changes require an MPM entry owning all model particles.")
+        solver.set_particle_radius(radius)
+        if solver.model is not self.model:
+            self.model.particle_radius.fill_(radius)
+            self.model.particle_max_radius = radius
+            for name in self.solver.entry_names():
+                view = self.solver.view(name)
+                if view.particle_count:
+                    view.particle_radius.fill_(radius)
+                    view.particle_max_radius = radius
+            self.solver.notify_model_changed(ModelFlags.MODEL_PROPERTIES)
+        self.bvh_refit = TimestampedBuffer()
+        self.invalidate_graph()
+
+    def _runtime_mpm_target(self, entry_name: str | None) -> tuple[SolverImplicitMPM, State, NewtonSolver]:
+        """Resolve the native solver, live local state, and its Isaac Lab driver."""
+        root = getattr(self, "solver", None)
+        if isinstance(root, SolverImplicitMPM):
+            if entry_name is not None:
+                raise ValueError("entry_name is only valid for coupled solvers.")
+            return root, self.state_0, self.solver_ops
+        if not isinstance(root, SolverCoupled):
+            raise RuntimeError("The initialized backend does not contain an MPM solver.")
+        names = [name for name in root.entry_names() if isinstance(root.solver(name), SolverImplicitMPM)]
+        if entry_name is None:
+            if len(names) != 1:
+                raise ValueError(f"Select entry_name from the MPM entries: {names}.")
+            entry_name = names[0]
+        if entry_name not in names:
+            raise ValueError(f"{entry_name!r} is not an MPM entry; select from {names}.")
+        return root.solver(entry_name), root.entry_state(entry_name), self.solver_ops.entries[entry_name]
 
     def step(self) -> bool:
         """Advance one physics step, or the whole decimation loop when :meth:`handles_decimation`.

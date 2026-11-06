@@ -52,6 +52,13 @@ class MPMSolverCfg(NewtonSolverCfg):
     ``"finite_difference"`` is deprecated in favor of ``"backward"``.
     """
 
+    contact_recovery_time: float = 0.0
+    """Python-only experimental velocity-level particle contact recovery time [s]; zero disables it.
+
+    Requires a particle collider basis. This bias can add energy or change deformation;
+    it does not project particle positions. Changing captured settings requires recapture.
+    """
+
     # grid
     voxel_size: float = 0.1
     """Size of the MPM grid voxels [m]."""

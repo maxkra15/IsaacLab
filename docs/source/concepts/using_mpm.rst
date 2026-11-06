@@ -382,8 +382,44 @@ follows:
   Newton's collision pipeline.
 * It treats rigid geometry as colliders. It is not a rigid-body or
   articulation dynamics solver, and it does not accept external rigid-body
-  forces. Kinematic bodies are given zero mass before the model is finalized,
-  and convex meshes are passed to the solver as triangle meshes.
+  forces. Kinematic colliders have zero effective MPM mass while retaining their
+  physical mass for coupled solvers. Convex meshes are passed as triangle meshes.
+
+
+Changing resolution between steps
+---------------------------------
+
+Change an initialized MPM entry through the Newton backend manager:
+
+.. code-block:: python
+
+   sim.backend_manager.set_voxel_size(0.02, entry_name="media")
+   sim.backend_manager.set_particle_radius(0.003, entry_name="media")
+
+Omit ``entry_name`` for direct MPM or a unique coupled MPM entry. Grid changes
+retain particle state and material history, discard grid warm starts, and allocate
+new resources; fixed grids cannot be resized. The next step recaptures CUDA graphs.
+Finer grids may need larger sparse capacities. Use infrequent curriculum boundaries.
+Radius changes keep count and mass fixed, changing reference volume
+``8 * radius**3`` and density; they do not split particles or create hard spheres.
+Coupled radius changes require the selected entry to own every model particle.
+
+Franka Pour accepts explicit ``MPMPointsCfg`` clouds via ``particle_count_env_cfg``.
+Construct a new environment at each count boundary: the helper preserves reference
+mass and volume and the policy interface, but resets all physical and material state.
+An external training driver carries policy and optimizer state. No live arrays are resized.
+Optional ``mpm_resolution_stages`` instead gate global voxel/radius changes on completed
+terminal-success cohorts; ``mpm_resolution_min_episodes`` sets their minimum size.
+These stages affect running worlds too and are disabled by default.
+
+``MPMSolverCfg.contact_recovery_time`` enables experimental velocity-level penetration
+recovery for particle contact bases. Zero disables it; it can add energy and does not
+guarantee containment. Franka's zero-hardening material freezes unused history rates;
+overrides enabling hardening must configure appropriate rates and reset material history.
+
+The compact-restriction optimization requires matching Newton and built Warp development
+checkouts. Use temporary ``uv run --with-editable`` overrides for those checkouts;
+Isaac Lab's standard Warp dependency remains unchanged.
 
 
 Limitations

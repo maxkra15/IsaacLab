@@ -190,7 +190,8 @@ def test_version_single_source_matches_literal_pins(source_checkout_root: Path):
     newton = next(package for package in lock["package"] if package["name"] == "newton")
     assert newton["version"] == versions["newton"]
     commit = newton["source"]["git"].rsplit("#", 1)[1]
-    newton_spec = f"newton[sim] @ git+https://github.com/newton-physics/newton.git@{commit}"
+    repository = newton["source"]["git"].split("?", maxsplit=1)[0]
+    newton_spec = f"newton[sim] @ git+{repository}@{commit}"
     assert newton_spec in dependencies
     assert newton_spec in overrides
 

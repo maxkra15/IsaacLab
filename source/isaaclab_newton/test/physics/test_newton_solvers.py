@@ -327,6 +327,7 @@ _MPM_FIELD_VALUES = [
     ("solver", "gauss-seidel"),
     ("warmstart_mode", "particles"),
     ("collider_velocity_mode", "backward"),
+    ("contact_recovery_time", 0.009),
     ("voxel_size", 0.0375),
     ("grid_type", "dense"),
     ("grid_padding", 4),
@@ -377,17 +378,16 @@ def test_mpm_cfg_translates_deprecated_collider_velocity_modes(mode, expected, d
     assert any(f"use {expected!r}" in message for message in deprecations) is deprecated
 
 
-def test_mpm_prepare_builder_makes_kinematic_bodies_massless():
-    """Kinematic bodies become massless so MPM treats them as kinematic colliders; dynamic bodies keep their mass."""
+def test_mpm_prepare_builder_preserves_shared_kinematic_mass():
+    """MPM preparation keeps physical mass and inertia needed by coupled rigid solvers."""
     builder = ModelBuilder()
     kinematic = builder.add_body(mass=0.35, inertia=wp.mat33(1.0), is_kinematic=True)
     dynamic = builder.add_body(mass=1.2, inertia=wp.mat33(2.0))
 
     MPMSolver.prepare_builder(MPMSolverCfg(), builder)
 
-    assert builder.body_mass[kinematic] == builder.body_inv_mass[kinematic] == 0.0
-    assert np.allclose(np.array(builder.body_inertia[kinematic]), 0.0)
-    assert np.allclose(np.array(builder.body_inv_inertia[kinematic]), 0.0)
+    assert builder.body_mass[kinematic] == pytest.approx(0.35)
+    assert np.allclose(np.array(builder.body_inertia[kinematic]), 1.0)
     assert builder.body_mass[dynamic] == pytest.approx(1.2)
     assert np.allclose(np.array(builder.body_inertia[dynamic]), 2.0)
 

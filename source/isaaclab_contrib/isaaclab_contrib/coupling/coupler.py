@@ -302,6 +302,8 @@ class CouplerSolver(NewtonSolver):
             proxies = [_resolve_proxy(model, proxy, template) for proxy in cfg.proxies]
             active_proxy_destinations = {proxy.destination for proxy in proxies if proxy.bodies or proxy.particles}
         _validate_resolved_entries(model, resolved_entries, cfg, active_proxy_destinations)
+        self.particle_owner_counts = {entry.config.name: len(entry.particles) for entry in resolved_entries}
+        """Resolved owned-particle counts, excluding foreign proxy rows in each local view."""
         self.entries: dict[str, NewtonSolver] = {}
         """Driver of each entry's solver, by entry name; filled while Newton builds the entries."""
         entries = [_coupled_entry(entry, mode, env_template, self.entries) for entry in resolved_entries]

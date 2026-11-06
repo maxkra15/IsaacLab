@@ -590,6 +590,18 @@ class NewtonManager(PhysicsManager):
         if self.backend is not None:
             self.backend.set_decimation(self._decimation)
 
+    def set_voxel_size(self, voxel_size: float, *, entry_name: str | None = None) -> None:
+        """Change MPM grid spacing between steps; see :meth:`NewtonBackend.set_voxel_size`."""
+        if self.backend is None:
+            raise RuntimeError("Initialize Newton physics before changing MPM resolution.")
+        self.backend.set_voxel_size(voxel_size, entry_name=entry_name)
+
+    def set_particle_radius(self, radius: float, *, entry_name: str | None = None) -> None:
+        """Change uniform MPM support radius; see :meth:`NewtonBackend.set_particle_radius`."""
+        if self.backend is None:
+            raise RuntimeError("Initialize Newton physics before changing MPM resolution.")
+        self.backend.set_particle_radius(radius, entry_name=entry_name)
+
     def handles_decimation(self) -> bool:
         """Whether :meth:`step` executes the full decimation loop; see :meth:`NewtonBackend.handles_decimation`."""
         return self.backend.handles_decimation()
