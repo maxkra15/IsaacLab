@@ -158,6 +158,9 @@ def _media_asset_cfg() -> MPMObjectCfg:
             density=1500.0,
             friction=0.7,
             yield_pressure=1.0e12,
+            # Hardening is disabled, so keep its unused plastic history fixed.
+            hardening_rate=0.0,
+            softening_rate=0.0,
         ),
     )
 
